@@ -18,10 +18,12 @@ public class VertexMaskForge : ModuleRules
 			{
 				"CoreUObject",
 				"Engine",
+				"InputCore",
 				"Slate",
 				"SlateCore",
 				"UnrealEd",
 				"ToolMenus",
+				"ContentBrowser",
 			}
 		);
 	}
