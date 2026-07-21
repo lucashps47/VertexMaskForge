@@ -20,6 +20,40 @@ enum class EVertexMaskForgeSelectionSource : uint8
 };
 ENUM_CLASS_FLAGS(EVertexMaskForgeSelectionSource)
 
+/** Coverage state of the LOD 0 Color Vertex Buffer. */
+enum class EVertexMaskForgeVertexColorState : uint8
+{
+	/** No Color Vertex Buffer, or it has zero entries. */
+	None,
+
+	/** Color Vertex Buffer present and its vertex count matches LOD 0's vertex count. */
+	Present,
+
+	/** Color Vertex Buffer present but its vertex count does not match LOD 0's vertex count. */
+	PartialOrInvalid,
+};
+
+/**
+ * Read-only technical diagnostics for a single Static Mesh, gathered from its
+ * render data. Computed once per refresh; never mutates the mesh.
+ */
+struct FVertexMaskForgeMeshDiagnostics
+{
+	/** True once the diagnostics below were successfully computed from valid render data. */
+	bool bValid = false;
+
+	int32 NumLODs = 0;
+	int32 LOD0NumVertices = 0;
+	int32 LOD0NumTriangles = 0;
+	int32 NumMaterialSlots = 0;
+
+	EVertexMaskForgeVertexColorState VertexColorState = EVertexMaskForgeVertexColorState::None;
+	int32 LOD0NumColorVertices = 0;
+
+	bool bNaniteEnabled = false;
+	bool bAllowCPUAccess = false;
+};
+
 /**
  * One unique Static Mesh found in the current selection.
  * Kept small and self-contained for this checkpoint; safe to relocate to a
@@ -37,6 +71,8 @@ struct FVertexMaskForgeSelectedMesh
 	FString AssetPathString;
 
 	EVertexMaskForgeSelectionSource Sources = EVertexMaskForgeSelectionSource::None;
+
+	FVertexMaskForgeMeshDiagnostics Diagnostics;
 };
 
 class SVertexMaskForgePanel : public SCompoundWidget
@@ -62,6 +98,13 @@ private:
 	void CollectContentBrowserSelection(
 		TArray<TSharedPtr<FVertexMaskForgeSelectedMesh>>& InOutMeshes,
 		TMap<FString, int32>& InOutPathToIndex) const;
+
+	/**
+	 * Resolves each entry's Static Mesh and computes its diagnostics.
+	 * Soft pointers are only resolved here, for the duration of the refresh;
+	 * no raw pointer is kept afterwards.
+	 */
+	void UpdateMeshDiagnostics(TArray<TSharedPtr<FVertexMaskForgeSelectedMesh>>& InOutMeshes) const;
 
 	TSharedRef<ITableRow> OnGenerateMeshRow(
 		TSharedPtr<FVertexMaskForgeSelectedMesh> InItem,

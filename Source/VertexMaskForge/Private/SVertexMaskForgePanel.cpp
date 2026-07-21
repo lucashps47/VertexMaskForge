@@ -10,6 +10,7 @@
 #include "Logging/LogMacros.h"
 #include "Modules/ModuleManager.h"
 #include "Selection.h"
+#include "StaticMeshResources.h"
 #include "Styling/CoreStyle.h"
 #include "Widgets/Input/SButton.h"
 #include "Widgets/Layout/SBorder.h"
@@ -70,6 +71,103 @@ namespace VertexMaskForgePanel
 
 		InOutPathToIndex.Add(AssetPathString, InOutMeshes.Num());
 		InOutMeshes.Add(MoveTemp(NewEntry));
+	}
+
+	/**
+	 * Reads LOD 0 / material / Nanite / CPU access diagnostics from a Static Mesh's
+	 * render data. Read-only: never touches SourceModel, MeshDescription, or RenderData.
+	 * Safe to call with a null or not-yet-built mesh.
+	 */
+	static FVertexMaskForgeMeshDiagnostics InspectStaticMesh(const UStaticMesh* Mesh)
+	{
+		FVertexMaskForgeMeshDiagnostics Diagnostics;
+
+		if (!IsValid(Mesh))
+		{
+			return Diagnostics;
+		}
+
+		Diagnostics.NumLODs = Mesh->GetNumLODs();
+		Diagnostics.NumMaterialSlots = Mesh->GetStaticMaterials().Num();
+		Diagnostics.bAllowCPUAccess = Mesh->bAllowCPUAccess != 0;
+		Diagnostics.bNaniteEnabled = Mesh->HasValidNaniteData();
+
+		if (!Mesh->HasValidRenderData(/*bCheckLODForVerts=*/true, /*LODIndex=*/0))
+		{
+			return Diagnostics;
+		}
+
+		const FStaticMeshRenderData* RenderData = Mesh->GetRenderData();
+		if (!RenderData || !RenderData->LODResources.IsValidIndex(0))
+		{
+			return Diagnostics;
+		}
+
+		const FStaticMeshLODResources& LOD0 = RenderData->LODResources[0];
+
+		Diagnostics.LOD0NumVertices = LOD0.GetNumVertices();
+		Diagnostics.LOD0NumTriangles = LOD0.GetNumTriangles();
+
+		const int32 ColorVertexCount = static_cast<int32>(LOD0.VertexBuffers.ColorVertexBuffer.GetNumVertices());
+		Diagnostics.LOD0NumColorVertices = ColorVertexCount;
+
+		if (ColorVertexCount <= 0)
+		{
+			Diagnostics.VertexColorState = EVertexMaskForgeVertexColorState::None;
+		}
+		else if (ColorVertexCount == Diagnostics.LOD0NumVertices)
+		{
+			Diagnostics.VertexColorState = EVertexMaskForgeVertexColorState::Present;
+		}
+		else
+		{
+			Diagnostics.VertexColorState = EVertexMaskForgeVertexColorState::PartialOrInvalid;
+		}
+
+		Diagnostics.bValid = true;
+
+		return Diagnostics;
+	}
+
+	static FText GetVertexColorStateLabel(const EVertexMaskForgeVertexColorState State)
+	{
+		switch (State)
+		{
+		case EVertexMaskForgeVertexColorState::Present:
+			return LOCTEXT("VertexColorPresent", "Present");
+		case EVertexMaskForgeVertexColorState::PartialOrInvalid:
+			return LOCTEXT("VertexColorPartial", "Partial/Invalid");
+		case EVertexMaskForgeVertexColorState::None:
+		default:
+			return LOCTEXT("VertexColorNone", "None");
+		}
+	}
+
+	static FText GetEnabledDisabledLabel(const bool bEnabled)
+	{
+		return bEnabled ? LOCTEXT("StateEnabled", "Enabled") : LOCTEXT("StateDisabled", "Disabled");
+	}
+
+	/** Builds the compact diagnostics line shown under each mesh row. */
+	static FText GetDiagnosticsSummaryText(const FVertexMaskForgeMeshDiagnostics& Diagnostics)
+	{
+		if (!Diagnostics.bValid)
+		{
+			return LOCTEXT("DiagnosticsUnavailable", "Render data unavailable");
+		}
+
+		return FText::Format(
+			LOCTEXT("DiagnosticsFormat",
+				"LODs: {0}   LOD 0 Vertices: {1}   LOD 0 Triangles: {2}   Material Slots: {3}   Vertex Colors: {4} ({5} / {6})   Nanite: {7}   Allow CPU Access: {8}"),
+			FText::AsNumber(Diagnostics.NumLODs),
+			FText::AsNumber(Diagnostics.LOD0NumVertices),
+			FText::AsNumber(Diagnostics.LOD0NumTriangles),
+			FText::AsNumber(Diagnostics.NumMaterialSlots),
+			GetVertexColorStateLabel(Diagnostics.VertexColorState),
+			FText::AsNumber(Diagnostics.LOD0NumColorVertices),
+			FText::AsNumber(Diagnostics.LOD0NumVertices),
+			GetEnabledDisabledLabel(Diagnostics.bNaniteEnabled),
+			GetEnabledDisabledLabel(Diagnostics.bAllowCPUAccess));
 	}
 }
 
@@ -188,6 +286,7 @@ void SVertexMaskForgePanel::RefreshSelection()
 
 	CollectViewportSelection(NewSelection, PathToIndex);
 	CollectContentBrowserSelection(NewSelection, PathToIndex);
+	UpdateMeshDiagnostics(NewSelection);
 
 	SelectedMeshes = MoveTemp(NewSelection);
 
@@ -291,6 +390,21 @@ void SVertexMaskForgePanel::CollectContentBrowserSelection(
 	}
 }
 
+void SVertexMaskForgePanel::UpdateMeshDiagnostics(TArray<TSharedPtr<FVertexMaskForgeSelectedMesh>>& InOutMeshes) const
+{
+	for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : InOutMeshes)
+	{
+		if (!Entry.IsValid())
+		{
+			continue;
+		}
+
+		// Resolved only for the duration of this refresh; no raw pointer is stored on Entry.
+		const UStaticMesh* Mesh = Entry->Mesh.LoadSynchronous();
+		Entry->Diagnostics = VertexMaskForgePanel::InspectStaticMesh(Mesh);
+	}
+}
+
 TSharedRef<ITableRow> SVertexMaskForgePanel::OnGenerateMeshRow(
 	TSharedPtr<FVertexMaskForgeSelectedMesh> InItem,
 	const TSharedRef<STableViewBase>& OwnerTable)
@@ -336,6 +450,19 @@ TSharedRef<ITableRow> SVertexMaskForgePanel::OnGenerateMeshRow(
 				.Text(InItem.IsValid() ? FText::FromString(InItem->AssetPathString) : FText::GetEmpty())
 				.ColorAndOpacity(FSlateColor::UseSubduedForeground())
 				.Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
+			]
+
+			+ SVerticalBox::Slot()
+			.AutoHeight()
+			.Padding(FMargin(0.f, 2.f, 0.f, 0.f))
+			[
+				SNew(STextBlock)
+				.Text(InItem.IsValid()
+					? VertexMaskForgePanel::GetDiagnosticsSummaryText(InItem->Diagnostics)
+					: FText::GetEmpty())
+				.ColorAndOpacity(FSlateColor::UseSubduedForeground())
+				.Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
+				.AutoWrapText(true)
 			]
 		];
 }
