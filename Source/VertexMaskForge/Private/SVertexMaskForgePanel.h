@@ -1,5 +1,6 @@
 #pragma once
 
+#include "Containers/BitArray.h"
 #include "CoreMinimal.h"
 #include "Math/Vector4.h"
 #include "Misc/EnumClassFlags.h"
@@ -11,6 +12,7 @@ class STableViewBase;
 class STextBlock;
 class UStaticMesh;
 template <typename ItemType> class SListView;
+enum class ECheckBoxState : uint8;
 
 namespace UE::Geometry { class FDynamicMesh3; }
 
@@ -131,6 +133,81 @@ struct FVertexMaskForgeColorStats
 	int32 NumNonBlack = 0;
 };
 
+/** Result of attempting to generate a scalar mask on a working mesh. */
+enum class EVertexMaskForgeScalarMaskState : uint8
+{
+	/** No generation has been attempted yet, or a prior result was invalidated. */
+	NotGenerated,
+
+	/** Generation succeeded and the values below are safe to use. */
+	Ready,
+
+	/** No valid working mesh (or no vertices) was available to generate from. */
+	Unavailable,
+
+	/** The mesh's local-space extent along the mask's axis is too small to normalize safely. */
+	DegenerateBounds,
+
+	/** Generation ran but produced values that failed validation (non-finite, out of [0,1], or a
+	 *  valid-value count mismatch). Surfaced rather than hidden; never auto-corrected. */
+	Invalid,
+};
+
+/**
+ * A transient per-vertex scalar mask (e.g. the Bounding Box Z prototype), owned by exactly one
+ * FVertexMaskForgeWorkingMesh. Exists only in memory; never written to the Primary Color Overlay,
+ * MeshDescription, RenderData, or the source asset.
+ *
+ * FDynamicMesh3 Vertex IDs are not necessarily compact (VertexCount() can be less than
+ * MaxVertexID()). Values/bHasValue are therefore sized to MaxVertexID() and only written at
+ * indices that were valid Vertex IDs at generation time -- use TryGetValue() rather than indexing
+ * Values directly, since unwritten slots are meaningless, not zero.
+ */
+struct FVertexMaskForgeScalarMask
+{
+	/** Small explicit tolerance for the Near Zero / Near One counters, matching color-diagnostic precedent. */
+	static constexpr float Tolerance = 1.0f / 255.0f;
+
+	EVertexMaskForgeScalarMaskState State = EVertexMaskForgeScalarMaskState::NotGenerated;
+
+	/** Indexed directly by Dynamic Mesh Vertex ID; sized to MaxVertexID() when State == Ready. */
+	TArray<float> Values;
+
+	/** Parallel to Values: true only at indices that are valid, written Vertex IDs. */
+	TBitArray<> bHasValue;
+
+	/** Safe accessor: returns false (and leaves OutValue untouched) for any ID not actually stored. */
+	bool TryGetValue(int32 VertexID, float& OutValue) const
+	{
+		if (!bHasValue.IsValidIndex(VertexID) || !bHasValue[VertexID])
+		{
+			return false;
+		}
+		OutValue = Values[VertexID];
+		return true;
+	}
+
+	int32 NumValidValues = 0;
+	float MinValue = 0.f;
+	float MaxValue = 0.f;
+	float MeanValue = 0.f;
+
+	/** Values within Tolerance of 0.0 / 1.0, respectively. */
+	int32 NumNearZero = 0;
+	int32 NumNearOne = 0;
+
+	/** Value at the vertex with the lowest local-space Z (Bottom). */
+	float BottomValue = 0.f;
+
+	/** Value at the vertex with the highest local-space Z (Top). */
+	float TopValue = 0.f;
+
+	/** Parameters used to produce this result, kept for diagnostic display. */
+	float Position = 0.5f;
+	float TransitionWidth = 1.0f;
+	bool bInvert = false;
+};
+
 /**
  * A transient, independent working copy of a Static Mesh's LOD 0, used as the basis for future
  * mask generators. Never written back to the source asset. Owns its FDynamicMesh3 by pointer so
@@ -190,6 +267,15 @@ struct FVertexMaskForgeWorkingMesh
 
 	EVertexMaskForgeWorkingVertexColorState VertexColorState = EVertexMaskForgeWorkingVertexColorState::Unavailable;
 	FVertexMaskForgeColorStats ColorStats;
+
+	/**
+	 * The Bounding Box Z mask prototype, if generated. A fresh FVertexMaskForgeWorkingMesh is
+	 * always constructed on Refresh Selection (see BuildWorkingMeshForStaticMesh), so this starts
+	 * at NotGenerated automatically every time the working mesh itself is rebuilt -- there is no
+	 * separate invalidation step needed for that case. Parameter-change invalidation is handled by
+	 * the panel explicitly resetting this field.
+	 */
+	FVertexMaskForgeScalarMask BoundingBoxZMask;
 };
 
 /**
@@ -266,10 +352,37 @@ private:
 	EVisibility GetListVisibility() const;
 	EVisibility GetRefreshedMessageVisibility() const;
 
+	// --- Bounding Box Z Mask prototype ------------------------------------------------------
+
+	/** Processes every selected entry's working mesh, generating or clearing its Bounding Box Z mask. */
+	FReply OnGenerateBoundingBoxMaskClicked();
+
+	float GetBoundingBoxMaskPosition() const { return BoundingBoxMaskPosition; }
+	void OnBoundingBoxMaskPositionChanged(float NewValue);
+
+	float GetBoundingBoxMaskTransitionWidth() const { return BoundingBoxMaskTransitionWidth; }
+	void OnBoundingBoxMaskTransitionWidthChanged(float NewValue);
+
+	ECheckBoxState GetBoundingBoxMaskInvertState() const;
+	void OnBoundingBoxMaskInvertChanged(ECheckBoxState NewState);
+
+	/**
+	 * Resets every selected entry's Bounding Box Z mask back to NotGenerated, without touching the
+	 * working mesh (FDynamicMesh3) itself. Called whenever Position/Transition Width/Invert change,
+	 * so stale statistics are never left looking current; the user must click Generate Mask again.
+	 */
+	void InvalidateBoundingBoxMasks();
+
 	TArray<TSharedPtr<FVertexMaskForgeSelectedMesh>> SelectedMeshes;
 
 	TSharedPtr<SListView<TSharedPtr<FVertexMaskForgeSelectedMesh>>> ListView;
 	TSharedPtr<STextBlock> SummaryText;
 
 	bool bHasRefreshedOnce = false;
+
+	// Bottom-to-Top Local Z prototype parameters; defaults reproduce the raw normalized gradient
+	// (Bottom = 0, Top = 1) -- see VertexMaskForgePanel::GenerateBoundingBoxZMask() for the formula.
+	float BoundingBoxMaskPosition = 0.5f;
+	float BoundingBoxMaskTransitionWidth = 1.0f;
+	bool bBoundingBoxMaskInvert = false;
 };

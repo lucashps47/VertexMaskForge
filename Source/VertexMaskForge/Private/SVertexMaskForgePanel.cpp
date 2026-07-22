@@ -11,6 +11,7 @@
 #include "GameFramework/Actor.h"
 #include "IContentBrowserSingleton.h"
 #include "Logging/LogMacros.h"
+#include "Math/NumericLimits.h"
 #include "MeshDescription.h"
 #include "MeshDescriptionToDynamicMesh.h"
 #include "Modules/ModuleManager.h"
@@ -20,6 +21,8 @@
 #include "UObject/Package.h"
 #include "Styling/CoreStyle.h"
 #include "Widgets/Input/SButton.h"
+#include "Widgets/Input/SCheckBox.h"
+#include "Widgets/Input/SSpinBox.h"
 #include "Widgets/Layout/SBorder.h"
 #include "Widgets/Layout/SBox.h"
 #include "Widgets/Layout/SSeparator.h"
@@ -656,6 +659,204 @@ namespace VertexMaskForgePanel
 			FText::AsNumber(Stats.NumNonWhite),
 			FText::AsNumber(Stats.NumNonBlack));
 	}
+
+	// --- Bounding Box Z Mask prototype (Local Z, Bottom to Top) -----------------------------
+
+	/**
+	 * Generates the Bounding Box Z mask for one working mesh.
+	 *
+	 * Formula (documented per checkpoint spec):
+	 *   NormalizedZ = (VertexZ - MinZ) / (MaxZ - MinZ)          -- local-space, from the Dynamic
+	 *                                                               Mesh's own vertex positions only
+	 *   Lower       = Position - TransitionWidth * 0.5
+	 *   Mask        = clamp((NormalizedZ - Lower) / TransitionWidth, 0, 1)
+	 *   if bInvert:  Mask = 1 - Mask
+	 *
+	 * With defaults (Position = 0.5, TransitionWidth = 1.0) this reduces exactly to NormalizedZ,
+	 * i.e. Bottom = 0, Top = 1. TransitionWidth is floored to a small epsilon to avoid division by
+	 * zero; Mask is clamped to [0,1] before Invert is applied, so Invert always yields Bottom = 1,
+	 * Top = 0 with the same defaults.
+	 *
+	 * Never touches the Primary Color Overlay, MeshDescription, RenderData, or the source asset --
+	 * only reads FDynamicMesh3 vertex positions and writes into the returned FVertexMaskForgeScalarMask.
+	 */
+	static FVertexMaskForgeScalarMask GenerateBoundingBoxZMask(
+		const UE::Geometry::FDynamicMesh3& Mesh,
+		const float Position,
+		const float TransitionWidth,
+		const bool bInvert)
+	{
+		FVertexMaskForgeScalarMask Mask;
+		Mask.Position = Position;
+		Mask.TransitionWidth = TransitionWidth;
+		Mask.bInvert = bInvert;
+
+		if (Mesh.VertexCount() <= 0)
+		{
+			Mask.State = EVertexMaskForgeScalarMaskState::Unavailable;
+			return Mask;
+		}
+
+		// Pass 1: local-space Z bounds, and which Vertex IDs hold them (for Bottom/Top lookup).
+		double MinZ = TNumericLimits<double>::Max();
+		double MaxZ = TNumericLimits<double>::Lowest();
+		int32 BottomVertexID = INDEX_NONE;
+		int32 TopVertexID = INDEX_NONE;
+
+		for (const int32 VertexID : Mesh.VertexIndicesItr())
+		{
+			const double Z = Mesh.GetVertex(VertexID).Z;
+			if (Z < MinZ)
+			{
+				MinZ = Z;
+				BottomVertexID = VertexID;
+			}
+			if (Z > MaxZ)
+			{
+				MaxZ = Z;
+				TopVertexID = VertexID;
+			}
+		}
+
+		// A small, explicitly documented epsilon: below this local-space Z extent, normalizing
+		// would amplify floating-point noise into a meaningless gradient, so we refuse instead.
+		constexpr double MinZExtent = 1e-5;
+		const double ZExtent = MaxZ - MinZ;
+		if (!FMath::IsFinite(ZExtent) || ZExtent <= MinZExtent || BottomVertexID == INDEX_NONE || TopVertexID == INDEX_NONE)
+		{
+			Mask.State = EVertexMaskForgeScalarMaskState::DegenerateBounds;
+			return Mask;
+		}
+
+		const int32 MaxVertexID = Mesh.MaxVertexID();
+		Mask.Values.SetNumZeroed(MaxVertexID);
+		Mask.bHasValue.Init(false, MaxVertexID);
+
+		// Epsilon guard against a zero (or near-zero) Transition Width, per the checkpoint spec.
+		const float SafeTransitionWidth = FMath::Max(TransitionWidth, 1e-4f);
+		const float Lower = Position - SafeTransitionWidth * 0.5f;
+
+		double Sum = 0.0;
+		float MinValue = 1.f;
+		float MaxValue = 0.f;
+		int32 NumNearZero = 0;
+		int32 NumNearOne = 0;
+		int32 NumWritten = 0;
+		bool bAllFinite = true;
+		bool bAllInRange = true;
+
+		for (const int32 VertexID : Mesh.VertexIndicesItr())
+		{
+			const double Z = Mesh.GetVertex(VertexID).Z;
+			const float NormalizedZ = static_cast<float>((Z - MinZ) / ZExtent);
+
+			float Value = FMath::Clamp((NormalizedZ - Lower) / SafeTransitionWidth, 0.f, 1.f);
+			if (bInvert)
+			{
+				Value = 1.f - Value;
+			}
+
+			if (!FMath::IsFinite(Value))
+			{
+				bAllFinite = false;
+			}
+			if (Value < 0.f || Value > 1.f)
+			{
+				bAllInRange = false;
+			}
+
+			Mask.Values[VertexID] = Value;
+			Mask.bHasValue[VertexID] = true;
+			++NumWritten;
+
+			Sum += Value;
+			MinValue = FMath::Min(MinValue, Value);
+			MaxValue = FMath::Max(MaxValue, Value);
+
+			if (FMath::IsNearlyZero(Value, FVertexMaskForgeScalarMask::Tolerance))
+			{
+				++NumNearZero;
+			}
+			if (FMath::IsNearlyEqual(Value, 1.f, FVertexMaskForgeScalarMask::Tolerance))
+			{
+				++NumNearOne;
+			}
+		}
+
+		Mask.NumValidValues = NumWritten;
+		Mask.MinValue = MinValue;
+		Mask.MaxValue = MaxValue;
+		Mask.MeanValue = NumWritten > 0 ? static_cast<float>(Sum / NumWritten) : 0.f;
+		Mask.NumNearZero = NumNearZero;
+		Mask.NumNearOne = NumNearOne;
+
+		float BottomValue = 0.f;
+		float TopValue = 0.f;
+		const bool bFoundBottom = Mask.TryGetValue(BottomVertexID, BottomValue);
+		const bool bFoundTop = Mask.TryGetValue(TopVertexID, TopValue);
+		Mask.BottomValue = BottomValue;
+		Mask.TopValue = TopValue;
+
+		// Integrity checks: never silently hide inconsistent output. None of these are expected to
+		// trigger given the formula above; they exist to catch a future regression rather than to
+		// handle an anticipated case.
+		if (!bAllFinite || !bAllInRange || !bFoundBottom || !bFoundTop || Mask.NumValidValues != Mesh.VertexCount())
+		{
+			Mask.State = EVertexMaskForgeScalarMaskState::Invalid;
+			return Mask;
+		}
+
+		Mask.State = EVertexMaskForgeScalarMaskState::Ready;
+		return Mask;
+	}
+
+	static FText GetScalarMaskStateLabel(const EVertexMaskForgeScalarMaskState State)
+	{
+		switch (State)
+		{
+		case EVertexMaskForgeScalarMaskState::Ready:
+			return LOCTEXT("ScalarMaskReady", "Ready");
+		case EVertexMaskForgeScalarMaskState::Unavailable:
+			return LOCTEXT("ScalarMaskUnavailable", "Unavailable");
+		case EVertexMaskForgeScalarMaskState::DegenerateBounds:
+			return LOCTEXT("ScalarMaskDegenerateBounds", "Degenerate Bounds (Local Z Extent insufficient)");
+		case EVertexMaskForgeScalarMaskState::Invalid:
+			return LOCTEXT("ScalarMaskInvalid", "Invalid");
+		case EVertexMaskForgeScalarMaskState::NotGenerated:
+		default:
+			return LOCTEXT("ScalarMaskNotGenerated", "Not Generated");
+		}
+	}
+
+	/** Formats a mask scalar value (0-1) with a fixed three-decimal precision. */
+	static FText FormatMaskValue(const float Value)
+	{
+		FNumberFormattingOptions Options;
+		Options.MinimumFractionalDigits = 3;
+		Options.MaximumFractionalDigits = 3;
+		return FText::AsNumber(Value, &Options);
+	}
+
+	/** Builds the compact "BBox Z Mask: ..." diagnostics line shown under each mesh row. */
+	static FText GetBoundingBoxMaskSummaryText(const FVertexMaskForgeScalarMask& Mask)
+	{
+		if (Mask.State != EVertexMaskForgeScalarMaskState::Ready)
+		{
+			return FText::Format(
+				LOCTEXT("BBoxMaskUnreadyFormat", "BBox Z Mask: {0}"),
+				GetScalarMaskStateLabel(Mask.State));
+		}
+
+		return FText::Format(
+			LOCTEXT("BBoxMaskReadyFormat",
+				"BBox Z Mask: Ready   Mask Values: {0}   Mask Range: {1}-{2}   Mean: {3}   Bottom → Top: {4} → {5}   Near Zero: {6}   Near One: {7}"),
+			FText::AsNumber(Mask.NumValidValues),
+			FormatMaskValue(Mask.MinValue), FormatMaskValue(Mask.MaxValue),
+			FormatMaskValue(Mask.MeanValue),
+			FormatMaskValue(Mask.BottomValue), FormatMaskValue(Mask.TopValue),
+			FText::AsNumber(Mask.NumNearZero),
+			FText::AsNumber(Mask.NumNearOne));
+	}
 }
 
 void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
@@ -752,6 +953,110 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 					.Text(LOCTEXT("SelectionRefreshed", "Selection refreshed"))
 					.ColorAndOpacity(FSlateColor::UseSubduedForeground())
 					.Visibility(this, &SVertexMaskForgePanel::GetRefreshedMessageVisibility)
+				]
+			]
+
+			+ SVerticalBox::Slot()
+			.AutoHeight()
+			.Padding(FMargin(0.f, 12.f, 0.f, 0.f))
+			[
+				SNew(SBorder)
+				.Padding(FMargin(8.f))
+				[
+					SNew(SVerticalBox)
+
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(FMargin(0.f, 0.f, 0.f, 2.f))
+					[
+						SNew(STextBlock)
+						.Text(LOCTEXT("BBoxMaskSectionTitle", "Bounding Box Mask — Prototype"))
+						.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
+					]
+
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(FMargin(0.f, 0.f, 0.f, 8.f))
+					[
+						SNew(STextBlock)
+						.Text(LOCTEXT("BBoxMaskSectionSubtitle", "Local Z — Bottom to Top"))
+						.ColorAndOpacity(FSlateColor::UseSubduedForeground())
+						.Font(FCoreStyle::GetDefaultFontStyle("Italic", 8))
+					]
+
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(FMargin(0.f, 0.f, 0.f, 4.f))
+					[
+						SNew(SHorizontalBox)
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						[
+							SNew(STextBlock)
+							.Text(LOCTEXT("BBoxMaskPositionLabel", "Position"))
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(4.f, 0.f, 12.f, 0.f))
+						[
+							SNew(SSpinBox<float>)
+							.MinDesiredWidth(80.f)
+							.MinValue(0.0f)
+							.MaxValue(1.0f)
+							.Delta(0.01f)
+							.Value(this, &SVertexMaskForgePanel::GetBoundingBoxMaskPosition)
+							.OnValueChanged(this, &SVertexMaskForgePanel::OnBoundingBoxMaskPositionChanged)
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						[
+							SNew(STextBlock)
+							.Text(LOCTEXT("BBoxMaskTransitionWidthLabel", "Transition Width"))
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(4.f, 0.f, 12.f, 0.f))
+						[
+							SNew(SSpinBox<float>)
+							.MinDesiredWidth(80.f)
+							.MinValue(0.001f)
+							.MaxValue(1.0f)
+							.Delta(0.01f)
+							.Value(this, &SVertexMaskForgePanel::GetBoundingBoxMaskTransitionWidth)
+							.OnValueChanged(this, &SVertexMaskForgePanel::OnBoundingBoxMaskTransitionWidthChanged)
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						[
+							SNew(SCheckBox)
+							.IsChecked(this, &SVertexMaskForgePanel::GetBoundingBoxMaskInvertState)
+							.OnCheckStateChanged(this, &SVertexMaskForgePanel::OnBoundingBoxMaskInvertChanged)
+							.Content()
+							[
+								SNew(STextBlock)
+								.Text(LOCTEXT("BBoxMaskInvertLabel", "Invert"))
+							]
+						]
+					]
+
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.HAlign(HAlign_Left)
+					[
+						SNew(SButton)
+						.Text(LOCTEXT("GenerateMask", "Generate Mask"))
+						.OnClicked(this, &SVertexMaskForgePanel::OnGenerateBoundingBoxMaskClicked)
+					]
 				]
 			]
 		]
@@ -1012,6 +1317,30 @@ TSharedRef<ITableRow> SVertexMaskForgePanel::OnGenerateMeshRow(
 				.Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
 				.AutoWrapText(true)
 			]
+
+			+ SVerticalBox::Slot()
+			.AutoHeight()
+			.Padding(FMargin(0.f, 2.f, 0.f, 0.f))
+			[
+				SNew(STextBlock)
+				// Bound as a live lambda, not a plain FText: SListView::RequestListRefresh()
+				// reuses an existing row widget for an unchanged item identity (see
+				// SListView::GenerateWidgetForItem, which only calls OnRefreshRow -- never
+				// OnGenerateRow again -- when a widget already exists for that TSharedPtr). Since
+				// Generate Mask mutates InItem->WorkingMesh.BoundingBoxZMask in place rather than
+				// replacing the entry, a plain FText captured once at row-creation time would stay
+				// frozen at whatever it was when the row was first generated (right after Refresh
+				// Selection, i.e. NotGenerated). A lambda re-evaluates every time Slate paints it.
+				.Text_Lambda([InItem]()
+				{
+					return InItem.IsValid()
+						? VertexMaskForgePanel::GetBoundingBoxMaskSummaryText(InItem->WorkingMesh.BoundingBoxZMask)
+						: FText::GetEmpty();
+				})
+				.ColorAndOpacity(FSlateColor::UseSubduedForeground())
+				.Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
+				.AutoWrapText(true)
+			]
 		];
 }
 
@@ -1033,6 +1362,118 @@ EVisibility SVertexMaskForgePanel::GetListVisibility() const
 EVisibility SVertexMaskForgePanel::GetRefreshedMessageVisibility() const
 {
 	return bHasRefreshedOnce ? EVisibility::Visible : EVisibility::Collapsed;
+}
+
+FReply SVertexMaskForgePanel::OnGenerateBoundingBoxMaskClicked()
+{
+	int32 NumReady = 0;
+	int32 NumUnavailable = 0;
+	int32 NumDegenerate = 0;
+	int32 NumInvalid = 0;
+
+	for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
+	{
+		if (!Entry.IsValid())
+		{
+			continue;
+		}
+
+		UE::Geometry::FDynamicMesh3* Mesh = Entry->WorkingMesh.Mesh.Get();
+		if (Entry->WorkingMesh.State != EVertexMaskForgeWorkingMeshState::Ready || !Mesh)
+		{
+			Entry->WorkingMesh.BoundingBoxZMask = FVertexMaskForgeScalarMask();
+			Entry->WorkingMesh.BoundingBoxZMask.State = EVertexMaskForgeScalarMaskState::Unavailable;
+			++NumUnavailable;
+			continue;
+		}
+
+		// Snapshot the Primary Color Overlay's state so we can prove it is untouched by generation.
+		const bool bHadColorsBefore = Mesh->Attributes() && Mesh->Attributes()->HasPrimaryColors();
+		const int32 ColorElementsBefore = bHadColorsBefore ? Mesh->Attributes()->PrimaryColors()->ElementCount() : 0;
+
+		Entry->WorkingMesh.BoundingBoxZMask = VertexMaskForgePanel::GenerateBoundingBoxZMask(
+			*Mesh, BoundingBoxMaskPosition, BoundingBoxMaskTransitionWidth, bBoundingBoxMaskInvert);
+
+		const bool bHasColorsAfter = Mesh->Attributes() && Mesh->Attributes()->HasPrimaryColors();
+		const int32 ColorElementsAfter = bHasColorsAfter ? Mesh->Attributes()->PrimaryColors()->ElementCount() : 0;
+		if (bHadColorsBefore != bHasColorsAfter || ColorElementsBefore != ColorElementsAfter)
+		{
+			// This would indicate a real integrity failure (the mask generator must never touch
+			// the color overlay), not a normal outcome -- hence Warning rather than silence.
+			UE_LOG(LogVertexMaskForge, Warning,
+				TEXT("Vertex Mask Forge: Bounding Box Z mask generation unexpectedly changed the Primary Color Overlay for '%s'."),
+				*Entry->AssetName);
+		}
+
+		switch (Entry->WorkingMesh.BoundingBoxZMask.State)
+		{
+		case EVertexMaskForgeScalarMaskState::Ready:
+			++NumReady;
+			break;
+		case EVertexMaskForgeScalarMaskState::DegenerateBounds:
+			++NumDegenerate;
+			break;
+		case EVertexMaskForgeScalarMaskState::Invalid:
+			++NumInvalid;
+			break;
+		case EVertexMaskForgeScalarMaskState::Unavailable:
+		case EVertexMaskForgeScalarMaskState::NotGenerated:
+		default:
+			++NumUnavailable;
+			break;
+		}
+	}
+
+	if (ListView.IsValid())
+	{
+		ListView->RequestListRefresh();
+	}
+
+	UE_LOG(LogVertexMaskForge, Log,
+		TEXT("Built Bounding Box Z masks: %d ready; %d unavailable; %d degenerate; %d invalid"),
+		NumReady, NumUnavailable, NumDegenerate, NumInvalid);
+
+	return FReply::Handled();
+}
+
+void SVertexMaskForgePanel::OnBoundingBoxMaskPositionChanged(const float NewValue)
+{
+	BoundingBoxMaskPosition = NewValue;
+	InvalidateBoundingBoxMasks();
+}
+
+void SVertexMaskForgePanel::OnBoundingBoxMaskTransitionWidthChanged(const float NewValue)
+{
+	BoundingBoxMaskTransitionWidth = NewValue;
+	InvalidateBoundingBoxMasks();
+}
+
+ECheckBoxState SVertexMaskForgePanel::GetBoundingBoxMaskInvertState() const
+{
+	return bBoundingBoxMaskInvert ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
+}
+
+void SVertexMaskForgePanel::OnBoundingBoxMaskInvertChanged(const ECheckBoxState NewState)
+{
+	bBoundingBoxMaskInvert = (NewState == ECheckBoxState::Checked);
+	InvalidateBoundingBoxMasks();
+}
+
+void SVertexMaskForgePanel::InvalidateBoundingBoxMasks()
+{
+	for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
+	{
+		if (Entry.IsValid())
+		{
+			// Reset only the mask; the working mesh (FDynamicMesh3) itself is left untouched.
+			Entry->WorkingMesh.BoundingBoxZMask = FVertexMaskForgeScalarMask();
+		}
+	}
+
+	if (ListView.IsValid())
+	{
+		ListView->RequestListRefresh();
+	}
 }
 
 #undef LOCTEXT_NAMESPACE
