@@ -2,17 +2,27 @@
 
 #include "Containers/BitArray.h"
 #include "CoreMinimal.h"
+#include "Delegates/IDelegateInstance.h"
 #include "Math/Vector4.h"
 #include "Misc/EnumClassFlags.h"
 #include "UObject/SoftObjectPtr.h"
+#include "UObject/StrongObjectPtr.h"
+#include "UObject/WeakObjectPtr.h"
 #include "Widgets/SCompoundWidget.h"
+
+class UWorld;
 
 class ITableRow;
 class STableViewBase;
 class STextBlock;
+class AActor;
+class UMaterialInterface;
 class UStaticMesh;
+class UStaticMeshComponent;
 template <typename ItemType> class SListView;
+template <typename OptionType> class SComboBox;
 enum class ECheckBoxState : uint8;
+namespace ESelectInfo { enum Type : int; }
 
 namespace UE::Geometry { class FDynamicMesh3; }
 
@@ -158,10 +168,14 @@ enum class EVertexMaskForgeScalarMaskState : uint8
  * FVertexMaskForgeWorkingMesh. Exists only in memory; never written to the Primary Color Overlay,
  * MeshDescription, RenderData, or the source asset.
  *
- * FDynamicMesh3 Vertex IDs are not necessarily compact (VertexCount() can be less than
- * MaxVertexID()). Values/bHasValue are therefore sized to MaxVertexID() and only written at
- * indices that were valid Vertex IDs at generation time -- use TryGetValue() rather than indexing
- * Values directly, since unwritten slots are meaningless, not zero.
+ * AUDITED: the Bounding Box Z mask (the only generator that exists so far) is computed directly in
+ * RENDER VERTEX order (see VertexMaskForgePanel::GenerateBoundingBoxZMask), so for it, Values/
+ * bHasValue are indexed by Render Vertex Index and are always dense (Values.Num() ==
+ * bHasValue.Num() == RenderVertexCount == the LOD's PositionVertexBuffer.GetNumVertices(), every
+ * slot written). This struct itself stays domain-agnostic (a future, genuinely topology-dependent
+ * generator could still index by Dynamic Mesh Vertex ID and leave bHasValue sparse) -- always use
+ * TryGetValue() rather than indexing Values directly, since an unwritten slot is meaningless, not
+ * zero, whichever domain produced it.
  */
 struct FVertexMaskForgeScalarMask
 {
@@ -170,10 +184,10 @@ struct FVertexMaskForgeScalarMask
 
 	EVertexMaskForgeScalarMaskState State = EVertexMaskForgeScalarMaskState::NotGenerated;
 
-	/** Indexed directly by Dynamic Mesh Vertex ID; sized to MaxVertexID() when State == Ready. */
+	/** Indexed by Render Vertex Index for the Bounding Box Z mask (see the struct-level audit note). */
 	TArray<float> Values;
 
-	/** Parallel to Values: true only at indices that are valid, written Vertex IDs. */
+	/** Parallel to Values: true only at indices that were actually written. */
 	TBitArray<> bHasValue;
 
 	/** Safe accessor: returns false (and leaves OutValue untouched) for any ID not actually stored. */
@@ -206,6 +220,17 @@ struct FVertexMaskForgeScalarMask
 	float Position = 0.5f;
 	float TransitionWidth = 1.0f;
 	bool bInvert = false;
+
+	// --- Temporary diagnostics (audited render-vertex-order fix) ---------------------------
+	// Added to make the Values.Num() == PositionVertexBuffer.GetNumVertices() invariant directly
+	// verifiable from the panel UI. See VertexMaskForgePanel::GetBoundingBoxMaskSummaryText().
+
+	/** LOD0 PositionVertexBuffer.GetNumVertices() at generation time; must equal Values.Num(). */
+	int32 RenderVertexCount = 0;
+
+	/** Local-space Z bounds used for normalization, over ALL render vertices of the LOD. */
+	double BoundsMinZ = 0.0;
+	double BoundsMaxZ = 0.0;
 };
 
 /**
@@ -279,6 +304,97 @@ struct FVertexMaskForgeWorkingMesh
 };
 
 /**
+ * What the artist currently sees in the viewport for Vertex Color preview purposes.
+ * Purely a session/panel-level setting -- never saved on the UStaticMesh, never affects the
+ * Bounding Box Z mask, Position, Transition Width, or Invert.
+ */
+enum class EVertexMaskForgePreviewMode : uint8
+{
+	/** Restore the mesh's own materials; no debug visualization is shown. */
+	OriginalMaterial,
+
+	/** Show the temporarily composed RGBA color (mask blended into the Channel Filter's channels). */
+	RGBVertexColor,
+
+	/** Show the composed color's Red channel as grayscale (R, R, R, 1). */
+	RedChannel,
+
+	/** Show the composed color's Green channel as grayscale (G, G, G, 1). */
+	GreenChannel,
+
+	/** Show the composed color's Blue channel as grayscale (B, B, B, 1). */
+	BlueChannel,
+};
+
+/**
+ * Centralized per-Actor "temporarily hidden in editor" ownership. Hiding is necessarily Actor-level
+ * (UE 5.8 has no transient-safe component-level visibility flag -- see the audit note on
+ * ActivatePreviewForComponent), so when two or more previewed components belong to the SAME Actor
+ * (either two entries in one FVertexMaskForgeSelectedMesh::PreviewComponents, or components from
+ * two different FVertexMaskForgeSelectedMesh entries), naively snapshotting/restoring
+ * IsTemporarilyHiddenInEditor() per-component would let one component's cleanup un-hide an Actor
+ * that another still-active preview depends on staying hidden. This struct instead records the
+ * Actor's original flag value once (on first acquire) and a reference count of how many active
+ * previews currently depend on the Actor being hidden; only the release that brings the count to
+ * zero actually restores the original value. Keyed externally by TWeakObjectPtr<AActor> in
+ * SVertexMaskForgePanel::ActorHideStates.
+ */
+struct FVertexMaskForgeActorHideState
+{
+	bool bOriginalHiddenInEditor = false;
+	int32 RefCount = 0;
+};
+
+/**
+ * Non-destructive preview state for one selected UStaticMeshComponent.
+ *
+ * IMPORTANT (audited): UStaticMeshComponent::Serialize() unconditionally re-serializes LODData
+ * (which holds OverrideVertexColors and PaintedVertices) via a custom `Ar << LODData`, regardless
+ * of LODData's own `UPROPERTY(transient)` tag, and OverrideMaterials is an ordinary (non-transient)
+ * UPROPERTY. This means a Save/Save All that occurs while a preview is active WOULD persist any
+ * of those properties if they were written directly onto the real, selected component -- even
+ * though the plugin never calls Modify()/MarkPackageDirty() itself, a package that is already
+ * dirty (or being autosaved) can still be written to disk mid-preview. For that reason this struct
+ * never mutates the selected component's own OverrideMaterials/OverrideVertexColors/PaintedVertices
+ * at all: it tracks a separate, transient, RF_Transient duplicate component instead (see
+ * EnsurePreviewComponent()), so there is nothing on the real component for a Save to persist.
+ */
+struct FVertexMaskForgePreviewComponentState
+{
+	/** The real, selected component. Read-only source for mesh/transform; never mutated. */
+	TWeakObjectPtr<UStaticMeshComponent> SourceComponent;
+
+	/**
+	 * Transient duplicate created only while preview is active, destroyed on cleanup. Outer is
+	 * GetTransientPackage() and it is never added to SourceComponent's owning Actor's component
+	 * list, so no Actor/level serialization path can ever discover or write it, independent of
+	 * RF_Transient. Overridden colors/materials live ONLY on this object.
+	 *
+	 * IMPORTANT (audited): RF_Transient only excludes an object from serialization; it does NOT by
+	 * itself keep the object reachable for Garbage Collection. TStrongObjectPtr is UE's supported
+	 * scoped-root mechanism for exactly this "keep a dynamically created UObject alive outside the
+	 * normal owning-UPROPERTY graph" case (see UObject/StrongObjectPtr.h). It is released via
+	 * .Reset() in RestoreComponentOriginal, so unlike AddToRoot() it never leaks a permanent root
+	 * reference -- a Collect Garbage while preview is active cannot collect this object.
+	 */
+	TStrongObjectPtr<UStaticMeshComponent> PreviewComponent;
+
+	/** True while PreviewComponent is active. */
+	bool bOverrideActive = false;
+
+	/**
+	 * True while this State currently holds one reference-count token in
+	 * SVertexMaskForgePanel::ActorHideStates for HiddenOwner. Tracked independently of
+	 * SourceComponent's validity so a release can still happen correctly even if SourceComponent (or
+	 * its owning Actor) is destroyed while preview is active -- see RestoreComponentOriginal.
+	 */
+	bool bHasAcquiredActorHide = false;
+
+	/** The Actor this State acquired a hide token for, captured at acquire time. */
+	TWeakObjectPtr<AActor> HiddenOwner;
+};
+
+/**
  * One unique Static Mesh found in the current selection.
  * Kept small and self-contained for this checkpoint; safe to relocate to a
  * shared header once processing is introduced.
@@ -299,6 +415,14 @@ struct FVertexMaskForgeSelectedMesh
 	FVertexMaskForgeMeshDiagnostics Diagnostics;
 
 	FVertexMaskForgeWorkingMesh WorkingMesh;
+
+	/**
+	 * Static Mesh Components in the tracked viewport selection that reference this asset, with
+	 * their non-destructive preview state. Populated only by CollectViewportSelection; empty for
+	 * entries that came only from the Content Browser (Preview is unavailable for those -- see
+	 * SVertexMaskForgePanel::ApplyPreviewToEntry).
+	 */
+	TArray<FVertexMaskForgePreviewComponentState> PreviewComponents;
 };
 
 class SVertexMaskForgePanel : public SCompoundWidget
@@ -373,12 +497,88 @@ private:
 	 */
 	void InvalidateBoundingBoxMasks();
 
+	// --- Preview (Preview Mode + Channel Filter) --------------------------------------------
+
+	TSharedRef<SWidget> OnGeneratePreviewModeRow(TSharedPtr<EVertexMaskForgePreviewMode> InOption) const;
+	void OnPreviewModeSelectionChanged(TSharedPtr<EVertexMaskForgePreviewMode> NewSelection, ESelectInfo::Type SelectInfo);
+	FText GetPreviewModeButtonText() const;
+
+	ECheckBoxState GetChannelFilterRState() const { return bChannelFilterR ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; }
+	void OnChannelFilterRChanged(ECheckBoxState NewState);
+	ECheckBoxState GetChannelFilterGState() const { return bChannelFilterG ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; }
+	void OnChannelFilterGChanged(ECheckBoxState NewState);
+	ECheckBoxState GetChannelFilterBState() const { return bChannelFilterB ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; }
+	void OnChannelFilterBChanged(ECheckBoxState NewState);
+	ECheckBoxState GetChannelFilterAState() const { return bChannelFilterA ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; }
+	void OnChannelFilterAChanged(ECheckBoxState NewState);
+
+	FText GetPreviewStatusText() const;
+
+	/**
+	 * Applies or restores preview visualization for every selected entry, based on the current
+	 * CurrentPreviewMode / Channel Filter / each entry's BoundingBoxZMask state. Idempotent and
+	 * side-effect-free with respect to the mask itself -- never generates or invalidates it.
+	 */
+	void UpdateAllPreviews();
+
+	/** Applies or restores preview for one entry, per current mode/filter/mask state. */
+	void ApplyPreviewToEntry(const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry);
+
+	/** Restores original materials and vertex colors on every tracked component of one entry. Idempotent. */
+	void RestorePreviewForEntry(FVertexMaskForgeSelectedMesh& Entry);
+
+	/**
+	 * Restores every currently-tracked entry's preview components. Called before Refresh Selection
+	 * replaces SelectedMeshes, and from the destructor, so no transient override ever outlives the
+	 * entries or the panel.
+	 */
+	void DestroyAllPreviews();
+
+	/** Lazily loads the engine's built-in vertex-color debug material (never a new persistent asset). */
+	UMaterialInterface* GetPreviewDebugMaterial();
+
+	/**
+	 * Bound to FWorldDelegates::OnWorldCleanup (registered once in Construct(), removed in the
+	 * destructor via WorldCleanupDelegateHandle). Fires at the very start of UWorld::CleanupWorld()
+	 * -- e.g. on level change/reload, or PIE end -- while World and its actors/components are still
+	 * fully valid, and BEFORE UWorld::ClearWorldComponents() or any actor/component teardown. This is
+	 * the correct point to synchronously restore/destroy every preview whose SourceComponent (or
+	 * PreviewComponent, or hidden Actor) belongs to World, so this panel never keeps a
+	 * TStrongObjectPtr (or an AActor::bHiddenEdTemporary override) referencing a World that is about
+	 * to go away. Never calls RefreshSelection or recreates previews -- pure cleanup, safe to run
+	 * during editor shutdown; does not assume GEditor is otherwise valid.
+	 */
+	void OnWorldCleanup(UWorld* World, bool bSessionEnded, bool bCleanupResources);
+
+	FDelegateHandle WorldCleanupDelegateHandle;
+
+	/**
+	 * Centralized per-Actor hide ref-counting for the whole panel (not per-entry), since components
+	 * from different FVertexMaskForgeSelectedMesh entries can share the same owning Actor. See
+	 * FVertexMaskForgeActorHideState.
+	 */
+	TMap<TWeakObjectPtr<AActor>, FVertexMaskForgeActorHideState> ActorHideStates;
+
 	TArray<TSharedPtr<FVertexMaskForgeSelectedMesh>> SelectedMeshes;
 
 	TSharedPtr<SListView<TSharedPtr<FVertexMaskForgeSelectedMesh>>> ListView;
 	TSharedPtr<STextBlock> SummaryText;
 
 	bool bHasRefreshedOnce = false;
+
+	// Preview Mode / Channel Filter are panel/session-transient: never saved on the asset, never
+	// invalidate or regenerate BoundingBoxZMask, and are fully independent of one another.
+	EVertexMaskForgePreviewMode CurrentPreviewMode = EVertexMaskForgePreviewMode::OriginalMaterial;
+	TArray<TSharedPtr<EVertexMaskForgePreviewMode>> PreviewModeOptions;
+	TSharedPtr<SComboBox<TSharedPtr<EVertexMaskForgePreviewMode>>> PreviewModeComboBox;
+
+	bool bChannelFilterR = true;
+	bool bChannelFilterG = true;
+	bool bChannelFilterB = true;
+	bool bChannelFilterA = false;
+
+	/** Resolved lazily via GetPreviewDebugMaterial(); weak because it is an asset the plugin does not own. */
+	TWeakObjectPtr<UMaterialInterface> PreviewDebugMaterial;
 
 	// Bottom-to-Top Local Z prototype parameters; defaults reproduce the raw normalized gradient
 	// (Bottom = 0, Top = 1) -- see VertexMaskForgePanel::GenerateBoundingBoxZMask() for the formula.

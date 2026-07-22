@@ -28,6 +28,10 @@ public class VertexMaskForge : ModuleRules
 				"StaticMeshDescription",
 				"MeshConversion",
 				"GeometryCore",
+				// Required for BeginInitResource(FRenderResource*) (RenderCore/Public/RenderResource.h),
+				// used to initialize the transient FColorVertexBuffer allocated for the non-destructive
+				// component-level Vertex Color preview (FStaticMeshComponentLODInfo::OverrideVertexColors).
+				"RenderCore",
 			}
 		);
 	}
