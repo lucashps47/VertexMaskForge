@@ -185,6 +185,42 @@ enum class EVertexMaskForgeScalarMaskSource : uint8
 	ConstantBlack,
 };
 
+/**
+ * How a mask layer's scalar value (M) combines with the channel's existing value (B) before Opacity
+ * is applied. Panel-level today (SVertexMaskForgePanel::BoundingBoxBlendMode), shared by the one
+ * Bounding Box Mask layer that exists in this checkpoint; the per-layer field this enum would
+ * belong to in a future mask stack (see VertexMaskForgePanel::ComposeMaskLayer's doc comment) does
+ * not exist yet -- see that function for the "prepared for, not implemented" boundary.
+ *
+ * All formulas below operate on already-normalized [0,1] scalars and are the RAW blend result
+ * (see VertexMaskForgePanel::ApplyMaskBlendMode) -- Opacity and the final clamp are applied
+ * afterwards, uniformly, by VertexMaskForgePanel::BlendMaskValue, never per-mode.
+ */
+enum class EVertexMaskForgeBlendMode : uint8
+{
+	/** R = M. With Opacity 1.0, exactly reproduces the tool's pre-Blend-Mode behavior (the mask
+	 *  value replaces the channel outright). Default. */
+	Copy,
+
+	/** R = B + M (no intermediate clamp -- see BlendMaskValue). */
+	Add,
+
+	/** R = B - M (no intermediate clamp -- see BlendMaskValue). */
+	Subtract,
+
+	/** R = B * M. */
+	Multiply,
+
+	/** R = (B < 0.5) ? (2*B*M) : (1 - 2*(1-B)*(1-M)). */
+	Overlay,
+
+	/** R = 1 - (1-B) * (1-M). */
+	Screen,
+
+	/** R = lerp(B, M, M). Deliberately NOT an alias of Copy -- see ApplyMaskBlendMode. */
+	Linear,
+};
+
 /** Which local/world axis one FVertexMaskForgeAxisMaskParams evaluates. */
 enum class EVertexMaskForgeBoundsAxis : uint8
 {
@@ -493,6 +529,81 @@ struct FVertexMaskForgePreviewComponentState
 
 	/** The Actor this State acquired a hide token for, captured at acquire time. */
 	TWeakObjectPtr<AActor> HiddenOwner;
+
+	/**
+	 * Immutable-after-capture snapshot of this component's effective input Vertex Colors at the
+	 * START of the current operation/session, in render-vertex order (LOD0-sized). Empty until the
+	 * first composition of a session.
+	 *
+	 * AUDITED (baseline-snapshot fix): captured EXACTLY ONCE per session by
+	 * VertexMaskForgePanel::UpdateWorkingColors, the first time it is called for this component this
+	 * session (detected by BaselineColors being empty or stale-sized) -- from SourceComponent's own
+	 * pre-existing OverrideVertexColors, or the Source Static Mesh's own LOD0 colors, or white (see
+	 * UpdateWorkingColors' own doc comment for the exact priority). After that single capture, this
+	 * array is NEVER written to again for the rest of the session -- UpdateWorkingColors' every later
+	 * call reads it, never re-reads SourceComponent's OverrideVertexColors or the asset's RenderData.
+	 * This is a genuine snapshot, not an assumption that the live sources happen not to change during
+	 * the session.
+	 *
+	 * Reset (emptied) together with CommittedColors/WorkingColors only when the session concludes --
+	 * see RestoreComponentOriginal, called by DestroyAllPreviews() from Cancel, Accept (success),
+	 * Accept as Instance Override (success), RefreshSelection (before rebuilding), and World cleanup
+	 * -- so a brand new session always starts from a fresh capture, never a stale one from a
+	 * concluded operation (whose baseline may since have changed, e.g. Accept just wrote new colors
+	 * onto this exact component/asset).
+	 */
+	TArray<FColor> BaselineColors;
+
+	/**
+	 * The last result EXPLICITLY CONSOLIDATED for this component, in render-vertex order
+	 * (LOD0-sized). Seeded from BaselineColors at the same moment BaselineColors itself is captured
+	 * (see that field's doc comment), then only ever overwritten by
+	 * VertexMaskForgePanel::UpdateWorkingColors when called with bCommit == true -- exclusively an
+	 * explicit Generate Mask click or a Fill White/Black action (see UpdateAllPreviews' own doc
+	 * comment for the exhaustive list of which triggers commit and which do not).
+	 *
+	 * AUDITED (Channel Filter toggle fix): this is what WorkingColors is rebuilt FROM on every single
+	 * recomposition (see WorkingColors' own doc comment) -- so a channel that is toggled OFF in the
+	 * Channel Filter before ever being consolidated correctly reverts to whatever this array already
+	 * holds for it (BaselineColors, if never consolidated; or an earlier Generate Mask/Fill's result,
+	 * if it was), rather than freezing whatever transient value a previous, uncommitted recomposition
+	 * happened to leave behind.
+	 *
+	 * Reset (emptied) together with BaselineColors/WorkingColors -- see BaselineColors' own doc
+	 * comment for every reset point.
+	 */
+	TArray<FColor> CommittedColors;
+
+	/**
+	 * Multi-channel TRANSIENT preview result for the CURRENT operation/session on this component, in
+	 * render-vertex order (LOD0-sized), holding the RAW composited RGBA (before any Preview Mode
+	 * display reduction). Empty until the first composition of a session. This is what the transient
+	 * PreviewComponent's OverrideVertexColors is set from (ApplyPreviewToEntry), and what Accept /
+	 * Accept as Instance Override read to build their FinalColors -- "the preview currently shown".
+	 *
+	 * AUDITED (Channel Filter toggle fix): REBUILT FROM CommittedColors on EVERY single call to
+	 * VertexMaskForgePanel::UpdateWorkingColors (WorkingColors = CommittedColors, verbatim, at the
+	 * start of every call) -- never carried forward from this array's own previous value. Each
+	 * channel currently enabled in the Channel Filter is then overwritten with a fresh
+	 * BlendMaskValue(BaselineColors.Channel, mask, BlendMode, Opacity, ...) -- ALWAYS computed from
+	 * BaselineColors, never from CommittedColors or this array's own prior value, which is what
+	 * prevents the same channel from ever accumulating across repeated recompositions. A channel NOT
+	 * currently enabled is simply whatever CommittedColors already holds for it -- so disabling a
+	 * channel immediately, visibly reverts it to its last CONSOLIDATED state (BaselineColors if never
+	 * consolidated), fixing the prior bug where a disabled channel froze at a transient, uncommitted
+	 * value instead. Alpha is refreshed from BaselineColors' own Alpha unconditionally on every call
+	 * (Blend Mode/Opacity never write Alpha).
+	 *
+	 * Reset (emptied) together with BaselineColors/CommittedColors -- see BaselineColors' own doc
+	 * comment for every reset point.
+	 *
+	 * Preview (ApplyPreviewToEntry), Accept (BuildAcceptTargets), and Accept as Instance Override
+	 * (BuildInstanceOverrideTargets) all read this SAME array -- Accept and Accept as Instance
+	 * Override themselves NEVER call UpdateWorkingColors; they only READ it as-is, so Accept always
+	 * persists exactly the last effectively-generated/shown preview, never a silently-recomposed
+	 * approximation of pending, ungenerated UI parameters.
+	 */
+	TArray<FColor> WorkingColors;
 };
 
 /**
@@ -669,6 +780,34 @@ private:
 	 *  Local-Z-only behavior until the user explicitly enables another axis. */
 	TStaticArray<FVertexMaskForgeAxisMaskParams, 3> BoundingBoxAxisParams;
 
+	// --- Bounding Box Mask: Blend Mode + Opacity --------------------------------------------
+
+	TSharedRef<SWidget> OnGenerateBlendModeRow(TSharedPtr<EVertexMaskForgeBlendMode> InOption) const;
+
+	/**
+	 * Treated exactly like a discrete axis parameter change (see OnAxisParamChangedDiscrete):
+	 * invalidates the current mask/preview, then, if Auto Update Preview is on, regenerates
+	 * immediately. Deliberately NOT treated like Channel Filter/Preview Mode (which always recompose
+	 * immediately via UpdateAllPreviews() regardless of Auto Update Preview) -- Blend Mode is a
+	 * generation-adjacent parameter whose change must wait for Generate Mask when Auto Update is off,
+	 * per this checkpoint's explicit requirement.
+	 */
+	void OnBlendModeSelectionChanged(TSharedPtr<EVertexMaskForgeBlendMode> NewSelection, ESelectInfo::Type SelectInfo);
+	FText GetBlendModeButtonText() const;
+
+	TArray<TSharedPtr<EVertexMaskForgeBlendMode>> BlendModeOptions;
+	TSharedPtr<SComboBox<TSharedPtr<EVertexMaskForgeBlendMode>>> BlendModeComboBox;
+
+	/** How the Bounding Box Mask's scalar value combines with each enabled channel's existing value.
+	 *  Default Copy: with Opacity 1.0, exactly reproduces the tool's pre-Blend-Mode behavior. */
+	EVertexMaskForgeBlendMode BoundingBoxBlendMode = EVertexMaskForgeBlendMode::Copy;
+
+	/** Opacity slider's continuous-drag handler -- mirrors the Position/Falloff spinboxes exactly
+	 *  (InvalidateBoundingBoxMasks() + ScheduleAutoUpdatePreview() inline in Construct(), no separate
+	 *  named function needed), gated by Auto Update Preview the same way. Clamped to [0, 1]; default
+	 *  1.0 (full effect of the Blend Mode -- matches the pre-Blend-Mode behavior when Mode == Copy). */
+	float BoundingBoxOpacity = 1.0f;
+
 	// --- Fill White / Fill Black utility masks ----------------------------------------------
 
 	FReply OnFillWhiteClicked();
@@ -684,8 +823,8 @@ private:
 	 * COMPLETELY UNTOUCHED (its previous mask, if any, is preserved) rather than reset to
 	 * Unavailable -- per the explicit "preserve the last valid Preview on failure" requirement.
 	 * Ends with UpdateAllPreviews(), which recomposes/reapplies the transient Preview (reusing the
-	 * exact same ApplyPreviewToEntry/ComposeRenderOrderPreviewColors path as every other mask) and
-	 * marks Pending Changes via RecomputeOperationState().
+	 * exact same ApplyPreviewToEntry/UpdateWorkingColors path as every other mask) and marks Pending
+	 * Changes via RecomputeOperationState().
 	 */
 	void RunConstantFill(float ConstantValue, EVertexMaskForgeScalarMaskSource Source, const FText& SuccessMessage);
 
@@ -771,8 +910,6 @@ private:
 	void OnChannelFilterGChanged(ECheckBoxState NewState);
 	ECheckBoxState GetChannelFilterBState() const { return bChannelFilterB ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; }
 	void OnChannelFilterBChanged(ECheckBoxState NewState);
-	ECheckBoxState GetChannelFilterAState() const { return bChannelFilterA ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; }
-	void OnChannelFilterAChanged(ECheckBoxState NewState);
 
 	FText GetPreviewStatusText() const;
 
@@ -780,8 +917,15 @@ private:
 	 * Applies or restores preview visualization for every selected entry, based on the current
 	 * CurrentPreviewMode / Channel Filter / each entry's BoundingBoxMask state. Idempotent and
 	 * side-effect-free with respect to the mask itself -- never generates or invalidates it.
+	 *
+	 * bCommit (audited, Channel Filter toggle fix): forwarded unchanged to ApplyPreviewToEntry /
+	 * UpdateWorkingColors -- true ONLY for an explicit Generate Mask click or a Fill White/Black
+	 * action (both promote the freshly-composed WorkingColors to CommittedColors); false for every
+	 * other trigger (Auto Update Preview, Channel Filter toggle, Preview Mode change, RefreshSelection,
+	 * mask invalidation) so none of those can silently consolidate a transient edit. See
+	 * FVertexMaskForgePreviewComponentState::CommittedColors' own doc comment for the full contract.
 	 */
-	void UpdateAllPreviews();
+	void UpdateAllPreviews(bool bCommit);
 
 	/**
 	 * Applies or restores preview for one entry, per current mode/filter/mask state.
@@ -789,11 +933,13 @@ private:
 	 * successfully computed a collective domain for this batch -- passed through unchanged to every
 	 * per-component GenerateBoundingBoxMask() re-evaluation (see the audit note there); nullptr means
 	 * "use each component's own individual bounds" (bUseUnifiedBounds off, or this entry's mask
-	 * Source isn't BoundingBox, in which case it's simply unused).
+	 * Source isn't BoundingBox, in which case it's simply unused). bCommit: see UpdateAllPreviews'
+	 * own doc comment; forwarded unchanged to UpdateWorkingColors.
 	 */
 	void ApplyPreviewToEntry(
 		const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry,
-		const TStaticArray<FVertexMaskForgeAxisBoundsResult, 3>* CollectiveBoundsPtr);
+		const TStaticArray<FVertexMaskForgeAxisBoundsResult, 3>* CollectiveBoundsPtr,
+		bool bCommit);
 
 	/** Restores original materials and vertex colors on every tracked component of one entry. Idempotent. */
 	void RestorePreviewForEntry(FVertexMaskForgeSelectedMesh& Entry);
@@ -945,7 +1091,6 @@ private:
 	bool bChannelFilterR = true;
 	bool bChannelFilterG = true;
 	bool bChannelFilterB = true;
-	bool bChannelFilterA = false;
 
 	/** Resolved lazily via GetPreviewDebugMaterial(); weak because it is an asset the plugin does not own. */
 	TWeakObjectPtr<UMaterialInterface> PreviewDebugMaterial;
