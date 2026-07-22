@@ -2452,36 +2452,28 @@ TSharedRef<SWidget> SVertexMaskForgePanel::BuildBoundingBoxAxisRow(const EVertex
 	.AutoHeight()
 	.Padding(FMargin(0.f, 6.f, 0.f, 2.f))
 	[
-		SNew(STextBlock)
-		.Text(Title)
-		.Font(FCoreStyle::GetDefaultFontStyle("Bold", 9))
+		SNew(SCheckBox)
+		.IsChecked_Lambda([this, AxisIndex]()
+		{
+			return BoundingBoxAxisParams[AxisIndex].bEnabled ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
+		})
+		.OnCheckStateChanged_Lambda([this, AxisIndex](const ECheckBoxState NewState)
+		{
+			BoundingBoxAxisParams[AxisIndex].bEnabled = (NewState == ECheckBoxState::Checked);
+			OnAxisParamChangedDiscrete();
+		})
+		.Content()
+		[
+			SNew(STextBlock)
+			.Text(Title)
+			.Font(FCoreStyle::GetDefaultFontStyle("Bold", 9))
+		]
 	]
 
 	+ SVerticalBox::Slot()
 	.AutoHeight()
 	[
 		SNew(SHorizontalBox)
-
-		+ SHorizontalBox::Slot()
-		.AutoWidth()
-		.VAlign(VAlign_Center)
-		.Padding(FMargin(0.f, 0.f, 6.f, 0.f))
-		[
-			SNew(SCheckBox)
-			.IsChecked_Lambda([this, AxisIndex]()
-			{
-				return BoundingBoxAxisParams[AxisIndex].bEnabled ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
-			})
-			.OnCheckStateChanged_Lambda([this, AxisIndex](const ECheckBoxState NewState)
-			{
-				BoundingBoxAxisParams[AxisIndex].bEnabled = (NewState == ECheckBoxState::Checked);
-				OnAxisParamChangedDiscrete();
-			})
-			.Content()
-			[
-				SNew(STextBlock).Text(LOCTEXT("AxisEnableLabel", "Enable"))
-			]
-		]
 
 		+ SHorizontalBox::Slot()
 		.AutoWidth()
@@ -2513,10 +2505,10 @@ TSharedRef<SWidget> SVertexMaskForgePanel::BuildBoundingBoxAxisRow(const EVertex
 		.AutoWidth()
 		.VAlign(VAlign_Center)
 		[
-			// Visible label only -- shortened from "Transition Width" so the row (with World Space
-			// added) fits within the panel's normal width without wrapping/clipping. The internal
-			// field/parameter name TransitionWidth and its logic are unchanged.
-			SNew(STextBlock).Text(LOCTEXT("AxisTransitionWidthLabel", "Transition"))
+			// Visible label only -- renamed from "Transition" to "Falloff" per the UI refinement pass.
+			// The internal field/parameter name TransitionWidth and its logic are unchanged (see the
+			// header doc on FVertexMaskForgeAxisMaskParams::TransitionWidth for why it stays as-is).
+			SNew(STextBlock).Text(LOCTEXT("AxisFalloffLabel", "Falloff"))
 		]
 
 		+ SHorizontalBox::Slot()

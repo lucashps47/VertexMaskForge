@@ -592,10 +592,12 @@ private:
 	// --- Bounding Box Mask (Local X / Local Y / Local Z, each with independent Local/World Space) --
 
 	/**
-	 * Builds one axis's UI row (title "Local X"/"Local Y"/"Local Z" -- no directional text -- plus
-	 * Enable/Position/Transition Width/Invert/Mirror/World Space controls, all bound via lambdas
-	 * capturing Axis by value). Called 3 times from Construct(); keeps the 3 axis rows from
-	 * triplicating Slate code even though the UI itself has 3 copies.
+	 * Builds one axis's UI row: a first line with the Enable checkbox labeled "Local X"/"Local Y"/
+	 * "Local Z" (no separate directional text), then a second line with Position/Falloff/Invert/
+	 * Mirror/World Space controls, all bound via lambdas capturing Axis by value). Called 3 times
+	 * from Construct(); keeps the 3 axis rows from triplicating Slate code even though the UI itself
+	 * has 3 copies. The visible "Falloff" label maps to the TransitionWidth field/parameter, which
+	 * keeps its name -- see FVertexMaskForgeAxisMaskParams::TransitionWidth.
 	 */
 	TSharedRef<SWidget> BuildBoundingBoxAxisRow(EVertexMaskForgeBoundsAxis Axis, const FText& Title);
 
