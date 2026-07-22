@@ -24,6 +24,10 @@ public class VertexMaskForge : ModuleRules
 				"UnrealEd",
 				"ToolMenus",
 				"ContentBrowser",
+				"MeshDescription",
+				"StaticMeshDescription",
+				"MeshConversion",
+				"GeometryCore",
 			}
 		);
 	}
