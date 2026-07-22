@@ -1,24 +1,20 @@
 #include "SVertexMaskForgePanel.h"
 
-#include "AssetRegistry/AssetData.h"
 #include "Components/SceneComponent.h"
 #include "Components/StaticMeshComponent.h"
 #include "Containers/Set.h"
-#include "ContentBrowserModule.h"
 #include "DynamicMesh/DynamicMesh3.h"
 #include "DynamicMesh/DynamicMeshAttributeSet.h"
 #include "Editor.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/World.h"
 #include "GameFramework/Actor.h"
-#include "IContentBrowserSingleton.h"
 #include "Logging/LogMacros.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Math/NumericLimits.h"
 #include "MeshDescription.h"
 #include "MeshDescriptionToDynamicMesh.h"
 #include "Misc/MessageDialog.h"
-#include "Modules/ModuleManager.h"
 #include "RenderResource.h"
 #include "Rendering/ColorVertexBuffer.h"
 #include "Rendering/PositionVertexBuffer.h"
@@ -37,13 +33,9 @@
 #include "Widgets/Input/SComboBox.h"
 #include "Widgets/Input/SSpinBox.h"
 #include "Widgets/Layout/SBorder.h"
-#include "Widgets/Layout/SBox.h"
 #include "Widgets/Layout/SSeparator.h"
 #include "Widgets/SBoxPanel.h"
-#include "Widgets/SOverlay.h"
 #include "Widgets/Text/STextBlock.h"
-#include "Widgets/Views/SListView.h"
-#include "Widgets/Views/STableRow.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogVertexMaskForge, Log, All);
 
@@ -58,26 +50,6 @@ FVertexMaskForgeWorkingMesh& FVertexMaskForgeWorkingMesh::operator=(FVertexMaskF
 
 namespace VertexMaskForgePanel
 {
-	static FText GetSourceLabel(const EVertexMaskForgeSelectionSource Sources)
-	{
-		const bool bViewport = EnumHasAnyFlags(Sources, EVertexMaskForgeSelectionSource::Viewport);
-		const bool bContentBrowser = EnumHasAnyFlags(Sources, EVertexMaskForgeSelectionSource::ContentBrowser);
-
-		if (bViewport && bContentBrowser)
-		{
-			return LOCTEXT("SourceBoth", "Viewport + Content Browser");
-		}
-		if (bViewport)
-		{
-			return LOCTEXT("SourceViewport", "Viewport");
-		}
-		if (bContentBrowser)
-		{
-			return LOCTEXT("SourceContentBrowser", "Content Browser");
-		}
-		return FText::GetEmpty();
-	}
-
 	/** Adds a mesh to the collected list, or merges its source flags if already present. */
 	static void AddOrUpdateSelectedMesh(
 		TArray<TSharedPtr<FVertexMaskForgeSelectedMesh>>& InOutMeshes,
@@ -85,13 +57,11 @@ namespace VertexMaskForgePanel
 		const FString& AssetPathString,
 		const FString& AssetName,
 		const TSoftObjectPtr<UStaticMesh>& SoftMesh,
-		const EVertexMaskForgeSelectionSource Source,
-		UStaticMeshComponent* SourceComponent = nullptr)
+		UStaticMeshComponent* SourceComponent)
 	{
 		int32 EntryIndex;
 		if (const int32* ExistingIndex = InOutPathToIndex.Find(AssetPathString))
 		{
-			InOutMeshes[*ExistingIndex]->Sources |= Source;
 			EntryIndex = *ExistingIndex;
 		}
 		else
@@ -100,7 +70,6 @@ namespace VertexMaskForgePanel
 			NewEntry->Mesh = SoftMesh;
 			NewEntry->AssetName = AssetName;
 			NewEntry->AssetPathString = AssetPathString;
-			NewEntry->Sources = Source;
 
 			EntryIndex = InOutMeshes.Num();
 			InOutPathToIndex.Add(AssetPathString, EntryIndex);
@@ -202,47 +171,6 @@ namespace VertexMaskForgePanel
 		Diagnostics.bValid = true;
 
 		return Diagnostics;
-	}
-
-	static FText GetVertexColorStateLabel(const EVertexMaskForgeVertexColorState State)
-	{
-		switch (State)
-		{
-		case EVertexMaskForgeVertexColorState::Present:
-			return LOCTEXT("VertexColorPresent", "Present");
-		case EVertexMaskForgeVertexColorState::PartialOrInvalid:
-			return LOCTEXT("VertexColorPartial", "Partial/Invalid");
-		case EVertexMaskForgeVertexColorState::None:
-		default:
-			return LOCTEXT("VertexColorNone", "None");
-		}
-	}
-
-	static FText GetEnabledDisabledLabel(const bool bEnabled)
-	{
-		return bEnabled ? LOCTEXT("StateEnabled", "Enabled") : LOCTEXT("StateDisabled", "Disabled");
-	}
-
-	/** Builds the compact diagnostics line shown under each mesh row. */
-	static FText GetDiagnosticsSummaryText(const FVertexMaskForgeMeshDiagnostics& Diagnostics)
-	{
-		if (!Diagnostics.bValid)
-		{
-			return LOCTEXT("DiagnosticsUnavailable", "Render data unavailable");
-		}
-
-		return FText::Format(
-			LOCTEXT("DiagnosticsFormat",
-				"LODs: {0}   LOD 0 Vertices: {1}   LOD 0 Triangles: {2}   Material Slots: {3}   Vertex Colors: {4} ({5} / {6})   Nanite: {7}   Allow CPU Access: {8}"),
-			FText::AsNumber(Diagnostics.NumLODs),
-			FText::AsNumber(Diagnostics.LOD0NumVertices),
-			FText::AsNumber(Diagnostics.LOD0NumTriangles),
-			FText::AsNumber(Diagnostics.NumMaterialSlots),
-			GetVertexColorStateLabel(Diagnostics.VertexColorState),
-			FText::AsNumber(Diagnostics.LOD0NumColorVertices),
-			FText::AsNumber(Diagnostics.LOD0NumVertices),
-			GetEnabledDisabledLabel(Diagnostics.bNaniteEnabled),
-			GetEnabledDisabledLabel(Diagnostics.bAllowCPUAccess));
 	}
 
 	// --- Working mesh (FMeshDescription -> FDynamicMesh3) -----------------------------------
@@ -367,69 +295,6 @@ namespace VertexMaskForgePanel
 				ElementTri[Corner] = ColorOverlay->AppendElement(Color);
 			}
 			ColorOverlay->SetTriangle(TriangleID, ElementTri);
-		}
-	}
-
-	static FText GetWorkingMeshStateLabel(const EVertexMaskForgeWorkingMeshState State)
-	{
-		switch (State)
-		{
-		case EVertexMaskForgeWorkingMeshState::Ready:
-			return LOCTEXT("WorkingMeshReady", "Ready");
-		case EVertexMaskForgeWorkingMeshState::SourceMeshDescriptionUnavailable:
-			return LOCTEXT("WorkingMeshNoSourceMeshDescription", "Source MeshDescription Unavailable");
-		case EVertexMaskForgeWorkingMeshState::ConversionFailed:
-			return LOCTEXT("WorkingMeshConversionFailed", "Conversion Failed");
-		case EVertexMaskForgeWorkingMeshState::InvalidSource:
-		default:
-			return LOCTEXT("WorkingMeshInvalidSource", "Invalid Source");
-		}
-	}
-
-	/**
-	 * Material IDs summary: communicates both the state and, for Preserved, whether every ID fell
-	 * within the source's Material Slot range plus the distinct-ID count. IDs are never remapped
-	 * or corrected here -- "Out of Range" is only ever reported, not fixed.
-	 */
-	static FText GetMaterialIDSummaryText(const FVertexMaskForgeWorkingMesh& WorkingMesh)
-	{
-		switch (WorkingMesh.MaterialIDState)
-		{
-		case EVertexMaskForgeMaterialIDState::Preserved:
-			if (WorkingMesh.bMaterialIDsInRange)
-			{
-				return FText::Format(LOCTEXT("MaterialIDPreservedFormat", "Preserved ({0})"),
-					FText::AsNumber(WorkingMesh.DistinctMaterialIDCount));
-			}
-			return FText::Format(LOCTEXT("MaterialIDPreservedOutOfRangeFormat", "Preserved (Out of Range) ({0})"),
-				FText::AsNumber(WorkingMesh.DistinctMaterialIDCount));
-		case EVertexMaskForgeMaterialIDState::Missing:
-			return LOCTEXT("MaterialIDMissing", "Missing");
-		case EVertexMaskForgeMaterialIDState::Unavailable:
-		default:
-			return LOCTEXT("MaterialIDUnavailable", "Unavailable");
-		}
-	}
-
-	static FText GetWorkingVertexColorStateLabel(const EVertexMaskForgeWorkingVertexColorState State)
-	{
-		switch (State)
-		{
-		case EVertexMaskForgeWorkingVertexColorState::Present:
-			return LOCTEXT("WorkingVertexColorPresent", "Present");
-		case EVertexMaskForgeWorkingVertexColorState::Missing:
-			// Vertex Instance Colors is a Mandatory MeshDescription attribute and defaults to
-			// white, and the Static Mesh build pipeline omits the Color Vertex Buffer entirely
-			// when every color equals that default. So "no buffer" only proves the effective
-			// result is white -- it does not prove whether white was ever explicitly painted vs.
-			// simply never touched. The internal state name (Missing) is kept as-is; only this
-			// user-facing label is softened to reflect that ambiguity.
-			return LOCTEXT("WorkingVertexColorMissing", "Not Stored (Defaults to White)");
-		case EVertexMaskForgeWorkingVertexColorState::Invalid:
-			return LOCTEXT("WorkingVertexColorInvalid", "Invalid");
-		case EVertexMaskForgeWorkingVertexColorState::Unavailable:
-		default:
-			return LOCTEXT("WorkingVertexColorUnavailable", "Unavailable");
 		}
 	}
 
@@ -657,66 +522,6 @@ namespace VertexMaskForgePanel
 		return WorkingMesh;
 	}
 
-	/** Builds the compact working-copy diagnostics line shown under each mesh row. */
-	static FText GetWorkingMeshSummaryText(const FVertexMaskForgeWorkingMesh& WorkingMesh)
-	{
-		if (WorkingMesh.State != EVertexMaskForgeWorkingMeshState::Ready)
-		{
-			return FText::Format(
-				LOCTEXT("WorkingMeshUnavailableFormat", "Working Copy: {0}"),
-				GetWorkingMeshStateLabel(WorkingMesh.State));
-		}
-
-		FText Summary = FText::Format(
-			LOCTEXT("WorkingMeshReadyFormat",
-				"Working Copy: Ready   Dynamic Verts: {0}   Tris: {1}   Material IDs: {2}   Vertex Color Attribute: {3}   Color Elements: {4}"),
-			FText::AsNumber(WorkingMesh.DynamicVertexCount),
-			FText::AsNumber(WorkingMesh.DynamicTriangleCount),
-			GetMaterialIDSummaryText(WorkingMesh),
-			GetWorkingVertexColorStateLabel(WorkingMesh.VertexColorState),
-			FText::AsNumber(WorkingMesh.ColorStats.NumElements));
-
-		// Only surface discarded/degenerate triangles when there actually were any.
-		if (WorkingMesh.DiscardedTriangleCount > 0)
-		{
-			Summary = FText::Format(
-				LOCTEXT("WorkingMeshDiscardedTrisFormat", "{0}   Discarded Tris: {1}"),
-				Summary,
-				FText::AsNumber(WorkingMesh.DiscardedTriangleCount));
-		}
-
-		return Summary;
-	}
-
-	/** Formats a 0-1 color channel value with a fixed two-decimal precision. */
-	static FText FormatColorChannel(const float Value)
-	{
-		FNumberFormattingOptions Options;
-		Options.MinimumFractionalDigits = 2;
-		Options.MaximumFractionalDigits = 2;
-		return FText::AsNumber(Value, &Options);
-	}
-
-	/** Builds the RGBA range / non-white / non-black summary line, or an empty text if not applicable. */
-	static FText GetColorStatsSummaryText(const FVertexMaskForgeWorkingMesh& WorkingMesh)
-	{
-		if (WorkingMesh.VertexColorState != EVertexMaskForgeWorkingVertexColorState::Present)
-		{
-			return FText::GetEmpty();
-		}
-
-		const FVertexMaskForgeColorStats& Stats = WorkingMesh.ColorStats;
-
-		return FText::Format(
-			LOCTEXT("ColorStatsFormat",
-				"RGBA Range: R {0}-{1} | G {2}-{3} | B {4}-{5} | A {6}-{7}   Non-white: {8}   Non-black: {9}"),
-			FormatColorChannel(Stats.MinColor.X), FormatColorChannel(Stats.MaxColor.X),
-			FormatColorChannel(Stats.MinColor.Y), FormatColorChannel(Stats.MaxColor.Y),
-			FormatColorChannel(Stats.MinColor.Z), FormatColorChannel(Stats.MaxColor.Z),
-			FormatColorChannel(Stats.MinColor.W), FormatColorChannel(Stats.MaxColor.W),
-			FText::AsNumber(Stats.NumNonWhite),
-			FText::AsNumber(Stats.NumNonBlack));
-	}
 
 	// --- Bounding Box Mask (Local X / Local Y / Local Z, each Local- or World-Space, Mirror) -----
 
@@ -1430,146 +1235,6 @@ namespace VertexMaskForgePanel
 			? EVertexMaskForgeScalarMaskState::Ready
 			: EVertexMaskForgeScalarMaskState::Invalid;
 		return Mask;
-	}
-
-	static FText GetScalarMaskStateLabel(const EVertexMaskForgeScalarMaskState State)
-	{
-		switch (State)
-		{
-		case EVertexMaskForgeScalarMaskState::Ready:
-			return LOCTEXT("ScalarMaskReady", "Ready");
-		case EVertexMaskForgeScalarMaskState::Unavailable:
-			return LOCTEXT("ScalarMaskUnavailable", "Unavailable");
-		case EVertexMaskForgeScalarMaskState::DegenerateBounds:
-			return LOCTEXT("ScalarMaskDegenerateBounds", "Degenerate Bounds (Local Z Extent insufficient)");
-		case EVertexMaskForgeScalarMaskState::Invalid:
-			return LOCTEXT("ScalarMaskInvalid", "Invalid");
-		case EVertexMaskForgeScalarMaskState::NotGenerated:
-		default:
-			return LOCTEXT("ScalarMaskNotGenerated", "Not Generated");
-		}
-	}
-
-	/** Formats a mask scalar value (0-1) with a fixed three-decimal precision. */
-	static FText FormatMaskValue(const float Value)
-	{
-		FNumberFormattingOptions Options;
-		Options.MinimumFractionalDigits = 3;
-		Options.MaximumFractionalDigits = 3;
-		return FText::AsNumber(Value, &Options);
-	}
-
-	/** Label for a mask's Source -- see the audit note on GetBoundingBoxMaskSummaryText. */
-	static FText GetMaskSourceLabel(const EVertexMaskForgeScalarMaskSource Source)
-	{
-		switch (Source)
-		{
-		case EVertexMaskForgeScalarMaskSource::ConstantWhite:
-			return LOCTEXT("MaskSourceConstantWhite", "Constant White");
-		case EVertexMaskForgeScalarMaskSource::ConstantBlack:
-			return LOCTEXT("MaskSourceConstantBlack", "Constant Black");
-		case EVertexMaskForgeScalarMaskSource::BoundingBox:
-		default:
-			return LOCTEXT("MaskSourceBoundingBox", "Bounding Box");
-		}
-	}
-
-	/**
-	 * Builds a short "X+Z, Mirror Z, X World" style descriptor of which axes are enabled/Mirror/
-	 * World Space, for Source == BoundingBox masks -- so the summary line never says just "Bounding
-	 * Box" when X or Y are involved (AUDITED, per the explicit requirement), and never claims
-	 * Mirror/World Space were used on an axis that did not use them.
-	 */
-	static FText GetBoundingBoxAxisDescriptor(const TStaticArray<FVertexMaskForgeAxisMaskParams, 3>& AxisParams)
-	{
-		static const TCHAR* AxisLetters[3] = { TEXT("X"), TEXT("Y"), TEXT("Z") };
-
-		FString AxisLetterList;
-		FString MirrorList;
-		FString WorldList;
-		for (int32 AxisIndex = 0; AxisIndex < 3; ++AxisIndex)
-		{
-			const FVertexMaskForgeAxisMaskParams& Params = AxisParams[AxisIndex];
-			if (!Params.bEnabled)
-			{
-				continue;
-			}
-			AxisLetterList += AxisLetters[AxisIndex];
-			if (Params.bMirror)
-			{
-				MirrorList += AxisLetters[AxisIndex];
-			}
-			if (Params.bWorldSpace)
-			{
-				WorldList += AxisLetters[AxisIndex];
-			}
-		}
-
-		if (AxisLetterList.IsEmpty())
-		{
-			return LOCTEXT("MaskAxisNone", "no axis");
-		}
-
-		FString Descriptor = AxisLetterList;
-		if (!MirrorList.IsEmpty())
-		{
-			Descriptor += FString::Printf(TEXT(", Mirror %s"), *MirrorList);
-		}
-		if (!WorldList.IsEmpty())
-		{
-			Descriptor += FString::Printf(TEXT(", %s World"), *WorldList);
-		}
-		return FText::FromString(Descriptor);
-	}
-
-	/**
-	 * Builds the compact "Mask (...): ..." diagnostics line shown under each mesh row.
-	 *
-	 * AUDITED: the label names the mask's Source explicitly (Bounding Box -- with an axis
-	 * descriptor -- / Constant White / Constant Black) instead of a hardcoded "BBox Z Mask:" --
-	 * otherwise the UI would keep describing a multi-axis or Fill result as Bounding Box Z.
-	 *
-	 * AUDITED (Unified Bounds): for Source == BoundingBox, also names Individual/Unified and the
-	 * selection size, e.g. "Bounding Box — Z World, Unified, 3 meshes" -- so the diagnostic never
-	 * silently implies Individual bounds while Unified Bounds is actually active, or vice versa.
-	 *
-	 * "Render Verts"/"Mask Values" (added in the earlier render-vertex-order fix) make the
-	 * Values.Num() == PositionVertexBuffer.GetNumVertices() invariant directly checkable from the
-	 * panel UI for every mask source.
-	 */
-	static FText GetBoundingBoxMaskSummaryText(const FVertexMaskForgeScalarMask& Mask)
-	{
-		if (Mask.State != EVertexMaskForgeScalarMaskState::Ready)
-		{
-			return FText::Format(
-				LOCTEXT("MaskUnreadyFormat", "Mask: {0}"),
-				GetScalarMaskStateLabel(Mask.State));
-		}
-
-		FText SourceLabel;
-		if (Mask.Source == EVertexMaskForgeScalarMaskSource::BoundingBox)
-		{
-			SourceLabel = FText::Format(
-				LOCTEXT("MaskSourceBoundingBoxAxesFormat", "Bounding Box — {0}, {1}, {2} mesh(es)"),
-				GetBoundingBoxAxisDescriptor(Mask.UsedAxisParams),
-				Mask.bUnifiedBounds ? LOCTEXT("MaskModeUnified", "Unified") : LOCTEXT("MaskModeIndividual", "Individual"),
-				FText::AsNumber(Mask.SelectionMeshCount));
-		}
-		else
-		{
-			SourceLabel = GetMaskSourceLabel(Mask.Source);
-		}
-
-		return FText::Format(
-			LOCTEXT("MaskReadyFormat",
-				"Mask ({0}): Ready   Render Verts: {1}   Mask Values: {2}   Mask Range: {3}-{4}   Mean: {5}   Near Zero: {6}   Near One: {7}"),
-			SourceLabel,
-			FText::AsNumber(Mask.RenderVertexCount),
-			FText::AsNumber(Mask.NumValidValues),
-			FormatMaskValue(Mask.MinValue), FormatMaskValue(Mask.MaxValue),
-			FormatMaskValue(Mask.MeanValue),
-			FText::AsNumber(Mask.NumNearZero),
-			FText::AsNumber(Mask.NumNearOne));
 	}
 
 	// --- Preview: Preview Mode / Channel Filter ----------------------------------------------
@@ -2989,6 +2654,14 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 	// this object finishes destructing.
 	WorldCleanupDelegateHandle = FWorldDelegates::OnWorldCleanup.AddRaw(this, &SVertexMaskForgePanel::OnWorldCleanup);
 
+	// AddRaw (not AddSP), same rationale as WorldCleanupDelegateHandle above: registered/removed
+	// explicitly via SelectionChangedDelegateHandle in the destructor. USelection::SelectionChangedEvent
+	// (Editor/UnrealEd/Public/Selection.h) is the engine's own official notification for Actor/
+	// Component/BSP scene selection changes -- used the same way by, e.g., SInViewportDetails and
+	// FDataLayerMode -- and is the sole automatic trigger for RefreshSelection() now that the manual
+	// "Refresh Selection" button is gone (see OnEditorSelectionChanged's own audit note).
+	SelectionChangedDelegateHandle = USelection::SelectionChangedEvent.AddRaw(this, &SVertexMaskForgePanel::OnEditorSelectionChanged);
+
 	PreviewModeOptions.Add(MakeShared<EVertexMaskForgePreviewMode>(EVertexMaskForgePreviewMode::OriginalMaterial));
 	PreviewModeOptions.Add(MakeShared<EVertexMaskForgePreviewMode>(EVertexMaskForgePreviewMode::RGBVertexColor));
 	PreviewModeOptions.Add(MakeShared<EVertexMaskForgePreviewMode>(EVertexMaskForgePreviewMode::RedChannel));
@@ -3034,70 +2707,6 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 
 			+ SVerticalBox::Slot()
 			.AutoHeight()
-			.Padding(FMargin(0.f, 0.f, 0.f, 8.f))
-			[
-				SAssignNew(SummaryText, STextBlock)
-				.Text(this, &SVertexMaskForgePanel::GetSummaryText)
-				.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
-			]
-
-			+ SVerticalBox::Slot()
-			.FillHeight(1.f)
-			.Padding(FMargin(0.f, 0.f, 0.f, 8.f))
-			[
-				SNew(SBox)
-				.MinDesiredHeight(160.f)
-				[
-					SNew(SOverlay)
-
-					+ SOverlay::Slot()
-					[
-						SNew(STextBlock)
-						.Text(LOCTEXT("EmptyState", "No Static Meshes selected"))
-						.ColorAndOpacity(FSlateColor::UseSubduedForeground())
-						.Visibility(this, &SVertexMaskForgePanel::GetEmptyStateVisibility)
-					]
-
-					+ SOverlay::Slot()
-					[
-						SAssignNew(ListView, SListView<TSharedPtr<FVertexMaskForgeSelectedMesh>>)
-						.ListItemsSource(&SelectedMeshes)
-						.SelectionMode(ESelectionMode::None)
-						.OnGenerateRow(this, &SVertexMaskForgePanel::OnGenerateMeshRow)
-						.Visibility(this, &SVertexMaskForgePanel::GetListVisibility)
-					]
-				]
-			]
-
-			+ SVerticalBox::Slot()
-			.AutoHeight()
-			.HAlign(HAlign_Left)
-			[
-				SNew(SHorizontalBox)
-
-				+ SHorizontalBox::Slot()
-				.AutoWidth()
-				[
-					SNew(SButton)
-					.Text(LOCTEXT("RefreshSelection", "Refresh Selection"))
-					.OnClicked(this, &SVertexMaskForgePanel::OnRefreshSelectionClicked)
-				]
-
-				+ SHorizontalBox::Slot()
-				.AutoWidth()
-				.VAlign(VAlign_Center)
-				.Padding(FMargin(8.f, 0.f, 0.f, 0.f))
-				[
-					SNew(STextBlock)
-					.Text(LOCTEXT("SelectionRefreshed", "Selection refreshed"))
-					.ColorAndOpacity(FSlateColor::UseSubduedForeground())
-					.Visibility(this, &SVertexMaskForgePanel::GetRefreshedMessageVisibility)
-				]
-			]
-
-			+ SVerticalBox::Slot()
-			.AutoHeight()
-			.Padding(FMargin(0.f, 12.f, 0.f, 0.f))
 			[
 				SNew(SBorder)
 				.Padding(FMargin(8.f))
@@ -3430,6 +3039,9 @@ SVertexMaskForgePanel::~SVertexMaskForgePanel()
 	// the rest of this destructor (and DestroyAllPreviews below) runs.
 	FWorldDelegates::OnWorldCleanup.Remove(WorldCleanupDelegateHandle);
 
+	// Same rationale, for the same reason: no callback into a partially-destructed panel.
+	USelection::SelectionChangedEvent.Remove(SelectionChangedDelegateHandle);
+
 	// Explicit cancel, even though ScheduleAutoUpdatePreview() also binds weak-safe (CreateSP) --
 	// this guarantees no pending debounce fires even one more Slate tick after this point.
 	if (GEditor)
@@ -3443,43 +3055,65 @@ SVertexMaskForgePanel::~SVertexMaskForgePanel()
 	DestroyAllPreviews();
 }
 
-FReply SVertexMaskForgePanel::OnRefreshSelectionClicked()
+void SVertexMaskForgePanel::OnEditorSelectionChanged(UObject* NewSelection)
 {
-	// Selection change with Pending Changes: offer Accept / Discard / Cancel (closest native
-	// equivalent to the Modeling Tools "switch tool with pending changes" prompt), rather than
-	// silently discarding or silently implicit-accepting.
-	if (OperationState == EVertexMaskForgeOperationState::PendingChanges)
+	// AUDITED (Selected Static Meshes panel removal): this is the sole trigger for RefreshSelection()
+	// now that the manual "Refresh Selection" button is gone. Bound to USelection::SelectionChangedEvent
+	// (fired for Actor/Component/BSP selection sets -- see Editor/UnrealEd/Public/Selection.h; NOT
+	// fired for Content Browser asset selection, which uses a completely separate API and is no
+	// longer consulted anywhere in this panel -- see CollectViewportSelection, the only collector
+	// left). NewSelection (which USelection instance changed) is deliberately unused: regardless of
+	// which one fired, the only thing this does is re-derive SelectedMeshes from the CURRENT scene
+	// selection, exactly like a manual Refresh Selection click did.
+	//
+	// Safety against an unresolved Preview (audited, replaces the old manual-refresh YesNoCancel
+	// prompt from the removed OnRefreshSelectionClicked): a modal dialog firing on every incidental
+	// selection change while a Preview is pending would be disruptive and is unnecessary, since
+	// Accept / Accept as Instance Override / Cancel are always visible and available regardless of
+	// the scene selection. So instead of prompting, this simply DECLINES to refresh at all while
+	// OperationState != Idle (PendingChanges: an unaccepted Preview exists; Applying: mid-Accept,
+	// never actually observable across a Slate tick since Accept is synchronous; Failed: the last
+	// Accept attempt was blocked/failed and its Preview is still intentionally preserved) --
+	// SelectedMeshes/PreviewComponents keep pointing at the session's ORIGINAL targets until the user
+	// explicitly resolves it. This can never silently apply a pending result to the new selection
+	// (RefreshSelection() is not called at all) and never silently discards it (DestroyAllPreviews()
+	// is not called either).
+	//
+	// DEFERRED SYNC (audited): rather than requiring another viewport/World Outliner click after the
+	// user resolves the pending operation, this records that a sync is owed
+	// (bSceneSelectionChangedDuringActiveOperation = true). SyncSelectionIfChangedDuringOperation(),
+	// called at the tail of OnCancelChangesClicked() / AcceptPendingChanges() /
+	// AcceptPendingChangesAsInstanceOverride() (and ONLY there -- see its own doc comment), consumes
+	// this flag and calls RefreshSelection() automatically once the operation has fully concluded
+	// against its ORIGINAL targets. So Accept/Cancel/Accept as Instance Override remain fully able to
+	// act on the original selection at any time, and the panel still catches up with a changed scene
+	// selection automatically, without ever retargeting the operation itself.
+	if (OperationState != EVertexMaskForgeOperationState::Idle)
 	{
-		const EAppReturnType::Type Choice = FMessageDialog::Open(
-			EAppMsgType::YesNoCancel,
-			LOCTEXT("RefreshWithPendingChanges",
-				"There are pending Vertex Mask Forge changes that have not been accepted.\n\n"
-				"Yes = Accept the changes, then refresh the selection.\n"
-				"No = Discard the changes, then refresh the selection.\n"
-				"Cancel = Keep the current selection and pending changes."));
-
-		switch (Choice)
-		{
-		case EAppReturnType::Yes:
-			if (!AcceptPendingChanges())
-			{
-				// Accept failed/was blocked -- do not refresh, so the user can see the error and the
-				// still-intact Preview, exactly as if they had clicked Accept directly.
-				return FReply::Handled();
-			}
-			break;
-		case EAppReturnType::No:
-			DestroyAllPreviews();
-			RecomputeOperationState();
-			break;
-		case EAppReturnType::Cancel:
-		default:
-			return FReply::Handled();
-		}
+		bSceneSelectionChangedDuringActiveOperation = true;
+		return;
 	}
 
+	// Already Idle: this call itself is about to sync SelectedMeshes with the current scene selection
+	// directly, so any flag left over from an earlier session (e.g. OperationState settled back to
+	// Idle through a path other than Cancel/Accept/Accept as Instance Override, such as a mask being
+	// invalidated with no PreviewComponents left) is moot -- clear it defensively so a later Cancel/
+	// Accept/Accept as Instance Override never performs a redundant extra refresh for a selection
+	// change this call already picked up.
+	bSceneSelectionChangedDuringActiveOperation = false;
+
 	RefreshSelection();
-	return FReply::Handled();
+}
+
+void SVertexMaskForgePanel::SyncSelectionIfChangedDuringOperation()
+{
+	if (!bSceneSelectionChangedDuringActiveOperation)
+	{
+		return;
+	}
+
+	bSceneSelectionChangedDuringActiveOperation = false;
+	RefreshSelection();
 }
 
 void SVertexMaskForgePanel::RefreshSelection()
@@ -3494,19 +3128,14 @@ void SVertexMaskForgePanel::RefreshSelection()
 	TArray<TSharedPtr<FVertexMaskForgeSelectedMesh>> NewSelection;
 	TMap<FString, int32> PathToIndex;
 
+	// Scene selection only (Actors/Components in the level, via Viewport or World Outliner) --
+	// Content Browser asset selection is never consulted anywhere in this panel; a UStaticMesh can
+	// only participate via a real, placed UStaticMeshComponent found here.
 	CollectViewportSelection(NewSelection, PathToIndex);
-	CollectContentBrowserSelection(NewSelection, PathToIndex);
 	UpdateMeshDiagnostics(NewSelection);
 	BuildWorkingMeshes(NewSelection);
 
 	SelectedMeshes = MoveTemp(NewSelection);
-
-	if (ListView.IsValid())
-	{
-		ListView->RequestListRefresh();
-	}
-
-	bHasRefreshedOnce = true;
 
 	UE_LOG(LogVertexMaskForge, Log, TEXT("Refreshed selection: %d unique Static Mesh asset(s)"), SelectedMeshes.Num());
 
@@ -3524,85 +3153,132 @@ void SVertexMaskForgePanel::CollectViewportSelection(
 		return;
 	}
 
-	USelection* SelectedActors = GEditor->GetSelectedActors();
-	if (!SelectedActors)
+	// Centralized eligibility gate for EVERY component reaching AddComponent below, from EITHER
+	// source (Actor-owned or directly-selected) -- never bypassed by either pass.
+	//
+	// AUDITED (explicit, structural rejection of this plugin's OWN transient/preview components --
+	// does NOT rely merely on "these are never registered with any USelection set", which is also
+	// true but is a fact about CALLERS, not a property of the object itself):
+	//   - IsValid(Component): UE 5.8's own official liveness check (UObject/UObjectGlobals.h) --
+	//     covers null, garbage-collected/unreachable, and pending-kill objects in one call.
+	//   - Component->GetOutermost() == GetTransientPackage(): the PRECISE structural signature of
+	//     EnsurePreviewComponent's output (NewObject<UStaticMeshComponent>(GetTransientPackage(),
+	//     NAME_None, RF_Transient) -- see its own audit note) and of any other genuinely-transient,
+	//     non-serialized object. A real, placed level component's outermost package is always the
+	//     level's own package (or, for a template component, the Blueprint class's package) -- never
+	//     the global transient package -- so this can never reject a legitimate placed component.
+	//   - Component->HasAnyFlags(RF_Transient): explicit flag check requested independently of the
+	//     package check above, as a second line of defense against the same class of object.
+	//     Ordinary placed level components must NOT be RF_Transient (RF_Transient objects are
+	//     excluded from normal level serialization by construction), so this cannot reject a
+	//     legitimate placed component either -- only throwaway/never-saved objects like our preview
+	//     components carry this flag.
+	//   - Component->GetStaticMesh() != nullptr: components with no mesh cannot participate.
+	// This is the ONLY place either selection source is filtered; both the Actor pass and the
+	// direct-Component pass funnel through this single gate.
+	auto IsEligibleComponent = [](const UStaticMeshComponent* Component) -> bool
 	{
-		return;
-	}
+		if (!IsValid(Component))
+		{
+			return false;
+		}
+		if (Component->GetOutermost() == GetTransientPackage() || Component->HasAnyFlags(RF_Transient))
+		{
+			return false;
+		}
+		if (!Component->GetStaticMesh())
+		{
+			return false;
+		}
+		return true;
+	};
 
-	TArray<AActor*> Actors;
-	SelectedActors->GetSelectedObjects<AActor>(Actors);
-
-	TArray<UStaticMeshComponent*> Components;
-
-	for (AActor* Actor : Actors)
+	auto AddComponent = [&InOutMeshes, &InOutPathToIndex, &IsEligibleComponent](UStaticMeshComponent* Component)
 	{
-		if (!IsValid(Actor))
+		if (!IsEligibleComponent(Component))
 		{
-			continue;
+			return;
 		}
 
-		Components.Reset();
-		Actor->GetComponents<UStaticMeshComponent>(Components);
-
-		for (UStaticMeshComponent* Component : Components)
-		{
-			if (!IsValid(Component))
-			{
-				continue;
-			}
-
-			UStaticMesh* Mesh = Component->GetStaticMesh();
-			if (!IsValid(Mesh))
-			{
-				continue;
-			}
-
-			VertexMaskForgePanel::AddOrUpdateSelectedMesh(
-				InOutMeshes,
-				InOutPathToIndex,
-				FSoftObjectPath(Mesh).ToString(),
-				Mesh->GetName(),
-				TSoftObjectPtr<UStaticMesh>(Mesh),
-				EVertexMaskForgeSelectionSource::Viewport,
-				Component);
-		}
-	}
-}
-
-void SVertexMaskForgePanel::CollectContentBrowserSelection(
-	TArray<TSharedPtr<FVertexMaskForgeSelectedMesh>>& InOutMeshes,
-	TMap<FString, int32>& InOutPathToIndex) const
-{
-	FContentBrowserModule& ContentBrowserModule =
-		FModuleManager::LoadModuleChecked<FContentBrowserModule>(TEXT("ContentBrowser"));
-
-	TArray<FAssetData> SelectedAssets;
-	ContentBrowserModule.Get().GetSelectedAssets(SelectedAssets);
-
-	const FTopLevelAssetPath StaticMeshClassPath = UStaticMesh::StaticClass()->GetClassPathName();
-
-	for (const FAssetData& AssetData : SelectedAssets)
-	{
-		if (!AssetData.IsValid())
-		{
-			continue;
-		}
-
-		if (AssetData.AssetClassPath != StaticMeshClassPath)
-		{
-			continue;
-		}
-
-		const TSoftObjectPtr<UStaticMesh> SoftMesh(AssetData.GetSoftObjectPath());
-
+		UStaticMesh* Mesh = Component->GetStaticMesh();
 		VertexMaskForgePanel::AddOrUpdateSelectedMesh(
 			InOutMeshes,
 			InOutPathToIndex,
-			AssetData.GetSoftObjectPath().ToString(),
-			AssetData.AssetName.ToString(),
-			SoftMesh,
-			EVertexMaskForgeSelectionSource::ContentBrowser);
+			FSoftObjectPath(Mesh).ToString(),
+			Mesh->GetName(),
+			TSoftObjectPtr<UStaticMesh>(Mesh),
+			Component);
+	};
+
+	// AUDITED (precedence -- confirmed against the UE 5.8 Level Editor's own click-handling source,
+	// not assumed): GEditor->GetSelectedActors() and GEditor->GetSelectedComponents() are separate
+	// USelection VIEWS over the SAME shared UTypedElementSelectionSet in the Level Editor (see
+	// SLevelEditor::Constructor: GetSelectedActors()->SetElementSelectionSet(SelectedElements) and
+	// GetSelectedComponents()->SetElementSelectionSet(SelectedElements) -- Editor/LevelEditor/Private/
+	// SLevelEditor.cpp). Confirmed in ViewportSelectionUtilities.cpp: LevelEditorViewport.cpp's own
+	// click dispatch only calls ClickComponent() when the owning Actor is ALREADY exclusively
+	// Actor-selected (bActorAlreadySelectedExclusively), and does NOT deselect that Actor when a
+	// component is then explicitly selected -- so after explicit component selection, the owning
+	// Actor legitimately REMAINS in GetSelectedActors() at the same time the component appears in
+	// GetSelectedComponents(). A naive "Actor pass ADDS everything, then Component pass ADDS more"
+	// would therefore silently re-include every OTHER component of that Actor too, defeating the
+	// user's explicit, narrower selection -- exactly the inconsistency audited here.
+	//
+	// The engine's own dispatch code (LevelEditorViewport.cpp) uses GetSelectedComponentCount() > 0
+	// as its own signal for "is an explicit component selection currently active"; ordinary actor
+	// (re)selection always clears the WHOLE shared element set first (UEditorEngine::SelectNone(),
+	// via the same shared SelectionSet), so this can never go stale relative to a different Actor --
+	// there is no path where a component from Actor A stays selected while Actor B becomes newly
+	// Actor-selected. This makes precedence fully deterministic:
+	//   - if ANY UStaticMeshComponent is explicitly selected (GetSelectedComponents() non-empty),
+	//     those components are the ONLY targets -- the owning Actor is never auto-expanded to its
+	//     other components;
+	//   - otherwise, fall back to Actor-granularity (every valid UStaticMeshComponent of every
+	//     selected Actor), exactly the pre-existing, already-validated behavior.
+	// Non-UStaticMeshComponent elements (e.g. a selected StaticMeshComponent's owning Actor being
+	// selected via SOME OTHER component type) never affect this -- only UStaticMeshComponent objects
+	// are ever queried from either USelection.
+	TArray<UStaticMeshComponent*> ExplicitComponents;
+	if (USelection* SelectedComponents = GEditor->GetSelectedComponents())
+	{
+		SelectedComponents->GetSelectedObjects<UStaticMeshComponent>(ExplicitComponents);
+	}
+
+	if (!ExplicitComponents.IsEmpty())
+	{
+		// Explicit component selection takes full precedence -- deduplicated by pointer identity via
+		// AddOrUpdateSelectedMesh (see its own audit note); never deduplicated by UStaticMesh, so two
+		// explicitly-selected components sharing the same asset remain independent targets.
+		for (UStaticMeshComponent* Component : ExplicitComponents)
+		{
+			AddComponent(Component);
+		}
+		return;
+	}
+
+	// Fallback: no explicit component selection -- every valid UStaticMeshComponent owned by every
+	// selected Actor. Actor-granularity by design (pre-existing, already-validated behavior):
+	// selecting an Actor with several UStaticMeshComponents collects ALL of them, not just one.
+	if (USelection* SelectedActors = GEditor->GetSelectedActors())
+	{
+		TArray<AActor*> Actors;
+		SelectedActors->GetSelectedObjects<AActor>(Actors);
+
+		TArray<UStaticMeshComponent*> Components;
+		for (AActor* Actor : Actors)
+		{
+			if (!IsValid(Actor))
+			{
+				continue;
+			}
+
+			Components.Reset();
+			Actor->GetComponents<UStaticMeshComponent>(Components);
+			for (UStaticMeshComponent* Component : Components)
+			{
+				AddComponent(Component);
+			}
+		}
 	}
 }
 
@@ -3648,141 +3324,6 @@ void SVertexMaskForgePanel::BuildWorkingMeshes(TArray<TSharedPtr<FVertexMaskForg
 	}
 
 	UE_LOG(LogVertexMaskForge, Log, TEXT("Built %d working mesh copy/copies; %d unavailable"), NumReady, NumUnavailable);
-}
-
-TSharedRef<ITableRow> SVertexMaskForgePanel::OnGenerateMeshRow(
-	TSharedPtr<FVertexMaskForgeSelectedMesh> InItem,
-	const TSharedRef<STableViewBase>& OwnerTable)
-{
-	const FText SourceLabel = InItem.IsValid()
-		? VertexMaskForgePanel::GetSourceLabel(InItem->Sources)
-		: FText::GetEmpty();
-
-	return SNew(STableRow<TSharedPtr<FVertexMaskForgeSelectedMesh>>, OwnerTable)
-		.Padding(FMargin(4.f, 3.f))
-		[
-			SNew(SVerticalBox)
-
-			+ SVerticalBox::Slot()
-			.AutoHeight()
-			[
-				SNew(SHorizontalBox)
-
-				+ SHorizontalBox::Slot()
-				.FillWidth(1.f)
-				.VAlign(VAlign_Center)
-				[
-					SNew(STextBlock)
-					.Text(InItem.IsValid() ? FText::FromString(InItem->AssetName) : FText::GetEmpty())
-					.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
-				]
-
-				+ SHorizontalBox::Slot()
-				.AutoWidth()
-				.VAlign(VAlign_Center)
-				.Padding(FMargin(8.f, 0.f, 0.f, 0.f))
-				[
-					SNew(STextBlock)
-					.Text(SourceLabel)
-					.ColorAndOpacity(FSlateColor::UseSubduedForeground())
-				]
-			]
-
-			+ SVerticalBox::Slot()
-			.AutoHeight()
-			[
-				SNew(STextBlock)
-				.Text(InItem.IsValid() ? FText::FromString(InItem->AssetPathString) : FText::GetEmpty())
-				.ColorAndOpacity(FSlateColor::UseSubduedForeground())
-				.Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
-			]
-
-			+ SVerticalBox::Slot()
-			.AutoHeight()
-			.Padding(FMargin(0.f, 2.f, 0.f, 0.f))
-			[
-				SNew(STextBlock)
-				.Text(InItem.IsValid()
-					? VertexMaskForgePanel::GetDiagnosticsSummaryText(InItem->Diagnostics)
-					: FText::GetEmpty())
-				.ColorAndOpacity(FSlateColor::UseSubduedForeground())
-				.Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
-				.AutoWrapText(true)
-			]
-
-			+ SVerticalBox::Slot()
-			.AutoHeight()
-			.Padding(FMargin(0.f, 2.f, 0.f, 0.f))
-			[
-				SNew(STextBlock)
-				.Text(InItem.IsValid()
-					? VertexMaskForgePanel::GetWorkingMeshSummaryText(InItem->WorkingMesh)
-					: FText::GetEmpty())
-				.ColorAndOpacity(FSlateColor::UseSubduedForeground())
-				.Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
-				.AutoWrapText(true)
-			]
-
-			+ SVerticalBox::Slot()
-			.AutoHeight()
-			.Padding(FMargin(0.f, 2.f, 0.f, 0.f))
-			[
-				SNew(STextBlock)
-				.Text(InItem.IsValid()
-					? VertexMaskForgePanel::GetColorStatsSummaryText(InItem->WorkingMesh)
-					: FText::GetEmpty())
-				.Visibility(InItem.IsValid()
-					&& InItem->WorkingMesh.VertexColorState == EVertexMaskForgeWorkingVertexColorState::Present
-					? EVisibility::Visible : EVisibility::Collapsed)
-				.ColorAndOpacity(FSlateColor::UseSubduedForeground())
-				.Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
-				.AutoWrapText(true)
-			]
-
-			+ SVerticalBox::Slot()
-			.AutoHeight()
-			.Padding(FMargin(0.f, 2.f, 0.f, 0.f))
-			[
-				SNew(STextBlock)
-				// Bound as a live lambda, not a plain FText: SListView::RequestListRefresh()
-				// reuses an existing row widget for an unchanged item identity (see
-				// SListView::GenerateWidgetForItem, which only calls OnRefreshRow -- never
-				// OnGenerateRow again -- when a widget already exists for that TSharedPtr). Since
-				// Generate Mask mutates InItem->WorkingMesh.BoundingBoxMask in place rather than
-				// replacing the entry, a plain FText captured once at row-creation time would stay
-				// frozen at whatever it was when the row was first generated (right after Refresh
-				// Selection, i.e. NotGenerated). A lambda re-evaluates every time Slate paints it.
-				.Text_Lambda([InItem]()
-				{
-					return InItem.IsValid()
-						? VertexMaskForgePanel::GetBoundingBoxMaskSummaryText(InItem->WorkingMesh.BoundingBoxMask)
-						: FText::GetEmpty();
-				})
-				.ColorAndOpacity(FSlateColor::UseSubduedForeground())
-				.Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
-				.AutoWrapText(true)
-			]
-		];
-}
-
-FText SVertexMaskForgePanel::GetSummaryText() const
-{
-	return FText::Format(LOCTEXT("SummaryFormat", "Selected Static Meshes: {0}"), FText::AsNumber(SelectedMeshes.Num()));
-}
-
-EVisibility SVertexMaskForgePanel::GetEmptyStateVisibility() const
-{
-	return SelectedMeshes.Num() == 0 ? EVisibility::Visible : EVisibility::Collapsed;
-}
-
-EVisibility SVertexMaskForgePanel::GetListVisibility() const
-{
-	return SelectedMeshes.Num() > 0 ? EVisibility::Visible : EVisibility::Collapsed;
-}
-
-EVisibility SVertexMaskForgePanel::GetRefreshedMessageVisibility() const
-{
-	return bHasRefreshedOnce ? EVisibility::Visible : EVisibility::Collapsed;
 }
 
 FReply SVertexMaskForgePanel::OnGenerateBoundingBoxMaskClicked()
@@ -3905,11 +3446,6 @@ FReply SVertexMaskForgePanel::OnGenerateBoundingBoxMaskClicked()
 		}
 	}
 
-	if (ListView.IsValid())
-	{
-		ListView->RequestListRefresh();
-	}
-
 	UE_LOG(LogVertexMaskForge, Log,
 		TEXT("Built Bounding Box masks: %d ready; %d unavailable; %d degenerate; %d invalid"),
 		NumReady, NumUnavailable, NumDegenerate, NumInvalid);
@@ -3932,11 +3468,6 @@ void SVertexMaskForgePanel::InvalidateBoundingBoxMasks()
 			// Reset only the mask; the working mesh (FDynamicMesh3) itself is left untouched.
 			Entry->WorkingMesh.BoundingBoxMask = FVertexMaskForgeScalarMask();
 		}
-	}
-
-	if (ListView.IsValid())
-	{
-		ListView->RequestListRefresh();
 	}
 
 	// Any preview color derived from the now-stale mask must stop being shown immediately -- true
@@ -4033,11 +3564,6 @@ void SVertexMaskForgePanel::RunConstantFill(
 
 		Entry->WorkingMesh.BoundingBoxMask = MoveTemp(NewMask);
 		++NumReady;
-	}
-
-	if (ListView.IsValid())
-	{
-		ListView->RequestListRefresh();
 	}
 
 	if (NumReady > 0 && NumFailed == 0)
@@ -4240,11 +3766,6 @@ void SVertexMaskForgePanel::RunAutoUpdatePreview()
 			FText::AsNumber(NumFailed), FText::FromString(FirstFailedAssetName));
 	}
 
-	if (ListView.IsValid())
-	{
-		ListView->RequestListRefresh();
-	}
-
 	// Recomposes/reapplies from whichever mask each entry ended up with (freshly regenerated, or the
 	// preserved previous one), and recomputes OperationState -- but never touches
 	// LastOperationErrorText (see the comment at the top of this function).
@@ -4423,15 +3944,15 @@ FReply SVertexMaskForgePanel::OnAcceptChangesClicked()
 FReply SVertexMaskForgePanel::OnCancelChangesClicked()
 {
 	// AUDITED (full session termination): Cancel now ends the CURRENT session entirely, not just the
-	// transient Preview. Root cause of the old "list stays populated" behavior: SelectedMeshes is
-	// populated ONLY by RefreshSelection() (called from Construct() once, and
-	// OnRefreshSelectionClicked() -- audited: no Tick, delegate, or polling mechanism anywhere in
-	// this panel watches or repopulates from the Editor's live selection). Clearing it here is
-	// therefore sufficient BY CONSTRUCTION: nothing silently repopulates it afterwards. The Unreal
-	// Editor's own selection (GetSelectedActors()/Content Browser) is never touched -- only this
-	// panel's OWN SelectedMeshes array and derived session state are cleared. Selecting the same
-	// mesh again and clicking Refresh Selection afterwards starts a genuinely new session, exactly
-	// like any other fresh Refresh Selection.
+	// transient Preview. SelectedMeshes is populated ONLY by RefreshSelection() (called once from
+	// Construct(), and automatically from OnEditorSelectionChanged() whenever the scene selection
+	// changes AND OperationState == Idle -- see its audit note). Clearing it here is therefore
+	// sufficient BY CONSTRUCTION: nothing silently repopulates it afterwards until OperationState
+	// actually becomes Idle again (which the RecomputeOperationState() call below does immediately).
+	// The Unreal Editor's own selection (GetSelectedActors()) is never touched -- only this panel's
+	// OWN SelectedMeshes array and derived session state are cleared. Because OperationState is Idle
+	// again immediately after this, the very next scene selection change (or an unchanged selection,
+	// if the user re-triggers one) starts a genuinely new session automatically.
 
 	// 1-2. Cancel any pending debounce/Auto Update callback FIRST -- a callback already queued
 	// before this click must never fire afterwards and regenerate/repopulate anything.
@@ -4455,16 +3976,17 @@ FReply SVertexMaskForgePanel::OnCancelChangesClicked()
 	LastInstanceOverrideStatusText = FText::GetEmpty();
 	LastRemoveOverrideStatusText = FText::GetEmpty();
 
-	// 10. Update the UI immediately to the empty state.
-	if (ListView.IsValid())
-	{
-		ListView->RequestListRefresh();
-	}
-
-	// 11. Ready for a new session: OperationState recomputes to Idle from the now-empty
+	// 10. Ready for a new session: OperationState recomputes to Idle from the now-empty
 	// SelectedMeshes (idempotent -- calling Cancel again finds everything already empty/idle and
 	// does nothing further, so no Ensure and no re-entrant cleanup).
 	RecomputeOperationState();
+
+	// 11. Deferred sync: if the scene selection changed while this (now-cancelled) operation was
+	// pending, catch up with the CURRENT scene selection now -- OperationState is Idle at this point
+	// (step 10), and the cancelled operation's original targets have already been fully discarded
+	// (steps 3-9), so this can never retarget or interrupt anything. No-ops (SelectedMeshes stays
+	// empty until the next real selection change) if the selection never changed during the session.
+	SyncSelectionIfChangedDuringOperation();
 
 	UE_LOG(LogVertexMaskForge, Log, TEXT("Vertex Mask Forge: Cancel ended the session -- tool selection list cleared, Editor selection untouched."));
 
@@ -4539,10 +4061,10 @@ bool SVertexMaskForgePanel::AcceptPendingChanges()
 	OperationState = EVertexMaskForgeOperationState::Idle;
 	LastOperationErrorText = FText::GetEmpty();
 
-	if (ListView.IsValid())
-	{
-		ListView->RequestListRefresh();
-	}
+	// Deferred sync: the write above already completed against the ORIGINAL SelectedMeshes/Targets
+	// captured before this call; only now, with OperationState settled back to Idle, is it safe to
+	// catch up with a scene selection that may have changed while this operation was pending.
+	SyncSelectionIfChangedDuringOperation();
 
 	return true;
 }
@@ -4618,10 +4140,10 @@ bool SVertexMaskForgePanel::AcceptPendingChangesAsInstanceOverride()
 		LOCTEXT("InstanceOverrideSuccessFormat", "Vertex Colors saved as instance overrides on {0} component(s). Source Static Mesh assets were not modified."),
 		FText::AsNumber(Targets.Num()));
 
-	if (ListView.IsValid())
-	{
-		ListView->RequestListRefresh();
-	}
+	// Deferred sync: the write above already completed against the ORIGINAL SelectedMeshes/Targets
+	// captured before this call; only now, with OperationState settled back to Idle, is it safe to
+	// catch up with a scene selection that may have changed while this operation was pending.
+	SyncSelectionIfChangedDuringOperation();
 
 	return true;
 }
@@ -4715,11 +4237,6 @@ bool SVertexMaskForgePanel::RemoveInstanceOverrides()
 	LastRemoveOverrideStatusText = FText::Format(
 		LOCTEXT("RemoveOverrideSuccessFormat", "Instance Vertex Color overrides removed from {0} component(s). Source Static Mesh assets were not modified."),
 		FText::AsNumber(Targets.Num()));
-
-	if (ListView.IsValid())
-	{
-		ListView->RequestListRefresh();
-	}
 
 	return true;
 }

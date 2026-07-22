@@ -6,7 +6,6 @@
 #include "Delegates/IDelegateInstance.h"
 #include "Engine/TimerHandle.h"
 #include "Math/Vector4.h"
-#include "Misc/EnumClassFlags.h"
 #include "UObject/SoftObjectPtr.h"
 #include "UObject/StrongObjectPtr.h"
 #include "UObject/WeakObjectPtr.h"
@@ -14,14 +13,10 @@
 
 class UWorld;
 
-class ITableRow;
-class STableViewBase;
-class STextBlock;
 class AActor;
 class UMaterialInterface;
 class UStaticMesh;
 class UStaticMeshComponent;
-template <typename ItemType> class SListView;
 template <typename OptionType> class SComboBox;
 enum class ECheckBoxState : uint8;
 namespace ESelectInfo { enum Type : int; }
@@ -48,15 +43,6 @@ enum class EVertexMaskForgeOperationState : uint8
 	 *  unchanged. Cleared by the next explicit user action (regenerate, Accept, Cancel). */
 	Failed,
 };
-
-/** Where a selected Static Mesh was found during a selection refresh. */
-enum class EVertexMaskForgeSelectionSource : uint8
-{
-	None = 0,
-	Viewport = 1 << 0,
-	ContentBrowser = 1 << 1,
-};
-ENUM_CLASS_FLAGS(EVertexMaskForgeSelectionSource)
 
 /** Coverage state of the LOD 0 Color Vertex Buffer. */
 enum class EVertexMaskForgeVertexColorState : uint8
@@ -320,7 +306,9 @@ struct FVertexMaskForgeScalarMask
 
 	// --- Temporary diagnostics (audited render-vertex-order fix) ---------------------------
 	// Added to make the Values.Num() == PositionVertexBuffer.GetNumVertices() invariant directly
-	// verifiable from the panel UI. See VertexMaskForgePanel::GetBoundingBoxMaskSummaryText().
+	// verifiable; RenderVertexCount/bUnifiedBounds/SelectionMeshCount below are diagnostic-only
+	// fields (no longer surfaced in the UI since the Selected Static Meshes panel was removed, but
+	// still computed and available for logging/future diagnostics).
 
 	/** LOD0 PositionVertexBuffer.GetNumVertices() at generation time; must equal Values.Num(). */
 	int32 RenderVertexCount = 0;
@@ -523,17 +511,16 @@ struct FVertexMaskForgeSelectedMesh
 	/** Cached full asset path string, used both for display and as the dedup key. */
 	FString AssetPathString;
 
-	EVertexMaskForgeSelectionSource Sources = EVertexMaskForgeSelectionSource::None;
-
 	FVertexMaskForgeMeshDiagnostics Diagnostics;
 
 	FVertexMaskForgeWorkingMesh WorkingMesh;
 
 	/**
-	 * Static Mesh Components in the tracked viewport selection that reference this asset, with
-	 * their non-destructive preview state. Populated only by CollectViewportSelection; empty for
-	 * entries that came only from the Content Browser (Preview is unavailable for those -- see
-	 * SVertexMaskForgePanel::ApplyPreviewToEntry).
+	 * Static Mesh Components in the tracked scene selection that reference this asset, with their
+	 * non-destructive preview state. Populated only by CollectViewportSelection -- the sole selection
+	 * source (Actors and directly-selected Components in the level; Content Browser asset selection
+	 * is never consulted anywhere in this panel), so this is never empty for an entry that exists at
+	 * all (every entry comes from at least one real, placed UStaticMeshComponent).
 	 */
 	TArray<FVertexMaskForgePreviewComponentState> PreviewComponents;
 };
@@ -550,18 +537,79 @@ public:
 	virtual ~SVertexMaskForgePanel() override;
 
 private:
-	FReply OnRefreshSelectionClicked();
+	/**
+	 * Bound to USelection::SelectionChangedEvent (registered once in Construct(), removed in the
+	 * destructor via SelectionChangedDelegateHandle) -- the sole automatic trigger for
+	 * RefreshSelection() now that the manual "Refresh Selection" button no longer exists. Fires for
+	 * Actor/Component/BSP scene selection changes only; Content Browser asset selection is a
+	 * completely separate system and was never routed through this delegate, matching this panel no
+	 * longer consulting the Content Browser at all (see CollectViewportSelection, the only collector
+	 * left). NewSelection (which USelection instance changed) is unused.
+	 *
+	 * Deferred-sync contract (replaces the old manual Refresh Selection button's YesNoCancel prompt):
+	 * while OperationState != Idle, an operation is pending against ORIGINAL targets that must never
+	 * be silently retargeted or discarded just because the scene selection changed underneath it --
+	 * so this does NOT call RefreshSelection() in that case. It also does NOT destroy previews, does
+	 * NOT touch SelectedMeshes, and does NOT create any transaction or mark anything dirty; it only
+	 * records that a sync is owed, via bSceneSelectionChangedDuringActiveOperation, so that the panel
+	 * can catch up automatically -- without requiring another viewport/World Outliner click -- the
+	 * moment the pending operation is actually resolved (see SyncSelectionIfChangedDuringOperation).
+	 */
+	void OnEditorSelectionChanged(UObject* NewSelection);
 
-	/** Re-queries the viewport and Content Browser selections and rebuilds the list. */
+	/** Re-queries the scene (viewport/World Outliner) selection and rebuilds the working set. */
 	void RefreshSelection();
 
-	/** Gathers unique Static Meshes from UStaticMeshComponents on selected actors. */
-	void CollectViewportSelection(
-		TArray<TSharedPtr<FVertexMaskForgeSelectedMesh>>& InOutMeshes,
-		TMap<FString, int32>& InOutPathToIndex) const;
+	/**
+	 * Set true by OnEditorSelectionChanged() when the scene selection changes while OperationState !=
+	 * Idle (i.e. while an operation is pending against targets captured before that change).
+	 * Consumed -- and cleared -- by SyncSelectionIfChangedDuringOperation(), called at the tail of
+	 * exactly the three actions that can legitimately conclude a session and return OperationState to
+	 * Idle: OnCancelChangesClicked(), AcceptPendingChanges() (on success), and
+	 * AcceptPendingChangesAsInstanceOverride() (on success). Deliberately NOT consumed by any other
+	 * RecomputeOperationState() call site (e.g. ordinary mask regeneration flipping PendingChanges<->
+	 * Idle), so an incidental state flip unrelated to actually concluding a session never triggers an
+	 * unwanted resync/rebuild.
+	 */
+	bool bSceneSelectionChangedDuringActiveOperation = false;
 
-	/** Gathers Static Mesh assets selected in the Content Browser. */
-	void CollectContentBrowserSelection(
+	/**
+	 * If the scene selection changed while the operation that just concluded was pending (see
+	 * bSceneSelectionChangedDuringActiveOperation), re-syncs SelectedMeshes with the CURRENT scene
+	 * selection via RefreshSelection() and clears the flag -- no extra viewport/World Outliner click
+	 * required. No-ops (no rebuild, no flicker, no clobbered status text) if the selection never
+	 * changed during the just-concluded operation.
+	 *
+	 * MUST only be called AFTER the operation's own targets have been fully validated/written (Accept
+	 * / Accept as Instance Override) or fully discarded (Cancel) against the ORIGINAL SelectedMeshes,
+	 * and after OperationState has already settled back to Idle -- calling this any earlier would let
+	 * a resync silently retarget or interrupt an in-flight operation, which must never happen.
+	 */
+	void SyncSelectionIfChangedDuringOperation();
+
+	/**
+	 * Gathers unique Static Meshes from UStaticMeshComponents in the CURRENT SCENE selection -- the
+	 * ONLY selection source this panel consults (Content Browser asset selection was removed
+	 * entirely; a UStaticMesh can only participate via a real, placed UStaticMeshComponent found
+	 * here). Every candidate component, from either source below, passes through one centralized
+	 * eligibility gate (IsEligibleComponent in the .cpp) that explicitly rejects invalid/pending-kill
+	 * objects and this plugin's own transient preview components (by outer package and RF_Transient,
+	 * not merely by the fact that they are never registered with any USelection set).
+	 *
+	 * Precedence between the two scene selection sources is DETERMINISTIC, not additive (audited
+	 * against the UE 5.8 Level Editor's own click-handling source -- see the .cpp for the full
+	 * evidence):
+	 *   - If GEditor->GetSelectedComponents() contains ANY UStaticMeshComponent (an explicit
+	 *     component-selection is active), those components ALONE are the targets -- their owning
+	 *     Actor(s) are never auto-expanded to all of their other components, even though the owning
+	 *     Actor legitimately remains present in GetSelectedActors() at the same time.
+	 *   - Otherwise, falls back to every valid UStaticMeshComponent owned by every selected Actor
+	 *     (GEditor->GetSelectedActors(), Actor->GetComponents<UStaticMeshComponent>()) -- the
+	 *     pre-existing, already-validated Actor-granularity behavior.
+	 * Never touches the Content Browser. See VertexMaskForgePanel::AddOrUpdateSelectedMesh for the
+	 * per-component dedup (by pointer identity, never by UStaticMesh).
+	 */
+	void CollectViewportSelection(
 		TArray<TSharedPtr<FVertexMaskForgeSelectedMesh>>& InOutMeshes,
 		TMap<FString, int32>& InOutPathToIndex) const;
 
@@ -579,15 +627,6 @@ private:
 	 * mesh and its computed statistics are kept on the entry.
 	 */
 	void BuildWorkingMeshes(TArray<TSharedPtr<FVertexMaskForgeSelectedMesh>>& InOutMeshes) const;
-
-	TSharedRef<ITableRow> OnGenerateMeshRow(
-		TSharedPtr<FVertexMaskForgeSelectedMesh> InItem,
-		const TSharedRef<STableViewBase>& OwnerTable);
-
-	FText GetSummaryText() const;
-	EVisibility GetEmptyStateVisibility() const;
-	EVisibility GetListVisibility() const;
-	EVisibility GetRefreshedMessageVisibility() const;
 
 	// --- Bounding Box Mask (Local X / Local Y / Local Z, each with independent Local/World Space) --
 
@@ -884,6 +923,10 @@ private:
 
 	FDelegateHandle WorldCleanupDelegateHandle;
 
+	/** See OnEditorSelectionChanged's doc comment. Registered/removed the same way as, and for the
+	 *  same reason as, WorldCleanupDelegateHandle above. */
+	FDelegateHandle SelectionChangedDelegateHandle;
+
 	/**
 	 * Centralized per-Actor hide ref-counting for the whole panel (not per-entry), since components
 	 * from different FVertexMaskForgeSelectedMesh entries can share the same owning Actor. See
@@ -892,11 +935,6 @@ private:
 	TMap<TWeakObjectPtr<AActor>, FVertexMaskForgeActorHideState> ActorHideStates;
 
 	TArray<TSharedPtr<FVertexMaskForgeSelectedMesh>> SelectedMeshes;
-
-	TSharedPtr<SListView<TSharedPtr<FVertexMaskForgeSelectedMesh>>> ListView;
-	TSharedPtr<STextBlock> SummaryText;
-
-	bool bHasRefreshedOnce = false;
 
 	// Preview Mode / Channel Filter are panel/session-transient: never saved on the asset, never
 	// invalidate or regenerate BoundingBoxMask, and are fully independent of one another.
