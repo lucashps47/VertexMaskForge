@@ -1,8 +1,10 @@
 #pragma once
 
 #include "Containers/BitArray.h"
+#include "Containers/StaticArray.h"
 #include "CoreMinimal.h"
 #include "Delegates/IDelegateInstance.h"
+#include "Engine/TimerHandle.h"
 #include "Math/Vector4.h"
 #include "Misc/EnumClassFlags.h"
 #include "UObject/SoftObjectPtr.h"
@@ -25,6 +27,27 @@ enum class ECheckBoxState : uint8;
 namespace ESelectInfo { enum Type : int; }
 
 namespace UE::Geometry { class FDynamicMesh3; }
+
+/**
+ * Explicit state of the Pending Changes workflow (Accept/Cancel). Never inferred merely from
+ * whether a PreviewComponent exists -- see SVertexMaskForgePanel::RecomputeOperationState().
+ */
+enum class EVertexMaskForgeOperationState : uint8
+{
+	/** No valid, acceptable Preview exists (no active Preview Mode, or no Ready mask being shown). */
+	Idle,
+
+	/** A valid mask is displayed in the transient Preview and can be Accepted. */
+	PendingChanges,
+
+	/** Accept is currently writing to Static Mesh asset(s). Synchronous in this checkpoint, but
+	 *  modeled explicitly so no other operation (auto-update, another Accept) can interleave. */
+	Applying,
+
+	/** The last Accept attempt was blocked or failed; the Preview that was attempted is preserved
+	 *  unchanged. Cleared by the next explicit user action (regenerate, Accept, Cancel). */
+	Failed,
+};
 
 /** Where a selected Static Mesh was found during a selection refresh. */
 enum class EVertexMaskForgeSelectionSource : uint8
@@ -163,14 +186,88 @@ enum class EVertexMaskForgeScalarMaskState : uint8
 	Invalid,
 };
 
+/** Which generator produced a FVertexMaskForgeScalarMask -- purely for UI/diagnostic labeling. */
+enum class EVertexMaskForgeScalarMaskSource : uint8
+{
+	/** GenerateBoundingBoxMask: combination (by maximum) of up to 3 independent axis gradients. */
+	BoundingBox,
+
+	/** GenerateConstantMask(1.0): every render vertex set to 1.0 (Fill White). */
+	ConstantWhite,
+
+	/** GenerateConstantMask(0.0): every render vertex set to 0.0 (Fill Black). */
+	ConstantBlack,
+};
+
+/** Which local/world axis one FVertexMaskForgeAxisMaskParams evaluates. */
+enum class EVertexMaskForgeBoundsAxis : uint8
+{
+	X,
+	Y,
+	Z,
+};
+
 /**
- * A transient per-vertex scalar mask (e.g. the Bounding Box Z prototype), owned by exactly one
+ * Independent parameters for ONE axis of the Bounding Box Mask (the "Local X" / "Local Y" /
+ * "Local Z" rows in the UI). Panel-level (SVertexMaskForgePanel::BoundingBoxAxisParams, indexed by
+ * EVertexMaskForgeBoundsAxis) -- shared across every selected entry, exactly like the single-axis
+ * Position/TransitionWidth/bInvert panel members this replaces.
+ */
+struct FVertexMaskForgeAxisMaskParams
+{
+	bool bEnabled = false;
+	float Position = 0.5f;
+	float TransitionWidth = 1.0f;
+	bool bInvert = false;
+
+	/** Adds a second, symmetric gradient in the opposite direction, combined with the base gradient
+	 *  by maximum (see VertexMaskForgePanel::GenerateBoundingBoxMask). Never alters Position or
+	 *  TransitionWidth. */
+	bool bMirror = false;
+
+	/** False (default): evaluate this axis in the Static Mesh's own local space. True: evaluate in
+	 *  World Space, using the specific previewed instance's own ComponentTransform. Independent per
+	 *  axis and independent of Position/TransitionWidth/bInvert/bMirror. */
+	bool bWorldSpace = false;
+};
+
+/**
+ * Per-axis bounds, either INDIVIDUAL (one Static Mesh's own LOD0, in its own chosen space) or
+ * COLLECTIVE (Unified Bounds -- the union across every participating component's render vertices,
+ * in that axis's chosen space), depending on which pass produced it. Domain-shape only; carries no
+ * opinion about which mode produced it -- see VertexMaskForgePanel::GenerateBoundingBoxMask's
+ * CollectiveBounds parameter and VertexMaskForgePanel::ComputeCollectiveAxisBounds.
+ */
+struct FVertexMaskForgeAxisBoundsResult
+{
+	double MinCoord = 0.0;
+	double MaxCoord = 0.0;
+	bool bDegenerate = false;
+
+	/**
+	 * Only meaningful for an enabled Local-space axis (bWorldSpace == false) when these bounds are
+	 * COLLECTIVE (Unified Bounds on). World-space direction that every participating component's own
+	 * local axis maps to -- validated compatible across all participants (see
+	 * VertexMaskForgePanel::ResolveSharedLocalAxis) -- used to project each component's own
+	 * world-space render-vertex positions onto one shared coordinate line without discarding
+	 * translation between instances. Normalized. Zero vector / unused for World-space axes and for
+	 * Individual (non-Unified) bounds.
+	 */
+	FVector SharedLocalAxisDirection = FVector::ZeroVector;
+
+	/** World-space length of the (pre-normalization) transformed local axis vector for the same
+	 *  axis -- i.e. the shared scale along that axis. See SharedLocalAxisDirection. */
+	double SharedLocalAxisScale = 1.0;
+};
+
+/**
+ * A transient per-vertex scalar mask (e.g. the Bounding Box Mask), owned by exactly one
  * FVertexMaskForgeWorkingMesh. Exists only in memory; never written to the Primary Color Overlay,
  * MeshDescription, RenderData, or the source asset.
  *
- * AUDITED: the Bounding Box Z mask (the only generator that exists so far) is computed directly in
- * RENDER VERTEX order (see VertexMaskForgePanel::GenerateBoundingBoxZMask), so for it, Values/
- * bHasValue are indexed by Render Vertex Index and are always dense (Values.Num() ==
+ * AUDITED: the Bounding Box Mask (the only spatial generator that exists so far) is computed
+ * directly in RENDER VERTEX order (see VertexMaskForgePanel::GenerateBoundingBoxMask), so for it,
+ * Values/bHasValue are indexed by Render Vertex Index and are always dense (Values.Num() ==
  * bHasValue.Num() == RenderVertexCount == the LOD's PositionVertexBuffer.GetNumVertices(), every
  * slot written). This struct itself stays domain-agnostic (a future, genuinely topology-dependent
  * generator could still index by Dynamic Mesh Vertex ID and leave bHasValue sparse) -- always use
@@ -184,7 +281,7 @@ struct FVertexMaskForgeScalarMask
 
 	EVertexMaskForgeScalarMaskState State = EVertexMaskForgeScalarMaskState::NotGenerated;
 
-	/** Indexed by Render Vertex Index for the Bounding Box Z mask (see the struct-level audit note). */
+	/** Indexed by Render Vertex Index for the Bounding Box Mask (see the struct-level audit note). */
 	TArray<float> Values;
 
 	/** Parallel to Values: true only at indices that were actually written. */
@@ -210,16 +307,16 @@ struct FVertexMaskForgeScalarMask
 	int32 NumNearZero = 0;
 	int32 NumNearOne = 0;
 
-	/** Value at the vertex with the lowest local-space Z (Bottom). */
-	float BottomValue = 0.f;
+	/** Which generator produced this mask -- so the UI never mislabels a Fill result as Bounding Box. */
+	EVertexMaskForgeScalarMaskSource Source = EVertexMaskForgeScalarMaskSource::BoundingBox;
 
-	/** Value at the vertex with the highest local-space Z (Top). */
-	float TopValue = 0.f;
-
-	/** Parameters used to produce this result, kept for diagnostic display. */
-	float Position = 0.5f;
-	float TransitionWidth = 1.0f;
-	bool bInvert = false;
+	/**
+	 * Snapshot of the per-axis parameters used to generate this mask (Source == BoundingBox only;
+	 * left default-constructed, all bEnabled == false, for Constant sources), indexed by
+	 * EVertexMaskForgeBoundsAxis -- purely for diagnostic display (which axes/Mirror/World Space
+	 * were active). Never affects composition; composition only ever reads Values/bHasValue.
+	 */
+	TStaticArray<FVertexMaskForgeAxisMaskParams, 3> UsedAxisParams;
 
 	// --- Temporary diagnostics (audited render-vertex-order fix) ---------------------------
 	// Added to make the Values.Num() == PositionVertexBuffer.GetNumVertices() invariant directly
@@ -228,9 +325,14 @@ struct FVertexMaskForgeScalarMask
 	/** LOD0 PositionVertexBuffer.GetNumVertices() at generation time; must equal Values.Num(). */
 	int32 RenderVertexCount = 0;
 
-	/** Local-space Z bounds used for normalization, over ALL render vertices of the LOD. */
-	double BoundsMinZ = 0.0;
-	double BoundsMaxZ = 0.0;
+	/** True if this mask (Source == BoundingBox only) was generated against a collective, Unified
+	 *  Bounds domain rather than this one mesh's own individual bounds. Diagnostic display only. */
+	bool bUnifiedBounds = false;
+
+	/** Total number of meshes in the selection at generation time (diagnostic display only; not a
+	 *  per-mesh count -- Individual and Unified masks generated from the same selection both report
+	 *  the same selection size, matching the checkpoint's diagnostic examples). */
+	int32 SelectionMeshCount = 0;
 };
 
 /**
@@ -294,19 +396,26 @@ struct FVertexMaskForgeWorkingMesh
 	FVertexMaskForgeColorStats ColorStats;
 
 	/**
-	 * The Bounding Box Z mask prototype, if generated. A fresh FVertexMaskForgeWorkingMesh is
-	 * always constructed on Refresh Selection (see BuildWorkingMeshForStaticMesh), so this starts
-	 * at NotGenerated automatically every time the working mesh itself is rebuilt -- there is no
-	 * separate invalidation step needed for that case. Parameter-change invalidation is handled by
-	 * the panel explicitly resetting this field.
+	 * The active mask (Bounding Box across up to 3 axes, or a Constant Fill), if generated. This is
+	 * the ENTRY-LEVEL reference: generated using the first live PreviewComponent's transform (or
+	 * FTransform::Identity if none), used for gating (Ready check), the row summary text, and
+	 * Content-Browser-only entries. When Source == BoundingBox and at least one axis uses World
+	 * Space, actual Preview/Accept composition RE-EVALUATES the mask per component with that
+	 * component's own transform (see ApplyPreviewToEntry / BuildAcceptTargets) rather than reusing
+	 * this shared reference -- so two instances of this asset can legitimately show different
+	 * results, exactly like a divergent per-instance OverrideVertexColors baseline already does. A
+	 * fresh FVertexMaskForgeWorkingMesh is always constructed on Refresh Selection (see
+	 * BuildWorkingMeshForStaticMesh), so this starts at NotGenerated automatically every time the
+	 * working mesh itself is rebuilt -- there is no separate invalidation step needed for that case.
+	 * Parameter-change invalidation is handled by the panel explicitly resetting this field.
 	 */
-	FVertexMaskForgeScalarMask BoundingBoxZMask;
+	FVertexMaskForgeScalarMask BoundingBoxMask;
 };
 
 /**
  * What the artist currently sees in the viewport for Vertex Color preview purposes.
  * Purely a session/panel-level setting -- never saved on the UStaticMesh, never affects the
- * Bounding Box Z mask, Position, Transition Width, or Invert.
+ * Bounding Box Mask or its per-axis parameters.
  */
 enum class EVertexMaskForgePreviewMode : uint8
 {
@@ -324,6 +433,10 @@ enum class EVertexMaskForgePreviewMode : uint8
 
 	/** Show the composed color's Blue channel as grayscale (B, B, B, 1). */
 	BlueChannel,
+
+	/** Show the composed color's Alpha channel as grayscale (A, A, A, 1) -- visualization only, never
+	 *  alters the real RGBA values held in the composed Preview/Accept data. */
+	AlphaChannel,
 };
 
 /**
@@ -476,26 +589,134 @@ private:
 	EVisibility GetListVisibility() const;
 	EVisibility GetRefreshedMessageVisibility() const;
 
-	// --- Bounding Box Z Mask prototype ------------------------------------------------------
-
-	/** Processes every selected entry's working mesh, generating or clearing its Bounding Box Z mask. */
-	FReply OnGenerateBoundingBoxMaskClicked();
-
-	float GetBoundingBoxMaskPosition() const { return BoundingBoxMaskPosition; }
-	void OnBoundingBoxMaskPositionChanged(float NewValue);
-
-	float GetBoundingBoxMaskTransitionWidth() const { return BoundingBoxMaskTransitionWidth; }
-	void OnBoundingBoxMaskTransitionWidthChanged(float NewValue);
-
-	ECheckBoxState GetBoundingBoxMaskInvertState() const;
-	void OnBoundingBoxMaskInvertChanged(ECheckBoxState NewState);
+	// --- Bounding Box Mask (Local X / Local Y / Local Z, each with independent Local/World Space) --
 
 	/**
-	 * Resets every selected entry's Bounding Box Z mask back to NotGenerated, without touching the
-	 * working mesh (FDynamicMesh3) itself. Called whenever Position/Transition Width/Invert change,
-	 * so stale statistics are never left looking current; the user must click Generate Mask again.
+	 * Builds one axis's UI row (title "Local X"/"Local Y"/"Local Z" -- no directional text -- plus
+	 * Enable/Position/Transition Width/Invert/Mirror/World Space controls, all bound via lambdas
+	 * capturing Axis by value). Called 3 times from Construct(); keeps the 3 axis rows from
+	 * triplicating Slate code even though the UI itself has 3 copies.
+	 */
+	TSharedRef<SWidget> BuildBoundingBoxAxisRow(EVertexMaskForgeBoundsAxis Axis, const FText& Title);
+
+	/**
+	 * Shared handler for a DISCRETE per-axis control change (Enable/Invert/Mirror/World Space --
+	 * anything that isn't a continuously-dragged slider): invalidates the current mask, then, if
+	 * Auto Update Preview is on, cancels any pending debounce (a stale continuous-slider callback
+	 * must never apply after a discrete change) and regenerates immediately.
+	 */
+	void OnAxisParamChangedDiscrete();
+
+	/** Processes every selected entry's working mesh, generating or clearing its Bounding Box Mask. */
+	FReply OnGenerateBoundingBoxMaskClicked();
+
+	/**
+	 * Resets every selected entry's Bounding Box Mask back to NotGenerated, without touching the
+	 * working mesh (FDynamicMesh3) itself. Called whenever any axis parameter changes, so stale
+	 * statistics are never left looking current; the user must click Generate Mask again (if Auto
+	 * Update Preview is off), or ScheduleAutoUpdatePreview()/RunAutoUpdatePreview() take over
+	 * automatically (if it is on). Never touches a Constant Fill mask's meaning -- Fill results are
+	 * independent of these axis parameters (only Generate Mask/Auto Update read them).
 	 */
 	void InvalidateBoundingBoxMasks();
+
+	/** Panel-level parameters for each of the 3 axes, indexed by EVertexMaskForgeBoundsAxis. Shared
+	 *  across every selected entry; per-instance World Space evaluation reads a component's own
+	 *  transform separately (see GenerateBoundingBoxMask) -- these parameters themselves never vary
+	 *  per entry or per component. Z starts bEnabled == true (matching the previously-validated
+	 *  single-axis default); X and Y start disabled, so a fresh panel reproduces the exact prior
+	 *  Local-Z-only behavior until the user explicitly enables another axis. */
+	TStaticArray<FVertexMaskForgeAxisMaskParams, 3> BoundingBoxAxisParams;
+
+	// --- Fill White / Fill Black utility masks ----------------------------------------------
+
+	FReply OnFillWhiteClicked();
+	FReply OnFillBlackClicked();
+
+	/**
+	 * Shared implementation for both Fill buttons: cancels any pending Auto Update Preview debounce
+	 * first (a Fill must never be overwritten moments later by a stale regeneration), then, for every
+	 * SelectedMeshes entry that passes the SAME entry-level validity gating as Generate Mask
+	 * (WorkingMesh Ready, resolvable Static Mesh, valid LOD 0 render data), generates a dense
+	 * constant-valued mask (VertexMaskForgePanel::GenerateConstantMask) and assigns it to that
+	 * entry's mask. Unlike a manual Generate Mask click, an entry that fails validation here is left
+	 * COMPLETELY UNTOUCHED (its previous mask, if any, is preserved) rather than reset to
+	 * Unavailable -- per the explicit "preserve the last valid Preview on failure" requirement.
+	 * Ends with UpdateAllPreviews(), which recomposes/reapplies the transient Preview (reusing the
+	 * exact same ApplyPreviewToEntry/ComposeRenderOrderPreviewColors path as every other mask) and
+	 * marks Pending Changes via RecomputeOperationState().
+	 */
+	void RunConstantFill(float ConstantValue, EVertexMaskForgeScalarMaskSource Source, const FText& SuccessMessage);
+
+	/** Enabled only when at least one selected entry has a Ready working mesh, and not while Applying. */
+	bool CanRunFill() const;
+
+	FText GetMaskActionStatusText() const { return LastMaskActionStatusText; }
+
+	/** Success/partial-failure message for the last Generate Mask / Fill action; cleared by the next
+	 *  mask-changing action (Generate Mask, Fill, parameter change, Refresh Selection, Accept, Cancel). */
+	FText LastMaskActionStatusText;
+
+	// --- Auto Update Preview (debounced automatic regeneration) ----------------------------
+
+	ECheckBoxState GetAutoUpdatePreviewState() const { return bAutoUpdatePreview ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; }
+	void OnAutoUpdatePreviewChanged(ECheckBoxState NewState);
+
+	/**
+	 * Arms (or restarts) a short one-shot debounce timer via GEditor's FTimerManager -- not a
+	 * per-frame Tick override -- so a burst of slider events (SSpinBox fires OnValueChanged
+	 * continuously while dragging) collapses into a single regeneration ~150ms after the LAST
+	 * event. Calling FTimerManager::SetTimer() again with the same FTimerHandle before it fires
+	 * clears and re-adds it (confirmed in TimerManager.cpp), which is exactly "a new change resets
+	 * the wait". No-ops if Auto Update Preview is off. Uses FTimerDelegate::CreateSP (weak-safe: a
+	 * pending timer harmlessly no-ops if this widget is destroyed first), but the timer is also
+	 * explicitly cleared in OnWorldCleanup() and the destructor rather than relying on that alone.
+	 */
+	void ScheduleAutoUpdatePreview();
+
+	/**
+	 * Regenerates the Bounding Box Mask for every eligible entry using the CURRENT per-axis
+	 * parameters. On a per-entry basis: if the new mask comes back Ready, it replaces the entry's
+	 * mask; otherwise (DegenerateBounds/Invalid/Unavailable, including "no axis enabled") the
+	 * entry's EXISTING mask is left untouched -- an auto-triggered regeneration must never destroy a
+	 * valid Preview, unlike a manual Generate Mask click (OnGenerateBoundingBoxMaskClicked), which
+	 * still unconditionally overwrites, per the already-validated checkpoint behavior. Never runs
+	 * while Applying (guarded defensively; not reachable in practice since Accept is synchronous).
+	 * Called by the debounce timer, or immediately for discrete parameter changes
+	 * (Enable/Invert/Mirror/World Space).
+	 */
+	void RunAutoUpdatePreview();
+
+	bool bAutoUpdatePreview = true;
+	FTimerHandle AutoUpdateDebounceTimerHandle;
+
+	// --- Unified Bounds (global, all 3 axes, all selected meshes) --------------------------
+
+	ECheckBoxState GetUnifiedBoundsState() const { return bUseUnifiedBounds ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; }
+
+	/**
+	 * Toggling Unified Bounds never recomputes just one mesh: it cancels any pending debounce,
+	 * invalidates every entry's current Bounding-Box-sourced mask (InvalidateBoundingBoxMasks()), and
+	 * -- only if Auto Update Preview is on -- immediately regenerates every eligible entry as one
+	 * coherent batch (RunAutoUpdatePreview(), which itself computes the collective domain once, if
+	 * applicable, and reuses it for every participant). If Auto Update Preview is off, parameters are
+	 * updated and results invalidated, but no new Preview is generated until the user clicks Generate
+	 * Mask -- same contract as every other axis parameter.
+	 */
+	void OnUnifiedBoundsChanged(ECheckBoxState NewState);
+
+	/**
+	 * False (default) preserves the tool's previously-validated behavior exactly: each component
+	 * normalizes its own render vertices against its OWN individual per-axis bounds (see
+	 * VertexMaskForgePanel::GenerateBoundingBoxMask's internal bounds pass). True: every enabled
+	 * axis is normalized against a COLLECTIVE domain -- the union of that axis's coordinate across
+	 * every participating component's render vertices (see VertexMaskForgePanel::
+	 * ComputeCollectiveAxisBounds) -- computed fresh before each batch (Generate Mask click, Auto
+	 * Update regeneration, every Preview refresh, and Accept validation), never cached across calls,
+	 * consistent with the rest of the panel's "always recompute, never stale" design. Global for all
+	 * 3 axes and the whole selection -- there is no per-axis or per-mesh Unified Bounds mode.
+	 */
+	bool bUseUnifiedBounds = false;
 
 	// --- Preview (Preview Mode + Channel Filter) --------------------------------------------
 
@@ -516,13 +737,22 @@ private:
 
 	/**
 	 * Applies or restores preview visualization for every selected entry, based on the current
-	 * CurrentPreviewMode / Channel Filter / each entry's BoundingBoxZMask state. Idempotent and
+	 * CurrentPreviewMode / Channel Filter / each entry's BoundingBoxMask state. Idempotent and
 	 * side-effect-free with respect to the mask itself -- never generates or invalidates it.
 	 */
 	void UpdateAllPreviews();
 
-	/** Applies or restores preview for one entry, per current mode/filter/mask state. */
-	void ApplyPreviewToEntry(const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry);
+	/**
+	 * Applies or restores preview for one entry, per current mode/filter/mask state.
+	 * CollectiveBoundsPtr is non-null only when bUseUnifiedBounds is on AND UpdateAllPreviews()
+	 * successfully computed a collective domain for this batch -- passed through unchanged to every
+	 * per-component GenerateBoundingBoxMask() re-evaluation (see the audit note there); nullptr means
+	 * "use each component's own individual bounds" (bUseUnifiedBounds off, or this entry's mask
+	 * Source isn't BoundingBox, in which case it's simply unused).
+	 */
+	void ApplyPreviewToEntry(
+		const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry,
+		const TStaticArray<FVertexMaskForgeAxisBoundsResult, 3>* CollectiveBoundsPtr);
 
 	/** Restores original materials and vertex colors on every tracked component of one entry. Idempotent. */
 	void RestorePreviewForEntry(FVertexMaskForgeSelectedMesh& Entry);
@@ -536,6 +766,41 @@ private:
 
 	/** Lazily loads the engine's built-in vertex-color debug material (never a new persistent asset). */
 	UMaterialInterface* GetPreviewDebugMaterial();
+
+	// --- Pending Changes: Accept / Cancel ---------------------------------------------------
+
+	EVertexMaskForgeOperationState GetOperationState() const { return OperationState; }
+
+	/** Recomputes OperationState (Idle/PendingChanges only -- see enum doc) from current data: a
+	 *  Preview Mode other than OriginalMaterial, and at least one entry with an active
+	 *  PreviewComponent and a Ready mask. Never touches LastOperationErrorText (callers that need to
+	 *  report a failure set it themselves, AFTER calling anything that ends in this, so a fresh
+	 *  message from this same pass is never clobbered). No-ops while Applying. */
+	void RecomputeOperationState();
+
+	bool CanAcceptChanges() const { return OperationState == EVertexMaskForgeOperationState::PendingChanges; }
+	FReply OnAcceptChangesClicked();
+
+	bool CanCancelChanges() const { return OperationState == EVertexMaskForgeOperationState::PendingChanges || OperationState == EVertexMaskForgeOperationState::Failed; }
+	FReply OnCancelChangesClicked();
+
+	FText GetOperationStatusText() const;
+
+	/**
+	 * Validates every eligible entry, confirms the destination with the user, and -- only if both
+	 * succeed -- writes permanently to the Static Mesh asset(s) inside one FScopedTransaction. See
+	 * the .cpp for the full validate-then-write contract (VertexMaskForgePanel::BuildAcceptTargets /
+	 * WriteAcceptTargets). Returns true only on a fully successful Accept.
+	 */
+	bool AcceptPendingChanges();
+
+	/** Records the reason the last Accept (or auto-update regeneration) was blocked/failed, shown in
+	 *  GetOperationStatusText(). Cleared explicitly at the START of each fresh attempt -- never by
+	 *  RecomputeOperationState(), so it survives whatever UpdateAllPreviews() call follows within the
+	 *  same attempt. */
+	FText LastOperationErrorText;
+
+	EVertexMaskForgeOperationState OperationState = EVertexMaskForgeOperationState::Idle;
 
 	/**
 	 * Bound to FWorldDelegates::OnWorldCleanup (registered once in Construct(), removed in the
@@ -567,7 +832,7 @@ private:
 	bool bHasRefreshedOnce = false;
 
 	// Preview Mode / Channel Filter are panel/session-transient: never saved on the asset, never
-	// invalidate or regenerate BoundingBoxZMask, and are fully independent of one another.
+	// invalidate or regenerate BoundingBoxMask, and are fully independent of one another.
 	EVertexMaskForgePreviewMode CurrentPreviewMode = EVertexMaskForgePreviewMode::OriginalMaterial;
 	TArray<TSharedPtr<EVertexMaskForgePreviewMode>> PreviewModeOptions;
 	TSharedPtr<SComboBox<TSharedPtr<EVertexMaskForgePreviewMode>>> PreviewModeComboBox;
@@ -579,10 +844,4 @@ private:
 
 	/** Resolved lazily via GetPreviewDebugMaterial(); weak because it is an asset the plugin does not own. */
 	TWeakObjectPtr<UMaterialInterface> PreviewDebugMaterial;
-
-	// Bottom-to-Top Local Z prototype parameters; defaults reproduce the raw normalized gradient
-	// (Bottom = 0, Top = 1) -- see VertexMaskForgePanel::GenerateBoundingBoxZMask() for the formula.
-	float BoundingBoxMaskPosition = 0.5f;
-	float BoundingBoxMaskTransitionWidth = 1.0f;
-	bool bBoundingBoxMaskInvert = false;
 };

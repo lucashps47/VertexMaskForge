@@ -32,6 +32,11 @@ public class VertexMaskForge : ModuleRules
 				// used to initialize the transient FColorVertexBuffer allocated for the non-destructive
 				// component-level Vertex Color preview (FStaticMeshComponentLODInfo::OverrideVertexColors).
 				"RenderCore",
+				// SPrimaryButton (Developer/ToolWidgets/Public/SPrimaryButton.h) for the Accept button --
+				// the same generic, Editor-Mode-agnostic widget class Modeling Tools Editor Mode itself
+				// uses for its Accept/Complete buttons (audited in ModelingToolsEditorModeToolkit.cpp).
+				// Editor-only and already Slate/Editor-Mode-independent, safe for a standalone panel.
+				"ToolWidgets",
 			}
 		);
 	}
