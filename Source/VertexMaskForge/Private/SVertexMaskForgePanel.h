@@ -783,6 +783,19 @@ private:
 	bool CanAcceptChanges() const { return OperationState == EVertexMaskForgeOperationState::PendingChanges; }
 	FReply OnAcceptChangesClicked();
 
+	/**
+	 * Alternative conclusion to the SAME PendingChanges session Accept would otherwise conclude:
+	 * writes the current Preview result as permanent per-instance OverrideVertexColors on each
+	 * selected UStaticMeshComponent, and NEVER touches the Source Static Mesh asset (no
+	 * Mesh->Modify(), GetMeshDescription(), CommitMeshDescription(), Build(), or
+	 * MarkPackageDirty() on the Static Mesh -- see VertexMaskForgePanel::WriteInstanceOverrideTargets
+	 * in the .cpp for the audited, engine-sourced justification). Shares Accept's PendingChanges gate
+	 * -- both are valid, mutually exclusive ways to conclude the same session; this one never calls
+	 * into AcceptPendingChanges() or vice versa.
+	 */
+	bool CanAcceptAsInstanceOverride() const { return OperationState == EVertexMaskForgeOperationState::PendingChanges; }
+	FReply OnAcceptAsInstanceOverrideClicked();
+
 	bool CanCancelChanges() const { return OperationState == EVertexMaskForgeOperationState::PendingChanges || OperationState == EVertexMaskForgeOperationState::Failed; }
 	FReply OnCancelChangesClicked();
 
@@ -796,11 +809,28 @@ private:
 	 */
 	bool AcceptPendingChanges();
 
+	/**
+	 * Validates every eligible component, confirms the (non-destructive, asset-safe) destination with
+	 * the user, and -- only if both succeed -- writes permanent OverrideVertexColors directly onto
+	 * each selected UStaticMeshComponent inside one FScopedTransaction (see
+	 * VertexMaskForgePanel::BuildInstanceOverrideTargets / WriteInstanceOverrideTargets). Unlike
+	 * AcceptPendingChanges(), never deduplicates by UStaticMesh -- two components sharing one asset
+	 * can end up with different FinalColors and are written independently. Returns true only on a
+	 * fully successful write.
+	 */
+	bool AcceptPendingChangesAsInstanceOverride();
+
 	/** Records the reason the last Accept (or auto-update regeneration) was blocked/failed, shown in
 	 *  GetOperationStatusText(). Cleared explicitly at the START of each fresh attempt -- never by
 	 *  RecomputeOperationState(), so it survives whatever UpdateAllPreviews() call follows within the
 	 *  same attempt. */
 	FText LastOperationErrorText;
+
+	/** Success message for the last successful "Accept as Instance Override", shown by
+	 *  GetOperationStatusText() while Idle (native Accept has no equivalent persistent success text
+	 *  today -- its Idle state already reads as "No pending changes." either way). Cleared at the
+	 *  start of every fresh Accept / Accept as Instance Override / Cancel attempt. */
+	FText LastInstanceOverrideStatusText;
 
 	EVertexMaskForgeOperationState OperationState = EVertexMaskForgeOperationState::Idle;
 

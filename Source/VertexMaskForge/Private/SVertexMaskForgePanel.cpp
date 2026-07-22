@@ -2096,6 +2096,249 @@ namespace VertexMaskForgePanel
 		return true;
 	}
 
+	// --- Accept as Instance Override: permanent write to component(s), Source Static Mesh untouched --
+
+	/**
+	 * One selected UStaticMeshComponent instance targeted by "Accept as Instance Override", with its
+	 * final, ready-to-write colors. NEVER deduplicated by UStaticMesh (unlike
+	 * FVertexMaskForgeAcceptTarget, which is 1-per-asset) -- two components that happen to reference
+	 * the same asset are independent targets here and can legitimately end up with different
+	 * FinalColors (divergent per-instance baselines, or divergent per-instance World Space
+	 * evaluation), since each writes only to its own component and never to the shared asset.
+	 */
+	struct FVertexMaskForgeInstanceOverrideTarget
+	{
+		TWeakObjectPtr<UStaticMeshComponent> Component;
+		/** Diagnostic-only label ("ComponentName (ActorLabel)"), used in error/status messages. */
+		FString ComponentLabel;
+		/** Render-vertex-order (LOD0), exactly as shown in Preview -- the data actually written. */
+		TArray<FColor> FinalColors;
+	};
+
+	/**
+	 * Validates every SelectedMeshes entry/component eligible for "Accept as Instance Override" and,
+	 * only if ALL of them pass, returns one target PER live PreviewComponent. Mirrors
+	 * BuildAcceptTargets' eligibility gate (Ready mask, at least one live PreviewComponent) and its
+	 * per-component World Space mask re-evaluation exactly, but deliberately omits two things
+	 * BuildAcceptTargets needs and this path does not:
+	 *   - the cross-component "all instances must agree" check, since that check exists ONLY because
+	 *     BuildAcceptTargets writes ONE shared asset from possibly-divergent per-instance baselines;
+	 *     here every component gets its own independent write target, so divergence is expected and
+	 *     harmless;
+	 *   - any MeshDescription/WedgeMap validation, since this path never touches the asset's
+	 *     MeshDescription at all -- only LOD0's render-vertex COUNT (from the asset's RenderData,
+	 *     read-only) is needed to size/validate FinalColors.
+	 */
+	static bool BuildInstanceOverrideTargets(
+		const TArray<TSharedPtr<FVertexMaskForgeSelectedMesh>>& SelectedMeshes,
+		const EVertexMaskForgePreviewMode CurrentPreviewMode,
+		const bool bFilterR, const bool bFilterG, const bool bFilterB, const bool bFilterA,
+		const bool bUseUnifiedBounds,
+		const TStaticArray<FVertexMaskForgeAxisMaskParams, 3>& BoundingBoxAxisParams,
+		TArray<FVertexMaskForgeInstanceOverrideTarget>& OutTargets,
+		FText& OutErrorText)
+	{
+		OutTargets.Reset();
+
+		if (CurrentPreviewMode == EVertexMaskForgePreviewMode::OriginalMaterial)
+		{
+			OutErrorText = LOCTEXT("InstanceOverrideNoActivePreview", "No active Preview to accept -- select a Preview Mode other than Original Material.");
+			return false;
+		}
+
+		// Computed ONCE for the whole operation, exactly mirroring UpdateAllPreviews() / BuildAcceptTargets,
+		// so this validates and writes against the SAME collective domain the Preview just showed.
+		TStaticArray<FVertexMaskForgeAxisBoundsResult, 3> CollectiveBounds;
+		const TStaticArray<FVertexMaskForgeAxisBoundsResult, 3>* CollectiveBoundsPtr = nullptr;
+		if (bUseUnifiedBounds)
+		{
+			if (!ComputeCollectiveAxisBounds(SelectedMeshes, BoundingBoxAxisParams, /*bForGeneration=*/false, CollectiveBounds, OutErrorText))
+			{
+				return false;
+			}
+			CollectiveBoundsPtr = &CollectiveBounds;
+		}
+
+		for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
+		{
+			if (!Entry.IsValid() || Entry->PreviewComponents.IsEmpty()
+				|| Entry->WorkingMesh.BoundingBoxMask.State != EVertexMaskForgeScalarMaskState::Ready)
+			{
+				continue;
+			}
+
+			UStaticMesh* Mesh = Entry->Mesh.LoadSynchronous();
+			if (!IsValid(Mesh) || !Mesh->HasValidRenderData(/*bCheckLODForVerts=*/true, /*LODIndex=*/0))
+			{
+				OutErrorText = FText::Format(
+					LOCTEXT("InstanceOverrideInvalidMeshFormat", "'{0}': Static Mesh could not be resolved or has no valid LOD 0 render data."),
+					FText::FromString(Entry->AssetName));
+				return false;
+			}
+
+			const FStaticMeshRenderData* RenderData = Mesh->GetRenderData();
+			if (!RenderData || !RenderData->LODResources.IsValidIndex(0))
+			{
+				OutErrorText = FText::Format(
+					LOCTEXT("InstanceOverrideNoRenderDataFormat", "'{0}': no LOD 0 render data available."),
+					FText::FromString(Entry->AssetName));
+				return false;
+			}
+			const FStaticMeshLODResources& LOD0 = RenderData->LODResources[0];
+
+			for (const FVertexMaskForgePreviewComponentState& State : Entry->PreviewComponents)
+			{
+				UStaticMeshComponent* SourceComponent = State.SourceComponent.Get();
+				if (!IsValid(SourceComponent))
+				{
+					continue;
+				}
+
+				// AUDITED (mirrors BuildAcceptTargets): re-evaluate the mask with THIS component's own
+				// ComponentTransform when Source == BoundingBox, so this operates on the SAME per-instance
+				// result the Preview actually showed for this component.
+				FVertexMaskForgeScalarMask PerComponentMask;
+				const FVertexMaskForgeScalarMask* EffectiveMask = &Entry->WorkingMesh.BoundingBoxMask;
+				if (Entry->WorkingMesh.BoundingBoxMask.Source == EVertexMaskForgeScalarMaskSource::BoundingBox)
+				{
+					PerComponentMask = GenerateBoundingBoxMask(
+						LOD0, Entry->WorkingMesh.BoundingBoxMask.UsedAxisParams, SourceComponent->GetComponentTransform(),
+						CollectiveBoundsPtr);
+					if (PerComponentMask.State != EVertexMaskForgeScalarMaskState::Ready)
+					{
+						continue;
+					}
+					EffectiveMask = &PerComponentMask;
+				}
+
+				const FColorVertexBuffer* InstanceOverrideColors =
+					SourceComponent->LODData.IsValidIndex(0) ? SourceComponent->LODData[0].OverrideVertexColors : nullptr;
+
+				int32 NumComposedUnused = 0;
+				TArray<FColor> ComponentColors = ComposeRenderOrderPreviewColors(
+					*EffectiveMask, LOD0, InstanceOverrideColors, CurrentPreviewMode,
+					bFilterR, bFilterG, bFilterB, bFilterA, NumComposedUnused);
+
+				if (ComponentColors.Num() != static_cast<int32>(LOD0.GetNumVertices()))
+				{
+					// Defensive only: ComposeRenderOrderPreviewColors always sizes its result to
+					// LOD0's own NumRenderVerts, so this cannot actually diverge in practice.
+					continue;
+				}
+
+				FVertexMaskForgeInstanceOverrideTarget Target;
+				Target.Component = SourceComponent;
+				Target.ComponentLabel = FString::Printf(TEXT("%s (%s)"), *SourceComponent->GetName(),
+					SourceComponent->GetOwner() ? *SourceComponent->GetOwner()->GetActorLabel() : TEXT("?"));
+				Target.FinalColors = MoveTemp(ComponentColors);
+				OutTargets.Add(MoveTemp(Target));
+			}
+		}
+
+		if (OutTargets.IsEmpty())
+		{
+			OutErrorText = LOCTEXT("InstanceOverrideNothingEligible", "No eligible pending changes to accept.");
+			return false;
+		}
+
+		return true;
+	}
+
+	/**
+	 * Writes every target's FinalColors as permanent OverrideVertexColors (LOD0 only) directly onto
+	 * its real UStaticMeshComponent, inside a single FScopedTransaction so this is one coherent Undo
+	 * step. NEVER touches the component's Static Mesh asset -- no Mesh->Modify(),
+	 * GetMeshDescription(), CommitMeshDescription(), Build(), or MarkPackageDirty() on the Static
+	 * Mesh anywhere in this function. Only Component->Modify() is called, which (per UObject::Modify())
+	 * marks the COMPONENT's own package (the level/Actor package) dirty -- the Static Mesh asset and
+	 * its package are left completely untouched.
+	 *
+	 * AUDITED against the Engine's own Mesh Paint Editor Mode source (not improvised):
+	 *   - The buffer-replace sequence -- ReleaseOverrideVertexColorsAndBlock() then `new
+	 *     FColorVertexBuffer` + InitFromColorArray() + BeginInitResource() -- mirrors the "no existing
+	 *     buffer / vertex count differs" branch of FMeshPaintStaticMeshComponentAdapter::PreEdit()
+	 *     (Engine/Plugins/MeshPainting/Source/MeshPaintingToolset/Private/MeshPaintStaticMeshAdapter.cpp).
+	 *     FStaticMeshComponentLODInfo::ReleaseOverrideVertexColorsAndBlock() (StaticMeshComponent.cpp)
+	 *     nulls the member immediately, enqueues the OLD buffer's render-thread resource release, then
+	 *     calls FlushRenderingCommands() to block until that release has actually completed -- so
+	 *     assigning a brand-new buffer right after it returns can never race the render thread or leak
+	 *     the old one.
+	 *   - PaintedVertices.Empty() before the replace, and Component->CachePaintedDataIfNecessary()
+	 *     after, mirror the same PreEdit() function: CachePaintedDataIfNecessary() (StaticMeshComponent.cpp)
+	 *     only repopulates PaintedVertices (the position/normal/color cache
+	 *     FixupOverrideColorsIfNecessary later uses to detect a stale override after the source mesh is
+	 *     rebuilt) when PaintedVertices.Num() == 0; without the Empty() call here, a component that
+	 *     already had override colors from an earlier session would keep its OLD (now-mismatched)
+	 *     cache instead of one describing the colors just written.
+	 *   - SetLODDataCount(1, Component->LODData.Num()) mirrors the exact
+	 *     SetLODDataCount(MinSize, CurrentCount) call pattern used throughout StaticMeshComponent.cpp
+	 *     (e.g. UStaticMeshComponent::ApplyComponentInstanceData): MinSize=1 only guarantees LOD0's
+	 *     entry exists (creating it if the component never had one), MaxSize=current count never trims
+	 *     -- so any pre-existing LOD1+ entries (if this component was ever painted through the Editor's
+	 *     own Mesh Paint tool with per-LOD overrides) are left completely untouched, matching the
+	 *     explicit LOD0-only scope of this checkpoint.
+	 *   - MarkRenderStateDirty() (rather than a heavier FComponentReregisterContext) is the standard,
+	 *     official trigger every UPrimitiveComponent property setter uses to recreate the scene proxy
+	 *     from current state -- sufficient here since nothing else about the component (bounds,
+	 *     collision, attachment) changes, only its override color buffer.
+	 *
+	 * Undo/Redo (audited, not assumed): UStaticMeshComponent::Serialize() unconditionally serializes
+	 * LODData (`Ar << LODData` in StaticMeshComponent.cpp) regardless of LODData's own
+	 * UPROPERTY(Transient) tag -- specifically so a full-object transaction (FScopedTransaction +
+	 * Component->Modify(), both used below) can snapshot and later restore it. On Undo, TArray's
+	 * element reconstruction for a transacted reload destructs the CURRENT FStaticMeshComponentLODInfo
+	 * first (its destructor calls CleanUp(), which safely releases/deletes whatever OverrideVertexColors
+	 * is live at that moment -- see FStaticMeshComponentLODInfo::~FStaticMeshComponentLODInfo()) before
+	 * the archive reloads the OLD snapshot, whose own Ar.IsLoading() branch (operator<<(FArchive&,
+	 * FStaticMeshComponentLODInfo&)) allocates a fresh FColorVertexBuffer and calls BeginInitResource()
+	 * itself. So Undo safely restores "no override" if none existed before this write, and Redo safely
+	 * reapplies these exact colors, with no leak and no dangling render-thread pointer either way. The
+	 * viewport refresh after Undo/Redo is handled by the engine's own UActorComponent::PostEditUndo()
+	 * (ActorComponent.cpp), which re-registers the component -- nothing extra is required here beyond
+	 * calling Component->Modify() before mutating LODData, which this function does first.
+	 */
+	static bool WriteInstanceOverrideTargets(const TArray<FVertexMaskForgeInstanceOverrideTarget>& Targets, FText& OutErrorText)
+	{
+		for (const FVertexMaskForgeInstanceOverrideTarget& Target : Targets)
+		{
+			UStaticMeshComponent* Component = Target.Component.Get();
+			UStaticMesh* Mesh = IsValid(Component) ? Component->GetStaticMesh() : nullptr;
+			const FStaticMeshRenderData* RenderData = IsValid(Mesh) ? Mesh->GetRenderData() : nullptr;
+			const bool bLODValid = RenderData && RenderData->LODResources.IsValidIndex(0);
+
+			if (!IsValid(Component) || !bLODValid
+				|| Target.FinalColors.Num() != static_cast<int32>(RenderData->LODResources[0].GetNumVertices()))
+			{
+				OutErrorText = FText::Format(
+					LOCTEXT("InstanceOverrideWriteRevalidationFailedFormat", "'{0}' failed re-validation immediately before writing; aborting (nothing was modified)."),
+					FText::FromString(Target.ComponentLabel));
+				return false;
+			}
+		}
+
+		FScopedTransaction Transaction(LOCTEXT("AcceptVertexMaskForgeInstanceOverride", "Accept Vertex Mask Forge Changes as Instance Override"));
+
+		for (const FVertexMaskForgeInstanceOverrideTarget& Target : Targets)
+		{
+			UStaticMeshComponent* Component = Target.Component.Get();
+
+			Component->Modify();
+			Component->SetLODDataCount(1, Component->LODData.Num());
+
+			FStaticMeshComponentLODInfo& LODInfo = Component->LODData[0];
+			LODInfo.ReleaseOverrideVertexColorsAndBlock();
+			LODInfo.PaintedVertices.Empty();
+			LODInfo.OverrideVertexColors = new FColorVertexBuffer();
+			LODInfo.OverrideVertexColors->InitFromColorArray(Target.FinalColors.GetData(), Target.FinalColors.Num());
+			BeginInitResource(LODInfo.OverrideVertexColors);
+
+			Component->CachePaintedDataIfNecessary();
+			Component->MarkRenderStateDirty();
+		}
+
+		return true;
+	}
+
 	/** Loads the engine's own built-in Vertex Color debug material. Never creates a new asset. */
 	static UMaterialInterface* LoadPreviewDebugMaterial()
 	{
@@ -2982,6 +3225,21 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 							.OnClicked(this, &SVertexMaskForgePanel::OnCancelChangesClicked)
 							.IsEnabled(this, &SVertexMaskForgePanel::CanCancelChanges)
 						]
+					]
+
+					// Secondary, explicitly alternative conclusion to the same PendingChanges session
+					// Accept (above) would otherwise conclude -- kept on its own row, below the native
+					// Accept/Cancel row, rather than folded into it, so it reads as an alternative
+					// rather than a third equally-weighted primary action.
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(FMargin(0.f, 0.f, 0.f, 4.f))
+					[
+						SNew(SButton)
+						.Text(LOCTEXT("AcceptAsInstanceOverride", "Accept as Instance Override"))
+						.ToolTipText(LOCTEXT("AcceptAsInstanceOverrideTooltip", "Stores the generated Vertex Colors as overrides on the selected component instances without modifying the Source Static Mesh. The result persists when the level is saved."))
+						.OnClicked(this, &SVertexMaskForgePanel::OnAcceptAsInstanceOverrideClicked)
+						.IsEnabled(this, &SVertexMaskForgePanel::CanAcceptAsInstanceOverride)
 					]
 
 					+ SVerticalBox::Slot()
@@ -3971,13 +4229,17 @@ FText SVertexMaskForgePanel::GetOperationStatusText() const
 	switch (OperationState)
 	{
 	case EVertexMaskForgeOperationState::PendingChanges:
-		return LOCTEXT("OperationStatePending", "Pending Changes: Accept to write Vertex Colors permanently, or Cancel to discard.");
+		return LOCTEXT("OperationStatePending", "Pending Changes: Accept writes Vertex Colors to the Source Static Mesh asset (affects every instance); Accept as Instance Override writes only to the selected component(s); Cancel discards.");
 	case EVertexMaskForgeOperationState::Applying:
 		return LOCTEXT("OperationStateApplying", "Applying...");
 	case EVertexMaskForgeOperationState::Failed:
 		return LOCTEXT("OperationStateFailed", "Accept failed (see message above).");
 	case EVertexMaskForgeOperationState::Idle:
 	default:
+		if (!LastInstanceOverrideStatusText.IsEmpty())
+		{
+			return LastInstanceOverrideStatusText;
+		}
 		return LOCTEXT("OperationStateIdle", "No pending changes.");
 	}
 }
@@ -4020,6 +4282,7 @@ FReply SVertexMaskForgePanel::OnCancelChangesClicked()
 	SelectedMeshes.Empty();
 	LastOperationErrorText = FText::GetEmpty();
 	LastMaskActionStatusText = FText::GetEmpty();
+	LastInstanceOverrideStatusText = FText::GetEmpty();
 
 	// 10. Update the UI immediately to the empty state.
 	if (ListView.IsValid())
@@ -4046,6 +4309,7 @@ bool SVertexMaskForgePanel::AcceptPendingChanges()
 
 	LastOperationErrorText = FText::GetEmpty();
 	LastMaskActionStatusText = FText::GetEmpty();
+	LastInstanceOverrideStatusText = FText::GetEmpty();
 
 	TArray<VertexMaskForgePanel::FVertexMaskForgeAcceptTarget> Targets;
 	FText ErrorText;
@@ -4102,6 +4366,84 @@ bool SVertexMaskForgePanel::AcceptPendingChanges()
 	DestroyAllPreviews();
 	OperationState = EVertexMaskForgeOperationState::Idle;
 	LastOperationErrorText = FText::GetEmpty();
+
+	if (ListView.IsValid())
+	{
+		ListView->RequestListRefresh();
+	}
+
+	return true;
+}
+
+FReply SVertexMaskForgePanel::OnAcceptAsInstanceOverrideClicked()
+{
+	AcceptPendingChangesAsInstanceOverride();
+	return FReply::Handled();
+}
+
+bool SVertexMaskForgePanel::AcceptPendingChangesAsInstanceOverride()
+{
+	if (OperationState != EVertexMaskForgeOperationState::PendingChanges)
+	{
+		return false;
+	}
+
+	LastOperationErrorText = FText::GetEmpty();
+	LastMaskActionStatusText = FText::GetEmpty();
+	LastInstanceOverrideStatusText = FText::GetEmpty();
+
+	TArray<VertexMaskForgePanel::FVertexMaskForgeInstanceOverrideTarget> Targets;
+	FText ErrorText;
+	if (!VertexMaskForgePanel::BuildInstanceOverrideTargets(
+		SelectedMeshes, CurrentPreviewMode, bChannelFilterR, bChannelFilterG, bChannelFilterB, bChannelFilterA,
+		bUseUnifiedBounds, BoundingBoxAxisParams,
+		Targets, ErrorText))
+	{
+		OperationState = EVertexMaskForgeOperationState::Failed;
+		LastOperationErrorText = ErrorText;
+		UE_LOG(LogVertexMaskForge, Warning, TEXT("Vertex Mask Forge: Accept as Instance Override blocked: %s"), *ErrorText.ToString());
+		return false;
+	}
+
+	// Confirm the (permanent, per-instance, asset-safe) destination before the first write -- same
+	// "only at the point of an actually permanent operation" rule as native Accept's confirmation.
+	const EAppReturnType::Type Choice = FMessageDialog::Open(
+		EAppMsgType::OkCancel,
+		FText::Format(
+			LOCTEXT("InstanceOverrideConfirmFormat",
+				"Vertex Colors will be stored as per-instance overrides on {0} selected component(s). "
+				"The Source Static Mesh assets will not be modified. The result persists when the level "
+				"is saved.\n\nProceed?"),
+			FText::AsNumber(Targets.Num())));
+	if (Choice != EAppReturnType::Ok)
+	{
+		// User declined at the confirmation step -- Preview and state are untouched, not a failure.
+		return false;
+	}
+
+	OperationState = EVertexMaskForgeOperationState::Applying;
+
+	if (!VertexMaskForgePanel::WriteInstanceOverrideTargets(Targets, ErrorText))
+	{
+		OperationState = EVertexMaskForgeOperationState::Failed;
+		LastOperationErrorText = ErrorText;
+		UE_LOG(LogVertexMaskForge, Error, TEXT("Vertex Mask Forge: Accept as Instance Override failed while writing: %s"), *ErrorText.ToString());
+		return false;
+	}
+
+	UE_LOG(LogVertexMaskForge, Log,
+		TEXT("Vertex Mask Forge: Accepted Vertex Color changes as instance overrides on %d component(s). Source Static Mesh assets were not modified."),
+		Targets.Num());
+
+	// Success: destroy the transient Preview (its job is done -- the colors now live permanently on
+	// the real component(s)) and return to Idle, exactly like native Accept, but WITHOUT ever calling
+	// into AcceptPendingChanges()/WriteAcceptTargets() -- this path never touches the Static Mesh asset.
+	DestroyAllPreviews();
+	OperationState = EVertexMaskForgeOperationState::Idle;
+	LastOperationErrorText = FText::GetEmpty();
+	LastInstanceOverrideStatusText = FText::Format(
+		LOCTEXT("InstanceOverrideSuccessFormat", "Vertex Colors saved as instance overrides on {0} component(s). Source Static Mesh assets were not modified."),
+		FText::AsNumber(Targets.Num()));
 
 	if (ListView.IsValid())
 	{
