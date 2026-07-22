@@ -820,6 +820,32 @@ private:
 	 */
 	bool AcceptPendingChangesAsInstanceOverride();
 
+	/**
+	 * Independent of Accept / Accept as Instance Override -- never requires, reads, or clears
+	 * PendingChanges. Removes the LOD0 Instance Vertex Color override (via
+	 * VertexMaskForgePanel::HasRemovableLOD0Override / BuildRemoveInstanceOverrideTargets, see the
+	 * .cpp) from every SELECTED component that currently has one, restoring that component's own
+	 * appearance to whatever Vertex Colors are stored in its Source Static Mesh. Enabled only while
+	 * OperationState == Idle (an unresolved PendingChanges OR Failed preview decision must be
+	 * concluded via Accept/Accept as Instance Override/Cancel first -- this deliberately never
+	 * discards a pending Preview itself) AND at least one selected component currently has a
+	 * removable override -- both re-evaluated live on every call (same as CanAcceptChanges /
+	 * CanCancelChanges already are), so Undo/Redo and Refresh Selection are reflected on the very
+	 * next Slate tick with no extra notification/delegate registration needed.
+	 */
+	bool CanRemoveInstanceOverride() const;
+	FReply OnRemoveInstanceOverrideClicked();
+
+	/**
+	 * Validates every selected component with a removable override, confirms the (non-destructive,
+	 * asset-safe) removal with the user, and -- only if both succeed -- removes each one's LOD0
+	 * OverrideVertexColors via UStaticMeshComponent::RemoveInstanceVertexColorsFromLOD(0) inside one
+	 * FScopedTransaction (see VertexMaskForgePanel::BuildRemoveInstanceOverrideTargets /
+	 * RemoveInstanceOverrideTargets). Never touches any Static Mesh asset. Never deduplicates by
+	 * UStaticMesh -- every selected component with an override is its own independent target.
+	 */
+	bool RemoveInstanceOverrides();
+
 	/** Records the reason the last Accept (or auto-update regeneration) was blocked/failed, shown in
 	 *  GetOperationStatusText(). Cleared explicitly at the START of each fresh attempt -- never by
 	 *  RecomputeOperationState(), so it survives whatever UpdateAllPreviews() call follows within the
@@ -829,8 +855,17 @@ private:
 	/** Success message for the last successful "Accept as Instance Override", shown by
 	 *  GetOperationStatusText() while Idle (native Accept has no equivalent persistent success text
 	 *  today -- its Idle state already reads as "No pending changes." either way). Cleared at the
-	 *  start of every fresh Accept / Accept as Instance Override / Cancel attempt. */
+	 *  start of every fresh Accept / Accept as Instance Override / Remove Instance Override / Cancel
+	 *  attempt. Mutually exclusive with LastRemoveOverrideStatusText -- whichever action ran most
+	 *  recently clears the other, so GetOperationStatusText() never shows a stale message from the
+	 *  other action. */
 	FText LastInstanceOverrideStatusText;
+
+	/** Success message for the last successful "Remove Instance Override", shown by
+	 *  GetOperationStatusText() while Idle. Cleared at the start of every fresh Accept / Accept as
+	 *  Instance Override / Remove Instance Override / Cancel attempt -- see
+	 *  LastInstanceOverrideStatusText's doc for the mutual-exclusion contract with this field. */
+	FText LastRemoveOverrideStatusText;
 
 	EVertexMaskForgeOperationState OperationState = EVertexMaskForgeOperationState::Idle;
 

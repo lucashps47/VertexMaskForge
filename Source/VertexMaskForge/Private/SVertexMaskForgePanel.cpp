@@ -2339,6 +2339,150 @@ namespace VertexMaskForgePanel
 		return true;
 	}
 
+	// --- Remove Instance Override: undo per-instance overrides, Source Static Mesh untouched --------
+
+	/**
+	 * True if Component's LOD0 currently has a non-empty Instance Vertex Color override -- i.e.
+	 * something an "Accept as Instance Override" (or the Editor's own Mesh Paint tool) previously
+	 * wrote that "Remove Instance Override" can meaningfully remove. False for a null/invalid
+	 * Component, a Component with no LODData[0] entry yet, or an entry whose OverrideVertexColors is
+	 * null or has zero vertices.
+	 */
+	static bool HasRemovableLOD0Override(const UStaticMeshComponent* Component)
+	{
+		if (!IsValid(Component) || !Component->LODData.IsValidIndex(0))
+		{
+			return false;
+		}
+		const FColorVertexBuffer* Override = Component->LODData[0].OverrideVertexColors;
+		return Override != nullptr && Override->GetNumVertices() > 0;
+	}
+
+	/**
+	 * One selected UStaticMeshComponent instance targeted by "Remove Instance Override". Unlike
+	 * FVertexMaskForgeInstanceOverrideTarget, carries no color payload -- removal needs only the
+	 * component identity. Never deduplicated by UStaticMesh; each selected component with a
+	 * removable override is its own independent target.
+	 */
+	struct FVertexMaskForgeRemoveOverrideTarget
+	{
+		TWeakObjectPtr<UStaticMeshComponent> Component;
+		/** Diagnostic-only label ("ComponentName (ActorLabel)"), used in error messages. */
+		FString ComponentLabel;
+	};
+
+	/**
+	 * Collects one target per SELECTED component (from SelectedMeshes[*].PreviewComponents, exactly
+	 * the same "real, currently-tracked selection" source BuildInstanceOverrideTargets reads) that
+	 * currently HasRemovableLOD0Override(). Deliberately does NOT gate on
+	 * WorkingMesh.BoundingBoxMask.State (Ready/NotGenerated/etc.) or on CurrentPreviewMode -- Remove
+	 * Instance Override never depends on a generated mask or an active Preview, only on whether the
+	 * component already carries an override from an earlier session. Never touches any Static Mesh
+	 * asset or its RenderData -- HasRemovableLOD0Override reads only the component's own LODData.
+	 */
+	static bool BuildRemoveInstanceOverrideTargets(
+		const TArray<TSharedPtr<FVertexMaskForgeSelectedMesh>>& SelectedMeshes,
+		TArray<FVertexMaskForgeRemoveOverrideTarget>& OutTargets,
+		FText& OutErrorText)
+	{
+		OutTargets.Reset();
+
+		for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
+		{
+			if (!Entry.IsValid())
+			{
+				continue;
+			}
+
+			for (const FVertexMaskForgePreviewComponentState& State : Entry->PreviewComponents)
+			{
+				UStaticMeshComponent* SourceComponent = State.SourceComponent.Get();
+				if (!HasRemovableLOD0Override(SourceComponent))
+				{
+					continue;
+				}
+
+				FVertexMaskForgeRemoveOverrideTarget Target;
+				Target.Component = SourceComponent;
+				Target.ComponentLabel = FString::Printf(TEXT("%s (%s)"), *SourceComponent->GetName(),
+					SourceComponent->GetOwner() ? *SourceComponent->GetOwner()->GetActorLabel() : TEXT("?"));
+				OutTargets.Add(MoveTemp(Target));
+			}
+		}
+
+		if (OutTargets.IsEmpty())
+		{
+			OutErrorText = LOCTEXT("RemoveOverrideNothingEligible", "No selected component currently has a removable Instance Vertex Color override.");
+			return false;
+		}
+
+		return true;
+	}
+
+	/**
+	 * Removes the LOD0 Instance Vertex Color override from every target's real UStaticMeshComponent,
+	 * inside a single FScopedTransaction so this is one coherent Undo step. NEVER touches the
+	 * component's Static Mesh asset -- no Mesh->Modify(), GetMeshDescription(), CommitMeshDescription(),
+	 * Build(), or MarkPackageDirty() on the Static Mesh anywhere in this function.
+	 *
+	 * AUDITED: uses the engine's own public API, UStaticMeshComponent::RemoveInstanceVertexColorsFromLOD(0)
+	 * (StaticMeshComponent.h/.cpp) -- NOT the all-LODs UStaticMeshComponent::RemoveInstanceVertexColors()
+	 * (which simply loops RemoveInstanceVertexColorsFromLOD() over every LOD index and would silently
+	 * expand this plugin's scope past LOD0, which nothing else here supports yet). Reading the
+	 * implementation: RemoveInstanceVertexColorsFromLOD(0) does exactly
+	 * `LODData[0].ReleaseOverrideVertexColorsAndBlock(); LODData[0].PaintedVertices.Empty();` -- the
+	 * SAME safe release this plugin's own WriteInstanceOverrideTargets already relies on for the
+	 * opposite (write) direction -- plus (WITH_EDITORONLY_DATA) refreshing StaticMeshDerivedDataKey
+	 * from the current Static Mesh's RenderData, keeping FixupOverrideColorsIfNecessary's staleness
+	 * bookkeeping consistent. It touches ONLY LODData[0]; every other LOD entry (if this component was
+	 * ever painted per-LOD via the Editor's own Mesh Paint tool) is left completely untouched.
+	 *
+	 * RemoveInstanceVertexColorsFromLOD() itself calls neither Modify() nor MarkRenderStateDirty() nor
+	 * MarkPackageDirty() -- confirmed by reading it end to end -- so, exactly mirroring the call order
+	 * UStaticMeshComponent::CopyInstanceVertexColorsIfCompatible() itself uses around the same API
+	 * (Modify() first, removal, then a render-state refresh), this function calls Component->Modify()
+	 * immediately before the removal and Component->MarkRenderStateDirty() immediately after.
+	 * Component->Modify() marks the COMPONENT's own package (the level/Actor package) dirty; the
+	 * Static Mesh asset and its package are never touched.
+	 *
+	 * Undo/Redo: identical mechanism already audited for WriteInstanceOverrideTargets, applied
+	 * symmetrically. UStaticMeshComponent::Serialize() unconditionally serializes LODData regardless
+	 * of its own UPROPERTY(Transient) tag, specifically so a full-object transaction can snapshot and
+	 * restore it. On Undo, TArray's transacted-reload element reconstruction destructs the CURRENT
+	 * FStaticMeshComponentLODInfo (harmless here -- its OverrideVertexColors is already null after the
+	 * removal) before the archive reloads the OLD snapshot, whose Ar.IsLoading() branch allocates a
+	 * fresh FColorVertexBuffer with the PRE-REMOVAL colors and calls BeginInitResource() itself -- so
+	 * Undo safely brings the override back exactly as it was, and Redo safely removes it again, with
+	 * no leak and no dangling render-thread pointer either way. Viewport refresh after Undo/Redo is
+	 * handled by the engine's own UActorComponent::PostEditUndo(), same as the write path.
+	 */
+	static bool RemoveInstanceOverrideTargets(const TArray<FVertexMaskForgeRemoveOverrideTarget>& Targets, FText& OutErrorText)
+	{
+		for (const FVertexMaskForgeRemoveOverrideTarget& Target : Targets)
+		{
+			if (!HasRemovableLOD0Override(Target.Component.Get()))
+			{
+				OutErrorText = FText::Format(
+					LOCTEXT("RemoveOverrideRevalidationFailedFormat", "'{0}' failed re-validation immediately before removing (no longer has a removable override); aborting (nothing was modified)."),
+					FText::FromString(Target.ComponentLabel));
+				return false;
+			}
+		}
+
+		FScopedTransaction Transaction(LOCTEXT("RemoveVertexMaskForgeInstanceOverride", "Remove Vertex Mask Forge Instance Override"));
+
+		for (const FVertexMaskForgeRemoveOverrideTarget& Target : Targets)
+		{
+			UStaticMeshComponent* Component = Target.Component.Get();
+
+			Component->Modify();
+			Component->RemoveInstanceVertexColorsFromLOD(0);
+			Component->MarkRenderStateDirty();
+		}
+
+		return true;
+	}
+
 	/** Loads the engine's own built-in Vertex Color debug material. Never creates a new asset. */
 	static UMaterialInterface* LoadPreviewDebugMaterial()
 	{
@@ -3227,19 +3371,41 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 						]
 					]
 
-					// Secondary, explicitly alternative conclusion to the same PendingChanges session
-					// Accept (above) would otherwise conclude -- kept on its own row, below the native
-					// Accept/Cancel row, rather than folded into it, so it reads as an alternative
-					// rather than a third equally-weighted primary action.
+					// Secondary row, explicitly alternative to the native Accept/Cancel row above: two
+					// related-but-independent per-instance override actions, sharing the row's width
+					// evenly so neither reads as more "primary" than the other. Kept on its own row
+					// (not folded into the native Accept/Cancel row) so the whole pair still reads as
+					// an alternative, not a third/fourth equally-weighted primary action. Each keeps
+					// its own tooltip, enabled condition, and callback -- never combined.
 					+ SVerticalBox::Slot()
 					.AutoHeight()
 					.Padding(FMargin(0.f, 0.f, 0.f, 4.f))
 					[
-						SNew(SButton)
-						.Text(LOCTEXT("AcceptAsInstanceOverride", "Accept as Instance Override"))
-						.ToolTipText(LOCTEXT("AcceptAsInstanceOverrideTooltip", "Stores the generated Vertex Colors as overrides on the selected component instances without modifying the Source Static Mesh. The result persists when the level is saved."))
-						.OnClicked(this, &SVertexMaskForgePanel::OnAcceptAsInstanceOverrideClicked)
-						.IsEnabled(this, &SVertexMaskForgePanel::CanAcceptAsInstanceOverride)
+						SNew(SHorizontalBox)
+
+						+ SHorizontalBox::Slot()
+						.FillWidth(1.f)
+						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
+						[
+							SNew(SButton)
+							.HAlign(HAlign_Center)
+							.Text(LOCTEXT("AcceptAsInstanceOverride", "Accept as Instance Override"))
+							.ToolTipText(LOCTEXT("AcceptAsInstanceOverrideTooltip", "Stores the generated Vertex Colors as overrides on the selected component instances without modifying the Source Static Mesh. The result persists when the level is saved."))
+							.OnClicked(this, &SVertexMaskForgePanel::OnAcceptAsInstanceOverrideClicked)
+							.IsEnabled(this, &SVertexMaskForgePanel::CanAcceptAsInstanceOverride)
+						]
+
+						+ SHorizontalBox::Slot()
+						.FillWidth(1.f)
+						.Padding(FMargin(4.f, 0.f, 0.f, 0.f))
+						[
+							SNew(SButton)
+							.HAlign(HAlign_Center)
+							.Text(LOCTEXT("RemoveInstanceOverride", "Remove Instance Override"))
+							.ToolTipText(LOCTEXT("RemoveInstanceOverrideTooltip", "Removes Vertex Color overrides from the selected component instances. The components will return to the Vertex Colors stored in their Source Static Mesh. The Source Static Mesh will not be modified."))
+							.OnClicked(this, &SVertexMaskForgePanel::OnRemoveInstanceOverrideClicked)
+							.IsEnabled(this, &SVertexMaskForgePanel::CanRemoveInstanceOverride)
+						]
 					]
 
 					+ SVerticalBox::Slot()
@@ -4236,6 +4402,10 @@ FText SVertexMaskForgePanel::GetOperationStatusText() const
 		return LOCTEXT("OperationStateFailed", "Accept failed (see message above).");
 	case EVertexMaskForgeOperationState::Idle:
 	default:
+		if (!LastRemoveOverrideStatusText.IsEmpty())
+		{
+			return LastRemoveOverrideStatusText;
+		}
 		if (!LastInstanceOverrideStatusText.IsEmpty())
 		{
 			return LastInstanceOverrideStatusText;
@@ -4283,6 +4453,7 @@ FReply SVertexMaskForgePanel::OnCancelChangesClicked()
 	LastOperationErrorText = FText::GetEmpty();
 	LastMaskActionStatusText = FText::GetEmpty();
 	LastInstanceOverrideStatusText = FText::GetEmpty();
+	LastRemoveOverrideStatusText = FText::GetEmpty();
 
 	// 10. Update the UI immediately to the empty state.
 	if (ListView.IsValid())
@@ -4310,6 +4481,7 @@ bool SVertexMaskForgePanel::AcceptPendingChanges()
 	LastOperationErrorText = FText::GetEmpty();
 	LastMaskActionStatusText = FText::GetEmpty();
 	LastInstanceOverrideStatusText = FText::GetEmpty();
+	LastRemoveOverrideStatusText = FText::GetEmpty();
 
 	TArray<VertexMaskForgePanel::FVertexMaskForgeAcceptTarget> Targets;
 	FText ErrorText;
@@ -4391,6 +4563,7 @@ bool SVertexMaskForgePanel::AcceptPendingChangesAsInstanceOverride()
 	LastOperationErrorText = FText::GetEmpty();
 	LastMaskActionStatusText = FText::GetEmpty();
 	LastInstanceOverrideStatusText = FText::GetEmpty();
+	LastRemoveOverrideStatusText = FText::GetEmpty();
 
 	TArray<VertexMaskForgePanel::FVertexMaskForgeInstanceOverrideTarget> Targets;
 	FText ErrorText;
@@ -4443,6 +4616,104 @@ bool SVertexMaskForgePanel::AcceptPendingChangesAsInstanceOverride()
 	LastOperationErrorText = FText::GetEmpty();
 	LastInstanceOverrideStatusText = FText::Format(
 		LOCTEXT("InstanceOverrideSuccessFormat", "Vertex Colors saved as instance overrides on {0} component(s). Source Static Mesh assets were not modified."),
+		FText::AsNumber(Targets.Num()));
+
+	if (ListView.IsValid())
+	{
+		ListView->RequestListRefresh();
+	}
+
+	return true;
+}
+
+bool SVertexMaskForgePanel::CanRemoveInstanceOverride() const
+{
+	if (OperationState != EVertexMaskForgeOperationState::Idle)
+	{
+		// An unresolved PendingChanges/Failed Preview decision must be concluded via Accept, Accept
+		// as Instance Override, or Cancel first -- this never discards a pending Preview itself.
+		return false;
+	}
+
+	for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
+	{
+		if (!Entry.IsValid())
+		{
+			continue;
+		}
+
+		for (const FVertexMaskForgePreviewComponentState& State : Entry->PreviewComponents)
+		{
+			if (VertexMaskForgePanel::HasRemovableLOD0Override(State.SourceComponent.Get()))
+			{
+				return true;
+			}
+		}
+	}
+
+	return false;
+}
+
+FReply SVertexMaskForgePanel::OnRemoveInstanceOverrideClicked()
+{
+	RemoveInstanceOverrides();
+	return FReply::Handled();
+}
+
+bool SVertexMaskForgePanel::RemoveInstanceOverrides()
+{
+	if (!CanRemoveInstanceOverride())
+	{
+		return false;
+	}
+
+	LastOperationErrorText = FText::GetEmpty();
+	LastMaskActionStatusText = FText::GetEmpty();
+	LastInstanceOverrideStatusText = FText::GetEmpty();
+	LastRemoveOverrideStatusText = FText::GetEmpty();
+
+	TArray<VertexMaskForgePanel::FVertexMaskForgeRemoveOverrideTarget> Targets;
+	FText ErrorText;
+	if (!VertexMaskForgePanel::BuildRemoveInstanceOverrideTargets(SelectedMeshes, Targets, ErrorText))
+	{
+		LastOperationErrorText = ErrorText;
+		UE_LOG(LogVertexMaskForge, Warning, TEXT("Vertex Mask Forge: Remove Instance Override blocked: %s"), *ErrorText.ToString());
+		return false;
+	}
+
+	// Confirm before the first write -- same "only at the point of an actually permanent operation"
+	// rule as Accept / Accept as Instance Override's own confirmations.
+	const EAppReturnType::Type Choice = FMessageDialog::Open(
+		EAppMsgType::OkCancel,
+		FText::Format(
+			LOCTEXT("RemoveOverrideConfirmFormat",
+				"Vertex Color overrides will be removed from {0} selected component(s). These "
+				"components will return to the Vertex Colors stored in their Source Static Mesh. "
+				"The Source Static Mesh assets will not be modified.\n\nProceed?"),
+			FText::AsNumber(Targets.Num())));
+	if (Choice != EAppReturnType::Ok)
+	{
+		// User declined at the confirmation step -- nothing was modified, not a failure.
+		return false;
+	}
+
+	if (!VertexMaskForgePanel::RemoveInstanceOverrideTargets(Targets, ErrorText))
+	{
+		LastOperationErrorText = ErrorText;
+		UE_LOG(LogVertexMaskForge, Error, TEXT("Vertex Mask Forge: Remove Instance Override failed while writing: %s"), *ErrorText.ToString());
+		return false;
+	}
+
+	UE_LOG(LogVertexMaskForge, Log,
+		TEXT("Vertex Mask Forge: Removed Instance Vertex Color overrides from %d component(s). Source Static Mesh assets were not modified."),
+		Targets.Num());
+
+	// Success: this operation never involves a Preview or PendingChanges session (CanRemoveInstanceOverride
+	// only allows it while already Idle), so there is no OperationState transition and no
+	// DestroyAllPreviews() call here -- the original selection and OperationState are left exactly as
+	// they were.
+	LastRemoveOverrideStatusText = FText::Format(
+		LOCTEXT("RemoveOverrideSuccessFormat", "Instance Vertex Color overrides removed from {0} component(s). Source Static Mesh assets were not modified."),
 		FText::AsNumber(Targets.Num()));
 
 	if (ListView.IsValid())
