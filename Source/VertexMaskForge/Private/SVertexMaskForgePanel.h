@@ -230,6 +230,17 @@ enum class EVertexMaskForgeScalarMaskSource : uint8
 	 * transform), so every component of the same asset shares the identical Curvature contribution.
 	 */
 	Curvature,
+
+	/**
+	 * GenerateNoiseMask / GenerateNoiseMaskFromDynamicMesh: a procedural 3D Perlin/FBM noise sampled at
+	 * each vertex's own LOCAL-SPACE position (see EVertexMaskForgeNoiseType and
+	 * FVertexMaskForgeNoiseGenerativeParams), reduced 0-1, scaled by Multiplier, remapped by Levels
+	 * Min/Max, and optionally inverted -- see VertexMaskForgePanel::ApplyNoiseArtisticParams for the
+	 * exact pipeline. Computed ONCE PER ENTRY (never per component -- Noise, like Curvature, is a pure
+	 * function of the asset's own local-space geometry and never depends on a component's transform),
+	 * so every component of the same asset shares the identical Noise contribution.
+	 */
+	Noise,
 };
 
 /** Which of FVertexMaskForgeWorkingMesh::CurvatureRawConvexCache/CurvatureRawConcaveCache (or their
@@ -248,6 +259,68 @@ enum class EVertexMaskForgeCurvatureType : uint8
 	 *  comment); convex and concave NEVER cancel each other out, since neither is ever computed as a
 	 *  single signed sum in the first place. Default. */
 	Both,
+};
+
+/** Which procedural noise VertexMaskForgePanel::ComputeRawNoiseValue evaluates -- see that function's
+ *  own doc comment for the exact formulas. */
+enum class EVertexMaskForgeNoiseType : uint8
+{
+	/** A single FMath::PerlinNoise3D sample, remapped from [-1,1] to [0,1]. */
+	Perlin,
+
+	/** Fractal Brownian Motion: a weighted sum of several Perlin octaves at increasing frequency and
+	 *  decreasing amplitude (see Octaves/Roughness/Lacunarity), normalized by the total amplitude
+	 *  weight BEFORE the signed-to-[0,1] remap. Default. */
+	FractalPerlin,
+};
+
+/**
+ * AUDITED (Noise V1): the GENERATIVE half of the Noise mask's parameters -- everything that changes
+ * WHAT the raw procedural pattern actually looks like, as opposed to how it is post-processed
+ * artistically (Multiplier/Levels/Invert/Opacity/Blend Mode, which live directly on the panel and are
+ * never part of this struct). Snapshotted onto FVertexMaskForgeWorkingMesh::NoiseCacheUsedParams at raw
+ * generation time and compared field-by-field on every subsequent Generate Mask / Auto Update pass (see
+ * VertexMaskForgePanel::EnsureNoiseRawCache) -- ANY difference (including a GeometryFingerprint change)
+ * forces a full recompute of NoiseRawCache; an exact match reuses it verbatim, zero re-evaluation.
+ */
+struct FVertexMaskForgeNoiseGenerativeParams
+{
+	EVertexMaskForgeNoiseType NoiseType = EVertexMaskForgeNoiseType::FractalPerlin;
+
+	/** Per-axis frequency multiplier. UI range [Epsilon, large]; default 1.0 each. See
+	 *  VertexMaskForgePanel::ComputeRawNoiseValue for the exact NoisePosition formula (Scale/100, so
+	 *  Scale 1 is approximately one noise unit per meter). */
+	float ScaleX = 1.0f;
+	float ScaleY = 1.0f;
+	float ScaleZ = 1.0f;
+
+	/** Domain offset, in NOISE SPACE (already post-Scale, post-SeedOffset) -- default 0 each. */
+	float OffsetX = 0.0f;
+	float OffsetY = 0.0f;
+	float OffsetZ = 0.0f;
+
+	/** Hashed deterministically into a 3D domain offset (VertexMaskForgePanel::ComputeNoiseSeedOffset)
+	 *  -- never FMath::Rand/FRandomStream, never global state. Default 0. */
+	int32 Seed = 0;
+
+	/** FractalPerlin only. UI range [1, 8]; default 4. */
+	int32 Octaves = 4;
+
+	/** FractalPerlin only: per-octave amplitude multiplier. UI range [0, 1]; default 0.5. */
+	float Roughness = 0.5f;
+
+	/** FractalPerlin only: per-octave frequency multiplier. UI minimum 1.0; default 2.0. */
+	float Lacunarity = 2.0f;
+
+	bool operator==(const FVertexMaskForgeNoiseGenerativeParams& Other) const
+	{
+		return NoiseType == Other.NoiseType
+			&& ScaleX == Other.ScaleX && ScaleY == Other.ScaleY && ScaleZ == Other.ScaleZ
+			&& OffsetX == Other.OffsetX && OffsetY == Other.OffsetY && OffsetZ == Other.OffsetZ
+			&& Seed == Other.Seed
+			&& Octaves == Other.Octaves && Roughness == Other.Roughness && Lacunarity == Other.Lacunarity;
+	}
+	bool operator!=(const FVertexMaskForgeNoiseGenerativeParams& Other) const { return !(*this == Other); }
 };
 
 /**
@@ -663,6 +736,39 @@ struct FVertexMaskForgeWorkingMesh
 	 *  CurvatureRenderVertexToDynamicMeshVertex were last built from -- see CurvatureRawConvexCache's own
 	 *  doc comment for the exact reuse/recompute rule. */
 	uint32 CurvatureCacheFingerprint = 0;
+
+	/**
+	 * AUDITED (Noise V1): the Noise slot's ENTRY-LEVEL mask -- same "holds REAL, final values directly
+	 * usable by every component" contract as CurvatureMask (see that field's own doc comment): Noise is
+	 * a pure function of local-space position, never a component transform, so there is no per-component
+	 * re-evaluation step for it in ApplyPreviewToEntry either. Populated by
+	 * VertexMaskForgePanel::GenerateNoiseMask (render-vertex domain) or GenerateNoiseMaskFromDynamicMesh
+	 * (Source-Topology/Nanite domain).
+	 */
+	FVertexMaskForgeScalarMask NoiseMask;
+
+	/**
+	 * AUDITED (Noise V1): the RAW procedural pattern -- FMath::PerlinNoise3D/FBM already reduced to
+	 * [0, 1] (signed*0.5+0.5, saturated) but with NO Multiplier/Levels/Invert applied yet -- cached
+	 * separately from NoiseMask.Values so that those three purely-artistic controls never repeat the
+	 * per-vertex Perlin evaluation. UNLIKE Curvature's raw cache, this is NOT purely geometric: it also
+	 * depends on the GENERATIVE parameters (see FVertexMaskForgeNoiseGenerativeParams) that determine
+	 * WHAT pattern is sampled -- so reuse requires BOTH GeometryFingerprint AND NoiseCacheUsedParams to
+	 * still match (see NoiseCacheFingerprint's own doc comment). Domain matches whichever generator
+	 * (GenerateNoiseMask/GenerateNoiseMaskFromDynamicMesh) last populated it for this entry -- render
+	 * vertex index for a non-Source-Topology entry, Dynamic Mesh Vertex ID for a Source-Topology one --
+	 * exactly like NoiseMask.Values' own domain, since bUseSourceTopology never changes at runtime for a
+	 * given entry.
+	 */
+	TArray<float> NoiseRawCache;
+
+	/** GeometryFingerprint NoiseRawCache was last built from -- compared, never assumed, alongside
+	 *  NoiseCacheUsedParams (see NoiseRawCache's own doc comment) every time Noise is (re)generated. */
+	uint32 NoiseCacheFingerprint = 0;
+
+	/** Generative parameters NoiseRawCache was last built from -- see NoiseRawCache's own doc comment.
+	 *  Compared by value (FVertexMaskForgeNoiseGenerativeParams::operator==) every regeneration. */
+	FVertexMaskForgeNoiseGenerativeParams NoiseCacheUsedParams;
 };
 
 /**
@@ -1343,6 +1449,129 @@ private:
 	float CurvatureOpacity = 1.0f;
 
 	bool bCurvatureEnabled = false;
+
+	// --- Noise Mask (V1: procedural 3D Perlin/FBM, Local Space only) -------------------------
+	// A fourth, independent, optional composition-stack layer -- structurally a peer of Bounding Box,
+	// Ambient Occlusion, and Curvature (see EVertexMaskForgeScalarMaskSource::Noise and
+	// ComposeMaskStack's own doc comment: "no fixed role"). Like Curvature, Noise never depends on a
+	// component's transform (pure function of LOCAL-SPACE position) -- generated exactly once per
+	// entry, real values included, reused directly by every tracked component of that entry. UNLIKE
+	// Curvature, its raw pattern DOES depend on artist-chosen generative parameters (Scale/Offset/Seed/
+	// Octaves/Roughness/Lacunarity/Type) -- see FVertexMaskForgeNoiseGenerativeParams and
+	// FVertexMaskForgeWorkingMesh::NoiseRawCache's own doc comments for the resulting two-tier
+	// invalidation contract (generative params gate a real regeneration, gated by Auto Update Preview
+	// exactly like Bounding Box axis params / AO Samples-MaxDistance-Bias; Multiplier/Levels/Invert/
+	// Opacity/Blend Mode are cheap, immediate, unconditional reprocessing, exactly like Curvature's own
+	// Type/Multiplier/Blur/Levels/Invert).
+
+	ECheckBoxState GetNoiseEnableState() const { return bNoiseEnabled ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; }
+
+	/** Same enable/disable contract as OnAOEnableChanged/OnCurvatureEnableChanged (see their own doc
+	 *  comments): turning OFF is always pure composition; turning ON reuses an already-Ready entry
+	 *  immediately (zero re-evaluation) and only regenerates entries that genuinely need it, gated by
+	 *  Auto Update Preview like any other raw/generative parameter. */
+	void OnNoiseEnableChanged(ECheckBoxState NewState);
+
+	TSharedRef<SWidget> OnGenerateNoiseTypeRow(TSharedPtr<EVertexMaskForgeNoiseType> InOption) const;
+	void OnNoiseTypeSelectionChanged(TSharedPtr<EVertexMaskForgeNoiseType> NewSelection, ESelectInfo::Type SelectInfo);
+	FText GetNoiseTypeButtonText() const;
+
+	TArray<TSharedPtr<EVertexMaskForgeNoiseType>> NoiseTypeOptions;
+	TSharedPtr<SComboBox<TSharedPtr<EVertexMaskForgeNoiseType>>> NoiseTypeComboBox;
+
+	/** Perlin or FractalPerlin -- see EVertexMaskForgeNoiseType. Default FractalPerlin (per explicit
+	 *  requirement). GENERATIVE -- see OnNoiseGenerativeParamChanged. */
+	EVertexMaskForgeNoiseType NoiseType = EVertexMaskForgeNoiseType::FractalPerlin;
+
+	/** Per-axis frequency multiplier. UI minimum a small positive epsilon (never exactly 0 -- see
+	 *  ComputeRawNoiseValue's own clamp). Default 1.0 each. GENERATIVE. */
+	float NoiseScaleX = 1.0f;
+	float NoiseScaleY = 1.0f;
+	float NoiseScaleZ = 1.0f;
+
+	/** Domain offset in noise space. Default 0 each. GENERATIVE. */
+	float NoiseOffsetX = 0.0f;
+	float NoiseOffsetY = 0.0f;
+	float NoiseOffsetZ = 0.0f;
+
+	/** Hashed deterministically into a 3D domain offset -- never engine RNG state. Default 0. GENERATIVE. */
+	int32 NoiseSeed = 0;
+
+	/** FractalPerlin only. UI range [1, 8]; default 4. GENERATIVE. */
+	int32 NoiseOctaves = 4;
+
+	/** FractalPerlin only. UI range [0, 1]; default 0.5. GENERATIVE. */
+	float NoiseRoughness = 0.5f;
+
+	/** FractalPerlin only. UI minimum 1.0; default 2.0. GENERATIVE. */
+	float NoiseLacunarity = 2.0f;
+
+	/**
+	 * Shared handler for ALL generative Noise parameters (Type/Scale XYZ/Offset XYZ/Seed/Octaves/
+	 * Roughness/Lacunarity): these change WHAT the raw pattern looks like, so -- exactly like Bounding
+	 * Box axis parameters (OnAxisParamChangedDiscrete) and AO's Samples/Max Distance/Bias
+	 * (InvalidateAODerivedMask) -- this invalidates every selected entry's NoiseMask (NOT NoiseRawCache
+	 * itself; EnsureNoiseRawCache's own GeometryFingerprint+params comparison decides reuse lazily, the
+	 * next time Noise is actually (re)generated) and then either regenerates immediately (Auto Update
+	 * Preview on) or waits for an explicit Generate Mask (off).
+	 */
+	void OnNoiseGenerativeParamChanged();
+
+	/** Same contract/range as BoundingBoxOpacity/AOOpacity/CurvatureMultiplier's own scale role -- UI
+	 *  range [0, 10], default 1.0. ARTISTIC -- see OnNoiseArtisticParamChanged. */
+	float NoiseMultiplier = 1.0f;
+
+	/** Same semantics as AOLevelsMin/CurvatureLevelsMin. UI range [0, 1]; default 0.0. ARTISTIC. */
+	float NoiseLevelsMin = 0.0f;
+
+	/** Same semantics as AOLevelsMax/CurvatureLevelsMax. UI range [0, 1]; default 1.0. ARTISTIC. */
+	float NoiseLevelsMax = 1.0f;
+
+	ECheckBoxState GetNoiseInvertState() const { return bNoiseInvert ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; }
+
+	/** Applied LAST, after Levels Min/Max, over the already-leveled [0,1] result (Mask = 1 - Mask) --
+	 *  same treatment as OnCurvatureInvertChanged/OnAOInvertChanged. Default false. ARTISTIC. */
+	void OnNoiseInvertChanged(ECheckBoxState NewState);
+
+	bool bNoiseInvert = false;
+
+	/**
+	 * Shared handler for Multiplier / Levels Min / Levels Max / Invert: ALL cheap, PURELY DOWNSTREAM
+	 * reprocessing of the already-cached NoiseRawCache (see that field's own doc comment) -- never the
+	 * per-vertex Perlin/FBM evaluation, never GeometryFingerprint, never the generative-params
+	 * comparison. So this is UNCONDITIONAL and immediate, never gated by Auto Update Preview, exactly
+	 * like OnCurvatureParamChanged. Regenerates every SelectedMeshes entry's NoiseMask directly from its
+	 * cached NoiseRawCache (entry-level, real values -- see FVertexMaskForgeWorkingMesh::NoiseMask),
+	 * then recomposes.
+	 */
+	void OnNoiseArtisticParamChanged();
+
+	TSharedRef<SWidget> OnGenerateNoiseBlendModeRow(TSharedPtr<EVertexMaskForgeBlendMode> InOption) const;
+	void OnNoiseBlendModeSelectionChanged(TSharedPtr<EVertexMaskForgeBlendMode> NewSelection, ESelectInfo::Type SelectInfo);
+	FText GetNoiseBlendModeButtonText() const;
+	TSharedPtr<SComboBox<TSharedPtr<EVertexMaskForgeBlendMode>>> NoiseBlendModeComboBox;
+
+	/** Same contract/range/default (Copy) as BoundingBoxBlendMode/AOBlendMode/CurvatureBlendMode --
+	 *  preserves the established "every new layer defaults to Copy" convention. ARTISTIC (pure
+	 *  composition, see RecomposeWorkingColors). */
+	EVertexMaskForgeBlendMode NoiseBlendMode = EVertexMaskForgeBlendMode::Copy;
+
+	/** Same contract/range/default as BoundingBoxOpacity/AOOpacity/CurvatureOpacity, independent of
+	 *  them. Applied ONLY during final composition (ComposeMaskStack), never to NoiseMask.Values itself.
+	 *  ARTISTIC. */
+	float NoiseOpacity = 1.0f;
+
+	bool bNoiseEnabled = false;
+
+	/**
+	 * AUDITED (Noise V1): resets ONLY every selected entry's NoiseMask slot back to NotGenerated (never
+	 * touches NoiseRawCache/NoiseCacheFingerprint/NoiseCacheUsedParams directly -- see NoiseRawCache's
+	 * own doc comment for why that is safe: the next real generation re-derives reuse-or-recompute from
+	 * the fingerprint+params comparison on its own). Same "raw/composition separation" contract as
+	 * InvalidateBoundingBoxRawMask/InvalidateAODerivedMask -- called ONLY by generative parameter
+	 * changes (OnNoiseGenerativeParamChanged), never by artistic ones.
+	 */
+	void InvalidateNoiseRawMask();
 
 	// --- Fill White / Fill Black utility masks ----------------------------------------------
 

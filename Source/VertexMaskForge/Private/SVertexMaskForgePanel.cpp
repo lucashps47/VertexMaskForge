@@ -2362,6 +2362,360 @@ namespace VertexMaskForgePanel
 		return Mask;
 	}
 
+	// --- Noise: procedural 3D Perlin/FBM, Local Space (V1) ------------------------------------------
+
+	static FText GetNoiseTypeLabel(const EVertexMaskForgeNoiseType Type)
+	{
+		switch (Type)
+		{
+		case EVertexMaskForgeNoiseType::Perlin:
+			return LOCTEXT("NoiseTypePerlin", "Perlin");
+		case EVertexMaskForgeNoiseType::FractalPerlin:
+			return LOCTEXT("NoiseTypeFractalPerlin", "Fractal Perlin (FBM)");
+		default:
+			return FText::GetEmpty();
+		}
+	}
+
+	/**
+	 * AUDITED (Noise V1, explicit requirement -- "Seed deve alterar o domínio por meio de um hash
+	 * determinístico convertido em um offset 3D"): converts Seed into a 3D domain offset via
+	 * GetTypeHash/HashCombine on Seed itself combined with a distinct per-axis salt constant -- the SAME
+	 * deterministic-hash idiom already used by ComputeDeterministicScrambleAngle/
+	 * ComputeDynamicMeshGeometryFingerprint elsewhere in this file. NEVER FMath::Rand/FRandomStream (no
+	 * engine RNG state touched), NEVER a pointer/address, NEVER dependent on iteration/execution order --
+	 * a pure function of Seed alone, so the SAME Seed always produces the EXACT same offset, and is safe
+	 * to call from any thread (ParallelFor workers included) with no synchronization.
+	 */
+	static FVector ComputeNoiseSeedOffset(const int32 Seed)
+	{
+		auto AxisOffset = [Seed](const uint32 AxisSalt) -> double
+		{
+			const uint32 Hash = HashCombine(GetTypeHash(Seed), AxisSalt);
+			// Arbitrary-looking but fully deterministic spread, large enough that neighboring seeds
+			// land in visibly different regions of Perlin's own periodic (256-cell) domain.
+			return (static_cast<double>(Hash) / static_cast<double>(MAX_uint32)) * 1000.0;
+		};
+		return FVector(AxisOffset(0x9E3779B1u), AxisOffset(0x85EBCA77u), AxisOffset(0xC2B2AE3Du));
+	}
+
+	/**
+	 * AUDITED (Noise V1): the expensive, GENERATIVE half of Noise -- samples ONE Perlin or FBM value at
+	 * LocalPosition (the vertex's own LOCAL/OBJECT-SPACE position -- LOD0's PositionVertexBuffer for a
+	 * non-Source-Topology entry, Mesh.GetVertex() for a Source-Topology one -- never a component
+	 * transform, never World Position, per the explicit "Local Space" requirement), returns a value
+	 * already reduced to [0, 1] (no Multiplier/Levels/Invert applied -- see ApplyNoiseArtisticParams for
+	 * that separate, cheap stage).
+	 *
+	 * NoisePosition = LocalPosition * (Scale/100) + Offset + SeedOffset -- per the explicit formula:
+	 * dividing by 100 converts Unreal's centimeter-scale local position into an approximately
+	 * meters-scale noise domain, so Scale 1 reads as "about one noise unit per meter" and remains
+	 * artistically comprehensible across modular meshes of different sizes. Offset and SeedOffset are
+	 * BOTH already in this same noise-space domain (added after the Scale multiply), per the explicit
+	 * "Offset deve operar em noise space" requirement.
+	 *
+	 * PERLIN: SignedNoise = FMath::PerlinNoise3D(NoisePosition); Mask = saturate(SignedNoise*0.5+0.5).
+	 *
+	 * FBM (FractalPerlin): sums SEVERAL Perlin octaves at increasing frequency (Frequency *= Lacunarity
+	 * each step, starting at 1) and decreasing amplitude (Amplitude *= Roughness each step, starting at
+	 * 1), normalizes by the TOTAL amplitude weight, and converts signed-to-[0,1] ONLY ONCE, AFTER that
+	 * sum -- per the explicit "Não remapear cada oitava individualmente antes da soma" requirement:
+	 * SignedFBM = Sum(Perlin(P*Frequency)*Amplitude) / Sum(Amplitude); Mask = saturate(SignedFBM*0.5+0.5).
+	 * WeightSum is guarded against zero (Octaves clamped to >= 1, Roughness >= 0, so WeightSum is always
+	 * >= 1 in practice, but an Epsilon floor is still applied defensively) -- never a division by zero.
+	 *
+	 * SAFETY: FMath::PerlinNoise3D itself is confirmed (UnrealMath.cpp) to read ONLY a function-local
+	 * `static const int32 Permutation[512]` lookup table -- populated once at first use via C++11
+	 * thread-safe static initialization and never mutated afterward, no FMath::Rand/global RNG state,
+	 * no heap access -- so concurrent reads from multiple ParallelFor workers are safe with no locking,
+	 * and the result depends ONLY on the input Location (fully deterministic, order-independent). All
+	 * inputs are defensively clamped (Scale away from zero, Octaves/Roughness/Lacunarity to their
+	 * documented safe ranges) and the final result is FMath::IsFinite-checked before being trusted, so
+	 * this can never return NaN/Inf even from a pathological parameter combination.
+	 */
+	static float ComputeRawNoiseValue(const FVector& LocalPosition, const FVertexMaskForgeNoiseGenerativeParams& Params, const FVector& SeedOffset)
+	{
+		constexpr double ScaleEpsilon = 1e-4;
+		const double SafeScaleX = FMath::Max(FMath::Abs(static_cast<double>(Params.ScaleX)), ScaleEpsilon);
+		const double SafeScaleY = FMath::Max(FMath::Abs(static_cast<double>(Params.ScaleY)), ScaleEpsilon);
+		const double SafeScaleZ = FMath::Max(FMath::Abs(static_cast<double>(Params.ScaleZ)), ScaleEpsilon);
+
+		const FVector BaseNoisePosition(
+			LocalPosition.X * (SafeScaleX / 100.0) + static_cast<double>(Params.OffsetX) + SeedOffset.X,
+			LocalPosition.Y * (SafeScaleY / 100.0) + static_cast<double>(Params.OffsetY) + SeedOffset.Y,
+			LocalPosition.Z * (SafeScaleZ / 100.0) + static_cast<double>(Params.OffsetZ) + SeedOffset.Z);
+
+		float SignedResult;
+		if (Params.NoiseType == EVertexMaskForgeNoiseType::Perlin)
+		{
+			SignedResult = FMath::PerlinNoise3D(BaseNoisePosition);
+		}
+		else
+		{
+			const int32 SafeOctaves = FMath::Clamp(Params.Octaves, 1, 8);
+			const float SafeRoughness = FMath::Clamp(Params.Roughness, 0.0f, 1.0f);
+			const float SafeLacunarity = FMath::Max(Params.Lacunarity, 1.0f);
+
+			double Frequency = 1.0;
+			float Amplitude = 1.0f;
+			double Sum = 0.0;
+			float WeightSum = 0.0f;
+			for (int32 Octave = 0; Octave < SafeOctaves; ++Octave)
+			{
+				const FVector OctavePosition = BaseNoisePosition * Frequency;
+				Sum += static_cast<double>(FMath::PerlinNoise3D(OctavePosition) * Amplitude);
+				WeightSum += Amplitude;
+				Frequency *= SafeLacunarity;
+				Amplitude *= SafeRoughness;
+			}
+			constexpr float WeightEpsilon = 1e-4f;
+			SignedResult = static_cast<float>(Sum / FMath::Max(WeightSum, WeightEpsilon));
+		}
+
+		if (!FMath::IsFinite(SignedResult))
+		{
+			SignedResult = 0.0f;
+		}
+		return FMath::Clamp(SignedResult * 0.5f + 0.5f, 0.0f, 1.0f);
+	}
+
+	/**
+	 * AUDITED (Noise V1): guarantees WorkingMesh.NoiseRawCache is valid for WorkingMesh's CURRENT
+	 * geometry AND the CURRENT generative parameters -- the ONE place ComputeRawNoiseValue is ever
+	 * invoked in a loop. Reuses the cache verbatim only when BOTH NoiseCacheFingerprint ==
+	 * WorkingMesh.GeometryFingerprint AND NoiseCacheUsedParams == Params (see
+	 * FVertexMaskForgeNoiseGenerativeParams::operator==) -- either differing forces a full recompute.
+	 * Multiplier/Levels/Invert/Opacity/Blend Mode changes never reach this function at all (see
+	 * OnNoiseArtisticParamChanged, which calls the cheap ApplyNoiseArtisticParams path directly).
+	 *
+	 * PARALLELIZED (audited): one ParallelFor over the domain's own vertex count, matching
+	 * GenerateAmbientOcclusionMask's own audited pattern -- ComputeRawNoiseValue's only dependency is
+	 * the read-only Params/SeedOffset (captured by reference, never mutated) and each vertex's own
+	 * position, so results never depend on execution order.
+	 */
+	static void EnsureNoiseRawCache(
+		FVertexMaskForgeWorkingMesh& WorkingMesh,
+		const bool bUseSourceTopology,
+		const FStaticMeshLODResources* LOD0ForRenderVertexDomain,
+		const FVertexMaskForgeNoiseGenerativeParams& Params)
+	{
+		if (!WorkingMesh.Mesh.IsValid())
+		{
+			return;
+		}
+		if (WorkingMesh.NoiseCacheFingerprint == WorkingMesh.GeometryFingerprint
+			&& WorkingMesh.NoiseCacheUsedParams == Params
+			&& !WorkingMesh.NoiseRawCache.IsEmpty())
+		{
+			return;
+		}
+
+		const FVector SeedOffset = ComputeNoiseSeedOffset(Params.Seed);
+
+		if (bUseSourceTopology)
+		{
+			using namespace UE::Geometry;
+			const FDynamicMesh3& Mesh = *WorkingMesh.Mesh;
+			const int32 MaxVID = Mesh.MaxVertexID();
+			TArray<float> RawValues;
+			RawValues.SetNumZeroed(MaxVID);
+
+			ParallelFor(MaxVID, [&Mesh, &RawValues, &Params, &SeedOffset](int32 VertexID)
+			{
+				if (!Mesh.IsVertex(VertexID))
+				{
+					return;
+				}
+				const FVector LocalPosition = Mesh.GetVertex(VertexID);
+				RawValues[VertexID] = ComputeRawNoiseValue(LocalPosition, Params, SeedOffset);
+			});
+
+			WorkingMesh.NoiseRawCache = MoveTemp(RawValues);
+		}
+		else if (LOD0ForRenderVertexDomain)
+		{
+			const FPositionVertexBuffer& Positions = LOD0ForRenderVertexDomain->VertexBuffers.PositionVertexBuffer;
+			const int32 NumRenderVerts = static_cast<int32>(Positions.GetNumVertices());
+			TArray<float> RawValues;
+			RawValues.SetNumUninitialized(NumRenderVerts);
+
+			ParallelFor(NumRenderVerts, [&Positions, &RawValues, &Params, &SeedOffset](int32 RenderIndex)
+			{
+				const FVector LocalPosition(Positions.VertexPosition(RenderIndex));
+				RawValues[RenderIndex] = ComputeRawNoiseValue(LocalPosition, Params, SeedOffset);
+			});
+
+			WorkingMesh.NoiseRawCache = MoveTemp(RawValues);
+		}
+		else
+		{
+			WorkingMesh.NoiseRawCache.Reset();
+			return;
+		}
+
+		WorkingMesh.NoiseCacheFingerprint = WorkingMesh.GeometryFingerprint;
+		WorkingMesh.NoiseCacheUsedParams = Params;
+
+		UE_LOG(LogVertexMaskForge, Log,
+			TEXT("Vertex Mask Forge: Noise raw pattern computed (%d vertices)."),
+			WorkingMesh.NoiseRawCache.Num());
+	}
+
+	/**
+	 * AUDITED (Noise V1): the CHEAP, purely-downstream half of Noise generation -- turns the cached raw
+	 * pattern (already in [0, 1]) into the final [0, 1] mask value, via Multiplier -> Levels -> Invert.
+	 * Reuses VertexMaskForgePanel::ApplyCurvatureLevels verbatim for the Levels step (same generic,
+	 * epsilon-safe-denominator remap contract -- see that function's own doc comment; calling it here is
+	 * NOT a formula duplication, it is the SAME shared helper, despite its Curvature-era name) -- per the
+	 * explicit "reutilize os helpers existentes... não duplique fórmulas" requirement. Invert is applied
+	 * LAST, after Levels, exactly like Curvature's own Invert.
+	 */
+	static TArray<float> ApplyNoiseArtisticParams(
+		const TArray<float>& RawCache,
+		const float Multiplier,
+		const float LevelsMin,
+		const float LevelsMax,
+		const bool bInvert)
+	{
+		const float ClampedMultiplier = FMath::Max(Multiplier, 0.0f);
+		const float ClampedLevelsMin = FMath::Clamp(LevelsMin, 0.0f, 1.0f);
+		const float ClampedLevelsMax = FMath::Clamp(LevelsMax, 0.0f, 1.0f);
+
+		TArray<float> Result;
+		Result.SetNumUninitialized(RawCache.Num());
+		for (int32 i = 0; i < RawCache.Num(); ++i)
+		{
+			const float Multiplied = FMath::Clamp(RawCache[i] * ClampedMultiplier, 0.0f, 1.0f);
+			const float Leveled = ApplyCurvatureLevels(Multiplied, ClampedLevelsMin, ClampedLevelsMax);
+			Result[i] = bInvert ? (1.0f - Leveled) : Leveled;
+		}
+		return Result;
+	}
+
+	/**
+	 * Generates the Noise Mask in RENDER VERTEX order for one entry (non-Nanite/non-Source-Topology) --
+	 * ensures the entry's cached raw pattern is current for the CURRENT generative parameters
+	 * (EnsureNoiseRawCache), then reprocesses it through Multiplier/Levels/Invert
+	 * (ApplyNoiseArtisticParams). Values are already render-vertex-domain (NoiseRawCache is generated
+	 * directly in that domain -- see EnsureNoiseRawCache -- no separate correspondence table is needed
+	 * the way Curvature's topology-dependent analysis requires, since Noise depends only on POSITION,
+	 * and LOD0's own PositionVertexBuffer already stores the correct per-render-vertex position,
+	 * including identical duplicated values for UV-seam-split wedges at the same source position).
+	 */
+	static FVertexMaskForgeScalarMask GenerateNoiseMask(
+		FVertexMaskForgeWorkingMesh& WorkingMesh,
+		const FStaticMeshLODResources& LOD0,
+		const FVertexMaskForgeNoiseGenerativeParams& Params,
+		const float Multiplier,
+		const float LevelsMin,
+		const float LevelsMax,
+		const bool bInvert)
+	{
+		FVertexMaskForgeScalarMask Mask;
+		Mask.Source = EVertexMaskForgeScalarMaskSource::Noise;
+
+		const int32 NumRenderVerts = static_cast<int32>(LOD0.VertexBuffers.PositionVertexBuffer.GetNumVertices());
+		Mask.RenderVertexCount = NumRenderVerts;
+
+		if (!WorkingMesh.Mesh.IsValid() || NumRenderVerts <= 0)
+		{
+			Mask.State = EVertexMaskForgeScalarMaskState::Unavailable;
+			return Mask;
+		}
+
+		EnsureNoiseRawCache(WorkingMesh, /*bUseSourceTopology=*/false, &LOD0, Params);
+		if (WorkingMesh.NoiseRawCache.Num() != NumRenderVerts)
+		{
+			Mask.State = EVertexMaskForgeScalarMaskState::Unavailable;
+			return Mask;
+		}
+
+		const TArray<float> Processed = ApplyNoiseArtisticParams(WorkingMesh.NoiseRawCache, Multiplier, LevelsMin, LevelsMax, bInvert);
+
+		Mask.Values = Processed;
+		Mask.bHasValue.Init(true, NumRenderVerts);
+
+		double Sum = 0.0;
+		for (int32 i = 0; i < Processed.Num(); ++i)
+		{
+			const float Value = Processed[i];
+			++Mask.NumValidValues;
+			Sum += Value;
+			Mask.MinValue = (Mask.NumValidValues == 1) ? Value : FMath::Min(Mask.MinValue, Value);
+			Mask.MaxValue = (Mask.NumValidValues == 1) ? Value : FMath::Max(Mask.MaxValue, Value);
+			if (Value <= FVertexMaskForgeScalarMask::Tolerance) { ++Mask.NumNearZero; }
+			if (Value >= 1.0f - FVertexMaskForgeScalarMask::Tolerance) { ++Mask.NumNearOne; }
+		}
+		Mask.MeanValue = (Mask.NumValidValues > 0) ? static_cast<float>(Sum / Mask.NumValidValues) : 0.0f;
+		Mask.State = (Mask.NumValidValues > 0) ? EVertexMaskForgeScalarMaskState::Ready : EVertexMaskForgeScalarMaskState::Unavailable;
+
+		return Mask;
+	}
+
+	/**
+	 * Sibling of GenerateNoiseMask for Source-Topology (Nanite) entries -- indexed directly by DYNAMIC
+	 * MESH VERTEX ID (Mesh.MaxVertexID()-sized, sparse-safe), no render-vertex correspondence needed:
+	 * UpdateWorkingColorsSourceTopology already looks this mask up by Mesh.GetTriangle(TriangleID)[Corner]
+	 * per corner (see its IndexOverride switch), exactly the same domain BoundingBoxMask/CurvatureMask
+	 * already use in this mode.
+	 */
+	static FVertexMaskForgeScalarMask GenerateNoiseMaskFromDynamicMesh(
+		FVertexMaskForgeWorkingMesh& WorkingMesh,
+		const FVertexMaskForgeNoiseGenerativeParams& Params,
+		const float Multiplier,
+		const float LevelsMin,
+		const float LevelsMax,
+		const bool bInvert)
+	{
+		using namespace UE::Geometry;
+
+		FVertexMaskForgeScalarMask Mask;
+		Mask.Source = EVertexMaskForgeScalarMaskSource::Noise;
+
+		if (!WorkingMesh.Mesh.IsValid())
+		{
+			Mask.State = EVertexMaskForgeScalarMaskState::Unavailable;
+			return Mask;
+		}
+		const FDynamicMesh3& Mesh = *WorkingMesh.Mesh;
+		Mask.RenderVertexCount = Mesh.VertexCount();
+
+		EnsureNoiseRawCache(WorkingMesh, /*bUseSourceTopology=*/true, nullptr, Params);
+		if (WorkingMesh.NoiseRawCache.IsEmpty())
+		{
+			Mask.State = EVertexMaskForgeScalarMaskState::Unavailable;
+			return Mask;
+		}
+
+		const TArray<float> Processed = ApplyNoiseArtisticParams(WorkingMesh.NoiseRawCache, Multiplier, LevelsMin, LevelsMax, bInvert);
+
+		const int32 MaxVID = Mesh.MaxVertexID();
+		Mask.Values.SetNumZeroed(MaxVID);
+		Mask.bHasValue.Init(false, MaxVID);
+
+		double Sum = 0.0;
+		for (const int32 VertexID : Mesh.VertexIndicesItr())
+		{
+			if (!Processed.IsValidIndex(VertexID))
+			{
+				continue;
+			}
+			const float Value = Processed[VertexID];
+			Mask.Values[VertexID] = Value;
+			Mask.bHasValue[VertexID] = true;
+			++Mask.NumValidValues;
+			Sum += Value;
+			Mask.MinValue = (Mask.NumValidValues == 1) ? Value : FMath::Min(Mask.MinValue, Value);
+			Mask.MaxValue = (Mask.NumValidValues == 1) ? Value : FMath::Max(Mask.MaxValue, Value);
+			if (Value <= FVertexMaskForgeScalarMask::Tolerance) { ++Mask.NumNearZero; }
+			if (Value >= 1.0f - FVertexMaskForgeScalarMask::Tolerance) { ++Mask.NumNearOne; }
+		}
+		Mask.MeanValue = (Mask.NumValidValues > 0) ? static_cast<float>(Sum / Mask.NumValidValues) : 0.0f;
+		Mask.State = (Mask.NumValidValues > 0) ? EVertexMaskForgeScalarMaskState::Ready : EVertexMaskForgeScalarMaskState::Unavailable;
+
+		return Mask;
+	}
+
 	/**
 	 * Generates the Ambient Occlusion Mask directly in RENDER VERTEX order for one component, using
 	 * CPU hemisphere raycasts against the component's OWN geometry via a GeometryCore
@@ -4026,6 +4380,13 @@ namespace VertexMaskForgePanel
 						// corners at the same source mesh vertex all read the identical value.
 						Layer.IndexOverride = VertTri[Corner];
 						break;
+					case EVertexMaskForgeScalarMaskSource::Noise:
+						// AUDITED (Noise V1): same domain as BoundingBox/Curvature -- Noise is cached and
+						// generated by DYNAMIC MESH VERTEX ID/local position (see
+						// GenerateNoiseMaskFromDynamicMesh), so a UV seam's several corners at the same
+						// source mesh vertex all read the identical value.
+						Layer.IndexOverride = VertTri[Corner];
+						break;
 					default: // ConstantWhite / ConstantBlack (Fill) -- corner-domain mask, see
 						// GenerateConstantMaskForCornerDomain.
 						Layer.IndexOverride = CornerIndex;
@@ -4172,7 +4533,8 @@ namespace VertexMaskForgePanel
 			if (!Entry.IsValid() || Entry->bUseSourceTopology || Entry->PreviewComponents.IsEmpty()
 				|| (Entry->WorkingMesh.BoundingBoxMask.State != EVertexMaskForgeScalarMaskState::Ready
 					&& Entry->WorkingMesh.AmbientOcclusionMask.State != EVertexMaskForgeScalarMaskState::Ready
-					&& Entry->WorkingMesh.CurvatureMask.State != EVertexMaskForgeScalarMaskState::Ready))
+					&& Entry->WorkingMesh.CurvatureMask.State != EVertexMaskForgeScalarMaskState::Ready
+					&& Entry->WorkingMesh.NoiseMask.State != EVertexMaskForgeScalarMaskState::Ready))
 			{
 				continue;
 			}
@@ -4522,7 +4884,8 @@ namespace VertexMaskForgePanel
 			if (!Entry.IsValid() || !Entry->bUseSourceTopology || Entry->PreviewComponents.IsEmpty()
 				|| (Entry->WorkingMesh.BoundingBoxMask.State != EVertexMaskForgeScalarMaskState::Ready
 					&& Entry->WorkingMesh.AmbientOcclusionMask.State != EVertexMaskForgeScalarMaskState::Ready
-					&& Entry->WorkingMesh.CurvatureMask.State != EVertexMaskForgeScalarMaskState::Ready))
+					&& Entry->WorkingMesh.CurvatureMask.State != EVertexMaskForgeScalarMaskState::Ready
+					&& Entry->WorkingMesh.NoiseMask.State != EVertexMaskForgeScalarMaskState::Ready))
 			{
 				continue;
 			}
@@ -5814,6 +6177,184 @@ FText SVertexMaskForgePanel::GetCurvatureBlendModeButtonText() const
 	return VertexMaskForgePanel::GetBlendModeLabel(CurvatureBlendMode);
 }
 
+void SVertexMaskForgePanel::InvalidateNoiseRawMask()
+{
+	LastMaskActionStatusText = FText::GetEmpty();
+
+	for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
+	{
+		if (Entry.IsValid())
+		{
+			Entry->WorkingMesh.NoiseMask = FVertexMaskForgeScalarMask();
+		}
+	}
+
+	if (!bAutoUpdatePreview)
+	{
+		UpdateAllPreviews(/*bCommit=*/false);
+	}
+}
+
+void SVertexMaskForgePanel::OnNoiseEnableChanged(const ECheckBoxState NewState)
+{
+	const bool bWasEnabled = bNoiseEnabled;
+	bNoiseEnabled = (NewState == ECheckBoxState::Checked);
+
+	// AUDITED (Noise V1): same enable/disable contract as OnCurvatureEnableChanged/OnAOEnableChanged
+	// (see their own doc comments) -- turning OFF is always pure composition; turning ON reuses an
+	// already-Ready entry immediately, and only regenerates entries that genuinely need it, gated by
+	// Auto Update Preview.
+	if (!bNoiseEnabled || bWasEnabled)
+	{
+		RecomposeWorkingColors();
+		return;
+	}
+
+	bool bAnyEntryNeedsGeneration = false;
+	for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
+	{
+		if (Entry.IsValid() && Entry->WorkingMesh.NoiseMask.State != EVertexMaskForgeScalarMaskState::Ready)
+		{
+			bAnyEntryNeedsGeneration = true;
+			break;
+		}
+	}
+
+	if (!bAnyEntryNeedsGeneration)
+	{
+		RecomposeWorkingColors();
+		return;
+	}
+
+	if (bAutoUpdatePreview)
+	{
+		if (GEditor)
+		{
+			GEditor->GetTimerManager()->ClearTimer(AutoUpdateDebounceTimerHandle);
+		}
+		RunAutoUpdatePreview();
+	}
+	else
+	{
+		RecomposeWorkingColors();
+	}
+}
+
+TSharedRef<SWidget> SVertexMaskForgePanel::OnGenerateNoiseTypeRow(TSharedPtr<EVertexMaskForgeNoiseType> InOption) const
+{
+	return SNew(STextBlock)
+		.Text(InOption.IsValid() ? VertexMaskForgePanel::GetNoiseTypeLabel(*InOption) : FText::GetEmpty());
+}
+
+void SVertexMaskForgePanel::OnNoiseTypeSelectionChanged(TSharedPtr<EVertexMaskForgeNoiseType> NewSelection, ESelectInfo::Type SelectInfo)
+{
+	if (!NewSelection.IsValid())
+	{
+		return;
+	}
+
+	NoiseType = *NewSelection;
+	OnNoiseGenerativeParamChanged();
+}
+
+FText SVertexMaskForgePanel::GetNoiseTypeButtonText() const
+{
+	return VertexMaskForgePanel::GetNoiseTypeLabel(NoiseType);
+}
+
+void SVertexMaskForgePanel::OnNoiseGenerativeParamChanged()
+{
+	// AUDITED (Noise V1): mirrors OnAxisParamChangedDiscrete's exact pattern -- Scale/Offset/Seed/
+	// Octaves/Roughness/Lacunarity/Type change WHAT the raw pattern looks like, so they invalidate
+	// every selected entry's NoiseMask (NoiseRawCache itself is left alone; EnsureNoiseRawCache's own
+	// GeometryFingerprint+params comparison decides reuse lazily the next time Noise is actually
+	// (re)generated) and either regenerate immediately (Auto Update Preview on, cancelling any stale
+	// debounce first) or wait for an explicit Generate Mask (off).
+	InvalidateNoiseRawMask();
+	if (bAutoUpdatePreview)
+	{
+		if (GEditor)
+		{
+			GEditor->GetTimerManager()->ClearTimer(AutoUpdateDebounceTimerHandle);
+		}
+		RunAutoUpdatePreview();
+	}
+}
+
+void SVertexMaskForgePanel::OnNoiseInvertChanged(const ECheckBoxState NewState)
+{
+	bNoiseInvert = (NewState == ECheckBoxState::Checked);
+	OnNoiseArtisticParamChanged();
+}
+
+void SVertexMaskForgePanel::OnNoiseArtisticParamChanged()
+{
+	// AUDITED (Noise V1): Multiplier/Levels Min/Levels Max/Invert are ALL cheap, purely downstream
+	// reprocessing of each entry's already-cached NoiseRawCache (see that field's own doc comment) --
+	// never the per-vertex Perlin/FBM evaluation, never GeometryFingerprint, never the generative-params
+	// comparison. So this is unconditional and immediate, exactly like OnCurvatureParamChanged,
+	// regardless of Auto Update Preview: regenerate every entry's NoiseMask directly from its raw cache,
+	// then recompose. An entry with no cached raw pattern yet is left untouched here -- Enable/Generate
+	// Mask/Auto Update are what populate the cache in the first place.
+	for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
+	{
+		if (!Entry.IsValid() || !bNoiseEnabled || Entry->WorkingMesh.NoiseRawCache.IsEmpty())
+		{
+			continue;
+		}
+
+		FVertexMaskForgeScalarMask NewNoiseMask;
+		if (Entry->bUseSourceTopology)
+		{
+			NewNoiseMask = VertexMaskForgePanel::GenerateNoiseMaskFromDynamicMesh(
+				Entry->WorkingMesh, Entry->WorkingMesh.NoiseCacheUsedParams,
+				NoiseMultiplier, NoiseLevelsMin, NoiseLevelsMax, bNoiseInvert);
+		}
+		else
+		{
+			const UStaticMesh* Mesh = Entry->Mesh.LoadSynchronous();
+			const FStaticMeshRenderData* RenderData = IsValid(Mesh) ? Mesh->GetRenderData() : nullptr;
+			if (!RenderData || !RenderData->LODResources.IsValidIndex(0))
+			{
+				continue;
+			}
+			NewNoiseMask = VertexMaskForgePanel::GenerateNoiseMask(
+				Entry->WorkingMesh, RenderData->LODResources[0],
+				Entry->WorkingMesh.NoiseCacheUsedParams,
+				NoiseMultiplier, NoiseLevelsMin, NoiseLevelsMax, bNoiseInvert);
+		}
+
+		if (NewNoiseMask.State == EVertexMaskForgeScalarMaskState::Ready)
+		{
+			Entry->WorkingMesh.NoiseMask = MoveTemp(NewNoiseMask);
+		}
+	}
+
+	RecomposeWorkingColors();
+}
+
+TSharedRef<SWidget> SVertexMaskForgePanel::OnGenerateNoiseBlendModeRow(TSharedPtr<EVertexMaskForgeBlendMode> InOption) const
+{
+	return SNew(STextBlock)
+		.Text(InOption.IsValid() ? VertexMaskForgePanel::GetBlendModeLabel(*InOption) : FText::GetEmpty());
+}
+
+void SVertexMaskForgePanel::OnNoiseBlendModeSelectionChanged(TSharedPtr<EVertexMaskForgeBlendMode> NewSelection, ESelectInfo::Type SelectInfo)
+{
+	if (!NewSelection.IsValid())
+	{
+		return;
+	}
+
+	NoiseBlendMode = *NewSelection;
+	RecomposeWorkingColors();
+}
+
+FText SVertexMaskForgePanel::GetNoiseBlendModeButtonText() const
+{
+	return VertexMaskForgePanel::GetBlendModeLabel(NoiseBlendMode);
+}
+
 FText SVertexMaskForgePanel::GetActiveMaskSourceText() const
 {
 	bool bAnyAxisEnabled = false;
@@ -5826,7 +6367,7 @@ FText SVertexMaskForgePanel::GetActiveMaskSourceText() const
 		}
 	}
 
-	TArray<FText, TInlineAllocator<3>> ActiveLayerNames;
+	TArray<FText, TInlineAllocator<4>> ActiveLayerNames;
 	if (bAnyAxisEnabled)
 	{
 		ActiveLayerNames.Add(LOCTEXT("ActiveLayerBBox", "Bounding Box"));
@@ -5839,10 +6380,14 @@ FText SVertexMaskForgePanel::GetActiveMaskSourceText() const
 	{
 		ActiveLayerNames.Add(LOCTEXT("ActiveLayerCurvature", "Curvature"));
 	}
+	if (bNoiseEnabled)
+	{
+		ActiveLayerNames.Add(LOCTEXT("ActiveLayerNoise", "Noise"));
+	}
 
 	if (ActiveLayerNames.IsEmpty())
 	{
-		return LOCTEXT("ActiveMaskSourceNone", "Active layers: None -- enable a Bounding Box axis, Ambient Occlusion, or Curvature");
+		return LOCTEXT("ActiveMaskSourceNone", "Active layers: None -- enable a Bounding Box axis, Ambient Occlusion, Curvature, or Noise");
 	}
 
 	TArray<FString> LayerStrings;
@@ -6057,6 +6602,9 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 	CurvatureTypeOptions.Add(MakeShared<EVertexMaskForgeCurvatureType>(EVertexMaskForgeCurvatureType::Convex));
 	CurvatureTypeOptions.Add(MakeShared<EVertexMaskForgeCurvatureType>(EVertexMaskForgeCurvatureType::Concave));
 	CurvatureTypeOptions.Add(MakeShared<EVertexMaskForgeCurvatureType>(EVertexMaskForgeCurvatureType::Both));
+
+	NoiseTypeOptions.Add(MakeShared<EVertexMaskForgeNoiseType>(EVertexMaskForgeNoiseType::Perlin));
+	NoiseTypeOptions.Add(MakeShared<EVertexMaskForgeNoiseType>(EVertexMaskForgeNoiseType::FractalPerlin));
 
 	// Z starts enabled to reproduce the exact previously-validated Local-Z-only default; X and Y
 	// start disabled (see BoundingBoxAxisParams' doc comment in the header).
@@ -6924,6 +7472,530 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 				]
 			]
 
+			// Noise Mask (V1): the tool's fourth, independent, optional composition-stack layer -- same
+			// collapsible panel pattern as Bounding Box/Ambient Occlusion/Curvature above.
+			+ SVerticalBox::Slot()
+			.AutoHeight()
+			.Padding(FMargin(0.f, 12.f, 0.f, 0.f))
+			[
+				SNew(SExpandableArea)
+				.InitiallyCollapsed(false)
+				.Padding(FMargin(8.f))
+				.HeaderContent()
+				[
+					SNew(STextBlock)
+					.Text(LOCTEXT("NoiseSectionTitle", "Noise Mask"))
+					.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
+				]
+				.BodyContent()
+				[
+					SNew(SVerticalBox)
+
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(FMargin(0.f, 0.f, 0.f, 6.f))
+					[
+						SNew(SCheckBox)
+						.IsChecked(this, &SVertexMaskForgePanel::GetNoiseEnableState)
+						.OnCheckStateChanged(this, &SVertexMaskForgePanel::OnNoiseEnableChanged)
+						.Content()
+						[
+							SNew(STextBlock)
+							.Text(LOCTEXT("NoiseEnableLabel", "Enable"))
+						]
+					]
+
+					// Blend Mode + Opacity: same Slate controls/dimensions/alignment/labels/tooltips/
+					// limits as the other three layers' own (see those sections above).
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(FMargin(0.f, 0.f, 0.f, 2.f))
+					[
+						SNew(SHorizontalBox)
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
+						[
+							SNew(STextBlock).Text(LOCTEXT("NoiseBlendModeLabel", "Blend Mode:"))
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						[
+							SAssignNew(NoiseBlendModeComboBox, SComboBox<TSharedPtr<EVertexMaskForgeBlendMode>>)
+							.OptionsSource(&BlendModeOptions)
+							.InitiallySelectedItem(BlendModeOptions[0])
+							.OnGenerateWidget(this, &SVertexMaskForgePanel::OnGenerateNoiseBlendModeRow)
+							.OnSelectionChanged(this, &SVertexMaskForgePanel::OnNoiseBlendModeSelectionChanged)
+							[
+								SNew(STextBlock)
+								.Text(this, &SVertexMaskForgePanel::GetNoiseBlendModeButtonText)
+							]
+						]
+					]
+
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(FMargin(0.f, 0.f, 0.f, 6.f))
+					[
+						SNew(SHorizontalBox)
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
+						[
+							SNew(STextBlock).Text(LOCTEXT("NoiseOpacityLabel", "Opacity:"))
+						]
+
+						+ SHorizontalBox::Slot()
+						.FillWidth(1.f)
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 8.f, 0.f))
+						[
+							SNew(SSlider)
+							.MinValue(0.0f)
+							.MaxValue(1.0f)
+							.Value_Lambda([this]() { return NoiseOpacity; })
+							.OnValueChanged_Lambda([this](const float NewValue)
+							{
+								NoiseOpacity = FMath::Clamp(NewValue, 0.0f, 1.0f);
+								RecomposeWorkingColors();
+							})
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						[
+							SNew(SSpinBox<float>)
+							.MinDesiredWidth(52.f)
+							.MinValue(0.0f)
+							.MaxValue(1.0f)
+							.Delta(0.01f)
+							.MinFractionalDigits(2)
+							.MaxFractionalDigits(2)
+							.Value_Lambda([this]() { return NoiseOpacity; })
+							.OnValueChanged_Lambda([this](const float NewValue)
+							{
+								NoiseOpacity = FMath::Clamp(NewValue, 0.0f, 1.0f);
+								RecomposeWorkingColors();
+							})
+						]
+					]
+
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(FMargin(0.f, 0.f, 0.f, 6.f))
+					[
+						SNew(SHorizontalBox)
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
+						[
+							SNew(STextBlock).Text(LOCTEXT("NoiseTypeLabel", "Noise Type:"))
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						[
+							SAssignNew(NoiseTypeComboBox, SComboBox<TSharedPtr<EVertexMaskForgeNoiseType>>)
+							.OptionsSource(&NoiseTypeOptions)
+							.InitiallySelectedItem(NoiseTypeOptions[1])
+							.OnGenerateWidget(this, &SVertexMaskForgePanel::OnGenerateNoiseTypeRow)
+							.OnSelectionChanged(this, &SVertexMaskForgePanel::OnNoiseTypeSelectionChanged)
+							.ToolTipText(LOCTEXT("NoiseTypeTooltip",
+								"Perlin: a single noise octave. Fractal Perlin (FBM): several octaves summed for more detail."))
+							[
+								SNew(STextBlock)
+								.Text(this, &SVertexMaskForgePanel::GetNoiseTypeButtonText)
+							]
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(12.f, 0.f, 0.f, 0.f))
+						[
+							SNew(SCheckBox)
+							.IsChecked(this, &SVertexMaskForgePanel::GetNoiseInvertState)
+							.OnCheckStateChanged(this, &SVertexMaskForgePanel::OnNoiseInvertChanged)
+							.Content()
+							[
+								SNew(STextBlock)
+								.Text(LOCTEXT("NoiseInvertLabel", "Invert"))
+							]
+						]
+					]
+
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(FMargin(0.f, 0.f, 0.f, 4.f))
+					[
+						SNew(SHorizontalBox)
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
+						[
+							SNew(STextBlock).Text(LOCTEXT("NoiseScaleLabel", "Scale"))
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
+						[
+							SNew(SSpinBox<float>)
+							.MinDesiredWidth(52.f)
+							.MinValue(0.001f)
+							.MaxValue(1000.0f)
+							.Delta(0.01f)
+							.ToolTipText(LOCTEXT("NoiseScaleXTooltip", "Frequency multiplier along local X. 1.0 is approximately one noise unit per meter."))
+							.Value_Lambda([this]() { return NoiseScaleX; })
+							.OnValueChanged_Lambda([this](const float NewValue)
+							{
+								NoiseScaleX = FMath::Max(NewValue, 0.001f);
+								OnNoiseGenerativeParamChanged();
+							})
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
+						[
+							SNew(SSpinBox<float>)
+							.MinDesiredWidth(52.f)
+							.MinValue(0.001f)
+							.MaxValue(1000.0f)
+							.Delta(0.01f)
+							.ToolTipText(LOCTEXT("NoiseScaleYTooltip", "Frequency multiplier along local Y."))
+							.Value_Lambda([this]() { return NoiseScaleY; })
+							.OnValueChanged_Lambda([this](const float NewValue)
+							{
+								NoiseScaleY = FMath::Max(NewValue, 0.001f);
+								OnNoiseGenerativeParamChanged();
+							})
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						[
+							SNew(SSpinBox<float>)
+							.MinDesiredWidth(52.f)
+							.MinValue(0.001f)
+							.MaxValue(1000.0f)
+							.Delta(0.01f)
+							.ToolTipText(LOCTEXT("NoiseScaleZTooltip", "Frequency multiplier along local Z."))
+							.Value_Lambda([this]() { return NoiseScaleZ; })
+							.OnValueChanged_Lambda([this](const float NewValue)
+							{
+								NoiseScaleZ = FMath::Max(NewValue, 0.001f);
+								OnNoiseGenerativeParamChanged();
+							})
+						]
+					]
+
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(FMargin(0.f, 0.f, 0.f, 4.f))
+					[
+						SNew(SHorizontalBox)
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
+						[
+							SNew(STextBlock).Text(LOCTEXT("NoiseOffsetLabel", "Offset"))
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
+						[
+							SNew(SSpinBox<float>)
+							.MinDesiredWidth(52.f)
+							.MinValue(-100000.0f)
+							.MaxValue(100000.0f)
+							.Delta(0.1f)
+							.ToolTipText(LOCTEXT("NoiseOffsetXTooltip", "Domain offset along X, in noise space."))
+							.Value_Lambda([this]() { return NoiseOffsetX; })
+							.OnValueChanged_Lambda([this](const float NewValue)
+							{
+								NoiseOffsetX = NewValue;
+								OnNoiseGenerativeParamChanged();
+							})
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
+						[
+							SNew(SSpinBox<float>)
+							.MinDesiredWidth(52.f)
+							.MinValue(-100000.0f)
+							.MaxValue(100000.0f)
+							.Delta(0.1f)
+							.ToolTipText(LOCTEXT("NoiseOffsetYTooltip", "Domain offset along Y, in noise space."))
+							.Value_Lambda([this]() { return NoiseOffsetY; })
+							.OnValueChanged_Lambda([this](const float NewValue)
+							{
+								NoiseOffsetY = NewValue;
+								OnNoiseGenerativeParamChanged();
+							})
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						[
+							SNew(SSpinBox<float>)
+							.MinDesiredWidth(52.f)
+							.MinValue(-100000.0f)
+							.MaxValue(100000.0f)
+							.Delta(0.1f)
+							.ToolTipText(LOCTEXT("NoiseOffsetZTooltip", "Domain offset along Z, in noise space."))
+							.Value_Lambda([this]() { return NoiseOffsetZ; })
+							.OnValueChanged_Lambda([this](const float NewValue)
+							{
+								NoiseOffsetZ = NewValue;
+								OnNoiseGenerativeParamChanged();
+							})
+						]
+					]
+
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(FMargin(0.f, 0.f, 0.f, 4.f))
+					[
+						SNew(SHorizontalBox)
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
+						[
+							SNew(STextBlock).Text(LOCTEXT("NoiseSeedLabel", "Seed"))
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 12.f, 0.f))
+						[
+							SNew(SSpinBox<int32>)
+							.MinDesiredWidth(64.f)
+							.MinValue(-2147483647)
+							.MaxValue(2147483647)
+							.Delta(1)
+							.Value_Lambda([this]() { return NoiseSeed; })
+							.OnValueChanged_Lambda([this](const int32 NewValue)
+							{
+								NoiseSeed = NewValue;
+								OnNoiseGenerativeParamChanged();
+							})
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
+						[
+							SNew(STextBlock)
+							.Text(LOCTEXT("NoiseMultiplierLabel", "Multiplier"))
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						[
+							SNew(SSpinBox<float>)
+							.MinDesiredWidth(52.f)
+							.MinValue(0.0f)
+							.MaxValue(10.0f)
+							.Delta(0.01f)
+							.Value_Lambda([this]() { return NoiseMultiplier; })
+							.OnValueChanged_Lambda([this](const float NewValue)
+							{
+								NoiseMultiplier = FMath::Max(NewValue, 0.0f);
+								OnNoiseArtisticParamChanged();
+							})
+						]
+					]
+
+					// FBM-only controls -- always visible in V1 (no dynamic show/hide by Noise Type),
+					// but disabled (IsEnabled) when Noise Type is Perlin since ComputeRawNoiseValue
+					// never reads them in that branch.
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(FMargin(0.f, 0.f, 0.f, 4.f))
+					[
+						SNew(SHorizontalBox)
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
+						[
+							SNew(STextBlock)
+							.Text(LOCTEXT("NoiseOctavesLabel", "Octaves"))
+							.ToolTipText(LOCTEXT("NoiseOctavesTooltip", "Fractal Perlin (FBM) only."))
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 12.f, 0.f))
+						[
+							SNew(SSpinBox<int32>)
+							.MinDesiredWidth(44.f)
+							.MinValue(1)
+							.MaxValue(8)
+							.Delta(1)
+							.IsEnabled_Lambda([this]() { return NoiseType == EVertexMaskForgeNoiseType::FractalPerlin; })
+							.Value_Lambda([this]() { return NoiseOctaves; })
+							.OnValueChanged_Lambda([this](const int32 NewValue)
+							{
+								NoiseOctaves = FMath::Clamp(NewValue, 1, 8);
+								OnNoiseGenerativeParamChanged();
+							})
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
+						[
+							SNew(STextBlock)
+							.Text(LOCTEXT("NoiseRoughnessLabel", "Roughness"))
+							.ToolTipText(LOCTEXT("NoiseRoughnessTooltip", "Per-octave amplitude multiplier. Fractal Perlin (FBM) only."))
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 12.f, 0.f))
+						[
+							SNew(SSpinBox<float>)
+							.MinDesiredWidth(52.f)
+							.MinValue(0.0f)
+							.MaxValue(1.0f)
+							.Delta(0.01f)
+							.IsEnabled_Lambda([this]() { return NoiseType == EVertexMaskForgeNoiseType::FractalPerlin; })
+							.Value_Lambda([this]() { return NoiseRoughness; })
+							.OnValueChanged_Lambda([this](const float NewValue)
+							{
+								NoiseRoughness = FMath::Clamp(NewValue, 0.0f, 1.0f);
+								OnNoiseGenerativeParamChanged();
+							})
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
+						[
+							SNew(STextBlock)
+							.Text(LOCTEXT("NoiseLacunarityLabel", "Lacunarity"))
+							.ToolTipText(LOCTEXT("NoiseLacunarityTooltip", "Per-octave frequency multiplier. Fractal Perlin (FBM) only."))
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						[
+							SNew(SSpinBox<float>)
+							.MinDesiredWidth(52.f)
+							.MinValue(1.0f)
+							.MaxValue(10.0f)
+							.Delta(0.01f)
+							.IsEnabled_Lambda([this]() { return NoiseType == EVertexMaskForgeNoiseType::FractalPerlin; })
+							.Value_Lambda([this]() { return NoiseLacunarity; })
+							.OnValueChanged_Lambda([this](const float NewValue)
+							{
+								NoiseLacunarity = FMath::Max(NewValue, 1.0f);
+								OnNoiseGenerativeParamChanged();
+							})
+						]
+					]
+
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					[
+						SNew(SHorizontalBox)
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
+						[
+							SNew(STextBlock)
+							.Text(LOCTEXT("NoiseLevelsMinLabel", "Levels Min"))
+							.ToolTipText(LOCTEXT("NoiseLevelsMinTooltip", "Values at or below this threshold become black."))
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 12.f, 0.f))
+						[
+							SNew(SSpinBox<float>)
+							.MinDesiredWidth(52.f)
+							.MinValue(0.0f)
+							.MaxValue(1.0f)
+							.Delta(0.01f)
+							.ToolTipText(LOCTEXT("NoiseLevelsMinTooltip", "Values at or below this threshold become black."))
+							.Value_Lambda([this]() { return NoiseLevelsMin; })
+							.OnValueChanged_Lambda([this](const float NewValue)
+							{
+								NoiseLevelsMin = FMath::Clamp(NewValue, 0.0f, 1.0f);
+								OnNoiseArtisticParamChanged();
+							})
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
+						[
+							SNew(STextBlock)
+							.Text(LOCTEXT("NoiseLevelsMaxLabel", "Levels Max"))
+							.ToolTipText(LOCTEXT("NoiseLevelsMaxTooltip", "Values at or above this threshold become white."))
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						[
+							SNew(SSpinBox<float>)
+							.MinDesiredWidth(52.f)
+							.MinValue(0.0f)
+							.MaxValue(1.0f)
+							.Delta(0.01f)
+							.ToolTipText(LOCTEXT("NoiseLevelsMaxTooltip", "Values at or above this threshold become white."))
+							.Value_Lambda([this]() { return NoiseLevelsMax; })
+							.OnValueChanged_Lambda([this](const float NewValue)
+							{
+								NoiseLevelsMax = FMath::Clamp(NewValue, 0.0f, 1.0f);
+								OnNoiseArtisticParamChanged();
+							})
+						]
+					]
+				]
+			]
+
 			+ SVerticalBox::Slot()
 			.AutoHeight()
 			.Padding(FMargin(0.f, 12.f, 0.f, 0.f))
@@ -7484,11 +8556,11 @@ FReply SVertexMaskForgePanel::OnGenerateBoundingBoxMaskClicked()
 			break;
 		}
 	}
-	if (!bAnyAxisEnabled && !bAOEnabled && !bCurvatureEnabled)
+	if (!bAnyAxisEnabled && !bAOEnabled && !bCurvatureEnabled && !bNoiseEnabled)
 	{
 		// Per the explicit requirement: never generate an empty mask silently, never replace the
 		// previous Preview, never enter Pending Changes with invalid data.
-		LastOperationErrorText = LOCTEXT("NoMaskSourceEnabled", "Enable at least one Bounding Box axis, Ambient Occlusion, or Curvature.");
+		LastOperationErrorText = LOCTEXT("NoMaskSourceEnabled", "Enable at least one Bounding Box axis, Ambient Occlusion, Curvature, or Noise.");
 		RecomputeOperationState();
 		return FReply::Handled();
 	}
@@ -7513,6 +8585,22 @@ FReply SVertexMaskForgePanel::OnGenerateBoundingBoxMaskClicked()
 	int32 NumBBoxReady = 0, NumBBoxUnavailable = 0, NumBBoxDegenerate = 0, NumBBoxInvalid = 0;
 	int32 NumAOReady = 0, NumAOUnavailable = 0;
 	int32 NumCurvatureReady = 0, NumCurvatureUnavailable = 0;
+	int32 NumNoiseReady = 0, NumNoiseUnavailable = 0;
+
+	// AUDITED (Noise V1): computed ONCE for this whole click, before touching any entry -- Noise's raw
+	// pattern generation only needs the CURRENT UI values, never per-entry state.
+	FVertexMaskForgeNoiseGenerativeParams NoiseGenerativeParams;
+	NoiseGenerativeParams.NoiseType = NoiseType;
+	NoiseGenerativeParams.ScaleX = NoiseScaleX;
+	NoiseGenerativeParams.ScaleY = NoiseScaleY;
+	NoiseGenerativeParams.ScaleZ = NoiseScaleZ;
+	NoiseGenerativeParams.OffsetX = NoiseOffsetX;
+	NoiseGenerativeParams.OffsetY = NoiseOffsetY;
+	NoiseGenerativeParams.OffsetZ = NoiseOffsetZ;
+	NoiseGenerativeParams.Seed = NoiseSeed;
+	NoiseGenerativeParams.Octaves = NoiseOctaves;
+	NoiseGenerativeParams.Roughness = NoiseRoughness;
+	NoiseGenerativeParams.Lacunarity = NoiseLacunarity;
 
 	for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
 	{
@@ -7550,9 +8638,12 @@ FReply SVertexMaskForgePanel::OnGenerateBoundingBoxMaskClicked()
 			Entry->WorkingMesh.AmbientOcclusionMask.State = EVertexMaskForgeScalarMaskState::Unavailable;
 			Entry->WorkingMesh.CurvatureMask = FVertexMaskForgeScalarMask();
 			Entry->WorkingMesh.CurvatureMask.State = EVertexMaskForgeScalarMaskState::Unavailable;
+			Entry->WorkingMesh.NoiseMask = FVertexMaskForgeScalarMask();
+			Entry->WorkingMesh.NoiseMask.State = EVertexMaskForgeScalarMaskState::Unavailable;
 			++NumBBoxUnavailable;
 			++NumAOUnavailable;
 			++NumCurvatureUnavailable;
+			++NumNoiseUnavailable;
 			continue;
 		}
 
@@ -7685,14 +8776,43 @@ FReply SVertexMaskForgePanel::OnGenerateBoundingBoxMaskClicked()
 			Entry->WorkingMesh.CurvatureMask = FVertexMaskForgeScalarMask();
 			++NumCurvatureUnavailable;
 		}
+
+		// AUDITED (Noise V1): same "real, entry-level computation, cache-reusing" contract as the
+		// Curvature block above -- see that block's own doc comment. GenerateNoiseMask/
+		// GenerateNoiseMaskFromDynamicMesh internally reuse WorkingMesh.NoiseRawCache whenever BOTH
+		// GeometryFingerprint AND NoiseGenerativeParams still match (see EnsureNoiseRawCache), so
+		// repeated Generate Mask clicks with unchanged Scale/Offset/Seed/Octaves/Roughness/Lacunarity/
+		// Type never redo the per-vertex Perlin/FBM evaluation.
+		if (bNoiseEnabled)
+		{
+			Entry->WorkingMesh.NoiseMask = Entry->bUseSourceTopology
+				? VertexMaskForgePanel::GenerateNoiseMaskFromDynamicMesh(
+					Entry->WorkingMesh, NoiseGenerativeParams, NoiseMultiplier, NoiseLevelsMin, NoiseLevelsMax, bNoiseInvert)
+				: VertexMaskForgePanel::GenerateNoiseMask(
+					Entry->WorkingMesh, RenderData->LODResources[0],
+					NoiseGenerativeParams, NoiseMultiplier, NoiseLevelsMin, NoiseLevelsMax, bNoiseInvert);
+			if (Entry->WorkingMesh.NoiseMask.State == EVertexMaskForgeScalarMaskState::Ready)
+			{
+				++NumNoiseReady;
+			}
+			else
+			{
+				++NumNoiseUnavailable;
+			}
+		}
+		else
+		{
+			Entry->WorkingMesh.NoiseMask = FVertexMaskForgeScalarMask();
+			++NumNoiseUnavailable;
+		}
 	}
 
 	// Log (explicit operation summary): this function is only reached by an explicit Generate Mask
 	// click -- RunAutoUpdatePreview has its own separate loop and never calls this one, so this line
 	// cannot fire on every slider tick.
 	UE_LOG(LogVertexMaskForge, Log,
-		TEXT("Vertex Mask Forge: Generate Mask: Bounding Box %d ready/%d unavailable/%d degenerate/%d invalid; Ambient Occlusion %d ready/%d unavailable; Curvature %d ready/%d unavailable."),
-		NumBBoxReady, NumBBoxUnavailable, NumBBoxDegenerate, NumBBoxInvalid, NumAOReady, NumAOUnavailable, NumCurvatureReady, NumCurvatureUnavailable);
+		TEXT("Vertex Mask Forge: Generate Mask: Bounding Box %d ready/%d unavailable/%d degenerate/%d invalid; Ambient Occlusion %d ready/%d unavailable; Curvature %d ready/%d unavailable; Noise %d ready/%d unavailable."),
+		NumBBoxReady, NumBBoxUnavailable, NumBBoxDegenerate, NumBBoxInvalid, NumAOReady, NumAOUnavailable, NumCurvatureReady, NumCurvatureUnavailable, NumNoiseReady, NumNoiseUnavailable);
 
 	// If a Vertex Color preview mode is active, recompose and reapply immediately using the
 	// mask(s) just persisted -- the user should not have to reselect the dropdown. bCommit=true:
@@ -8003,11 +9123,11 @@ void SVertexMaskForgePanel::RunAutoUpdatePreview(const bool bIncludeAO)
 	// AUDITED (BBox Invert exception): when bIncludeAO is false (OnAxisInvertChanged's scoped call),
 	// Ambient Occlusion is treated as irrelevant to this call regardless of bAOEnabled's actual value
 	// -- see the AO block below, which is skipped entirely in that case.
-	if (!bAnyAxisEnabled && !(bIncludeAO && bAOEnabled) && !bCurvatureEnabled)
+	if (!bAnyAxisEnabled && !(bIncludeAO && bAOEnabled) && !bCurvatureEnabled && !bNoiseEnabled)
 	{
 		// Preserve every entry's existing masks untouched and surface the specific message -- do not
 		// fall through to the generic "could not be regenerated" wording below.
-		LastOperationErrorText = LOCTEXT("NoMaskSourceEnabledAutoUpdate", "Enable at least one Bounding Box axis, Ambient Occlusion, or Curvature.");
+		LastOperationErrorText = LOCTEXT("NoMaskSourceEnabledAutoUpdate", "Enable at least one Bounding Box axis, Ambient Occlusion, Curvature, or Noise.");
 		UpdateAllPreviews(/*bCommit=*/false);
 		return;
 	}
@@ -8036,6 +9156,21 @@ void SVertexMaskForgePanel::RunAutoUpdatePreview(const bool bIncludeAO)
 
 	int32 NumFailed = 0;
 	FString FirstFailedAssetName;
+
+	// AUDITED (Noise V1): same once-per-batch snapshot as OnGenerateBoundingBoxMaskClicked -- see that
+	// call site's own comment.
+	FVertexMaskForgeNoiseGenerativeParams NoiseGenerativeParams;
+	NoiseGenerativeParams.NoiseType = NoiseType;
+	NoiseGenerativeParams.ScaleX = NoiseScaleX;
+	NoiseGenerativeParams.ScaleY = NoiseScaleY;
+	NoiseGenerativeParams.ScaleZ = NoiseScaleZ;
+	NoiseGenerativeParams.OffsetX = NoiseOffsetX;
+	NoiseGenerativeParams.OffsetY = NoiseOffsetY;
+	NoiseGenerativeParams.OffsetZ = NoiseOffsetZ;
+	NoiseGenerativeParams.Seed = NoiseSeed;
+	NoiseGenerativeParams.Octaves = NoiseOctaves;
+	NoiseGenerativeParams.Roughness = NoiseRoughness;
+	NoiseGenerativeParams.Lacunarity = NoiseLacunarity;
 
 	for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
 	{
@@ -8173,6 +9308,29 @@ void SVertexMaskForgePanel::RunAutoUpdatePreview(const bool bIncludeAO)
 		{
 			Entry->WorkingMesh.CurvatureMask = FVertexMaskForgeScalarMask();
 		}
+
+		// AUDITED (Noise V1): same "real, entry-level computation, cache-reusing" contract as the
+		// Curvature block above -- see that block's own doc comment. Never gated by bIncludeAO either
+		// (same rationale as Curvature).
+		if (bNoiseEnabled)
+		{
+			FVertexMaskForgeScalarMask NewNoiseMask = Entry->bUseSourceTopology
+				? VertexMaskForgePanel::GenerateNoiseMaskFromDynamicMesh(
+					Entry->WorkingMesh, NoiseGenerativeParams, NoiseMultiplier, NoiseLevelsMin, NoiseLevelsMax, bNoiseInvert)
+				: VertexMaskForgePanel::GenerateNoiseMask(
+					Entry->WorkingMesh, RenderData->LODResources[0],
+					NoiseGenerativeParams, NoiseMultiplier, NoiseLevelsMin, NoiseLevelsMax, bNoiseInvert);
+			if (NewNoiseMask.State == EVertexMaskForgeScalarMaskState::Ready)
+			{
+				Entry->WorkingMesh.NoiseMask = MoveTemp(NewNoiseMask);
+			}
+			// else: preserve whatever NoiseMask this entry already had -- same "auto-update never
+			// replaces a valid Preview with incomplete/degenerate data" contract as Bounding Box/Curvature.
+		}
+		else
+		{
+			Entry->WorkingMesh.NoiseMask = FVertexMaskForgeScalarMask();
+		}
 	}
 
 	if (NumFailed > 0)
@@ -8259,7 +9417,8 @@ FText SVertexMaskForgePanel::GetPreviewStatusText() const
 		bAnyViewportComponent = true;
 		if (Entry->WorkingMesh.BoundingBoxMask.State == EVertexMaskForgeScalarMaskState::Ready
 			|| Entry->WorkingMesh.AmbientOcclusionMask.State == EVertexMaskForgeScalarMaskState::Ready
-			|| Entry->WorkingMesh.CurvatureMask.State == EVertexMaskForgeScalarMaskState::Ready)
+			|| Entry->WorkingMesh.CurvatureMask.State == EVertexMaskForgeScalarMaskState::Ready
+			|| Entry->WorkingMesh.NoiseMask.State == EVertexMaskForgeScalarMaskState::Ready)
 		{
 			bAnyReady = true;
 		}
@@ -8382,7 +9541,8 @@ void SVertexMaskForgePanel::RecomputeOperationState()
 		if (Entry.IsValid() && !Entry->PreviewComponents.IsEmpty()
 			&& (Entry->WorkingMesh.BoundingBoxMask.State == EVertexMaskForgeScalarMaskState::Ready
 				|| Entry->WorkingMesh.AmbientOcclusionMask.State == EVertexMaskForgeScalarMaskState::Ready
-				|| Entry->WorkingMesh.CurvatureMask.State == EVertexMaskForgeScalarMaskState::Ready))
+				|| Entry->WorkingMesh.CurvatureMask.State == EVertexMaskForgeScalarMaskState::Ready
+				|| Entry->WorkingMesh.NoiseMask.State == EVertexMaskForgeScalarMaskState::Ready))
 		{
 			bHasPending = true;
 			break;
@@ -8701,9 +9861,12 @@ void SVertexMaskForgePanel::ApplyPreviewToEntry(
 	// per-component re-evaluation is needed (Curvature never needs one -- see CurvatureMask's own doc
 	// comment) -- WorkingMesh.CurvatureMask.State can legitimately still read Ready while disabled.
 	const bool bCurvatureEntryReady = bCurvatureEnabled && WorkingMesh.CurvatureMask.State == EVertexMaskForgeScalarMaskState::Ready;
+	// AUDITED (Noise V1): same live-gating rationale as bCurvatureEntryReady above -- Noise is also
+	// entry-level, real values, no per-component re-evaluation needed.
+	const bool bNoiseEntryReady = bNoiseEnabled && WorkingMesh.NoiseMask.State == EVertexMaskForgeScalarMaskState::Ready;
 	if (WorkingMesh.State != EVertexMaskForgeWorkingMeshState::Ready
 		|| !WorkingMesh.Mesh.IsValid()
-		|| (!bBBoxEntryReady && !bAOEntryReady && !bCurvatureEntryReady))
+		|| (!bBBoxEntryReady && !bAOEntryReady && !bCurvatureEntryReady && !bNoiseEntryReady))
 	{
 		// Nothing safe to preview yet (both slots NotGenerated/Unavailable/DegenerateBounds/Invalid):
 		// show the original colors/materials rather than a stale or fabricated result. AUDITED
@@ -8848,6 +10011,16 @@ void SVertexMaskForgePanel::ApplyPreviewToEntry(
 				{
 					Layers.Add({ &WorkingMesh.CurvatureMask, CurvatureBlendMode, CurvatureOpacity });
 				}
+				// AUDITED (Noise V1): same "no per-component re-evaluation" contract as Curvature above --
+				// WorkingMesh.NoiseMask already holds the REAL, final values for every component of this
+				// entry. Composed AFTER Curvature, per the explicit ordering requirement (Bounding Box ->
+				// Ambient Occlusion -> Curvature -> Noise) -- though see ComposeMaskStack's own doc
+				// comment: canonical composition order is actually determined by each layer's OWN Blend
+				// Mode, not by Layers.Add() call order, which only matters for documentation clarity here.
+				if (!bAnyLayerFailed && bNoiseEntryReady)
+				{
+					Layers.Add({ &WorkingMesh.NoiseMask, NoiseBlendMode, NoiseOpacity });
+				}
 			}
 
 			if (bAnyLayerFailed || Layers.IsEmpty())
@@ -8976,6 +10149,13 @@ void SVertexMaskForgePanel::ApplyPreviewToEntry(
 			if (!bAnyLayerFailed && bCurvatureEntryReady)
 			{
 				Layers.Add({ &WorkingMesh.CurvatureMask, CurvatureBlendMode, CurvatureOpacity });
+			}
+			// AUDITED (Noise V1): same "no per-component re-evaluation needed" contract as Curvature
+			// above -- WorkingMesh.NoiseMask already holds the REAL, final per-render-vertex values;
+			// IndexOverride stays at its default (-1), looked up by the shared render vertex index.
+			if (!bAnyLayerFailed && bNoiseEntryReady)
+			{
+				Layers.Add({ &WorkingMesh.NoiseMask, NoiseBlendMode, NoiseOpacity });
 			}
 		}
 
