@@ -217,6 +217,37 @@ enum class EVertexMaskForgeScalarMaskSource : uint8
 	 * ApplyAOLevelsAndInvert's own doc comment for the exact pipeline and rationale.
 	 */
 	AmbientOcclusion,
+
+	/**
+	 * GenerateCurvatureMask / GenerateCurvatureMaskFromDynamicMesh: a signed, topology-based curvature
+	 * measure (discrete mean-curvature-normal approximation from adjacent face dihedral angles),
+	 * reduced by Curvature Type (Convex/Concave/Both -- see EVertexMaskForgeCurvatureType), scaled by
+	 * Multiplier, smoothed by a topological Blur, and remapped by Levels Min/Max -- see
+	 * VertexMaskForgePanel::ApplyCurvatureArtisticParams for the exact pipeline. Values are always in
+	 * [0, 1] (0 = flat/no curvature of the selected Type, 1 = maximum). Computed ONCE PER ENTRY (never
+	 * per component -- unlike Bounding Box's World Space axes and Ambient Occlusion, Curvature is a
+	 * pure function of the asset's own local-space topology and never depends on a component's
+	 * transform), so every component of the same asset shares the identical Curvature contribution.
+	 */
+	Curvature,
+};
+
+/** Which of FVertexMaskForgeWorkingMesh::CurvatureRawConvexCache/CurvatureRawConcaveCache (or their
+ *  union) Curvature Type selects as the mask magnitude -- see
+ *  VertexMaskForgePanel::ApplyCurvatureArtisticParams. */
+enum class EVertexMaskForgeCurvatureType : uint8
+{
+	/** Mask = RawConvexCurvature -- convex edges/bulges only; concave regions read as 0 (black). */
+	Convex,
+
+	/** Mask = RawConcaveCurvature -- concave cavities/creases only; convex regions read as 0 (black). */
+	Concave,
+
+	/** Mask = max(RawConvexCurvature, RawConcaveCurvature) -- a union of the two INDEPENDENTLY
+	 *  accumulated magnitude arrays (see FVertexMaskForgeWorkingMesh::CurvatureRawConvexCache's own doc
+	 *  comment); convex and concave NEVER cancel each other out, since neither is ever computed as a
+	 *  single signed sum in the first place. Default. */
+	Both,
 };
 
 /**
@@ -572,6 +603,66 @@ struct FVertexMaskForgeWorkingMesh
 	 * RefreshSelection).
 	 */
 	FVertexMaskForgeScalarMask AmbientOcclusionMask;
+
+	/**
+	 * The Curvature slot's ENTRY-LEVEL mask -- and, UNLIKE AmbientOcclusionMask above, this DOES hold
+	 * the REAL, final Values/bHasValue directly usable by every component: Curvature is a pure function
+	 * of the asset's own local-space topology (see EVertexMaskForgeScalarMaskSource::Curvature's own
+	 * doc comment) with no per-component/per-transform variation, so there is no per-component
+	 * re-evaluation step for it in ApplyPreviewToEntry the way Bounding Box's World Space axes and
+	 * Ambient Occlusion require -- this entry-level result IS the per-component contribution, for every
+	 * tracked component of this entry. Populated by VertexMaskForgePanel::GenerateCurvatureMask
+	 * (render-vertex domain) or GenerateCurvatureMaskFromDynamicMesh (Source-Topology/Nanite domain),
+	 * exactly mirroring BoundingBoxMask's own domain split. Reset together with BoundingBoxMask/
+	 * AmbientOcclusionMask (parameter changes, RefreshSelection) -- see CurvatureRawConvexCache below for
+	 * what is DELIBERATELY NOT reset by a Curvature Type/Multiplier/Blur/Levels/Invert change.
+	 */
+	FVertexMaskForgeScalarMask CurvatureMask;
+
+	/**
+	 * AUDITED (Curvature CLASSIFICATION FIX): the EXPENSIVE, geometry-only half of Curvature generation,
+	 * cached separately from CurvatureMask.Values so that Curvature Type/Multiplier/Blur/Levels/Invert/
+	 * Opacity/Blend Mode changes -- all cheap, purely-downstream reprocessing -- never repeat the
+	 * adjacency/dihedral-angle analysis. Indexed by DYNAMIC MESH VERTEX ID (WorkingMesh.Mesh's own
+	 * domain -- the "source mesh vertex" a UV seam/hard edge's several render vertices/corners all
+	 * share).
+	 *
+	 * TWO SEPARATE non-negative magnitude arrays (Convex and Concave), NOT one signed scalar -- see
+	 * VertexMaskForgePanel::ComputeRawCurvatureMagnitudes' own doc comment for why a single signed sum
+	 * per vertex allowed positive and negative per-edge contributions to cancel BEFORE Curvature Type
+	 * ever saw them (the actual root cause of the Convex/Concave misclassification bug this fix
+	 * addresses), and for the exact algorithm/normalization. Both arrays share the SAME normalization
+	 * scale (computed once, together) and are both in [0, 1]. Empty until Curvature is generated at
+	 * least once for this entry.
+	 *
+	 * Valid ONLY when CurvatureCacheFingerprint == GeometryFingerprint (see that field's own doc
+	 * comment) -- compared, never assumed, every time Curvature is (re)generated; a mismatch (including
+	 * the initial 0/0 state on a freshly built WorkingMesh, which never matches a real, non-zero
+	 * GeometryFingerprint) forces a full recompute. A brand new FVertexMaskForgeWorkingMesh (built fresh
+	 * on every RefreshSelection) always starts with this empty and CurvatureCacheFingerprint at 0, so a
+	 * genuine geometry change is caught automatically, with no separate invalidation step needed.
+	 */
+	TArray<float> CurvatureRawConvexCache;
+	TArray<float> CurvatureRawConcaveCache;
+
+	/**
+	 * AUDITED (Curvature layer): render-vertex-domain correspondence cache, valid ONLY for a non-Source-
+	 * Topology (non-Nanite) entry -- maps each LOD0 render vertex index to the DYNAMIC MESH VERTEX ID
+	 * (CurvatureRawConvexCache/CurvatureRawConcaveCache's own domain) it was converted from, derived once
+	 * from WorkingMesh.TriIDMap + the source MeshDescription's own VertexInstance->Vertex/WedgeMap
+	 * correspondence (see VertexMaskForgePanel::ComputeCurvatureRenderVertexCorrespondence). This is what
+	 * makes a UV seam's several split render vertices all read the SAME cached curvature value, rather
+	 * than each being (mis)treated as topologically isolated. Rebuilt together with the raw caches (same
+	 * fingerprint check); empty and unused for a Source-Topology entry, which looks up the raw caches
+	 * directly by Dynamic Mesh Vertex ID per triangle corner instead (see
+	 * UpdateWorkingColorsSourceTopology).
+	 */
+	TArray<int32> CurvatureRenderVertexToDynamicMeshVertex;
+
+	/** GeometryFingerprint CurvatureRawConvexCache/CurvatureRawConcaveCache/
+	 *  CurvatureRenderVertexToDynamicMeshVertex were last built from -- see CurvatureRawConvexCache's own
+	 *  doc comment for the exact reuse/recompute rule. */
+	uint32 CurvatureCacheFingerprint = 0;
 };
 
 /**
@@ -1163,6 +1254,95 @@ private:
 	 *  ApplyAOLevelsAndInvert), but still invalidates/regenerates through the normal discrete-parameter
 	 *  path so the composed Preview picks up the new Values immediately. */
 	void OnAOLevelsChanged();
+
+	// --- Curvature Mask ----------------------------------------------------------------------
+	// A third, independent, optional composition-stack layer -- structurally a peer of Bounding Box
+	// and Ambient Occlusion (see EVertexMaskForgeScalarMaskSource::Curvature and ComposeMaskStack's own
+	// doc comment: "no fixed role", any future generator plugs in exactly the same way). UNLIKE Ambient
+	// Occlusion, Curvature never depends on a component's transform (see FVertexMaskForgeWorkingMesh::
+	// CurvatureMask's own doc comment) -- it is generated exactly once per entry, real values included,
+	// and every tracked component of that entry reuses the SAME entry-level result directly.
+
+	ECheckBoxState GetCurvatureEnableState() const { return bCurvatureEnabled ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; }
+
+	/** Same enable/disable contract as OnAOEnableChanged (see its own doc comment): turning OFF is
+	 *  always pure composition; turning ON reuses an already-Ready entry immediately (zero re-analysis)
+	 *  and only regenerates entries that genuinely need it, gated by Auto Update Preview like any other
+	 *  raw/geometric parameter. */
+	void OnCurvatureEnableChanged(ECheckBoxState NewState);
+
+	TSharedRef<SWidget> OnGenerateCurvatureTypeRow(TSharedPtr<EVertexMaskForgeCurvatureType> InOption) const;
+	void OnCurvatureTypeSelectionChanged(TSharedPtr<EVertexMaskForgeCurvatureType> NewSelection, ESelectInfo::Type SelectInfo);
+	FText GetCurvatureTypeButtonText() const;
+
+	TArray<TSharedPtr<EVertexMaskForgeCurvatureType>> CurvatureTypeOptions;
+	TSharedPtr<SComboBox<TSharedPtr<EVertexMaskForgeCurvatureType>>> CurvatureTypeComboBox;
+
+	/** Convex/Concave/Both -- see EVertexMaskForgeCurvatureType. Default Both (per explicit requirement):
+	 *  convex and concave regions both show, without cancelling each other out. */
+	EVertexMaskForgeCurvatureType CurvatureType = EVertexMaskForgeCurvatureType::Both;
+
+	/** UI range [0, 10], default 1.0, clamped again in ApplyCurvatureArtisticParams to >= 0. Scales the
+	 *  Type-extracted magnitude BEFORE Blur/Levels -- 0 removes the layer's contribution entirely, 1 is
+	 *  the original analyzed intensity, >1 amplifies it. Never Opacity's role (see OnCurvatureParamChanged). */
+	float CurvatureMultiplier = 1.0f;
+
+	/** UI range [0, 10], default 0.0 (no blur). Integer part = full topological-averaging iterations;
+	 *  fractional part = a further lerp toward one more iteration -- see
+	 *  VertexMaskForgePanel::ApplyTopologicalCurvatureBlur for the exact algorithm. Purely a downstream
+	 *  reprocessing of the cached raw magnitudes; never re-derives adjacency/dihedral angles. */
+	float CurvatureBlur = 0.0f;
+
+	/** Same semantics as AOLevelsMin, applied to the Type/Multiplier/Blur result (see
+	 *  VertexMaskForgePanel::ApplyCurvatureLevels) -- UI range [0, 1], default 0.0. Purely compositional;
+	 *  see OnCurvatureParamChanged. */
+	float CurvatureLevelsMin = 0.0f;
+
+	/** Same semantics as AOLevelsMax -- UI range [0, 1], default 1.0. */
+	float CurvatureLevelsMax = 1.0f;
+
+	ECheckBoxState GetCurvatureInvertState() const { return bCurvatureInvert ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; }
+
+	/** Applied LAST, after Levels Min/Max, over the already-leveled [0,1] result (Mask = 1 - Mask) --
+	 *  see OnCurvatureParamChanged's own doc comment for the exact pipeline order. Same treatment as
+	 *  OnAOInvertChanged: never touches the cached raw Convex/Concave magnitudes, purely compositional,
+	 *  routed through the same shared OnCurvatureParamChanged reprocess. Default false. */
+	void OnCurvatureInvertChanged(ECheckBoxState NewState);
+
+	bool bCurvatureInvert = false;
+
+	/**
+	 * Shared handler for Curvature Type / Multiplier / Blur / Levels Min / Levels Max / Invert: ALL of
+	 * these are cheap, PURELY DOWNSTREAM reprocessing of the already-cached raw Convex/Concave magnitude
+	 * arrays (see FVertexMaskForgeWorkingMesh::CurvatureRawConvexCache's own doc comment) -- none of
+	 * them ever re-run the adjacency/dihedral-angle analysis or touch GeometryFingerprint, so (unlike
+	 * Bounding Box axis parameters or AO Samples/Max Distance/Bias) this is UNCONDITIONAL and immediate,
+	 * never gated by Auto Update Preview, exactly like OnAOInvertChanged/OnAOLevelsChanged. Regenerates
+	 * every SelectedMeshes entry's CurvatureMask directly from its cached raw magnitudes (entry-level,
+	 * real values -- see FVertexMaskForgeWorkingMesh::CurvatureMask), then recomposes. Pipeline order:
+	 * raw Convex/Concave -> Curvature Type -> Multiplier -> Blur -> Levels Min/Max -> Invert -> (Opacity
+	 * + Blend Mode, applied downstream by ComposeMaskStack, unchanged).
+	 */
+	void OnCurvatureParamChanged();
+
+	TSharedRef<SWidget> OnGenerateCurvatureBlendModeRow(TSharedPtr<EVertexMaskForgeBlendMode> InOption) const;
+	void OnCurvatureBlendModeSelectionChanged(TSharedPtr<EVertexMaskForgeBlendMode> NewSelection, ESelectInfo::Type SelectInfo);
+	FText GetCurvatureBlendModeButtonText() const;
+	TSharedPtr<SComboBox<TSharedPtr<EVertexMaskForgeBlendMode>>> CurvatureBlendModeComboBox;
+
+	/** Same contract/range as BoundingBoxBlendMode/AOBlendMode. Default Copy -- preserves this tool's
+	 *  established "every new layer defaults to Copy" convention (BoundingBoxBlendMode and AOBlendMode
+	 *  both default to Copy; Add was considered but rejected specifically to keep that convention
+	 *  consistent -- see the Curvature implementation report). */
+	EVertexMaskForgeBlendMode CurvatureBlendMode = EVertexMaskForgeBlendMode::Copy;
+
+	/** Same contract/range/default as BoundingBoxOpacity/AOOpacity, independent of them. Applied ONLY
+	 *  during final composition (ComposeMaskStack), never to CurvatureMask.Values itself -- Opacity 0
+	 *  leaves the layer with no influence without erasing what Bounding Box/Ambient Occlusion already
+	 *  produced (same contract every existing layer's Opacity already has). */
+	float CurvatureOpacity = 1.0f;
+
+	bool bCurvatureEnabled = false;
 
 	// --- Fill White / Fill Black utility masks ----------------------------------------------
 

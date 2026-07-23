@@ -32,6 +32,7 @@
 #include "TimerManager.h"
 #include "UObject/Package.h"
 #include "UObject/UObjectGlobals.h"
+#include "VectorUtil.h"
 #include "SPrimaryButton.h"
 #include "Styling/CoreStyle.h"
 #include "Widgets/Input/SButton.h"
@@ -41,6 +42,7 @@
 #include "Widgets/Input/SSpinBox.h"
 #include "Widgets/Layout/SBorder.h"
 #include "Widgets/Layout/SExpandableArea.h"
+#include "Widgets/Layout/SScrollBox.h"
 #include "Widgets/Layout/SSeparator.h"
 #include "Widgets/SBoxPanel.h"
 #include "Widgets/Text/STextBlock.h"
@@ -1679,6 +1681,687 @@ namespace VertexMaskForgePanel
 		return bInvert ? (1.0f - LeveledAO) : LeveledAO;
 	}
 
+	// --- Curvature: topology-based signed curvature analysis + artistic post-processing ------------
+
+	/**
+	 * AUDITED (Curvature CLASSIFICATION FIX -- root cause): finds which of TriangleID's own three
+	 * winding-ordered edges (Mesh.GetTriEdges: slot 0 = Tri[0]->Tri[1], slot 1 = Tri[1]->Tri[2], slot 2
+	 * = Tri[2]->Tri[0] -- confirmed against FDynamicMesh3::AddTriangleInternal/AddTriangleEdge in the
+	 * engine source, not assumed) matches EdgeID, and returns that edge's two vertex IDs in THAT
+	 * triangle's own winding order (Tri[i] -> Tri[(i+1)%3]).
+	 *
+	 * This is the fix for the actual root cause of the Convex/Concave misclassification bug:
+	 * FDynamicMesh3::GetEdgeV() returns FEdge::Vert, which FDynamicMesh3::ReplaceEdgeVertex() stores as
+	 * FMath::Min(a,b)/FMath::Max(a,b) -- i.e. MIN/MAX-VERTEX-ID-SORTED, not oriented by any triangle's
+	 * winding (the engine's own doc comment on GetEdgeV even implies this, contrasting it with the
+	 * separate GetOrientedBoundaryEdgeV() -- "oriented based on attached triangle (rather than
+	 * min-sorted)", which unfortunately only covers BOUNDARY edges, not the interior edges Curvature
+	 * needs). The previous implementation used GetEdgeV()'s raw, non-oriented order directly as
+	 * EdgeDir, with NO relationship to which triangle was reported as EdgeT.A/EdgeT.B (also an
+	 * unspecified internal storage order) -- so for two geometrically-identical folds (e.g. two convex
+	 * bevel edges on the same mesh), the computed dihedral sign could come out differently, purely
+	 * depending on unrelated internal ID/insertion-order accidents, not on the actual geometry. This
+	 * exactly explains the reported symptom: Convex worked on SOME bevels and not others, Concave was
+	 * broken, and Both (abs of an already-inconsistently-signed value) showed extra/wrong detail.
+	 *
+	 * Confirmed against the engine's own established pattern for this exact problem:
+	 * GeometryCore/Private/Tessellation/Regularization.cpp (edge-flip decision code) explicitly
+	 * re-derives edge direction from Mesh.GetTriangle(Edge.Tri[0]) and the edge's position within that
+	 * triangle's winding, rather than trusting Edge.Vert's raw order -- the same technique used here.
+	 */
+	static UE::Geometry::FIndex2i GetTriangleOrientedEdgeVertices(const UE::Geometry::FDynamicMesh3& Mesh, const int32 TriangleID, const int32 EdgeID)
+	{
+		using namespace UE::Geometry;
+		const FIndex3i TriVerts = Mesh.GetTriangle(TriangleID);
+		const FIndex3i TriEdges = Mesh.GetTriEdges(TriangleID);
+		if (TriEdges.A == EdgeID)
+		{
+			return FIndex2i(TriVerts.A, TriVerts.B);
+		}
+		if (TriEdges.B == EdgeID)
+		{
+			return FIndex2i(TriVerts.B, TriVerts.C);
+		}
+		// TriEdges.C == EdgeID, by construction (this function is only ever called with an EdgeID
+		// already confirmed to belong to TriangleID via Mesh.GetEdgeT).
+		return FIndex2i(TriVerts.C, TriVerts.A);
+	}
+
+	/** Per-vertex raw curvature magnitudes -- see ComputeRawCurvatureMagnitudes' own doc comment. Both
+	 *  arrays are non-negative, sized Mesh.MaxVertexID(), and share the SAME normalization scale (see
+	 *  that function for why a single, combined scale is used rather than two independent ones). */
+	struct FVertexMaskForgeCurvatureRawResult
+	{
+		TArray<float> ConvexMagnitude;
+		TArray<float> ConcaveMagnitude;
+	};
+
+	/**
+	 * AUDITED (Curvature CLASSIFICATION FIX): the expensive, GEOMETRY-ONLY analysis half of Curvature
+	 * generation -- computes discrete Convex/Concave curvature MAGNITUDES per Dynamic Mesh Vertex ID,
+	 * using ONLY the mesh's own topological adjacency (edges/triangles), never spatial proximity, never
+	 * a component transform, never Preview Mode/material state.
+	 *
+	 * ROOT-CAUSE FIX (per the explicit diagnostic requirement -- see GetTriangleOrientedEdgeVertices'
+	 * own doc comment for the orientation half of the fix, and the "no signed cancellation" note below
+	 * for the other half):
+	 *   1. ORIENTATION: EdgeDir is now derived from T0's (EdgeT.A's) own triangle winding
+	 *      (GetTriangleOrientedEdgeVertices), NEVER from GetEdgeV()'s raw min/max-sorted order. This
+	 *      guarantees the standard invariance property (verified both empirically -- see the temporary
+	 *      automation test run for this fix -- and algebraically): swapping which triangle is used as
+	 *      reference (T0<->T1, i.e. N0<->N1) walks the shared edge in the OPPOSITE winding direction on
+	 *      a consistently-wound (orientable) manifold mesh, which flips EdgeDir too, leaving the
+	 *      resulting signed angle IDENTICAL either way -- cross(N1,N0)=-cross(N0,N1) combined with
+	 *      EdgeDir->-EdgeDir cancels the two sign flips. Uses the engine's own audited
+	 *      VectorUtil::OrientedDihedralAngle(N0, N1, EdgeDir) -- confirmed via source read to compute
+	 *      exactly atan2(Edge.(N0^N1), N0.N1) -- rather than reimplementing atan2 by hand.
+	 *   2. NO SIGNED CANCELLATION AT THE VERTEX (the "Both shows extra/wrong detail" root cause): each
+	 *      edge's signed contribution is classified as Convex or Concave THIS EDGE, individually, BEFORE
+	 *      being added to its two endpoints -- accumulated into TWO SEPARATE per-vertex sums
+	 *      (ConvexSum/ConcaveSum), never into one signed scalar that a later abs()/max(x,0) would have
+	 *      to un-mix. A vertex on a bevel that has both a slightly-convex and a slightly-concave
+	 *      incident edge (e.g. an irregular triangulation) now correctly shows SOME of both, rather than
+	 *      the two silently netting out to near-zero (or worse, flipping sign) before Convex/Concave
+	 *      ever get to see them.
+	 *
+	 * Per-edge contribution = OrientedDihedralAngle * EdgeLength (edge-length weighting, unchanged from
+	 * before -- a standard, legitimate discrete weighting; see this function's own doc note on why
+	 * triangle-COUNT alone is not the driver of the result). Each of ConvexSum/ConcaveSum is then
+	 * divided by max(VertexAreaSum, Epsilon) (1/3 the summed area of the vertex's own incident
+	 * triangles, the standard mixed-Voronoi-area approximation, computed in a single separate pass over
+	 * TriangleIndicesItr()) -- this normalizes out local triangle DENSITY, so a denser tessellation of
+	 * the same physical surface produces a comparable value rather than one that scales with triangle
+	 * count.
+	 *
+	 * BOUNDARY EDGES: an edge with only ONE adjacent triangle (Mesh.IsBoundaryEdge) contributes NOTHING
+	 * to either endpoint -- there is no second face to form a dihedral angle with, and inventing one
+	 * would fabricate a false halo along open boundaries.
+	 *
+	 * DEGENERATE TRIANGLES: a triangle whose GetTriNormal() result fails to reach unit length
+	 * (SizeSquared() below a small epsilon -- zero-area/degenerate) is treated as absent for BOTH the
+	 * dihedral term of any edge bordering it AND its own area contribution; this can never produce
+	 * NaN/Inf, since an invalid normal is detected and skipped before it enters any dot/cross product.
+	 *
+	 * NON-MANIFOLD EDGES / MULTIPLE ISLANDS: FMeshDescriptionToDynamicMesh::Convert already resolves
+	 * non-manifold edges by splitting them into separate manifold vertices during conversion, so
+	 * FDynamicMesh3's own edge API (GetEdgeT, at most 2 triangles) already reflects manifold-safe
+	 * topology by the time this function runs. Multiple disconnected islands never interact: every
+	 * accumulation here is strictly local (a vertex's own incident edges/triangles only) -- no
+	 * spatial/global step, no position-based matching anywhere in this function.
+	 *
+	 * ISOLATED VERTICES: a vertex with zero incident triangles gets VertexAreaSum 0, guarded by the
+	 * Epsilon-clamped denominator -- curvature 0 in both arrays, never a division by zero.
+	 *
+	 * GLOBAL ROBUST NORMALIZATION (explicit requirement -- avoid a single outlier dominating the whole
+	 * mesh's contrast): both ConvexSum and ConcaveSum carry units of 1/length and scale with the asset's
+	 * own physical size, so they are normalized here by dividing by the 90th PERCENTILE of the COMBINED,
+	 * UNION distribution of non-zero |ConvexSum| and |ConcaveSum| magnitudes across the whole mesh
+	 * (chosen over the maximum so a single spiky vertex cannot compress the mesh's contrast toward
+	 * zero), then clamped to [0, 1]. AUDITED (explicit "document the choice" requirement): a SINGLE,
+	 * SHARED scale is used for both arrays -- deliberately NOT two independent percentiles -- so that a
+	 * mesh with (for example) much stronger convex bevels than concave grooves still shows the concave
+	 * detail at its true RELATIVE intensity rather than being independently re-stretched to look equally
+	 * strong; this also means enabling/disabling Concave detail can never rescale Convex's own values or
+	 * vice versa, since the shared scale is computed once from BOTH arrays together, not recomputed per
+	 * Curvature Type selection (Curvature Type is purely a downstream selector -- see
+	 * ApplyCurvatureArtisticParams -- and never touches this cache). With fewer than 8 combined non-zero
+	 * samples (a near-flat or tiny mesh), the scale defaults to 1.0 (no amplification).
+	 */
+	static FVertexMaskForgeCurvatureRawResult ComputeRawCurvatureMagnitudes(const UE::Geometry::FDynamicMesh3& Mesh)
+	{
+		using namespace UE::Geometry;
+
+		const int32 MaxVID = Mesh.MaxVertexID();
+		TArray<float> ConvexSum, ConcaveSum, AreaSum;
+		ConvexSum.SetNumZeroed(MaxVID);
+		ConcaveSum.SetNumZeroed(MaxVID);
+		AreaSum.SetNumZeroed(MaxVID);
+
+		constexpr double NormalEpsilonSq = 1e-12;
+		constexpr double AngleEpsilon = 1e-6; // radians; below this, treat the fold as flat (neither sign).
+
+		// Pass 1: per-vertex mixed-area accumulation, one pass over triangles.
+		for (const int32 TriangleID : Mesh.TriangleIndicesItr())
+		{
+			const double Area = Mesh.GetTriArea(TriangleID);
+			if (!FMath::IsFinite(Area) || Area <= 0.0)
+			{
+				continue;
+			}
+			const FIndex3i Tri = Mesh.GetTriangle(TriangleID);
+			const float AreaThird = static_cast<float>(Area / 3.0);
+			AreaSum[Tri.A] += AreaThird;
+			AreaSum[Tri.B] += AreaThird;
+			AreaSum[Tri.C] += AreaThird;
+		}
+
+		// Pass 2: per-edge ORIENTED signed dihedral angle, classified Convex/Concave BEFORE
+		// accumulation -- see this function's own doc comment for both halves of the fix.
+		for (const int32 EdgeID : Mesh.EdgeIndicesItr())
+		{
+			if (Mesh.IsBoundaryEdge(EdgeID))
+			{
+				continue;
+			}
+			const FIndex2i EdgeT = Mesh.GetEdgeT(EdgeID);
+			if (EdgeT.A == IndexConstants::InvalidID || EdgeT.B == IndexConstants::InvalidID)
+			{
+				continue;
+			}
+
+			const FVector3d N0 = Mesh.GetTriNormal(EdgeT.A);
+			const FVector3d N1 = Mesh.GetTriNormal(EdgeT.B);
+			if (N0.SquaredLength() < NormalEpsilonSq || N1.SquaredLength() < NormalEpsilonSq)
+			{
+				// One (or both) adjacent triangle is degenerate -- no valid dihedral term.
+				continue;
+			}
+
+			// AUDITED (root-cause fix): oriented by T0's (EdgeT.A's) own winding -- never GetEdgeV()'s
+			// raw min/max-sorted order. See GetTriangleOrientedEdgeVertices' own doc comment.
+			const FIndex2i OrientedEdgeV = GetTriangleOrientedEdgeVertices(Mesh, EdgeT.A, EdgeID);
+			FVector3d EdgeDir = Mesh.GetVertex(OrientedEdgeV.B) - Mesh.GetVertex(OrientedEdgeV.A);
+			const double EdgeLength = EdgeDir.Length();
+			if (!FMath::IsFinite(EdgeLength) || EdgeLength < UE_DOUBLE_KINDA_SMALL_NUMBER)
+			{
+				continue;
+			}
+			EdgeDir /= EdgeLength;
+
+			const double SignedDihedral = VectorUtil::OrientedDihedralAngle(N0, N1, EdgeDir);
+			if (!FMath::IsFinite(SignedDihedral))
+			{
+				continue;
+			}
+
+			const double SignedContribution = SignedDihedral * EdgeLength;
+			if (SignedContribution > AngleEpsilon)
+			{
+				const float Value = static_cast<float>(SignedContribution);
+				ConvexSum[OrientedEdgeV.A] += Value;
+				ConvexSum[OrientedEdgeV.B] += Value;
+			}
+			else if (SignedContribution < -AngleEpsilon)
+			{
+				const float Value = static_cast<float>(-SignedContribution);
+				ConcaveSum[OrientedEdgeV.A] += Value;
+				ConcaveSum[OrientedEdgeV.B] += Value;
+			}
+			// else: within epsilon of flat -- contributes to neither.
+		}
+
+		constexpr float AreaEpsilon = 1e-8f;
+		FVertexMaskForgeCurvatureRawResult Result;
+		Result.ConvexMagnitude.SetNumZeroed(MaxVID);
+		Result.ConcaveMagnitude.SetNumZeroed(MaxVID);
+		TArray<float> CombinedNonZeroMagnitudes;
+		CombinedNonZeroMagnitudes.Reserve(MaxVID * 2);
+
+		for (const int32 VertexID : Mesh.VertexIndicesItr())
+		{
+			const float SafeArea = FMath::Max(AreaSum[VertexID], AreaEpsilon);
+			const float ConvexValue = ConvexSum[VertexID] / SafeArea;
+			const float ConcaveValue = ConcaveSum[VertexID] / SafeArea;
+			const float SafeConvex = FMath::IsFinite(ConvexValue) ? ConvexValue : 0.0f;
+			const float SafeConcave = FMath::IsFinite(ConcaveValue) ? ConcaveValue : 0.0f;
+			Result.ConvexMagnitude[VertexID] = SafeConvex;
+			Result.ConcaveMagnitude[VertexID] = SafeConcave;
+			if (!FMath::IsNearlyZero(SafeConvex))
+			{
+				CombinedNonZeroMagnitudes.Add(SafeConvex);
+			}
+			if (!FMath::IsNearlyZero(SafeConcave))
+			{
+				CombinedNonZeroMagnitudes.Add(SafeConcave);
+			}
+		}
+
+		float NormalizationScale = 1.0f;
+		if (CombinedNonZeroMagnitudes.Num() >= 8)
+		{
+			CombinedNonZeroMagnitudes.Sort();
+			const int32 PercentileIndex = FMath::Clamp(
+				FMath::RoundToInt(0.90f * static_cast<float>(CombinedNonZeroMagnitudes.Num() - 1)),
+				0, CombinedNonZeroMagnitudes.Num() - 1);
+			const float PercentileValue = CombinedNonZeroMagnitudes[PercentileIndex];
+			if (PercentileValue > UE_KINDA_SMALL_NUMBER)
+			{
+				NormalizationScale = PercentileValue;
+			}
+		}
+
+		for (const int32 VertexID : Mesh.VertexIndicesItr())
+		{
+			Result.ConvexMagnitude[VertexID] = FMath::Clamp(Result.ConvexMagnitude[VertexID] / NormalizationScale, 0.0f, 1.0f);
+			Result.ConcaveMagnitude[VertexID] = FMath::Clamp(Result.ConcaveMagnitude[VertexID] / NormalizationScale, 0.0f, 1.0f);
+		}
+
+		return Result;
+	}
+
+	/**
+	 * AUDITED (Curvature layer): builds the render-vertex correspondence used ONLY for a non-Source-
+	 * Topology (non-Nanite) entry -- maps each LOD0 render vertex index to the DYNAMIC MESH VERTEX ID
+	 * (ComputeRawCurvatureMagnitudes' own domain) it corresponds to, so that a UV seam's several split
+	 * render vertices all read the SAME curvature value (the explicit "propagate to vertex instances"
+	 * requirement), rather than each being treated as a topologically isolated point.
+	 *
+	 * Derived from the SAME TriIDMap + WedgeMap correspondence already audited and relied upon by
+	 * ReconstructOmittedColorOverlay/WriteAcceptTargets -- never position-matching. For each Dynamic
+	 * Mesh triangle: SourceTriangleID = TriIDMap[TriangleID]; its 3 source VertexInstanceIDs give, via
+	 * the SAME ordinal-position WedgeMap lookup WriteAcceptTargets uses (VertexInstances().GetElementIDs()
+	 * enumerated in order, LOD0.WedgeMap[ordinal] = render vertex index), the 3 render vertex indices
+	 * that correspond -- in the SAME corner order -- to the Dynamic Mesh triangle's own 3 VertexIDs
+	 * (Mesh.GetTriangle(TriangleID)). A render vertex that never receives an assignment (WedgeMap
+	 * INDEX_NONE, or genuinely absent from the wedge) is left at INDEX_NONE; callers must check for it.
+	 */
+	static TArray<int32> ComputeCurvatureRenderVertexCorrespondence(
+		const UE::Geometry::FDynamicMesh3& Mesh,
+		const TArray<FTriangleID>& TriIDMap,
+		const FMeshDescription& MeshDescription,
+		const FStaticMeshLODResources& LOD0)
+	{
+		using namespace UE::Geometry;
+
+		const int32 NumRenderVerts = static_cast<int32>(LOD0.VertexBuffers.PositionVertexBuffer.GetNumVertices());
+		TArray<int32> Correspondence;
+		Correspondence.Init(INDEX_NONE, NumRenderVerts);
+
+		if (LOD0.WedgeMap.Num() != MeshDescription.VertexInstances().Num())
+		{
+			// Same "never approximate" discipline as WriteAcceptTargets -- a stale/mismatched WedgeMap
+			// yields an all-INDEX_NONE correspondence rather than a guessed one; callers treat every
+			// render vertex as unmapped (falls back to 0.0f via TryGetValue's own bHasValue gate).
+			return Correspondence;
+		}
+
+		TMap<int32, int32> VertexInstanceToRenderIndex;
+		VertexInstanceToRenderIndex.Reserve(MeshDescription.VertexInstances().Num());
+		int32 Ordinal = 0;
+		for (const FVertexInstanceID InstanceID : MeshDescription.VertexInstances().GetElementIDs())
+		{
+			const int32 RenderIndex = LOD0.WedgeMap[Ordinal];
+			if (RenderIndex != INDEX_NONE)
+			{
+				VertexInstanceToRenderIndex.Add(InstanceID.GetValue(), RenderIndex);
+			}
+			++Ordinal;
+		}
+
+		for (const int32 TriangleID : Mesh.TriangleIndicesItr())
+		{
+			if (!TriIDMap.IsValidIndex(TriangleID))
+			{
+				continue;
+			}
+			const FTriangleID SourceTriangleID = TriIDMap[TriangleID];
+			if (!MeshDescription.IsTriangleValid(SourceTriangleID))
+			{
+				continue;
+			}
+			const TArrayView<const FVertexInstanceID> SourceInstances = MeshDescription.GetTriangleVertexInstances(SourceTriangleID);
+			if (SourceInstances.Num() != 3)
+			{
+				continue;
+			}
+			const FIndex3i DynamicTri = Mesh.GetTriangle(TriangleID);
+			for (int32 Corner = 0; Corner < 3; ++Corner)
+			{
+				if (const int32* RenderIndex = VertexInstanceToRenderIndex.Find(SourceInstances[Corner].GetValue()))
+				{
+					if (Correspondence.IsValidIndex(*RenderIndex))
+					{
+						Correspondence[*RenderIndex] = DynamicTri[Corner];
+					}
+				}
+			}
+		}
+
+		return Correspondence;
+	}
+
+	/**
+	 * AUDITED (Curvature CLASSIFICATION FIX): guarantees WorkingMesh.CurvatureRawConvexCache/
+	 * CurvatureRawConcaveCache/CurvatureRenderVertexToDynamicMeshVertex are valid for WorkingMesh.Mesh's
+	 * CURRENT geometry -- the ONE place the expensive analysis (ComputeRawCurvatureMagnitudes) and the
+	 * render-vertex correspondence (ComputeCurvatureRenderVertexCorrespondence) are ever invoked. Reuses
+	 * both verbatim whenever CurvatureCacheFingerprint already matches WorkingMesh.GeometryFingerprint
+	 * (see that field's own doc comment) -- Curvature Type/Multiplier/Blur/Levels/Invert/Opacity/Blend
+	 * Mode changes never reach this function at all (see OnCurvatureParamChanged, which calls the cheap
+	 * ApplyCurvatureArtisticParams path directly), so this only ever runs again after a genuine geometry
+	 * change (RefreshSelection building a new WorkingMesh, whose fingerprint differs by construction).
+	 * MeshDescription/LOD0 are optional -- omitted (nullptr) for a Source-Topology entry, which has no
+	 * use for the render-vertex correspondence at all.
+	 */
+	static void EnsureCurvatureRawCache(
+		FVertexMaskForgeWorkingMesh& WorkingMesh,
+		const FMeshDescription* MeshDescriptionForCorrespondence,
+		const FStaticMeshLODResources* LOD0ForCorrespondence)
+	{
+		if (!WorkingMesh.Mesh.IsValid())
+		{
+			return;
+		}
+		if (WorkingMesh.CurvatureCacheFingerprint == WorkingMesh.GeometryFingerprint
+			&& !WorkingMesh.CurvatureRawConvexCache.IsEmpty())
+		{
+			return;
+		}
+
+		FVertexMaskForgeCurvatureRawResult RawResult = ComputeRawCurvatureMagnitudes(*WorkingMesh.Mesh);
+		WorkingMesh.CurvatureRawConvexCache = MoveTemp(RawResult.ConvexMagnitude);
+		WorkingMesh.CurvatureRawConcaveCache = MoveTemp(RawResult.ConcaveMagnitude);
+
+		if (MeshDescriptionForCorrespondence && LOD0ForCorrespondence)
+		{
+			WorkingMesh.CurvatureRenderVertexToDynamicMeshVertex = ComputeCurvatureRenderVertexCorrespondence(
+				*WorkingMesh.Mesh, WorkingMesh.TriIDMap, *MeshDescriptionForCorrespondence, *LOD0ForCorrespondence);
+		}
+		else
+		{
+			WorkingMesh.CurvatureRenderVertexToDynamicMeshVertex.Reset();
+		}
+
+		WorkingMesh.CurvatureCacheFingerprint = WorkingMesh.GeometryFingerprint;
+
+		UE_LOG(LogVertexMaskForge, Log,
+			TEXT("Vertex Mask Forge: Curvature raw analysis computed (%d vertices)."),
+			WorkingMesh.CurvatureRawConvexCache.Num());
+	}
+
+	/**
+	 * AUDITED (Curvature layer): topological blur -- diffuses Input (already in [0, 1], Dynamic Mesh
+	 * Vertex domain) over the mesh's own one-ring vertex adjacency (Mesh.VtxVerticesItr), NEVER by
+	 * spatial distance. Double-buffered per iteration (reads only from the PREVIOUS iteration's buffer,
+	 * writes only to the next -- never mutates in place while still being read, so results never depend
+	 * on vertex enumeration order). Each iteration: NewValue[v] = mean of {Value[v]} UNION {Value[n] for
+	 * n in v's one-ring neighbors} -- an unweighted average that includes the vertex's own current value,
+	 * which is what keeps a boundary/low-valence vertex (fewer neighbors) from darkening artificially:
+	 * it is never diluted by a fabricated zero/missing neighbor, only ever averaged with values that
+	 * genuinely exist. A vertex with zero neighbors (isolated) is simply left unchanged.
+	 *
+	 * BlurAmount's integer part is the number of FULL iterations; the fractional part lerps the last
+	 * pre-final-iteration buffer toward one more iteration (BlurAmount 2.5 = 2 full iterations, then
+	 * lerp 50% toward a 3rd) -- matches the exact "0.0 sem blur; 1.0 uma iteração; 2.5 duas iterações
+	 * completas e 50% da terceira" contract. BlurAmount <= 0 returns Input verbatim (copied), no
+	 * allocation churn beyond the one copy. Every value stays in [0, 1] throughout: an average of
+	 * numbers already in [0, 1] cannot leave that range.
+	 */
+	static TArray<float> ApplyTopologicalCurvatureBlur(
+		const UE::Geometry::FDynamicMesh3& Mesh,
+		const TArray<float>& Input,
+		const float BlurAmount)
+	{
+		if (BlurAmount <= 0.0f || Input.IsEmpty())
+		{
+			return Input;
+		}
+
+		const int32 FullIterations = FMath::FloorToInt32(BlurAmount);
+		const float FractionalIteration = BlurAmount - static_cast<float>(FullIterations);
+
+		auto RunOneIteration = [&Mesh](const TArray<float>& Src) -> TArray<float>
+		{
+			TArray<float> Dst = Src;
+			for (const int32 VertexID : Mesh.VertexIndicesItr())
+			{
+				float Sum = Src[VertexID];
+				int32 Count = 1;
+				for (const int32 NeighborID : Mesh.VtxVerticesItr(VertexID))
+				{
+					if (Src.IsValidIndex(NeighborID))
+					{
+						Sum += Src[NeighborID];
+						++Count;
+					}
+				}
+				Dst[VertexID] = Sum / static_cast<float>(Count);
+			}
+			return Dst;
+		};
+
+		TArray<float> Current = Input;
+		for (int32 Iter = 0; Iter < FullIterations; ++Iter)
+		{
+			Current = RunOneIteration(Current);
+		}
+
+		if (FractionalIteration > UE_KINDA_SMALL_NUMBER)
+		{
+			TArray<float> OneMore = RunOneIteration(Current);
+			for (int32 i = 0; i < Current.Num(); ++i)
+			{
+				Current[i] = FMath::Lerp(Current[i], OneMore[i], FractionalIteration);
+			}
+		}
+
+		return Current;
+	}
+
+	/**
+	 * AUDITED (Curvature layer): Levels Min/Max remap, same epsilon-safe-denominator/clamp contract as
+	 * ApplyAOLevelsAndInvert (see its own doc comment for the DIVIDE-BY-ZERO/NaN safety rationale --
+	 * LevelsMax <= LevelsMin degenerates to a deterministic hard step, never NaN/Inf) -- deliberately a
+	 * SEPARATE, smaller function rather than reusing ApplyAOLevelsAndInvert itself, since that function's
+	 * BaseAO = 1 - RawAO vanilla-inversion step and its trailing user Invert are AO-specific conventions
+	 * that do not apply to Curvature (Curvature has no Invert control at all, per the explicit
+	 * requirement) -- reusing it here would either silently invert Curvature or require threading a
+	 * meaningless bInvert=false through every call site. AO's own Levels behavior is untouched.
+	 */
+	static float ApplyCurvatureLevels(const float Value, const float LevelsMin, const float LevelsMax)
+	{
+		constexpr float Epsilon = 1e-4f;
+		const float Denom = FMath::Max(LevelsMax - LevelsMin, Epsilon);
+		return FMath::Clamp((Value - LevelsMin) / Denom, 0.0f, 1.0f);
+	}
+
+	/**
+	 * AUDITED (Curvature CLASSIFICATION FIX): the CHEAP, purely-downstream half of Curvature generation
+	 * -- turns the cached, normalized Convex/Concave magnitude arrays (RawConvex/RawConcave, Dynamic
+	 * Mesh Vertex domain, both already in [0, 1] -- see ComputeRawCurvatureMagnitudes) into the final
+	 * [0, 1] mask value for the SAME domain, via the exact pipeline order specified: Curvature Type ->
+	 * Multiplier -> Blur -> Levels -> Invert. Never touches mesh topology/adjacency/normals -- Type is a
+	 * per-element SELECTION (no arithmetic that could re-mix Convex and Concave), Multiplier a
+	 * per-element scale+clamp, Blur a topological diffusion over the ALREADY-Type/Multiplier-processed
+	 * array (reusing Mesh only for its adjacency, not recomputing anything geometric), Levels a
+	 * per-element remap, Invert a final per-element `1 - x`. Called by BOTH GenerateCurvatureMask
+	 * (render-vertex domain caller then re-indexes this Dynamic-Mesh-Vertex-domain result via the
+	 * correspondence cache) and GenerateCurvatureMaskFromDynamicMesh (uses this result directly).
+	 *
+	 * AUDITED (root-cause fix, "no cancellation" half): Type no longer computes max(Signed,0)/
+	 * max(-Signed,0)/abs(Signed) on a single already-summed signed value (the source of the reported
+	 * cancellation bug) -- it now SELECTS between the two independently-accumulated, never-mixed
+	 * RawConvex/RawConcave arrays. Both = max(RawConvex[i], RawConcave[i]) -- a union that can never
+	 * exceed 1 (both inputs are already clamped to [0,1] by the shared normalization) and never lets one
+	 * side's magnitude subtract from or cancel the other's, matching the explicit "Both deve ser
+	 * exatamente a união visual dos dois" requirement.
+	 */
+	static TArray<float> ApplyCurvatureArtisticParams(
+		const UE::Geometry::FDynamicMesh3& Mesh,
+		const TArray<float>& RawConvex,
+		const TArray<float>& RawConcave,
+		const EVertexMaskForgeCurvatureType Type,
+		const float Multiplier,
+		const float Blur,
+		const float LevelsMin,
+		const float LevelsMax,
+		const bool bInvert)
+	{
+		const float ClampedMultiplier = FMath::Max(Multiplier, 0.0f);
+		const float ClampedBlur = FMath::Clamp(Blur, 0.0f, 10.0f);
+		const float ClampedLevelsMin = FMath::Clamp(LevelsMin, 0.0f, 1.0f);
+		const float ClampedLevelsMax = FMath::Clamp(LevelsMax, 0.0f, 1.0f);
+
+		TArray<float> TypeAndMultiplied;
+		TypeAndMultiplied.SetNumUninitialized(RawConvex.Num());
+		for (int32 i = 0; i < RawConvex.Num(); ++i)
+		{
+			float Magnitude;
+			switch (Type)
+			{
+			case EVertexMaskForgeCurvatureType::Convex:
+				Magnitude = RawConvex[i];
+				break;
+			case EVertexMaskForgeCurvatureType::Concave:
+				Magnitude = RawConcave[i];
+				break;
+			case EVertexMaskForgeCurvatureType::Both:
+			default:
+				Magnitude = FMath::Max(RawConvex[i], RawConcave[i]);
+				break;
+			}
+			TypeAndMultiplied[i] = FMath::Clamp(Magnitude * ClampedMultiplier, 0.0f, 1.0f);
+		}
+
+		TArray<float> Blurred = ApplyTopologicalCurvatureBlur(Mesh, TypeAndMultiplied, ClampedBlur);
+
+		TArray<float> Result;
+		Result.SetNumUninitialized(Blurred.Num());
+		for (int32 i = 0; i < Blurred.Num(); ++i)
+		{
+			const float Leveled = ApplyCurvatureLevels(Blurred[i], ClampedLevelsMin, ClampedLevelsMax);
+			Result[i] = bInvert ? (1.0f - Leveled) : Leveled;
+		}
+		return Result;
+	}
+
+	/**
+	 * Generates the Curvature Mask in RENDER VERTEX order for one entry (non-Nanite/non-Source-Topology)
+	 * -- ensures the entry's cached raw analysis is current (EnsureCurvatureRawCache), reprocesses it
+	 * through Type/Multiplier/Blur/Levels (ApplyCurvatureArtisticParams, Dynamic Mesh Vertex domain),
+	 * then re-indexes into render-vertex domain via CurvatureRenderVertexToDynamicMeshVertex -- so every
+	 * render vertex sharing a source mesh vertex (a UV seam or hard edge split) reads the IDENTICAL
+	 * value, satisfying the "propagate to vertex instances" requirement. A render vertex with no
+	 * correspondence (INDEX_NONE) is left unwritten (bHasValue false), never guessed.
+	 */
+	static FVertexMaskForgeScalarMask GenerateCurvatureMask(
+		FVertexMaskForgeWorkingMesh& WorkingMesh,
+		const FMeshDescription* MeshDescription,
+		const FStaticMeshLODResources& LOD0,
+		const EVertexMaskForgeCurvatureType Type,
+		const float Multiplier,
+		const float Blur,
+		const float LevelsMin,
+		const float LevelsMax,
+		const bool bInvert)
+	{
+		FVertexMaskForgeScalarMask Mask;
+		Mask.Source = EVertexMaskForgeScalarMaskSource::Curvature;
+
+		const int32 NumRenderVerts = static_cast<int32>(LOD0.VertexBuffers.PositionVertexBuffer.GetNumVertices());
+		Mask.RenderVertexCount = NumRenderVerts;
+
+		if (!WorkingMesh.Mesh.IsValid() || NumRenderVerts <= 0 || !MeshDescription)
+		{
+			Mask.State = EVertexMaskForgeScalarMaskState::Unavailable;
+			return Mask;
+		}
+
+		EnsureCurvatureRawCache(WorkingMesh, MeshDescription, &LOD0);
+		if (WorkingMesh.CurvatureRawConvexCache.IsEmpty() || WorkingMesh.CurvatureRenderVertexToDynamicMeshVertex.Num() != NumRenderVerts)
+		{
+			Mask.State = EVertexMaskForgeScalarMaskState::Unavailable;
+			return Mask;
+		}
+
+		const TArray<float> DynamicMeshValues = ApplyCurvatureArtisticParams(
+			*WorkingMesh.Mesh, WorkingMesh.CurvatureRawConvexCache, WorkingMesh.CurvatureRawConcaveCache,
+			Type, Multiplier, Blur, LevelsMin, LevelsMax, bInvert);
+
+		Mask.Values.SetNumZeroed(NumRenderVerts);
+		Mask.bHasValue.Init(false, NumRenderVerts);
+
+		double Sum = 0.0;
+		for (int32 RenderIndex = 0; RenderIndex < NumRenderVerts; ++RenderIndex)
+		{
+			const int32 DynamicVertexID = WorkingMesh.CurvatureRenderVertexToDynamicMeshVertex[RenderIndex];
+			if (DynamicVertexID == INDEX_NONE || !DynamicMeshValues.IsValidIndex(DynamicVertexID))
+			{
+				continue;
+			}
+			const float Value = DynamicMeshValues[DynamicVertexID];
+			Mask.Values[RenderIndex] = Value;
+			Mask.bHasValue[RenderIndex] = true;
+			++Mask.NumValidValues;
+			Sum += Value;
+			Mask.MinValue = (Mask.NumValidValues == 1) ? Value : FMath::Min(Mask.MinValue, Value);
+			Mask.MaxValue = (Mask.NumValidValues == 1) ? Value : FMath::Max(Mask.MaxValue, Value);
+			if (Value <= FVertexMaskForgeScalarMask::Tolerance) { ++Mask.NumNearZero; }
+			if (Value >= 1.0f - FVertexMaskForgeScalarMask::Tolerance) { ++Mask.NumNearOne; }
+		}
+		Mask.MeanValue = (Mask.NumValidValues > 0) ? static_cast<float>(Sum / Mask.NumValidValues) : 0.0f;
+		Mask.State = (Mask.NumValidValues > 0) ? EVertexMaskForgeScalarMaskState::Ready : EVertexMaskForgeScalarMaskState::Unavailable;
+
+		return Mask;
+	}
+
+	/**
+	 * Sibling of GenerateCurvatureMask for Source-Topology (Nanite) entries -- indexed directly by
+	 * DYNAMIC MESH VERTEX ID (Mesh.MaxVertexID()-sized, sparse-safe), no render-vertex correspondence
+	 * needed: UpdateWorkingColorsSourceTopology already looks this mask up by
+	 * Mesh.GetTriangle(TriangleID)[Corner] per corner (see its IndexOverride switch), exactly the same
+	 * domain BoundingBoxMask already uses in this mode.
+	 */
+	static FVertexMaskForgeScalarMask GenerateCurvatureMaskFromDynamicMesh(
+		FVertexMaskForgeWorkingMesh& WorkingMesh,
+		const EVertexMaskForgeCurvatureType Type,
+		const float Multiplier,
+		const float Blur,
+		const float LevelsMin,
+		const float LevelsMax,
+		const bool bInvert)
+	{
+		using namespace UE::Geometry;
+
+		FVertexMaskForgeScalarMask Mask;
+		Mask.Source = EVertexMaskForgeScalarMaskSource::Curvature;
+
+		if (!WorkingMesh.Mesh.IsValid())
+		{
+			Mask.State = EVertexMaskForgeScalarMaskState::Unavailable;
+			return Mask;
+		}
+		const FDynamicMesh3& Mesh = *WorkingMesh.Mesh;
+		Mask.RenderVertexCount = Mesh.VertexCount();
+
+		EnsureCurvatureRawCache(WorkingMesh, nullptr, nullptr);
+		if (WorkingMesh.CurvatureRawConvexCache.IsEmpty())
+		{
+			Mask.State = EVertexMaskForgeScalarMaskState::Unavailable;
+			return Mask;
+		}
+
+		const TArray<float> DynamicMeshValues = ApplyCurvatureArtisticParams(
+			Mesh, WorkingMesh.CurvatureRawConvexCache, WorkingMesh.CurvatureRawConcaveCache,
+			Type, Multiplier, Blur, LevelsMin, LevelsMax, bInvert);
+
+		const int32 MaxVID = Mesh.MaxVertexID();
+		Mask.Values.SetNumZeroed(MaxVID);
+		Mask.bHasValue.Init(false, MaxVID);
+
+		double Sum = 0.0;
+		for (const int32 VertexID : Mesh.VertexIndicesItr())
+		{
+			if (!DynamicMeshValues.IsValidIndex(VertexID))
+			{
+				continue;
+			}
+			const float Value = DynamicMeshValues[VertexID];
+			Mask.Values[VertexID] = Value;
+			Mask.bHasValue[VertexID] = true;
+			++Mask.NumValidValues;
+			Sum += Value;
+			Mask.MinValue = (Mask.NumValidValues == 1) ? Value : FMath::Min(Mask.MinValue, Value);
+			Mask.MaxValue = (Mask.NumValidValues == 1) ? Value : FMath::Max(Mask.MaxValue, Value);
+			if (Value <= FVertexMaskForgeScalarMask::Tolerance) { ++Mask.NumNearZero; }
+			if (Value >= 1.0f - FVertexMaskForgeScalarMask::Tolerance) { ++Mask.NumNearOne; }
+		}
+		Mask.MeanValue = (Mask.NumValidValues > 0) ? static_cast<float>(Sum / Mask.NumValidValues) : 0.0f;
+		Mask.State = (Mask.NumValidValues > 0) ? EVertexMaskForgeScalarMaskState::Ready : EVertexMaskForgeScalarMaskState::Unavailable;
+
+		return Mask;
+	}
+
 	/**
 	 * Generates the Ambient Occlusion Mask directly in RENDER VERTEX order for one component, using
 	 * CPU hemisphere raycasts against the component's OWN geometry via a GeometryCore
@@ -2649,6 +3332,21 @@ namespace VertexMaskForgePanel
 		}
 	}
 
+	static FText GetCurvatureTypeLabel(const EVertexMaskForgeCurvatureType Type)
+	{
+		switch (Type)
+		{
+		case EVertexMaskForgeCurvatureType::Convex:
+			return LOCTEXT("CurvatureTypeConvex", "Convex");
+		case EVertexMaskForgeCurvatureType::Concave:
+			return LOCTEXT("CurvatureTypeConcave", "Concave");
+		case EVertexMaskForgeCurvatureType::Both:
+			return LOCTEXT("CurvatureTypeBoth", "Both");
+		default:
+			return FText::GetEmpty();
+		}
+	}
+
 	// --- Blend Mode math (see EVertexMaskForgeBlendMode) -------------------------------------
 
 	/**
@@ -3321,6 +4019,13 @@ namespace VertexMaskForgePanel
 					case EVertexMaskForgeScalarMaskSource::AmbientOcclusion:
 						Layer.IndexOverride = NormalTri[Corner];
 						break;
+					case EVertexMaskForgeScalarMaskSource::Curvature:
+						// AUDITED (Curvature layer): same domain as BoundingBox -- Curvature is cached
+						// and generated by DYNAMIC MESH VERTEX ID (see GenerateCurvatureMaskFromDynamicMesh),
+						// never per-corner or per-normal-element, so a UV seam/hard edge's several
+						// corners at the same source mesh vertex all read the identical value.
+						Layer.IndexOverride = VertTri[Corner];
+						break;
 					default: // ConstantWhite / ConstantBlack (Fill) -- corner-domain mask, see
 						// GenerateConstantMaskForCornerDomain.
 						Layer.IndexOverride = CornerIndex;
@@ -3466,7 +4171,8 @@ namespace VertexMaskForgePanel
 			// when WedgeMap is invalid).
 			if (!Entry.IsValid() || Entry->bUseSourceTopology || Entry->PreviewComponents.IsEmpty()
 				|| (Entry->WorkingMesh.BoundingBoxMask.State != EVertexMaskForgeScalarMaskState::Ready
-					&& Entry->WorkingMesh.AmbientOcclusionMask.State != EVertexMaskForgeScalarMaskState::Ready))
+					&& Entry->WorkingMesh.AmbientOcclusionMask.State != EVertexMaskForgeScalarMaskState::Ready
+					&& Entry->WorkingMesh.CurvatureMask.State != EVertexMaskForgeScalarMaskState::Ready))
 			{
 				continue;
 			}
@@ -3815,7 +4521,8 @@ namespace VertexMaskForgePanel
 		{
 			if (!Entry.IsValid() || !Entry->bUseSourceTopology || Entry->PreviewComponents.IsEmpty()
 				|| (Entry->WorkingMesh.BoundingBoxMask.State != EVertexMaskForgeScalarMaskState::Ready
-					&& Entry->WorkingMesh.AmbientOcclusionMask.State != EVertexMaskForgeScalarMaskState::Ready))
+					&& Entry->WorkingMesh.AmbientOcclusionMask.State != EVertexMaskForgeScalarMaskState::Ready
+					&& Entry->WorkingMesh.CurvatureMask.State != EVertexMaskForgeScalarMaskState::Ready))
 			{
 				continue;
 			}
@@ -4957,6 +5664,156 @@ FText SVertexMaskForgePanel::GetAOBlendModeButtonText() const
 	return VertexMaskForgePanel::GetBlendModeLabel(AOBlendMode);
 }
 
+void SVertexMaskForgePanel::OnCurvatureEnableChanged(const ECheckBoxState NewState)
+{
+	const bool bWasEnabled = bCurvatureEnabled;
+	bCurvatureEnabled = (NewState == ECheckBoxState::Checked);
+
+	// AUDITED (Curvature layer): same enable/disable contract as OnAOEnableChanged (see its own doc
+	// comment) -- turning OFF is always pure composition; turning ON reuses an already-Ready entry
+	// immediately (CurvatureMask.State == Ready already, e.g. from a previous session before Disable),
+	// and only regenerates entries that genuinely need it, gated by Auto Update Preview like any other
+	// raw/geometric parameter.
+	if (!bCurvatureEnabled || bWasEnabled)
+	{
+		RecomposeWorkingColors();
+		return;
+	}
+
+	bool bAnyEntryNeedsGeneration = false;
+	for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
+	{
+		if (Entry.IsValid() && Entry->WorkingMesh.CurvatureMask.State != EVertexMaskForgeScalarMaskState::Ready)
+		{
+			bAnyEntryNeedsGeneration = true;
+			break;
+		}
+	}
+
+	if (!bAnyEntryNeedsGeneration)
+	{
+		RecomposeWorkingColors();
+		return;
+	}
+
+	if (bAutoUpdatePreview)
+	{
+		if (GEditor)
+		{
+			GEditor->GetTimerManager()->ClearTimer(AutoUpdateDebounceTimerHandle);
+		}
+		RunAutoUpdatePreview();
+	}
+	else
+	{
+		// At least one entry needs Generate Mask, but entries that ARE already Ready must still be
+		// shown immediately -- never held pending just because a DIFFERENT entry needs generation.
+		RecomposeWorkingColors();
+	}
+}
+
+TSharedRef<SWidget> SVertexMaskForgePanel::OnGenerateCurvatureTypeRow(TSharedPtr<EVertexMaskForgeCurvatureType> InOption) const
+{
+	return SNew(STextBlock)
+		.Text(InOption.IsValid() ? VertexMaskForgePanel::GetCurvatureTypeLabel(*InOption) : FText::GetEmpty());
+}
+
+void SVertexMaskForgePanel::OnCurvatureTypeSelectionChanged(TSharedPtr<EVertexMaskForgeCurvatureType> NewSelection, ESelectInfo::Type SelectInfo)
+{
+	if (!NewSelection.IsValid())
+	{
+		return;
+	}
+
+	CurvatureType = *NewSelection;
+	OnCurvatureParamChanged();
+}
+
+FText SVertexMaskForgePanel::GetCurvatureTypeButtonText() const
+{
+	return VertexMaskForgePanel::GetCurvatureTypeLabel(CurvatureType);
+}
+
+void SVertexMaskForgePanel::OnCurvatureInvertChanged(const ECheckBoxState NewState)
+{
+	bCurvatureInvert = (NewState == ECheckBoxState::Checked);
+
+	// AUDITED (Curvature layer): PURE composition, same contract as OnAOInvertChanged -- the cached raw
+	// Convex/Concave magnitudes are NEVER touched; Invert is applied fresh, live, every recomposition
+	// (see ApplyCurvatureArtisticParams, applied LAST after Levels), via the shared
+	// OnCurvatureParamChanged reprocess. Zero re-analysis, works identically regardless of Auto Update
+	// Preview or domain (Render-Vertex/Source-Topology).
+	OnCurvatureParamChanged();
+}
+
+void SVertexMaskForgePanel::OnCurvatureParamChanged()
+{
+	// AUDITED (Curvature layer): Type/Multiplier/Blur/Levels Min/Levels Max/Invert are ALL cheap,
+	// purely downstream reprocessing of each entry's already-cached raw Convex/Concave magnitude arrays
+	// (see FVertexMaskForgeWorkingMesh::CurvatureRawConvexCache's own doc comment) -- never the
+	// adjacency/dihedral-angle analysis, never GeometryFingerprint. So this is unconditional and
+	// immediate, exactly like OnAOInvertChanged/OnAOLevelsChanged, regardless of Auto Update Preview:
+	// regenerate every entry's CurvatureMask directly from its raw cache, then recompose. An entry with
+	// no cached raw curvature yet (Curvature never successfully generated for it) is left untouched
+	// here -- Enable/Generate Mask/Auto Update are what populate the cache in the first place; this
+	// function only ever reprocesses what already exists.
+	for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
+	{
+		if (!Entry.IsValid() || !bCurvatureEnabled || Entry->WorkingMesh.CurvatureRawConvexCache.IsEmpty())
+		{
+			continue;
+		}
+
+		FVertexMaskForgeScalarMask NewCurvatureMask;
+		if (Entry->bUseSourceTopology)
+		{
+			NewCurvatureMask = VertexMaskForgePanel::GenerateCurvatureMaskFromDynamicMesh(
+				Entry->WorkingMesh, CurvatureType, CurvatureMultiplier, CurvatureBlur, CurvatureLevelsMin, CurvatureLevelsMax, bCurvatureInvert);
+		}
+		else
+		{
+			const UStaticMesh* Mesh = Entry->Mesh.LoadSynchronous();
+			const FStaticMeshRenderData* RenderData = IsValid(Mesh) ? Mesh->GetRenderData() : nullptr;
+			if (!RenderData || !RenderData->LODResources.IsValidIndex(0))
+			{
+				continue;
+			}
+			NewCurvatureMask = VertexMaskForgePanel::GenerateCurvatureMask(
+				Entry->WorkingMesh, Mesh->GetMeshDescription(0), RenderData->LODResources[0],
+				CurvatureType, CurvatureMultiplier, CurvatureBlur, CurvatureLevelsMin, CurvatureLevelsMax, bCurvatureInvert);
+		}
+
+		if (NewCurvatureMask.State == EVertexMaskForgeScalarMaskState::Ready)
+		{
+			Entry->WorkingMesh.CurvatureMask = MoveTemp(NewCurvatureMask);
+		}
+	}
+
+	RecomposeWorkingColors();
+}
+
+TSharedRef<SWidget> SVertexMaskForgePanel::OnGenerateCurvatureBlendModeRow(TSharedPtr<EVertexMaskForgeBlendMode> InOption) const
+{
+	return SNew(STextBlock)
+		.Text(InOption.IsValid() ? VertexMaskForgePanel::GetBlendModeLabel(*InOption) : FText::GetEmpty());
+}
+
+void SVertexMaskForgePanel::OnCurvatureBlendModeSelectionChanged(TSharedPtr<EVertexMaskForgeBlendMode> NewSelection, ESelectInfo::Type SelectInfo)
+{
+	if (!NewSelection.IsValid())
+	{
+		return;
+	}
+
+	CurvatureBlendMode = *NewSelection;
+	RecomposeWorkingColors();
+}
+
+FText SVertexMaskForgePanel::GetCurvatureBlendModeButtonText() const
+{
+	return VertexMaskForgePanel::GetBlendModeLabel(CurvatureBlendMode);
+}
+
 FText SVertexMaskForgePanel::GetActiveMaskSourceText() const
 {
 	bool bAnyAxisEnabled = false;
@@ -4969,19 +5826,34 @@ FText SVertexMaskForgePanel::GetActiveMaskSourceText() const
 		}
 	}
 
-	if (bAnyAxisEnabled && bAOEnabled)
-	{
-		return LOCTEXT("ActiveMaskSourceBoth", "Active layers: Bounding Box + Ambient Occlusion");
-	}
+	TArray<FText, TInlineAllocator<3>> ActiveLayerNames;
 	if (bAnyAxisEnabled)
 	{
-		return LOCTEXT("ActiveMaskSourceBBoxOnly", "Active layers: Bounding Box only");
+		ActiveLayerNames.Add(LOCTEXT("ActiveLayerBBox", "Bounding Box"));
 	}
 	if (bAOEnabled)
 	{
-		return LOCTEXT("ActiveMaskSourceAOOnly", "Active layers: Ambient Occlusion only");
+		ActiveLayerNames.Add(LOCTEXT("ActiveLayerAO", "Ambient Occlusion"));
 	}
-	return LOCTEXT("ActiveMaskSourceNone", "Active layers: None -- enable a Bounding Box axis or Ambient Occlusion");
+	if (bCurvatureEnabled)
+	{
+		ActiveLayerNames.Add(LOCTEXT("ActiveLayerCurvature", "Curvature"));
+	}
+
+	if (ActiveLayerNames.IsEmpty())
+	{
+		return LOCTEXT("ActiveMaskSourceNone", "Active layers: None -- enable a Bounding Box axis, Ambient Occlusion, or Curvature");
+	}
+
+	TArray<FString> LayerStrings;
+	LayerStrings.Reserve(ActiveLayerNames.Num());
+	for (const FText& Name : ActiveLayerNames)
+	{
+		LayerStrings.Add(Name.ToString());
+	}
+	return FText::Format(
+		LOCTEXT("ActiveMaskSourceListFormat", "Active layers: {0}"),
+		FText::FromString(FString::Join(LayerStrings, TEXT(" + "))));
 }
 
 TSharedRef<SWidget> SVertexMaskForgePanel::BuildBoundingBoxAxisRow(const EVertexMaskForgeBoundsAxis Axis, const FText& Title)
@@ -5182,16 +6054,45 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 	BlendModeOptions.Add(MakeShared<EVertexMaskForgeBlendMode>(EVertexMaskForgeBlendMode::Screen));
 	BlendModeOptions.Add(MakeShared<EVertexMaskForgeBlendMode>(EVertexMaskForgeBlendMode::Linear));
 
+	CurvatureTypeOptions.Add(MakeShared<EVertexMaskForgeCurvatureType>(EVertexMaskForgeCurvatureType::Convex));
+	CurvatureTypeOptions.Add(MakeShared<EVertexMaskForgeCurvatureType>(EVertexMaskForgeCurvatureType::Concave));
+	CurvatureTypeOptions.Add(MakeShared<EVertexMaskForgeCurvatureType>(EVertexMaskForgeCurvatureType::Both));
+
 	// Z starts enabled to reproduce the exact previously-validated Local-Z-only default; X and Y
 	// start disabled (see BoundingBoxAxisParams' doc comment in the header).
 	BoundingBoxAxisParams[static_cast<int32>(EVertexMaskForgeBoundsAxis::Z)].bEnabled = true;
 
+	// AUDITED (vertical scroll checkpoint): SBorder's single child previously received the full
+	// available area from ChildSlot and simply handed it straight to the root SVerticalBox -- with
+	// every one of that VerticalBox's ~20 top-level slots AutoHeight, the box's DESIRED height is the
+	// sum of all of them, but nothing in this chain ever CLIPPED-WITH-SCROLL when the Editor's dock tab
+	// allotted LESS actual height than that sum (a fixed-size dock tab does not grow to fit; it simply
+	// gives this widget its own client area and lets Slate's normal arrange/clip behavior take over) --
+	// so once four expandable panels were open at once, the tail of the vertical stack (Fill White/
+	// Fill Black, Channel Filter, Auto Update Preview, Generate Mask, Accept/Cancel) rendered past the
+	// bottom edge with no way to reach it. SScrollBox is inserted as SBorder's sole child, in the SAME
+	// position the root SVerticalBox previously occupied -- it inherits the SAME bounded area SBorder
+	// already receives from ChildSlot (no explicit FillHeight plumbing needed: SBorder's own single-
+	// child slot and SCompoundWidget's ChildSlot both already give their one child the full allotted
+	// area, they just never used to have anything that would CLIP+SCROLL that area against oversized
+	// content) and provides exactly that missing clip-and-scroll behavior, with a visible vertical
+	// scrollbar precisely when content exceeds the available height. The entire pre-existing content
+	// (title through Accept/Cancel/status text) moves inside the ScrollBox's one slot, UNCHANGED and in
+	// the SAME order -- Accept/Cancel are ordinary AutoHeight rows in the same vertical flow as
+	// everything else here (this panel has no separately-docked toolbar/footer), so per the "if the
+	// buttons are naturally part of the vertical content, keep them inside the scroll so they remain
+	// reachable" instruction, they scroll with everything else rather than being carved out into an
+	// artificial fixed footer that this panel's existing layout was never designed around.
 	ChildSlot
 	[
 		SNew(SBorder)
 		.Padding(FMargin(12.f))
 		[
-			SNew(SVerticalBox)
+			SNew(SScrollBox)
+			.Orientation(Orient_Vertical)
+			+ SScrollBox::Slot()
+			[
+				SNew(SVerticalBox)
 
 			+ SVerticalBox::Slot()
 			.AutoHeight()
@@ -5694,6 +6595,335 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 				]
 			]
 
+			// Curvature Mask: the tool's third, independent, optional composition-stack layer -- same
+			// collapsible panel pattern as Bounding Box/Ambient Occlusion above (SExpandableArea, header
+			// title only, Enable moved into the body's first row -- same rationale as AO's own doc note).
+			+ SVerticalBox::Slot()
+			.AutoHeight()
+			.Padding(FMargin(0.f, 12.f, 0.f, 0.f))
+			[
+				SNew(SExpandableArea)
+				.InitiallyCollapsed(false)
+				.Padding(FMargin(8.f))
+				.HeaderContent()
+				[
+					SNew(STextBlock)
+					.Text(LOCTEXT("CurvatureSectionTitle", "Curvature Mask"))
+					.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
+				]
+				.BodyContent()
+				[
+					SNew(SVerticalBox)
+
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(FMargin(0.f, 0.f, 0.f, 6.f))
+					[
+						SNew(SCheckBox)
+						.IsChecked(this, &SVertexMaskForgePanel::GetCurvatureEnableState)
+						.OnCheckStateChanged(this, &SVertexMaskForgePanel::OnCurvatureEnableChanged)
+						.Content()
+						[
+							SNew(STextBlock)
+							.Text(LOCTEXT("CurvatureEnableLabel", "Enable"))
+						]
+					]
+
+					// Blend Mode + Opacity: same Slate controls/dimensions/alignment/labels/tooltips/
+					// limits as Bounding Box/Ambient Occlusion's own (see those sections above) --
+					// independent CurvatureBlendMode/CurvatureOpacity state, same BlendModeOptions list,
+					// same ComposeMaskStack formulas.
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(FMargin(0.f, 0.f, 0.f, 2.f))
+					[
+						SNew(SHorizontalBox)
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
+						[
+							SNew(STextBlock).Text(LOCTEXT("CurvatureBlendModeLabel", "Blend Mode:"))
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						[
+							SAssignNew(CurvatureBlendModeComboBox, SComboBox<TSharedPtr<EVertexMaskForgeBlendMode>>)
+							.OptionsSource(&BlendModeOptions)
+							.InitiallySelectedItem(BlendModeOptions[0])
+							.OnGenerateWidget(this, &SVertexMaskForgePanel::OnGenerateCurvatureBlendModeRow)
+							.OnSelectionChanged(this, &SVertexMaskForgePanel::OnCurvatureBlendModeSelectionChanged)
+							[
+								SNew(STextBlock)
+								.Text(this, &SVertexMaskForgePanel::GetCurvatureBlendModeButtonText)
+							]
+						]
+					]
+
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(FMargin(0.f, 0.f, 0.f, 6.f))
+					[
+						SNew(SHorizontalBox)
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
+						[
+							SNew(STextBlock).Text(LOCTEXT("CurvatureOpacityLabel", "Opacity:"))
+						]
+
+						+ SHorizontalBox::Slot()
+						.FillWidth(1.f)
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 8.f, 0.f))
+						[
+							SNew(SSlider)
+							.MinValue(0.0f)
+							.MaxValue(1.0f)
+							.Value_Lambda([this]() { return CurvatureOpacity; })
+							.OnValueChanged_Lambda([this](const float NewValue)
+							{
+								CurvatureOpacity = FMath::Clamp(NewValue, 0.0f, 1.0f);
+								RecomposeWorkingColors();
+							})
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						[
+							SNew(SSpinBox<float>)
+							.MinDesiredWidth(52.f)
+							.MinValue(0.0f)
+							.MaxValue(1.0f)
+							.Delta(0.01f)
+							.MinFractionalDigits(2)
+							.MaxFractionalDigits(2)
+							.Value_Lambda([this]() { return CurvatureOpacity; })
+							.OnValueChanged_Lambda([this](const float NewValue)
+							{
+								CurvatureOpacity = FMath::Clamp(NewValue, 0.0f, 1.0f);
+								RecomposeWorkingColors();
+							})
+						]
+					]
+
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(FMargin(0.f, 0.f, 0.f, 6.f))
+					[
+						SNew(SHorizontalBox)
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
+						[
+							SNew(STextBlock).Text(LOCTEXT("CurvatureTypeLabel", "Curvature Type:"))
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						[
+							SAssignNew(CurvatureTypeComboBox, SComboBox<TSharedPtr<EVertexMaskForgeCurvatureType>>)
+							.OptionsSource(&CurvatureTypeOptions)
+							.InitiallySelectedItem(CurvatureTypeOptions[2])
+							.OnGenerateWidget(this, &SVertexMaskForgePanel::OnGenerateCurvatureTypeRow)
+							.OnSelectionChanged(this, &SVertexMaskForgePanel::OnCurvatureTypeSelectionChanged)
+							.ToolTipText(LOCTEXT("CurvatureTypeTooltip",
+								"Convex: only outward edges/bulges. Concave: only cavities/creases. Both: both signs, without cancelling out."))
+							[
+								SNew(STextBlock)
+								.Text(this, &SVertexMaskForgePanel::GetCurvatureTypeButtonText)
+							]
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(12.f, 0.f, 0.f, 0.f))
+						[
+							SNew(SCheckBox)
+							.IsChecked(this, &SVertexMaskForgePanel::GetCurvatureInvertState)
+							.OnCheckStateChanged(this, &SVertexMaskForgePanel::OnCurvatureInvertChanged)
+							.Content()
+							[
+								SNew(STextBlock)
+								.Text(LOCTEXT("CurvatureInvertLabel", "Invert"))
+							]
+						]
+					]
+
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(FMargin(0.f, 0.f, 0.f, 4.f))
+					[
+						SNew(SHorizontalBox)
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
+						[
+							SNew(STextBlock).Text(LOCTEXT("CurvatureMultiplierLabel", "Multiplier"))
+						]
+
+						+ SHorizontalBox::Slot()
+						.FillWidth(1.f)
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 8.f, 0.f))
+						[
+							SNew(SSlider)
+							.MinValue(0.0f)
+							.MaxValue(10.0f)
+							.Value_Lambda([this]() { return CurvatureMultiplier; })
+							.OnValueChanged_Lambda([this](const float NewValue)
+							{
+								CurvatureMultiplier = FMath::Max(NewValue, 0.0f);
+								OnCurvatureParamChanged();
+							})
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						[
+							SNew(SSpinBox<float>)
+							.MinDesiredWidth(52.f)
+							.MinValue(0.0f)
+							.MaxValue(10.0f)
+							.Delta(0.01f)
+							.Value_Lambda([this]() { return CurvatureMultiplier; })
+							.OnValueChanged_Lambda([this](const float NewValue)
+							{
+								CurvatureMultiplier = FMath::Max(NewValue, 0.0f);
+								OnCurvatureParamChanged();
+							})
+						]
+					]
+
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(FMargin(0.f, 0.f, 0.f, 4.f))
+					[
+						SNew(SHorizontalBox)
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
+						[
+							SNew(STextBlock)
+							.Text(LOCTEXT("CurvatureBlurLabel", "Blur"))
+							.ToolTipText(LOCTEXT("CurvatureBlurTooltip",
+								"Topological smoothing of the Curvature mask. Whole number = full iterations; fractional part blends toward one more."))
+						]
+
+						+ SHorizontalBox::Slot()
+						.FillWidth(1.f)
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 8.f, 0.f))
+						[
+							SNew(SSlider)
+							.MinValue(0.0f)
+							.MaxValue(10.0f)
+							.Value_Lambda([this]() { return CurvatureBlur; })
+							.OnValueChanged_Lambda([this](const float NewValue)
+							{
+								CurvatureBlur = FMath::Clamp(NewValue, 0.0f, 10.0f);
+								OnCurvatureParamChanged();
+							})
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						[
+							SNew(SSpinBox<float>)
+							.MinDesiredWidth(52.f)
+							.MinValue(0.0f)
+							.MaxValue(10.0f)
+							.Delta(0.01f)
+							.Value_Lambda([this]() { return CurvatureBlur; })
+							.OnValueChanged_Lambda([this](const float NewValue)
+							{
+								CurvatureBlur = FMath::Clamp(NewValue, 0.0f, 10.0f);
+								OnCurvatureParamChanged();
+							})
+						]
+					]
+
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					[
+						SNew(SHorizontalBox)
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
+						[
+							SNew(STextBlock)
+							.Text(LOCTEXT("CurvatureLevelsMinLabel", "Levels Min"))
+							.ToolTipText(LOCTEXT("CurvatureLevelsMinTooltip", "Values at or below this threshold become black."))
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 12.f, 0.f))
+						[
+							SNew(SSpinBox<float>)
+							.MinDesiredWidth(52.f)
+							.MinValue(0.0f)
+							.MaxValue(1.0f)
+							.Delta(0.01f)
+							.ToolTipText(LOCTEXT("CurvatureLevelsMinTooltip", "Values at or below this threshold become black."))
+							.Value_Lambda([this]() { return CurvatureLevelsMin; })
+							.OnValueChanged_Lambda([this](const float NewValue)
+							{
+								CurvatureLevelsMin = FMath::Clamp(NewValue, 0.0f, 1.0f);
+								OnCurvatureParamChanged();
+							})
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
+						[
+							SNew(STextBlock)
+							.Text(LOCTEXT("CurvatureLevelsMaxLabel", "Levels Max"))
+							.ToolTipText(LOCTEXT("CurvatureLevelsMaxTooltip", "Values at or above this threshold become white."))
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						[
+							SNew(SSpinBox<float>)
+							.MinDesiredWidth(52.f)
+							.MinValue(0.0f)
+							.MaxValue(1.0f)
+							.Delta(0.01f)
+							.ToolTipText(LOCTEXT("CurvatureLevelsMaxTooltip", "Values at or above this threshold become white."))
+							.Value_Lambda([this]() { return CurvatureLevelsMax; })
+							.OnValueChanged_Lambda([this](const float NewValue)
+							{
+								CurvatureLevelsMax = FMath::Clamp(NewValue, 0.0f, 1.0f);
+								OnCurvatureParamChanged();
+							})
+						]
+					]
+				]
+			]
+
 			+ SVerticalBox::Slot()
 			.AutoHeight()
 			.Padding(FMargin(0.f, 12.f, 0.f, 0.f))
@@ -5926,6 +7156,7 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 					]
 				]
 			]
+			] // closes SScrollBox::Slot content
 		]
 	];
 
@@ -6253,11 +7484,11 @@ FReply SVertexMaskForgePanel::OnGenerateBoundingBoxMaskClicked()
 			break;
 		}
 	}
-	if (!bAnyAxisEnabled && !bAOEnabled)
+	if (!bAnyAxisEnabled && !bAOEnabled && !bCurvatureEnabled)
 	{
 		// Per the explicit requirement: never generate an empty mask silently, never replace the
 		// previous Preview, never enter Pending Changes with invalid data.
-		LastOperationErrorText = LOCTEXT("NoMaskSourceEnabled", "Enable at least one Bounding Box axis or Ambient Occlusion.");
+		LastOperationErrorText = LOCTEXT("NoMaskSourceEnabled", "Enable at least one Bounding Box axis, Ambient Occlusion, or Curvature.");
 		RecomputeOperationState();
 		return FReply::Handled();
 	}
@@ -6281,6 +7512,7 @@ FReply SVertexMaskForgePanel::OnGenerateBoundingBoxMaskClicked()
 
 	int32 NumBBoxReady = 0, NumBBoxUnavailable = 0, NumBBoxDegenerate = 0, NumBBoxInvalid = 0;
 	int32 NumAOReady = 0, NumAOUnavailable = 0;
+	int32 NumCurvatureReady = 0, NumCurvatureUnavailable = 0;
 
 	for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
 	{
@@ -6306,6 +7538,9 @@ FReply SVertexMaskForgePanel::OnGenerateBoundingBoxMaskClicked()
 		{
 			bWorkingMeshOK = false;
 		}
+		// AUDITED (Curvature layer): only needed for the render-vertex correspondence build (non-Source-
+		// Topology entries) inside GenerateCurvatureMask -- resolved here, once, alongside RenderData.
+		const FMeshDescription* MeshDescription = bWorkingMeshOK ? Mesh->GetMeshDescription(0) : nullptr;
 
 		if (!bWorkingMeshOK)
 		{
@@ -6313,8 +7548,11 @@ FReply SVertexMaskForgePanel::OnGenerateBoundingBoxMaskClicked()
 			Entry->WorkingMesh.BoundingBoxMask.State = EVertexMaskForgeScalarMaskState::Unavailable;
 			Entry->WorkingMesh.AmbientOcclusionMask = FVertexMaskForgeScalarMask();
 			Entry->WorkingMesh.AmbientOcclusionMask.State = EVertexMaskForgeScalarMaskState::Unavailable;
+			Entry->WorkingMesh.CurvatureMask = FVertexMaskForgeScalarMask();
+			Entry->WorkingMesh.CurvatureMask.State = EVertexMaskForgeScalarMaskState::Unavailable;
 			++NumBBoxUnavailable;
 			++NumAOUnavailable;
+			++NumCurvatureUnavailable;
 			continue;
 		}
 
@@ -6415,14 +7653,46 @@ FReply SVertexMaskForgePanel::OnGenerateBoundingBoxMaskClicked()
 			Entry->WorkingMesh.AmbientOcclusionMask = FVertexMaskForgeScalarMask();
 			++NumAOUnavailable;
 		}
+
+		// AUDITED (Curvature layer): UNLIKE the AO block above, this is a REAL, entry-level computation
+		// (not validation-only) -- see FVertexMaskForgeWorkingMesh::CurvatureMask's own doc comment for
+		// why Curvature needs no per-component re-evaluation at all (it never depends on a component's
+		// transform), so there is no separate "real computation" call site elsewhere the way
+		// ApplyPreviewToEntry is for AO -- generating it here, once per entry, IS the only computation
+		// site. GenerateCurvatureMask/GenerateCurvatureMaskFromDynamicMesh internally reuse the cached
+		// raw analysis (WorkingMesh.CurvatureRawConvexCache/CurvatureRawConcaveCache) whenever
+		// GeometryFingerprint still matches, so repeated Generate Mask clicks after the first never redo
+		// the expensive adjacency/dihedral pass.
+		if (bCurvatureEnabled)
+		{
+			Entry->WorkingMesh.CurvatureMask = Entry->bUseSourceTopology
+				? VertexMaskForgePanel::GenerateCurvatureMaskFromDynamicMesh(
+					Entry->WorkingMesh, CurvatureType, CurvatureMultiplier, CurvatureBlur, CurvatureLevelsMin, CurvatureLevelsMax, bCurvatureInvert)
+				: VertexMaskForgePanel::GenerateCurvatureMask(
+					Entry->WorkingMesh, MeshDescription, RenderData->LODResources[0],
+					CurvatureType, CurvatureMultiplier, CurvatureBlur, CurvatureLevelsMin, CurvatureLevelsMax, bCurvatureInvert);
+			if (Entry->WorkingMesh.CurvatureMask.State == EVertexMaskForgeScalarMaskState::Ready)
+			{
+				++NumCurvatureReady;
+			}
+			else
+			{
+				++NumCurvatureUnavailable;
+			}
+		}
+		else
+		{
+			Entry->WorkingMesh.CurvatureMask = FVertexMaskForgeScalarMask();
+			++NumCurvatureUnavailable;
+		}
 	}
 
 	// Log (explicit operation summary): this function is only reached by an explicit Generate Mask
 	// click -- RunAutoUpdatePreview has its own separate loop and never calls this one, so this line
 	// cannot fire on every slider tick.
 	UE_LOG(LogVertexMaskForge, Log,
-		TEXT("Vertex Mask Forge: Generate Mask: Bounding Box %d ready/%d unavailable/%d degenerate/%d invalid; Ambient Occlusion %d ready/%d unavailable."),
-		NumBBoxReady, NumBBoxUnavailable, NumBBoxDegenerate, NumBBoxInvalid, NumAOReady, NumAOUnavailable);
+		TEXT("Vertex Mask Forge: Generate Mask: Bounding Box %d ready/%d unavailable/%d degenerate/%d invalid; Ambient Occlusion %d ready/%d unavailable; Curvature %d ready/%d unavailable."),
+		NumBBoxReady, NumBBoxUnavailable, NumBBoxDegenerate, NumBBoxInvalid, NumAOReady, NumAOUnavailable, NumCurvatureReady, NumCurvatureUnavailable);
 
 	// If a Vertex Color preview mode is active, recompose and reapply immediately using the
 	// mask(s) just persisted -- the user should not have to reselect the dropdown. bCommit=true:
@@ -6733,11 +8003,11 @@ void SVertexMaskForgePanel::RunAutoUpdatePreview(const bool bIncludeAO)
 	// AUDITED (BBox Invert exception): when bIncludeAO is false (OnAxisInvertChanged's scoped call),
 	// Ambient Occlusion is treated as irrelevant to this call regardless of bAOEnabled's actual value
 	// -- see the AO block below, which is skipped entirely in that case.
-	if (!bAnyAxisEnabled && !(bIncludeAO && bAOEnabled))
+	if (!bAnyAxisEnabled && !(bIncludeAO && bAOEnabled) && !bCurvatureEnabled)
 	{
 		// Preserve every entry's existing masks untouched and surface the specific message -- do not
 		// fall through to the generic "could not be regenerated" wording below.
-		LastOperationErrorText = LOCTEXT("NoMaskSourceEnabledAutoUpdate", "Enable at least one Bounding Box axis or Ambient Occlusion.");
+		LastOperationErrorText = LOCTEXT("NoMaskSourceEnabledAutoUpdate", "Enable at least one Bounding Box axis, Ambient Occlusion, or Curvature.");
 		UpdateAllPreviews(/*bCommit=*/false);
 		return;
 	}
@@ -6784,6 +8054,9 @@ void SVertexMaskForgePanel::RunAutoUpdatePreview(const bool bIncludeAO)
 		{
 			continue;
 		}
+		// AUDITED (Curvature layer): only needed for the render-vertex correspondence build (non-Source-
+		// Topology entries) inside GenerateCurvatureMask -- resolved here, once, alongside RenderData.
+		const FMeshDescription* MeshDescription = Mesh->GetMeshDescription(0);
 
 		FTransform ReferenceTransform = FTransform::Identity;
 		bool bHasLiveComponent = false;
@@ -6875,6 +8148,31 @@ void SVertexMaskForgePanel::RunAutoUpdatePreview(const bool bIncludeAO)
 				Entry->WorkingMesh.AmbientOcclusionMask = FVertexMaskForgeScalarMask();
 			}
 		}
+
+		// AUDITED (Curvature layer): same "real, entry-level computation, cache-reusing" contract as
+		// OnGenerateBoundingBoxMaskClicked's own Curvature block -- see that call site's doc comment.
+		// Never gated by bIncludeAO: that flag's own contract (see the AO block's doc comment above) is
+		// narrowly about shielding Ambient Occlusion from BBox Invert's immediate-regeneration exception,
+		// the same way Bounding Box's own regeneration above is never gated by it either.
+		if (bCurvatureEnabled)
+		{
+			FVertexMaskForgeScalarMask NewCurvatureMask = Entry->bUseSourceTopology
+				? VertexMaskForgePanel::GenerateCurvatureMaskFromDynamicMesh(
+					Entry->WorkingMesh, CurvatureType, CurvatureMultiplier, CurvatureBlur, CurvatureLevelsMin, CurvatureLevelsMax, bCurvatureInvert)
+				: VertexMaskForgePanel::GenerateCurvatureMask(
+					Entry->WorkingMesh, MeshDescription, RenderData->LODResources[0],
+					CurvatureType, CurvatureMultiplier, CurvatureBlur, CurvatureLevelsMin, CurvatureLevelsMax, bCurvatureInvert);
+			if (NewCurvatureMask.State == EVertexMaskForgeScalarMaskState::Ready)
+			{
+				Entry->WorkingMesh.CurvatureMask = MoveTemp(NewCurvatureMask);
+			}
+			// else: preserve whatever CurvatureMask this entry already had -- same "auto-update never
+			// replaces a valid Preview with incomplete/degenerate data" contract as Bounding Box above.
+		}
+		else
+		{
+			Entry->WorkingMesh.CurvatureMask = FVertexMaskForgeScalarMask();
+		}
 	}
 
 	if (NumFailed > 0)
@@ -6960,7 +8258,8 @@ FText SVertexMaskForgePanel::GetPreviewStatusText() const
 
 		bAnyViewportComponent = true;
 		if (Entry->WorkingMesh.BoundingBoxMask.State == EVertexMaskForgeScalarMaskState::Ready
-			|| Entry->WorkingMesh.AmbientOcclusionMask.State == EVertexMaskForgeScalarMaskState::Ready)
+			|| Entry->WorkingMesh.AmbientOcclusionMask.State == EVertexMaskForgeScalarMaskState::Ready
+			|| Entry->WorkingMesh.CurvatureMask.State == EVertexMaskForgeScalarMaskState::Ready)
 		{
 			bAnyReady = true;
 		}
@@ -7082,7 +8381,8 @@ void SVertexMaskForgePanel::RecomputeOperationState()
 	{
 		if (Entry.IsValid() && !Entry->PreviewComponents.IsEmpty()
 			&& (Entry->WorkingMesh.BoundingBoxMask.State == EVertexMaskForgeScalarMaskState::Ready
-				|| Entry->WorkingMesh.AmbientOcclusionMask.State == EVertexMaskForgeScalarMaskState::Ready))
+				|| Entry->WorkingMesh.AmbientOcclusionMask.State == EVertexMaskForgeScalarMaskState::Ready
+				|| Entry->WorkingMesh.CurvatureMask.State == EVertexMaskForgeScalarMaskState::Ready))
 		{
 			bHasPending = true;
 			break;
@@ -7396,9 +8696,14 @@ void SVertexMaskForgePanel::ApplyPreviewToEntry(
 	// layer is meant to be excluded from the stack; bAOEnabled is the live, authoritative "is this
 	// layer currently supposed to participate" signal.
 	const bool bAOEntryReady = bAOEnabled && WorkingMesh.AmbientOcclusionMask.State == EVertexMaskForgeScalarMaskState::Ready;
+	// AUDITED (Curvature layer): same live-gating rationale as bAOEntryReady above, and same
+	// "entry-level result IS the per-component contribution" property as bBBoxEntryReady when no
+	// per-component re-evaluation is needed (Curvature never needs one -- see CurvatureMask's own doc
+	// comment) -- WorkingMesh.CurvatureMask.State can legitimately still read Ready while disabled.
+	const bool bCurvatureEntryReady = bCurvatureEnabled && WorkingMesh.CurvatureMask.State == EVertexMaskForgeScalarMaskState::Ready;
 	if (WorkingMesh.State != EVertexMaskForgeWorkingMeshState::Ready
 		|| !WorkingMesh.Mesh.IsValid()
-		|| (!bBBoxEntryReady && !bAOEntryReady))
+		|| (!bBBoxEntryReady && !bAOEntryReady && !bCurvatureEntryReady))
 	{
 		// Nothing safe to preview yet (both slots NotGenerated/Unavailable/DegenerateBounds/Invalid):
 		// show the original colors/materials rather than a stale or fabricated result. AUDITED
@@ -7534,6 +8839,15 @@ void SVertexMaskForgePanel::ApplyPreviewToEntry(
 						Layers.Add({ &PerComponentAOMask, AOBlendMode, AOOpacity });
 					}
 				}
+				// AUDITED (Curvature layer): NO per-component re-evaluation, unlike Bounding Box/Ambient
+				// Occlusion above -- WorkingMesh.CurvatureMask already holds the REAL, final values for
+				// every component of this entry (see its own doc comment), so this simply adds the
+				// entry-level mask directly. IndexOverride is resolved per-corner by
+				// UpdateWorkingColorsSourceTopology's own switch (Curvature -> Dynamic Mesh Vertex ID).
+				if (!bAnyLayerFailed && bCurvatureEntryReady)
+				{
+					Layers.Add({ &WorkingMesh.CurvatureMask, CurvatureBlendMode, CurvatureOpacity });
+				}
 			}
 
 			if (bAnyLayerFailed || Layers.IsEmpty())
@@ -7653,6 +8967,15 @@ void SVertexMaskForgePanel::ApplyPreviewToEntry(
 				{
 					Layers.Add({ &PerComponentAOMask, AOBlendMode, AOOpacity });
 				}
+			}
+			// AUDITED (Curvature layer): same "no per-component re-evaluation needed" contract as the
+			// Source-Topology branch above -- WorkingMesh.CurvatureMask already holds the REAL, final
+			// per-render-vertex values (see its own doc comment); IndexOverride stays at its default
+			// (-1), so ComposeMaskStack simply looks it up by the shared render vertex index, exactly
+			// like Bounding Box/Ambient Occlusion already do in this domain.
+			if (!bAnyLayerFailed && bCurvatureEntryReady)
+			{
+				Layers.Add({ &WorkingMesh.CurvatureMask, CurvatureBlendMode, CurvatureOpacity });
 			}
 		}
 
