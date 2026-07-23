@@ -4,6 +4,7 @@
 #include "Containers/StaticArray.h"
 #include "CoreMinimal.h"
 #include "Delegates/IDelegateInstance.h"
+#include "EditorUndoClient.h"
 #include "Engine/TimerHandle.h"
 #include "Math/Vector4.h"
 #include "MeshTypes.h"
@@ -202,10 +203,19 @@ enum class EVertexMaskForgeScalarMaskSource : uint8
 	/** GenerateConstantMask(0.0): every render vertex set to 0.0 (Fill Black). */
 	ConstantBlack,
 
-	/** GenerateAmbientOcclusionMask: per-render-vertex hemisphere-raycast occlusion fraction.
-	 *  Convention (before Invert): 0.0 = exposed (no occluders found), 1.0 = fully occluded/cavity --
-	 *  i.e. the OPPOSITE of the common "black = occluded" texture-baking convention. FVertexMaskForgeAOParams::bInvert
-	 *  swaps it. */
+	/**
+	 * GenerateAmbientOcclusionMask: per-render-vertex hemisphere-raycast occlusion fraction.
+	 *
+	 * AUDITED (AO Levels + vanilla inversion checkpoint): RawAO (the raw cached raycast fraction,
+	 * unchanged: 0.0 = exposed, 1.0 = fully occluded/cavity) is no longer what composition/Preview
+	 * ever sees directly. VertexMaskForgePanel::ApplyAOLevelsAndInvert (the single, shared, pure
+	 * post-processing step both domains call) first flips it into BaseAO = 1 - RawAO -- i.e. the
+	 * VANILLA convention is now the common "black = occluded" texture-baking one, unconditionally,
+	 * independent of FVertexMaskForgeAOParams::bInvert (which keeps its own default/false meaning:
+	 * "invert the new vanilla result", not "toggle between old and new vanilla"). Levels Min/Max are
+	 * then applied to BaseAO, and bInvert is applied LAST, over the leveled result. See
+	 * ApplyAOLevelsAndInvert's own doc comment for the exact pipeline and rationale.
+	 */
 	AmbientOcclusion,
 };
 
@@ -232,9 +242,29 @@ struct FVertexMaskForgeAOParams
 	 *  range [0.001, 10.0]; default 0.1. */
 	float Bias = 0.1f;
 
-	/** Applied AFTER the raw occlusion fraction is computed (Result = 1 - AO) -- never requires
-	 *  recomputing raw samples or rebuilding the tree; see GenerateAmbientOcclusionMask. */
+	/**
+	 * AUDITED (AO Levels + vanilla inversion): user-facing Invert, applied LAST, AFTER Levels Min/Max
+	 * -- see VertexMaskForgePanel::ApplyAOLevelsAndInvert for the exact pipeline (RawAO -> BaseAO ->
+	 * Levels -> this). Never requires recomputing raw samples or rebuilding the tree -- purely
+	 * compositional, like Levels below.
+	 */
 	bool bInvert = false;
+
+	/**
+	 * AUDITED (AO Levels): values in the vanilla BaseAO (see ApplyAOLevelsAndInvert) at or below this
+	 * threshold become 0 (black). UI range [0, 1]; default 0.0 (no compression at the low end).
+	 * Purely compositional -- changing this never requires recomputing raw samples or rebuilding the
+	 * tree; see GenerateAmbientOcclusionMask's own cache contract.
+	 */
+	float LevelsMin = 0.0f;
+
+	/**
+	 * AUDITED (AO Levels): values in the vanilla BaseAO (see ApplyAOLevelsAndInvert) at or above this
+	 * threshold become 1 (white). UI range [0, 1]; default 1.0 (no compression at the high end). With
+	 * both LevelsMin=0 and LevelsMax=1 (the defaults), Levels is a no-op and BaseAO passes through
+	 * unchanged. Purely compositional -- same cache-safety contract as LevelsMin.
+	 */
+	float LevelsMax = 1.0f;
 };
 
 /**
@@ -674,8 +704,8 @@ struct FVertexMaskForgePreviewComponentState
 	 *
 	 * Reset (emptied) together with CommittedColors/WorkingColors only when the session concludes --
 	 * see RestoreComponentOriginal, called by DestroyAllPreviews() from Cancel, Accept (success),
-	 * Accept as Instance Override (success), RefreshSelection (before rebuilding), and World cleanup
-	 * -- so a brand new session always starts from a fresh capture, never a stale one from a
+	 * RefreshSelection (before rebuilding), and World cleanup -- so a brand new session always starts
+	 * from a fresh capture, never a stale one from a
 	 * concluded operation (whose baseline may since have changed, e.g. Accept just wrote new colors
 	 * onto this exact component/asset).
 	 */
@@ -705,8 +735,8 @@ struct FVertexMaskForgePreviewComponentState
 	 * Multi-channel TRANSIENT preview result for the CURRENT operation/session on this component, in
 	 * render-vertex order (LOD0-sized), holding the RAW composited RGBA (before any Preview Mode
 	 * display reduction). Empty until the first composition of a session. This is what the transient
-	 * PreviewComponent's OverrideVertexColors is set from (ApplyPreviewToEntry), and what Accept /
-	 * Accept as Instance Override read to build their FinalColors -- "the preview currently shown".
+	 * PreviewComponent's OverrideVertexColors is set from (ApplyPreviewToEntry), and what Accept reads
+	 * to build its FinalColors -- "the preview currently shown".
 	 *
 	 * AUDITED (Channel Filter toggle fix): REBUILT FROM CommittedColors on EVERY single call to
 	 * VertexMaskForgePanel::UpdateWorkingColors (WorkingColors = CommittedColors, verbatim, at the
@@ -724,11 +754,10 @@ struct FVertexMaskForgePreviewComponentState
 	 * Reset (emptied) together with BaselineColors/CommittedColors -- see BaselineColors' own doc
 	 * comment for every reset point.
 	 *
-	 * Preview (ApplyPreviewToEntry), Accept (BuildAcceptTargets), and Accept as Instance Override
-	 * (BuildInstanceOverrideTargets) all read this SAME array -- Accept and Accept as Instance
-	 * Override themselves NEVER call UpdateWorkingColors; they only READ it as-is, so Accept always
-	 * persists exactly the last effectively-generated/shown preview, never a silently-recomposed
-	 * approximation of pending, ungenerated UI parameters.
+	 * Preview (ApplyPreviewToEntry) and Accept (BuildAcceptTargets) both read this SAME array --
+	 * Accept itself NEVER calls UpdateWorkingColors; it only READs it as-is, so Accept always persists
+	 * exactly the last effectively-generated/shown preview, never a silently-recomposed approximation
+	 * of pending, ungenerated UI parameters.
 	 */
 	TArray<FColor> WorkingColors;
 
@@ -813,15 +842,12 @@ struct FVertexMaskForgeSelectedMesh
 	 * Nanite mesh with an explicit High Res Source Model DOES have a valid WedgeMap on LOD 0, but
 	 * Nanite's runtime renderer still never reads per-instance OverrideVertexColors (that limitation is
 	 * about Nanite rendering, not about WedgeMap availability) -- routing such a mesh back to the
-	 * render-vertex/OverrideVertexColors preview path would silently show nothing again, and Accept as
-	 * Instance Override would silently produce no visible effect, the exact bug this whole feature
-	 * fixes. So EVERY Nanite-enabled mesh uses Source-Topology mode, unconditionally, for both
-	 * behaviors: Bounding Box/Ambient Occlusion are generated against WorkingMesh.Mesh (the SOURCE-
-	 * topology FDynamicMesh3) via GenerateBoundingBoxMaskFromDynamicMesh /
-	 * GenerateAmbientOcclusionMaskFromDynamicMesh -- the same domain UE's own Paint Vertex Colors tool
-	 * uses, proven correct for Nanite by the native-tool audit -- and Accept as Instance Override is
-	 * never valid (see HasNaniteMeshInSelection). Render-Vertex mode is reserved for non-Nanite meshes
-	 * only in this phase.
+	 * render-vertex/OverrideVertexColors preview path would silently show nothing again, the exact bug
+	 * this whole feature fixes. So EVERY Nanite-enabled mesh uses Source-Topology mode, unconditionally:
+	 * Bounding Box/Ambient Occlusion are generated against WorkingMesh.Mesh (the SOURCE-topology
+	 * FDynamicMesh3) via GenerateBoundingBoxMaskFromDynamicMesh / GenerateAmbientOcclusionMaskFromDynamicMesh
+	 * -- the same domain UE's own Paint Vertex Colors tool uses, proven correct for Nanite by the
+	 * native-tool audit. Render-Vertex mode is reserved for non-Nanite meshes only in this phase.
 	 */
 	bool bUseSourceTopology = false;
 
@@ -835,7 +861,7 @@ struct FVertexMaskForgeSelectedMesh
 	TArray<FVertexMaskForgePreviewComponentState> PreviewComponents;
 };
 
-class SVertexMaskForgePanel : public SCompoundWidget
+class SVertexMaskForgePanel : public SCompoundWidget, public FEditorUndoClient
 {
 public:
 	SLATE_BEGIN_ARGS(SVertexMaskForgePanel) {}
@@ -846,7 +872,16 @@ public:
 	/** Declared here and defined in the .cpp so FDynamicMesh3 only needs to be complete there. */
 	virtual ~SVertexMaskForgePanel() override;
 
+	/**
+	 * FEditorUndoClient. Registered/unregistered via GEditor->RegisterForUndo/UnregisterForUndo in
+	 * Construct()/the destructor. See HandlePostUndoRedo's own doc comment for the full contract --
+	 * this is panel-state resync ONLY, never a substitute for Accept's own transactional write. */
+	virtual void PostUndo(bool bSuccess) override;
+	virtual void PostRedo(bool bSuccess) override;
+
 private:
+	void HandlePostUndoRedo(bool bSuccess, bool bIsRedo);
+
 	/**
 	 * Bound to USelection::SelectionChangedEvent (registered once in Construct(), removed in the
 	 * destructor via SelectionChangedDelegateHandle) -- the sole automatic trigger for
@@ -874,12 +909,11 @@ private:
 	 * Set true by OnEditorSelectionChanged() when the scene selection changes while OperationState !=
 	 * Idle (i.e. while an operation is pending against targets captured before that change).
 	 * Consumed -- and cleared -- by SyncSelectionIfChangedDuringOperation(), called at the tail of
-	 * exactly the three actions that can legitimately conclude a session and return OperationState to
-	 * Idle: OnCancelChangesClicked(), AcceptPendingChanges() (on success), and
-	 * AcceptPendingChangesAsInstanceOverride() (on success). Deliberately NOT consumed by any other
-	 * RecomputeOperationState() call site (e.g. ordinary mask regeneration flipping PendingChanges<->
-	 * Idle), so an incidental state flip unrelated to actually concluding a session never triggers an
-	 * unwanted resync/rebuild.
+	 * exactly the two actions that can legitimately conclude a session and return OperationState to
+	 * Idle: OnCancelChangesClicked() and AcceptPendingChanges() (on success). Deliberately NOT
+	 * consumed by any other RecomputeOperationState() call site (e.g. ordinary mask regeneration
+	 * flipping PendingChanges<->Idle), so an incidental state flip unrelated to actually concluding a
+	 * session never triggers an unwanted resync/rebuild.
 	 */
 	bool bSceneSelectionChangedDuringActiveOperation = false;
 
@@ -890,9 +924,9 @@ private:
 	 * required. No-ops (no rebuild, no flicker, no clobbered status text) if the selection never
 	 * changed during the just-concluded operation.
 	 *
-	 * MUST only be called AFTER the operation's own targets have been fully validated/written (Accept
-	 * / Accept as Instance Override) or fully discarded (Cancel) against the ORIGINAL SelectedMeshes,
-	 * and after OperationState has already settled back to Idle -- calling this any earlier would let
+	 * MUST only be called AFTER the operation's own targets have been fully validated/written (Accept)
+	 * or fully discarded (Cancel) against the ORIGINAL SelectedMeshes, and after OperationState has
+	 * already settled back to Idle -- calling this any earlier would let
 	 * a resync silently retarget or interrupt an in-flight operation, which must never happen.
 	 */
 	void SyncSelectionIfChangedDuringOperation();
@@ -1116,6 +1150,20 @@ private:
 	/** Unreal units (World Space); clamped again in GenerateAmbientOcclusionMask to [0.001, 10.0]. */
 	float AOBias = 0.1f;
 
+	/** AUDITED (AO Levels): see FVertexMaskForgeAOParams::LevelsMin's own doc comment for the exact
+	 *  pipeline. UI range [0, 1]; default 0.0. Purely compositional -- see OnAOLevelsChanged. */
+	float AOLevelsMin = 0.0f;
+
+	/** AUDITED (AO Levels): see FVertexMaskForgeAOParams::LevelsMax's own doc comment. UI range [0, 1];
+	 *  default 1.0. Purely compositional -- see OnAOLevelsChanged. */
+	float AOLevelsMax = 1.0f;
+
+	/** Same treatment as OnAOInvertChanged -- Levels never touches the AO acceleration structure or the
+	 *  raw per-vertex/per-element samples (applied only when Values is populated from RawValues -- see
+	 *  ApplyAOLevelsAndInvert), but still invalidates/regenerates through the normal discrete-parameter
+	 *  path so the composed Preview picks up the new Values immediately. */
+	void OnAOLevelsChanged();
+
 	// --- Fill White / Fill Black utility masks ----------------------------------------------
 
 	FReply OnFillWhiteClicked();
@@ -1259,9 +1307,8 @@ private:
 
 	/** Restores original materials and vertex colors on every tracked component of one entry --
 	 *  session-end variant (resets BaselineColors/CommittedColors/WorkingColors/AOCache too). Idempotent.
-	 *  Only called from DestroyAllPreviews() (Cancel, Accept, Accept as Instance Override, RefreshSelection,
-	 *  World cleanup) -- a genuine session end. See RestorePreviewForEntryVisualOnly for the
-	 *  mid-session/compositional case. */
+	 *  Only called from DestroyAllPreviews() (Cancel, Accept, RefreshSelection, World cleanup) -- a
+	 *  genuine session end. See RestorePreviewForEntryVisualOnly for the mid-session/compositional case. */
 	void RestorePreviewForEntry(FVertexMaskForgeSelectedMesh& Entry);
 
 	/** AUDITED (raw/composition separation checkpoint): visual-only restore on every tracked component
@@ -1286,34 +1333,16 @@ private:
 
 	EVertexMaskForgeOperationState GetOperationState() const { return OperationState; }
 
-	/** Recomputes OperationState (Idle/PendingChanges only -- see enum doc) from current data: a
-	 *  Preview Mode other than OriginalMaterial, and at least one entry with an active
-	 *  PreviewComponent and a Ready mask. Never touches LastOperationErrorText (callers that need to
-	 *  report a failure set it themselves, AFTER calling anything that ends in this, so a fresh
-	 *  message from this same pass is never clobbered). No-ops while Applying. */
+	/** Recomputes OperationState (Idle/PendingChanges only -- see enum doc) from current data: at
+	 *  least one entry with an active PreviewComponent and a Ready mask, independent of the current
+	 *  Preview Mode (Preview Mode only controls presentation, never persistence -- see
+	 *  ApplyPreviewToEntry's bUseOriginalMaterials). Never touches LastOperationErrorText (callers
+	 *  that need to report a failure set it themselves, AFTER calling anything that ends in this, so a
+	 *  fresh message from this same pass is never clobbered). No-ops while Applying. */
 	void RecomputeOperationState();
 
 	bool CanAcceptChanges() const { return OperationState == EVertexMaskForgeOperationState::PendingChanges; }
 	FReply OnAcceptChangesClicked();
-
-	/**
-	 * Alternative conclusion to the SAME PendingChanges session Accept would otherwise conclude:
-	 * writes the current Preview result as permanent per-instance OverrideVertexColors on each
-	 * selected UStaticMeshComponent, and NEVER touches the Source Static Mesh asset (no
-	 * Mesh->Modify(), GetMeshDescription(), CommitMeshDescription(), Build(), or
-	 * MarkPackageDirty() on the Static Mesh -- see VertexMaskForgePanel::WriteInstanceOverrideTargets
-	 * in the .cpp for the audited, engine-sourced justification). Shares Accept's PendingChanges gate
-	 * -- both are valid, mutually exclusive ways to conclude the same session; this one never calls
-	 * into AcceptPendingChanges() or vice versa.
-	 *
-	 * AUDITED (Nanite): additionally requires !HasNaniteMeshInSelection() -- Nanite's runtime renderer
-	 * never reads FStaticMeshComponentLODInfo::OverrideVertexColors (confirmed against the UE 5.8
-	 * Mesh Vertex Paint Tool / Nanite rendering source), so writing an instance override onto a
-	 * Nanite-enabled component would silently produce no visible result. Accept (writing to the
-	 * Source Static Mesh) is the only route that can affect a Nanite mesh's rendering.
-	 */
-	bool CanAcceptAsInstanceOverride() const { return OperationState == EVertexMaskForgeOperationState::PendingChanges && !HasNaniteMeshInSelection(); }
-	FReply OnAcceptAsInstanceOverrideClicked();
 
 	/**
 	 * True if any currently selected entry's already-resolved Static Mesh has Nanite enabled
@@ -1323,11 +1352,9 @@ private:
 	 */
 	bool HasNaniteMeshInSelection() const;
 
-	/** Explains why the button is disabled when HasNaniteMeshInSelection() is true; the normal
-	 *  tooltip otherwise. */
-	FText GetAcceptAsInstanceOverrideTooltip() const;
-
-	/** Visible only while HasNaniteMeshInSelection() is true -- shown next to the Accept row. */
+	/** Visible only while HasNaniteMeshInSelection() is true -- shown next to the Accept row, explains
+	 *  that Accept for a Nanite-enabled mesh writes to the Source Static Mesh asset and affects every
+	 *  instance using it. */
 	EVisibility GetNaniteNoticeVisibility() const { return HasNaniteMeshInSelection() ? EVisibility::Visible : EVisibility::Collapsed; }
 
 	bool CanCancelChanges() const { return OperationState == EVertexMaskForgeOperationState::PendingChanges || OperationState == EVertexMaskForgeOperationState::Failed; }
@@ -1343,63 +1370,11 @@ private:
 	 */
 	bool AcceptPendingChanges();
 
-	/**
-	 * Validates every eligible component, confirms the (non-destructive, asset-safe) destination with
-	 * the user, and -- only if both succeed -- writes permanent OverrideVertexColors directly onto
-	 * each selected UStaticMeshComponent inside one FScopedTransaction (see
-	 * VertexMaskForgePanel::BuildInstanceOverrideTargets / WriteInstanceOverrideTargets). Unlike
-	 * AcceptPendingChanges(), never deduplicates by UStaticMesh -- two components sharing one asset
-	 * can end up with different FinalColors and are written independently. Returns true only on a
-	 * fully successful write.
-	 */
-	bool AcceptPendingChangesAsInstanceOverride();
-
-	/**
-	 * Independent of Accept / Accept as Instance Override -- never requires, reads, or clears
-	 * PendingChanges. Removes the LOD0 Instance Vertex Color override (via
-	 * VertexMaskForgePanel::HasRemovableLOD0Override / BuildRemoveInstanceOverrideTargets, see the
-	 * .cpp) from every SELECTED component that currently has one, restoring that component's own
-	 * appearance to whatever Vertex Colors are stored in its Source Static Mesh. Enabled only while
-	 * OperationState == Idle (an unresolved PendingChanges OR Failed preview decision must be
-	 * concluded via Accept/Accept as Instance Override/Cancel first -- this deliberately never
-	 * discards a pending Preview itself) AND at least one selected component currently has a
-	 * removable override -- both re-evaluated live on every call (same as CanAcceptChanges /
-	 * CanCancelChanges already are), so Undo/Redo and Refresh Selection are reflected on the very
-	 * next Slate tick with no extra notification/delegate registration needed.
-	 */
-	bool CanRemoveInstanceOverride() const;
-	FReply OnRemoveInstanceOverrideClicked();
-
-	/**
-	 * Validates every selected component with a removable override, confirms the (non-destructive,
-	 * asset-safe) removal with the user, and -- only if both succeed -- removes each one's LOD0
-	 * OverrideVertexColors via UStaticMeshComponent::RemoveInstanceVertexColorsFromLOD(0) inside one
-	 * FScopedTransaction (see VertexMaskForgePanel::BuildRemoveInstanceOverrideTargets /
-	 * RemoveInstanceOverrideTargets). Never touches any Static Mesh asset. Never deduplicates by
-	 * UStaticMesh -- every selected component with an override is its own independent target.
-	 */
-	bool RemoveInstanceOverrides();
-
 	/** Records the reason the last Accept (or auto-update regeneration) was blocked/failed, shown in
 	 *  GetOperationStatusText(). Cleared explicitly at the START of each fresh attempt -- never by
 	 *  RecomputeOperationState(), so it survives whatever UpdateAllPreviews() call follows within the
 	 *  same attempt. */
 	FText LastOperationErrorText;
-
-	/** Success message for the last successful "Accept as Instance Override", shown by
-	 *  GetOperationStatusText() while Idle (native Accept has no equivalent persistent success text
-	 *  today -- its Idle state already reads as "No pending changes." either way). Cleared at the
-	 *  start of every fresh Accept / Accept as Instance Override / Remove Instance Override / Cancel
-	 *  attempt. Mutually exclusive with LastRemoveOverrideStatusText -- whichever action ran most
-	 *  recently clears the other, so GetOperationStatusText() never shows a stale message from the
-	 *  other action. */
-	FText LastInstanceOverrideStatusText;
-
-	/** Success message for the last successful "Remove Instance Override", shown by
-	 *  GetOperationStatusText() while Idle. Cleared at the start of every fresh Accept / Accept as
-	 *  Instance Override / Remove Instance Override / Cancel attempt -- see
-	 *  LastInstanceOverrideStatusText's doc for the mutual-exclusion contract with this field. */
-	FText LastRemoveOverrideStatusText;
 
 	EVertexMaskForgeOperationState OperationState = EVertexMaskForgeOperationState::Idle;
 

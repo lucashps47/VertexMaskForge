@@ -40,6 +40,7 @@
 #include "Widgets/Input/SSlider.h"
 #include "Widgets/Input/SSpinBox.h"
 #include "Widgets/Layout/SBorder.h"
+#include "Widgets/Layout/SExpandableArea.h"
 #include "Widgets/Layout/SSeparator.h"
 #include "Widgets/SBoxPanel.h"
 #include "Widgets/Text/STextBlock.h"
@@ -1633,6 +1634,52 @@ namespace VertexMaskForgePanel
 	}
 
 	/**
+	 * AUDITED (AO Levels + vanilla inversion checkpoint): the ONE shared, pure post-processing step
+	 * both GenerateAmbientOcclusionMask (render-vertex) and GenerateAmbientOcclusionMaskFromDynamicMesh
+	 * (Source-Topology) call to turn a single cached RawAO sample into the final composed value --
+	 * never duplicated, never diverges between the two domains. Does no geometry, no raycasts, no cache
+	 * access; a pure scalar transform, safe to call every recomposition regardless of Auto Update
+	 * Preview, cache hit/miss, or which domain called it.
+	 *
+	 * PIPELINE (confirmed against the existing composition order before writing this; see the
+	 * checkpoint report for the full confirmation):
+	 *   1. RawAO: the raw hemisphere-occlusion fraction from AOCache.RawValues (or
+	 *      FVertexMaskForgeSourceTopologyAOCache.RawValues) -- convention unchanged: 0 = exposed
+	 *      (no occluders), 1 = fully occluded/cavity.
+	 *   2. BaseAO = 1 - RawAO -- the NEW vanilla inversion (checkpoint requirement): baked
+	 *      unconditionally into the AO layer's own interpretation, independent of the user-facing
+	 *      Invert checkbox, which keeps its default (false/unchecked) meaning and serialized value.
+	 *      With Invert left OFF, BaseAO is now exactly what previously required Invert ON to see.
+	 *   3. LevelsMin/LevelsMax: saturate((BaseAO - LevelsMin) / max(LevelsMax - LevelsMin, Epsilon)) --
+	 *      a standard black/white-point remap over BaseAO. Defaults (Min=0, Max=1) make this an exact
+	 *      no-op (Denom=1, numerator unchanged, saturate is a no-op since BaseAO is already in [0,1]),
+	 *      so existing sessions/serialized state that predate this field (defaulting to 0/1) are
+	 *      visually unaffected -- see the checkpoint report.
+	 *   4. User Invert (bInvert): applied LAST, over the ALREADY-leveled result -- FinalAO = bInvert ?
+	 *      (1 - LeveledAO) : LeveledAO. This is what makes Invert "invert the new vanilla result" rather
+	 *      than "toggle between old and new vanilla" -- the vanilla flip in step 2 is unconditional and
+	 *      structural, not something Invert ever cancels back out to the OLD pre-checkpoint behavior.
+	 *
+	 * DIVIDE-BY-ZERO / NaN SAFETY: LevelsMax <= LevelsMin (including exactly equal) is handled by
+	 * clamping the denominator to a small Epsilon rather than rejecting the input or clamping
+	 * LevelsMin/LevelsMax themselves -- the UI keeps showing exactly what the user set (never silently
+	 * snapped), and the composed result becomes a hard step (everything at or above LevelsMin reads as
+	 * white) instead of NaN/Inf/undefined -- a deterministic, artist-legible degenerate case rather than
+	 * a crash or a silently-wrong value.
+	 */
+	static float ApplyAOLevelsAndInvert(const float RawAO, const float LevelsMin, const float LevelsMax, const bool bInvert)
+	{
+		constexpr float Epsilon = 1e-4f;
+
+		const float BaseAO = 1.0f - RawAO;
+
+		const float Denom = FMath::Max(LevelsMax - LevelsMin, Epsilon);
+		const float LeveledAO = FMath::Clamp((BaseAO - LevelsMin) / Denom, 0.0f, 1.0f);
+
+		return bInvert ? (1.0f - LeveledAO) : LeveledAO;
+	}
+
+	/**
 	 * Generates the Ambient Occlusion Mask directly in RENDER VERTEX order for one component, using
 	 * CPU hemisphere raycasts against the component's OWN geometry via a GeometryCore
 	 * UE::Geometry::FDynamicMeshAABBTree3 (UE 5.8's stable, Runtime-module mesh spatial index).
@@ -1769,6 +1816,11 @@ namespace VertexMaskForgePanel
 		Params.Samples = FMath::Clamp(Params.Samples, 8, 256);
 		Params.MaxDistance = FMath::Clamp(Params.MaxDistance, 0.01f, 10000.0f);
 		Params.Bias = FMath::Clamp(Params.Bias, 0.001f, 10.0f);
+		// AUDITED (AO Levels): clamped independently to [0,1] each -- LevelsMax <= LevelsMin is a valid,
+		// deterministic degenerate case (see ApplyAOLevelsAndInvert's own doc comment), not something to
+		// reorder or reject here.
+		Params.LevelsMin = FMath::Clamp(Params.LevelsMin, 0.0f, 1.0f);
+		Params.LevelsMax = FMath::Clamp(Params.LevelsMax, 0.0f, 1.0f);
 		Mask.UsedAOParams = Params;
 
 		const FPositionVertexBuffer& RenderPositions = LOD0.VertexBuffers.PositionVertexBuffer;
@@ -2017,7 +2069,7 @@ namespace VertexMaskForgePanel
 		for (int32 i = 0; i < NumRenderVerts; ++i)
 		{
 			const float Raw = Cache.RawValues[i];
-			const float Value = FMath::Clamp(Params.bInvert ? (1.0f - Raw) : Raw, 0.0f, 1.0f);
+			const float Value = ApplyAOLevelsAndInvert(Raw, Params.LevelsMin, Params.LevelsMax, Params.bInvert);
 			Mask.Values[i] = Value;
 
 			Sum += Value;
@@ -2092,6 +2144,11 @@ namespace VertexMaskForgePanel
 		Params.Samples = FMath::Clamp(Params.Samples, 8, 256);
 		Params.MaxDistance = FMath::Clamp(Params.MaxDistance, 0.01f, 10000.0f);
 		Params.Bias = FMath::Clamp(Params.Bias, 0.001f, 10.0f);
+		// AUDITED (AO Levels): clamped independently to [0,1] each -- LevelsMax <= LevelsMin is a valid,
+		// deterministic degenerate case (see ApplyAOLevelsAndInvert's own doc comment), not something to
+		// reorder or reject here.
+		Params.LevelsMin = FMath::Clamp(Params.LevelsMin, 0.0f, 1.0f);
+		Params.LevelsMax = FMath::Clamp(Params.LevelsMax, 0.0f, 1.0f);
 		Mask.UsedAOParams = Params;
 
 		const FDynamicMeshNormalOverlay* NormalOverlay =
@@ -2318,7 +2375,7 @@ namespace VertexMaskForgePanel
 		for (const int32 ElementID : NormalOverlay->ElementIndicesItr())
 		{
 			const float Raw = Cache.RawValues[ElementID];
-			const float Value = FMath::Clamp(Params.bInvert ? (1.0f - Raw) : Raw, 0.0f, 1.0f);
+			const float Value = ApplyAOLevelsAndInvert(Raw, Params.LevelsMin, Params.LevelsMax, Params.bInvert);
 			Mask.Values[ElementID] = Value;
 			Mask.bHasValue[ElementID] = true;
 			++NumValid;
@@ -2999,9 +3056,8 @@ namespace VertexMaskForgePanel
 	/**
 	 * Updates BaselineColors/CommittedColors/WorkingColors (see FVertexMaskForgePreviewComponentState's
 	 * own doc comments for the full architectural contract) IN PLACE for one component. This is the
-	 * ONLY function that ever writes to any of the three arrays, and Preview/Accept/Accept as
-	 * Instance Override all consume WorkingColors as this function leaves it, so all three always
-	 * see the exact same result.
+	 * ONLY function that ever writes to any of the three arrays, and both Preview and Accept consume
+	 * WorkingColors as this function leaves it, so both always see the exact same result.
 	 *
 	 * AUDITED (baseline-snapshot fix): BaselineColors is captured ONCE per component per session --
 	 * exactly when it is empty or stale-sized (first composition of a new session, or the render
@@ -3172,9 +3228,8 @@ namespace VertexMaskForgePanel
 	 *     color, never borrowed from a different corner" contract UpdateWorkingColors already
 	 *     guarantees for render vertices, just at corner granularity here. No per-instance
 	 *     OverrideVertexColors priority in this domain (unlike UpdateWorkingColors): Nanite's renderer
-	 *     never reads per-instance overrides at all (see HasNaniteMeshInSelection/
-	 *     CanAcceptAsInstanceOverride), so there is no per-instance baseline to prioritize -- baseline
-	 *     always comes from the asset's own source color overlay.
+	 *     never reads per-instance overrides at all, so there is no per-instance baseline to
+	 *     prioritize -- baseline always comes from the asset's own source color overlay.
 	 *   - Bounding Box layer's value: looked up by DYNAMIC MESH VERTEX ID (Mesh.GetTriangle(tid)[corner])
 	 *     -- BBox is a pure function of position, so corner-level granularity is not needed for the
 	 *     VALUE itself, only for where it gets written.
@@ -3311,10 +3366,9 @@ namespace VertexMaskForgePanel
 	 *
 	 * AUDITED (Preview-Mode-cannot-affect-Accept fix): DISPLAY-ONLY. Called exclusively from
 	 * ApplyPreviewToEntry, for the transient PreviewComponent shown in the viewport. Accept
-	 * (BuildAcceptTargets) and Accept as Instance Override (BuildInstanceOverrideTargets) NEVER call
-	 * this function -- they persist State.WorkingColors verbatim, so the real multi-channel RGB is
-	 * written regardless of which Preview Mode happens to be selected at the moment of Accept.
-	 * Read-only: never mutates WorkingColors.
+	 * (BuildAcceptTargets) NEVER calls this function -- it persists State.WorkingColors verbatim, so
+	 * the real multi-channel RGB is written regardless of which Preview Mode happens to be selected at
+	 * the moment of Accept. Read-only: never mutates WorkingColors.
 	 */
 	static TArray<FColor> DeriveDisplayColors(const TArray<FColor>& WorkingColors, const EVertexMaskForgePreviewMode Mode)
 	{
@@ -3385,12 +3439,10 @@ namespace VertexMaskForgePanel
 	 *
 	 * AUDITED (Preview-Mode-cannot-affect-Accept fix): takes NO EVertexMaskForgePreviewMode parameter
 	 * at all, and reads State.WorkingColors VERBATIM -- never through DeriveDisplayColors -- so the
-	 * persisted result is the same real multi-channel RGB regardless of which Preview Mode (Full RGB,
-	 * Red/Green/Blue/Alpha Channel) happens to be selected when Accept runs. The function's only
-	 * caller, AcceptPendingChanges(), already requires OperationState == PendingChanges, which
-	 * RecomputeOperationState() only ever sets while CurrentPreviewMode != OriginalMaterial -- so the
-	 * "no active Preview" case this function used to gate on cannot reach here in the first place and
-	 * needs no check of its own.
+	 * persisted result is the same real multi-channel RGB regardless of which Preview Mode (Original
+	 * Material, Full RGB, Red/Green/Blue Channel) happens to be selected when Accept runs.
+	 * RecomputeOperationState() computes PendingChanges identically regardless of CurrentPreviewMode
+	 * (see its own doc comment), so this function needs no Preview-Mode check of its own either.
 	 */
 	static bool BuildAcceptTargets(
 		const TArray<TSharedPtr<FVertexMaskForgeSelectedMesh>>& SelectedMeshes,
@@ -3548,20 +3600,37 @@ namespace VertexMaskForgePanel
 	/**
 	 * Writes every target's FinalColors into its Static Mesh asset's LOD 0 MeshDescription (via the
 	 * SAME WedgeMap-based approach as UMeshPaintingSubsystem::PropagateColorsToRawMesh -- see the
-	 * audit note on BuildAcceptTargets), inside a single FScopedTransaction so Accept is one coherent
-	 * Undo step. Re-validates every target BEFORE opening the transaction or modifying anything --
-	 * once the write loop starts, every step is expected to succeed by construction (validated moments
+	 * audit note on BuildAcceptTargets). Re-validates every target BEFORE modifying anything -- once
+	 * the write loop starts, every step is expected to succeed by construction (validated moments
 	 * earlier, synchronously, nothing else runs in between), so there is no mid-loop rollback path:
-	 * if this function ever returns false, NOTHING has been modified and no transaction was opened.
+	 * if this function ever returns false, NOTHING has been modified.
 	 *
-	 * Mesh->Modify() is called before editing so Undo restores the previous colors (UStaticMesh::
-	 * PostEditUndo() already triggers Build() automatically via PostEditChangeProperty() on Undo/Redo
-	 * -- see StaticMesh.cpp -- so no extra Undo/Redo handling is needed here). Mesh->Build() is called
-	 * once per asset AFTER all of its colors are committed, to regenerate RenderData (including a
-	 * fresh FColorVertexBuffer) from the edited MeshDescription -- the same order
-	 * UMeshPaintModeSubsystem::PropagateVertexColors uses.
+	 * AUDITED (Undo/Redo fix): does NOT open its own FScopedTransaction or call Mesh->Build() -- the
+	 * caller (AcceptPendingChanges) owns ONE outer transaction spanning this function and its
+	 * Source-Topology sibling together, and calls BuildModifiedMeshes() for both domains' results only
+	 * AFTER that transaction closes (see BuildModifiedMeshes' own doc comment for why the rebuild must
+	 * stay outside it). Every successfully-written Mesh is appended to OutModifiedMeshes for that later
+	 * pass.
+	 *
+	 * AUDITED (Undo/Redo fix, root cause): Mesh->Modify() ALONE only snapshots UStaticMesh's own
+	 * UPROPERTY fields -- the TObjectPtr<UStaticMeshDescriptionBulkData> pointer VALUE inside
+	 * FStaticMeshSourceModel, which does not change (same sub-object instance before and after Accept).
+	 * The actual serialized MeshDescription bytes live inside that SEPARATE UObject
+	 * (UStaticMeshDescriptionBulkData, via UMeshDescriptionBaseBulkData::Serialize -- see
+	 * MeshDescriptionBaseBulkData.h/.cpp), which the Editor transaction system only captures if Modify()
+	 * is ALSO called on THAT object -- exactly what UStaticMesh::ModifyMeshDescription(LodIndex) does
+	 * (StaticMesh.cpp: `SourceModel.StaticMeshDescriptionBulkData->Modify(bAlwaysMarkDirty)`). Without
+	 * it, Mesh->Modify() alone records an empty/no-op change for this asset, so Undo never restores the
+	 * previous colors (this was the actual bug -- not a refresh/notification problem). Confirmed against
+	 * the native reference for this exact commit sequence, Modeling Tools'
+	 * UStaticMeshToolTarget::CommitMeshDescription (StaticMeshToolTarget.cpp): SetFlags(RF_Transactional)
+	 * -> Modify() -> ModifyMeshDescription(LodIndex) -> mutate -> CommitMeshDescription(LodIndex) ->
+	 * PostEditChange() (done here via BuildModifiedMeshes/Build(), the derived-data equivalent). On
+	 * Undo, UStaticMesh::PostEditUndo() -> Super::PostEditUndo() -> PostEditChangeProperty() -> Build()
+	 * automatically regenerates RenderData (and Nanite data) from the restored MeshDescription -- no
+	 * extra Undo/Redo handling is needed here for that part.
 	 */
-	static bool WriteAcceptTargets(const TArray<FVertexMaskForgeAcceptTarget>& Targets, FText& OutErrorText)
+	static bool WriteAcceptTargets(const TArray<FVertexMaskForgeAcceptTarget>& Targets, TArray<UStaticMesh*>& OutModifiedMeshes, FText& OutErrorText)
 	{
 		for (const FVertexMaskForgeAcceptTarget& Target : Targets)
 		{
@@ -3581,18 +3650,19 @@ namespace VertexMaskForgePanel
 			}
 		}
 
-		FScopedTransaction Transaction(LOCTEXT("AcceptVertexMaskForgeChanges", "Accept Vertex Mask Forge Changes"));
-
-		TArray<UStaticMesh*> ModifiedMeshes;
-		ModifiedMeshes.Reserve(Targets.Num());
-
 		for (const FVertexMaskForgeAcceptTarget& Target : Targets)
 		{
 			UStaticMesh* Mesh = Target.Mesh.Get();
 			FMeshDescription* MeshDescription = Mesh->GetMeshDescription(0);
 			const FStaticMeshLODResources& LOD0 = Mesh->GetRenderData()->LODResources[0];
 
+			// AUDITED (Undo/Redo fix): SetFlags is defensive (assets already loaded in the Editor are
+			// transactional in practice) and matches the native reference exactly; Modify() captures
+			// UStaticMesh's own properties, ModifyMeshDescription(0) captures the source data that
+			// actually changes -- see this function's own doc comment for why both are required.
+			Mesh->SetFlags(RF_Transactional);
 			Mesh->Modify();
+			Mesh->ModifyMeshDescription(0);
 
 			FStaticMeshAttributes Attributes(*MeshDescription);
 			TVertexInstanceAttributesRef<FVector4f> Colors = Attributes.GetVertexInstanceColors();
@@ -3609,14 +3679,7 @@ namespace VertexMaskForgePanel
 			}
 
 			Mesh->CommitMeshDescription(0);
-			ModifiedMeshes.Add(Mesh);
-		}
-
-		// Rebuild once per asset, after all of its colors are committed -- regenerates RenderData
-		// (including a fresh FColorVertexBuffer) from the edited MeshDescription.
-		for (UStaticMesh* Mesh : ModifiedMeshes)
-		{
-			Mesh->Build(/*bInSilent=*/true);
+			OutModifiedMeshes.Add(Mesh);
 		}
 
 		return true;
@@ -3845,8 +3908,14 @@ namespace VertexMaskForgePanel
 	 * Colors tool's own commit (see the native-tool audit), without re-running a full mesh conversion
 	 * (which could risk touching other attributes). Same two-pass (re-validate everything, THEN write)
 	 * discipline as WriteAcceptTargets -- if this returns false, nothing was modified.
+	 *
+	 * AUDITED (Undo/Redo fix): like its render-vertex sibling, does NOT open its own FScopedTransaction
+	 * or call Mesh->Build() -- see WriteAcceptTargets' own doc comment for why (single outer
+	 * transaction owned by AcceptPendingChanges, rebuild deferred to BuildModifiedMeshes() after that
+	 * transaction closes) and for the ModifyMeshDescription() root-cause explanation, which applies
+	 * identically here.
 	 */
-	static bool WriteSourceTopologyAcceptTargets(const TArray<FVertexMaskForgeSourceTopologyAcceptTarget>& Targets, FText& OutErrorText)
+	static bool WriteSourceTopologyAcceptTargets(const TArray<FVertexMaskForgeSourceTopologyAcceptTarget>& Targets, TArray<UStaticMesh*>& OutModifiedMeshes, FText& OutErrorText)
 	{
 		using namespace UE::Geometry;
 
@@ -3876,16 +3945,6 @@ namespace VertexMaskForgePanel
 			}
 		}
 
-		// AUDITED: nests inside the caller's own outer FScopedTransaction (AcceptPendingChanges) when
-		// both a render-vertex and a Source-Topology write happen in the same Accept -- UE's transaction
-		// system merges nested Begin/End pairs into the single outermost Undo step, so this is still
-		// exactly ONE coherent Undo step for the whole operation, same as WriteAcceptTargets' own
-		// (identical) pattern.
-		FScopedTransaction Transaction(LOCTEXT("AcceptVertexMaskForgeSourceTopologyChanges", "Accept Vertex Mask Forge Changes (Source Topology)"));
-
-		TArray<UStaticMesh*> ModifiedMeshes;
-		ModifiedMeshes.Reserve(Targets.Num());
-
 		for (const FVertexMaskForgeSourceTopologyAcceptTarget& Target : Targets)
 		{
 			UStaticMesh* Mesh = Target.Mesh.Get();
@@ -3893,7 +3952,11 @@ namespace VertexMaskForgePanel
 			const FDynamicMesh3& WorkingDynamicMesh = *Target.Entry->WorkingMesh.Mesh;
 			const TArray<FTriangleID>& TriIDMap = Target.Entry->WorkingMesh.TriIDMap;
 
+			// AUDITED (Undo/Redo fix): see WriteAcceptTargets' own doc comment -- ModifyMeshDescription
+			// is the call that actually makes the source data participate in the Transaction Buffer.
+			Mesh->SetFlags(RF_Transactional);
 			Mesh->Modify();
+			Mesh->ModifyMeshDescription(0);
 
 			FStaticMeshAttributes Attributes(*MeshDescription);
 			TVertexInstanceAttributesRef<FVector4f> Colors = Attributes.GetVertexInstanceColors();
@@ -3974,399 +4037,51 @@ namespace VertexMaskForgePanel
 				TEXT("Vertex Mask Forge: Accept (Source Topology) -- '%s': colors written, CommitMeshDescription succeeded, persistence verified."),
 				*Target.AssetName);
 
-			ModifiedMeshes.Add(Mesh);
+			OutModifiedMeshes.Add(Mesh);
 		}
 
-		// Rebuild once per asset, after all of its colors are committed -- regenerates RenderData AND
-		// Nanite cluster data from the edited source MeshDescription, in the SAME build pass (see the
-		// native Nanite build audit: MeshBuilderModule.BuildMesh() reads VertexInstanceColors directly
-		// from this same source MeshDescription when constructing Nanite's cluster input).
-		//
-		// AUDITED (BUG FIX round -- Build failure detection, per explicit requirement): OutErrors is
-		// passed and checked -- Mesh->Build() is void and does not throw, so this is the only way to
-		// learn a build genuinely failed rather than silently leaving stale RenderData/Nanite data in
-		// place while the caller believes Accept succeeded.
-		for (UStaticMesh* Mesh : ModifiedMeshes)
+		return true;
+	}
+
+	/**
+	 * Rebuilds RenderData (and Nanite cluster data, for Nanite-enabled assets -- same build pass, see
+	 * the native Nanite build audit: MeshBuilderModule.BuildMesh() reads VertexInstanceColors directly
+	 * from the same source MeshDescription when constructing Nanite's cluster input) for every mesh
+	 * whose MeshDescription was just committed by WriteAcceptTargets/WriteSourceTopologyAcceptTargets.
+	 *
+	 * AUDITED (Undo/Redo fix): called by AcceptPendingChanges AFTER its outer FScopedTransaction has
+	 * already closed -- mirrors UE::ToolTarget::Internal::PostEditChangeWithConditionalUndo, the
+	 * audited native reference (Modeling Tools' own StaticMeshToolTarget::CommitMeshDescription commit
+	 * sequence): RenderData/Nanite data is DERIVED, deterministically regenerated from the (now
+	 * transacted) MeshDescription on both Accept and Undo/Redo (UStaticMesh::PostEditUndo() ->
+	 * Super::PostEditUndo() -> PostEditChangeProperty() -> Build(), the exact same derivation) -- so it
+	 * must never itself be captured inside a transaction. GUndo is suppressed for the duration of each
+	 * Build() call, exactly as the native pattern does, so an already-closed outer transaction (or the
+	 * complete absence of one) can never be reopened or polluted by whatever Modify() calls Build()
+	 * triggers internally (e.g. component re-registration).
+	 */
+	static bool BuildModifiedMeshes(const TArray<UStaticMesh*>& Meshes, FText& OutErrorText)
+	{
+		for (UStaticMesh* Mesh : Meshes)
 		{
+			if (!IsValid(Mesh))
+			{
+				continue;
+			}
+
+			TGuardValue<ITransaction*> SuppressTransaction(GUndo, nullptr);
 			TArray<FText> BuildErrors;
 			Mesh->Build(/*bInSilent=*/true, &BuildErrors);
 			if (!BuildErrors.IsEmpty())
 			{
 				OutErrorText = FText::Format(
-					LOCTEXT("AcceptSourceTopologyBuildFailedFormat",
-						"'{0}': Build failed after committing Vertex Colors: {1}"),
+					LOCTEXT("AcceptBuildFailedFormat", "'{0}': Build failed after committing Vertex Colors: {1}"),
 					FText::FromString(Mesh->GetName()), BuildErrors[0]);
-				UE_LOG(LogVertexMaskForge, Error,
-					TEXT("Vertex Mask Forge: Accept (Source Topology) Build FAILED for '%s': %s"),
+				UE_LOG(LogVertexMaskForge, Error, TEXT("Vertex Mask Forge: Accept Build FAILED for '%s': %s"),
 					*Mesh->GetName(), *BuildErrors[0].ToString());
 				return false;
 			}
-			UE_LOG(LogVertexMaskForge, Log, TEXT("Vertex Mask Forge: Accept (Source Topology) -- '%s': Build completed."), *Mesh->GetName());
-		}
-
-		return true;
-	}
-
-	// --- Accept as Instance Override: permanent write to component(s), Source Static Mesh untouched --
-
-	/**
-	 * One selected UStaticMeshComponent instance targeted by "Accept as Instance Override", with its
-	 * final, ready-to-write colors. NEVER deduplicated by UStaticMesh (unlike
-	 * FVertexMaskForgeAcceptTarget, which is 1-per-asset) -- two components that happen to reference
-	 * the same asset are independent targets here and can legitimately end up with different
-	 * FinalColors (divergent per-instance baselines, or divergent per-instance World Space
-	 * evaluation), since each writes only to its own component and never to the shared asset.
-	 */
-	struct FVertexMaskForgeInstanceOverrideTarget
-	{
-		TWeakObjectPtr<UStaticMeshComponent> Component;
-		/** Diagnostic-only label ("ComponentName (ActorLabel)"), used in error/status messages. */
-		FString ComponentLabel;
-		/** Render-vertex-order (LOD0), exactly as shown in Preview -- the data actually written. */
-		TArray<FColor> FinalColors;
-	};
-
-	/**
-	 * Validates every SelectedMeshes entry/component eligible for "Accept as Instance Override" and,
-	 * only if ALL of them pass, returns one target PER live PreviewComponent. Mirrors
-	 * BuildAcceptTargets' eligibility gate (Ready mask, at least one live PreviewComponent) and its
-	 * per-component World Space mask re-evaluation exactly, but deliberately omits two things
-	 * BuildAcceptTargets needs and this path does not:
-	 *   - the cross-component "all instances must agree" check, since that check exists ONLY because
-	 *     BuildAcceptTargets writes ONE shared asset from possibly-divergent per-instance baselines;
-	 *     here every component gets its own independent write target, so divergence is expected and
-	 *     harmless;
-	 *   - any MeshDescription/WedgeMap validation, since this path never touches the asset's
-	 *     MeshDescription at all -- only LOD0's render-vertex COUNT (from the asset's RenderData,
-	 *     read-only) is needed to size/validate FinalColors.
-	 *
-	 * AUDITED (recompute-at-Accept fix): like BuildAcceptTargets, this function NEVER calls
-	 * UpdateWorkingColors and NEVER re-evaluates GenerateBoundingBoxMask -- it only READS each
-	 * component's State.WorkingColors. See BuildAcceptTargets' own doc comment for the full
-	 * structural guarantee this relies on (every parameter that could affect composition either
-	 * invalidates the mask, disabling Accept until regenerated, or itself synchronously updates
-	 * WorkingColors before Accept can run).
-	 *
-	 * AUDITED (Preview-Mode-cannot-affect-Accept fix): like BuildAcceptTargets, takes NO
-	 * EVertexMaskForgePreviewMode parameter and reads State.WorkingColors verbatim -- never through
-	 * DeriveDisplayColors -- for the same reason: AcceptPendingChangesAsInstanceOverride() already
-	 * requires OperationState == PendingChanges, which RecomputeOperationState() only ever sets while
-	 * CurrentPreviewMode != OriginalMaterial.
-	 */
-	static bool BuildInstanceOverrideTargets(
-		const TArray<TSharedPtr<FVertexMaskForgeSelectedMesh>>& SelectedMeshes,
-		TArray<FVertexMaskForgeInstanceOverrideTarget>& OutTargets,
-		FText& OutErrorText)
-	{
-		OutTargets.Reset();
-
-		for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
-		{
-			// AUDITED (composition-stack checkpoint): eligible if EITHER slot is Ready -- this gate is
-			// only a coarse pre-filter anyway; the actual data persisted is always State.WorkingColors
-			// (read verbatim below), never re-derived from either mask here.
-			if (!Entry.IsValid() || Entry->PreviewComponents.IsEmpty()
-				|| (Entry->WorkingMesh.BoundingBoxMask.State != EVertexMaskForgeScalarMaskState::Ready
-					&& Entry->WorkingMesh.AmbientOcclusionMask.State != EVertexMaskForgeScalarMaskState::Ready))
-			{
-				continue;
-			}
-
-			UStaticMesh* Mesh = Entry->Mesh.LoadSynchronous();
-			if (!IsValid(Mesh) || !Mesh->HasValidRenderData(/*bCheckLODForVerts=*/true, /*LODIndex=*/0))
-			{
-				OutErrorText = FText::Format(
-					LOCTEXT("InstanceOverrideInvalidMeshFormat", "'{0}': Static Mesh could not be resolved or has no valid LOD 0 render data."),
-					FText::FromString(Entry->AssetName));
-				return false;
-			}
-
-			const FStaticMeshRenderData* RenderData = Mesh->GetRenderData();
-			if (!RenderData || !RenderData->LODResources.IsValidIndex(0))
-			{
-				OutErrorText = FText::Format(
-					LOCTEXT("InstanceOverrideNoRenderDataFormat", "'{0}': no LOD 0 render data available."),
-					FText::FromString(Entry->AssetName));
-				return false;
-			}
-			const FStaticMeshLODResources& LOD0 = RenderData->LODResources[0];
-
-			for (const FVertexMaskForgePreviewComponentState& State : Entry->PreviewComponents)
-			{
-				UStaticMeshComponent* SourceComponent = State.SourceComponent.Get();
-				if (!IsValid(SourceComponent))
-				{
-					continue;
-				}
-
-				// AUDITED (recompute-at-Accept fix): read-only -- see this function's own doc comment.
-				if (State.WorkingColors.IsEmpty())
-				{
-					continue;
-				}
-				// AUDITED (Preview-Mode-cannot-affect-Accept fix): the raw multi-channel result,
-				// verbatim -- never DeriveDisplayColors, never CurrentPreviewMode.
-				TArray<FColor> ComponentColors = State.WorkingColors;
-
-				if (ComponentColors.Num() != static_cast<int32>(LOD0.GetNumVertices()))
-				{
-					// Defensive only: WorkingColors is always sized by UpdateWorkingColors (the only
-					// writer) to LOD0's own NumRenderVerts -- this cannot actually diverge in practice.
-					continue;
-				}
-
-				FVertexMaskForgeInstanceOverrideTarget Target;
-				Target.Component = SourceComponent;
-				Target.ComponentLabel = FString::Printf(TEXT("%s (%s)"), *SourceComponent->GetName(),
-					SourceComponent->GetOwner() ? *SourceComponent->GetOwner()->GetActorLabel() : TEXT("?"));
-				Target.FinalColors = MoveTemp(ComponentColors);
-				OutTargets.Add(MoveTemp(Target));
-			}
-		}
-
-		if (OutTargets.IsEmpty())
-		{
-			OutErrorText = LOCTEXT("InstanceOverrideNothingEligible", "No eligible pending changes to accept.");
-			return false;
-		}
-
-		return true;
-	}
-
-	/**
-	 * Writes every target's FinalColors as permanent OverrideVertexColors (LOD0 only) directly onto
-	 * its real UStaticMeshComponent, inside a single FScopedTransaction so this is one coherent Undo
-	 * step. NEVER touches the component's Static Mesh asset -- no Mesh->Modify(),
-	 * GetMeshDescription(), CommitMeshDescription(), Build(), or MarkPackageDirty() on the Static
-	 * Mesh anywhere in this function. Only Component->Modify() is called, which (per UObject::Modify())
-	 * marks the COMPONENT's own package (the level/Actor package) dirty -- the Static Mesh asset and
-	 * its package are left completely untouched.
-	 *
-	 * AUDITED against the Engine's own Mesh Paint Editor Mode source (not improvised):
-	 *   - The buffer-replace sequence -- ReleaseOverrideVertexColorsAndBlock() then `new
-	 *     FColorVertexBuffer` + InitFromColorArray() + BeginInitResource() -- mirrors the "no existing
-	 *     buffer / vertex count differs" branch of FMeshPaintStaticMeshComponentAdapter::PreEdit()
-	 *     (Engine/Plugins/MeshPainting/Source/MeshPaintingToolset/Private/MeshPaintStaticMeshAdapter.cpp).
-	 *     FStaticMeshComponentLODInfo::ReleaseOverrideVertexColorsAndBlock() (StaticMeshComponent.cpp)
-	 *     nulls the member immediately, enqueues the OLD buffer's render-thread resource release, then
-	 *     calls FlushRenderingCommands() to block until that release has actually completed -- so
-	 *     assigning a brand-new buffer right after it returns can never race the render thread or leak
-	 *     the old one.
-	 *   - PaintedVertices.Empty() before the replace, and Component->CachePaintedDataIfNecessary()
-	 *     after, mirror the same PreEdit() function: CachePaintedDataIfNecessary() (StaticMeshComponent.cpp)
-	 *     only repopulates PaintedVertices (the position/normal/color cache
-	 *     FixupOverrideColorsIfNecessary later uses to detect a stale override after the source mesh is
-	 *     rebuilt) when PaintedVertices.Num() == 0; without the Empty() call here, a component that
-	 *     already had override colors from an earlier session would keep its OLD (now-mismatched)
-	 *     cache instead of one describing the colors just written.
-	 *   - SetLODDataCount(1, Component->LODData.Num()) mirrors the exact
-	 *     SetLODDataCount(MinSize, CurrentCount) call pattern used throughout StaticMeshComponent.cpp
-	 *     (e.g. UStaticMeshComponent::ApplyComponentInstanceData): MinSize=1 only guarantees LOD0's
-	 *     entry exists (creating it if the component never had one), MaxSize=current count never trims
-	 *     -- so any pre-existing LOD1+ entries (if this component was ever painted through the Editor's
-	 *     own Mesh Paint tool with per-LOD overrides) are left completely untouched, matching the
-	 *     explicit LOD0-only scope of this checkpoint.
-	 *   - MarkRenderStateDirty() (rather than a heavier FComponentReregisterContext) is the standard,
-	 *     official trigger every UPrimitiveComponent property setter uses to recreate the scene proxy
-	 *     from current state -- sufficient here since nothing else about the component (bounds,
-	 *     collision, attachment) changes, only its override color buffer.
-	 *
-	 * Undo/Redo (audited, not assumed): UStaticMeshComponent::Serialize() unconditionally serializes
-	 * LODData (`Ar << LODData` in StaticMeshComponent.cpp) regardless of LODData's own
-	 * UPROPERTY(Transient) tag -- specifically so a full-object transaction (FScopedTransaction +
-	 * Component->Modify(), both used below) can snapshot and later restore it. On Undo, TArray's
-	 * element reconstruction for a transacted reload destructs the CURRENT FStaticMeshComponentLODInfo
-	 * first (its destructor calls CleanUp(), which safely releases/deletes whatever OverrideVertexColors
-	 * is live at that moment -- see FStaticMeshComponentLODInfo::~FStaticMeshComponentLODInfo()) before
-	 * the archive reloads the OLD snapshot, whose own Ar.IsLoading() branch (operator<<(FArchive&,
-	 * FStaticMeshComponentLODInfo&)) allocates a fresh FColorVertexBuffer and calls BeginInitResource()
-	 * itself. So Undo safely restores "no override" if none existed before this write, and Redo safely
-	 * reapplies these exact colors, with no leak and no dangling render-thread pointer either way. The
-	 * viewport refresh after Undo/Redo is handled by the engine's own UActorComponent::PostEditUndo()
-	 * (ActorComponent.cpp), which re-registers the component -- nothing extra is required here beyond
-	 * calling Component->Modify() before mutating LODData, which this function does first.
-	 */
-	static bool WriteInstanceOverrideTargets(const TArray<FVertexMaskForgeInstanceOverrideTarget>& Targets, FText& OutErrorText)
-	{
-		for (const FVertexMaskForgeInstanceOverrideTarget& Target : Targets)
-		{
-			UStaticMeshComponent* Component = Target.Component.Get();
-			UStaticMesh* Mesh = IsValid(Component) ? Component->GetStaticMesh() : nullptr;
-			const FStaticMeshRenderData* RenderData = IsValid(Mesh) ? Mesh->GetRenderData() : nullptr;
-			const bool bLODValid = RenderData && RenderData->LODResources.IsValidIndex(0);
-
-			if (!IsValid(Component) || !bLODValid
-				|| Target.FinalColors.Num() != static_cast<int32>(RenderData->LODResources[0].GetNumVertices()))
-			{
-				OutErrorText = FText::Format(
-					LOCTEXT("InstanceOverrideWriteRevalidationFailedFormat", "'{0}' failed re-validation immediately before writing; aborting (nothing was modified)."),
-					FText::FromString(Target.ComponentLabel));
-				return false;
-			}
-		}
-
-		FScopedTransaction Transaction(LOCTEXT("AcceptVertexMaskForgeInstanceOverride", "Accept Vertex Mask Forge Changes as Instance Override"));
-
-		for (const FVertexMaskForgeInstanceOverrideTarget& Target : Targets)
-		{
-			UStaticMeshComponent* Component = Target.Component.Get();
-
-			Component->Modify();
-			Component->SetLODDataCount(1, Component->LODData.Num());
-
-			FStaticMeshComponentLODInfo& LODInfo = Component->LODData[0];
-			LODInfo.ReleaseOverrideVertexColorsAndBlock();
-			LODInfo.PaintedVertices.Empty();
-			LODInfo.OverrideVertexColors = new FColorVertexBuffer();
-			LODInfo.OverrideVertexColors->InitFromColorArray(Target.FinalColors.GetData(), Target.FinalColors.Num());
-			BeginInitResource(LODInfo.OverrideVertexColors);
-
-			Component->CachePaintedDataIfNecessary();
-			Component->MarkRenderStateDirty();
-		}
-
-		return true;
-	}
-
-	// --- Remove Instance Override: undo per-instance overrides, Source Static Mesh untouched --------
-
-	/**
-	 * True if Component's LOD0 currently has a non-empty Instance Vertex Color override -- i.e.
-	 * something an "Accept as Instance Override" (or the Editor's own Mesh Paint tool) previously
-	 * wrote that "Remove Instance Override" can meaningfully remove. False for a null/invalid
-	 * Component, a Component with no LODData[0] entry yet, or an entry whose OverrideVertexColors is
-	 * null or has zero vertices.
-	 */
-	static bool HasRemovableLOD0Override(const UStaticMeshComponent* Component)
-	{
-		if (!IsValid(Component) || !Component->LODData.IsValidIndex(0))
-		{
-			return false;
-		}
-		const FColorVertexBuffer* Override = Component->LODData[0].OverrideVertexColors;
-		return Override != nullptr && Override->GetNumVertices() > 0;
-	}
-
-	/**
-	 * One selected UStaticMeshComponent instance targeted by "Remove Instance Override". Unlike
-	 * FVertexMaskForgeInstanceOverrideTarget, carries no color payload -- removal needs only the
-	 * component identity. Never deduplicated by UStaticMesh; each selected component with a
-	 * removable override is its own independent target.
-	 */
-	struct FVertexMaskForgeRemoveOverrideTarget
-	{
-		TWeakObjectPtr<UStaticMeshComponent> Component;
-		/** Diagnostic-only label ("ComponentName (ActorLabel)"), used in error messages. */
-		FString ComponentLabel;
-	};
-
-	/**
-	 * Collects one target per SELECTED component (from SelectedMeshes[*].PreviewComponents, exactly
-	 * the same "real, currently-tracked selection" source BuildInstanceOverrideTargets reads) that
-	 * currently HasRemovableLOD0Override(). Deliberately does NOT gate on
-	 * WorkingMesh.BoundingBoxMask.State (Ready/NotGenerated/etc.) or on CurrentPreviewMode -- Remove
-	 * Instance Override never depends on a generated mask or an active Preview, only on whether the
-	 * component already carries an override from an earlier session. Never touches any Static Mesh
-	 * asset or its RenderData -- HasRemovableLOD0Override reads only the component's own LODData.
-	 */
-	static bool BuildRemoveInstanceOverrideTargets(
-		const TArray<TSharedPtr<FVertexMaskForgeSelectedMesh>>& SelectedMeshes,
-		TArray<FVertexMaskForgeRemoveOverrideTarget>& OutTargets,
-		FText& OutErrorText)
-	{
-		OutTargets.Reset();
-
-		for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
-		{
-			if (!Entry.IsValid())
-			{
-				continue;
-			}
-
-			for (const FVertexMaskForgePreviewComponentState& State : Entry->PreviewComponents)
-			{
-				UStaticMeshComponent* SourceComponent = State.SourceComponent.Get();
-				if (!HasRemovableLOD0Override(SourceComponent))
-				{
-					continue;
-				}
-
-				FVertexMaskForgeRemoveOverrideTarget Target;
-				Target.Component = SourceComponent;
-				Target.ComponentLabel = FString::Printf(TEXT("%s (%s)"), *SourceComponent->GetName(),
-					SourceComponent->GetOwner() ? *SourceComponent->GetOwner()->GetActorLabel() : TEXT("?"));
-				OutTargets.Add(MoveTemp(Target));
-			}
-		}
-
-		if (OutTargets.IsEmpty())
-		{
-			OutErrorText = LOCTEXT("RemoveOverrideNothingEligible", "No selected component currently has a removable Instance Vertex Color override.");
-			return false;
-		}
-
-		return true;
-	}
-
-	/**
-	 * Removes the LOD0 Instance Vertex Color override from every target's real UStaticMeshComponent,
-	 * inside a single FScopedTransaction so this is one coherent Undo step. NEVER touches the
-	 * component's Static Mesh asset -- no Mesh->Modify(), GetMeshDescription(), CommitMeshDescription(),
-	 * Build(), or MarkPackageDirty() on the Static Mesh anywhere in this function.
-	 *
-	 * AUDITED: uses the engine's own public API, UStaticMeshComponent::RemoveInstanceVertexColorsFromLOD(0)
-	 * (StaticMeshComponent.h/.cpp) -- NOT the all-LODs UStaticMeshComponent::RemoveInstanceVertexColors()
-	 * (which simply loops RemoveInstanceVertexColorsFromLOD() over every LOD index and would silently
-	 * expand this plugin's scope past LOD0, which nothing else here supports yet). Reading the
-	 * implementation: RemoveInstanceVertexColorsFromLOD(0) does exactly
-	 * `LODData[0].ReleaseOverrideVertexColorsAndBlock(); LODData[0].PaintedVertices.Empty();` -- the
-	 * SAME safe release this plugin's own WriteInstanceOverrideTargets already relies on for the
-	 * opposite (write) direction -- plus (WITH_EDITORONLY_DATA) refreshing StaticMeshDerivedDataKey
-	 * from the current Static Mesh's RenderData, keeping FixupOverrideColorsIfNecessary's staleness
-	 * bookkeeping consistent. It touches ONLY LODData[0]; every other LOD entry (if this component was
-	 * ever painted per-LOD via the Editor's own Mesh Paint tool) is left completely untouched.
-	 *
-	 * RemoveInstanceVertexColorsFromLOD() itself calls neither Modify() nor MarkRenderStateDirty() nor
-	 * MarkPackageDirty() -- confirmed by reading it end to end -- so, exactly mirroring the call order
-	 * UStaticMeshComponent::CopyInstanceVertexColorsIfCompatible() itself uses around the same API
-	 * (Modify() first, removal, then a render-state refresh), this function calls Component->Modify()
-	 * immediately before the removal and Component->MarkRenderStateDirty() immediately after.
-	 * Component->Modify() marks the COMPONENT's own package (the level/Actor package) dirty; the
-	 * Static Mesh asset and its package are never touched.
-	 *
-	 * Undo/Redo: identical mechanism already audited for WriteInstanceOverrideTargets, applied
-	 * symmetrically. UStaticMeshComponent::Serialize() unconditionally serializes LODData regardless
-	 * of its own UPROPERTY(Transient) tag, specifically so a full-object transaction can snapshot and
-	 * restore it. On Undo, TArray's transacted-reload element reconstruction destructs the CURRENT
-	 * FStaticMeshComponentLODInfo (harmless here -- its OverrideVertexColors is already null after the
-	 * removal) before the archive reloads the OLD snapshot, whose Ar.IsLoading() branch allocates a
-	 * fresh FColorVertexBuffer with the PRE-REMOVAL colors and calls BeginInitResource() itself -- so
-	 * Undo safely brings the override back exactly as it was, and Redo safely removes it again, with
-	 * no leak and no dangling render-thread pointer either way. Viewport refresh after Undo/Redo is
-	 * handled by the engine's own UActorComponent::PostEditUndo(), same as the write path.
-	 */
-	static bool RemoveInstanceOverrideTargets(const TArray<FVertexMaskForgeRemoveOverrideTarget>& Targets, FText& OutErrorText)
-	{
-		for (const FVertexMaskForgeRemoveOverrideTarget& Target : Targets)
-		{
-			if (!HasRemovableLOD0Override(Target.Component.Get()))
-			{
-				OutErrorText = FText::Format(
-					LOCTEXT("RemoveOverrideRevalidationFailedFormat", "'{0}' failed re-validation immediately before removing (no longer has a removable override); aborting (nothing was modified)."),
-					FText::FromString(Target.ComponentLabel));
-				return false;
-			}
-		}
-
-		FScopedTransaction Transaction(LOCTEXT("RemoveVertexMaskForgeInstanceOverride", "Remove Vertex Mask Forge Instance Override"));
-
-		for (const FVertexMaskForgeRemoveOverrideTarget& Target : Targets)
-		{
-			UStaticMeshComponent* Component = Target.Component.Get();
-
-			Component->Modify();
-			Component->RemoveInstanceVertexColorsFromLOD(0);
-			Component->MarkRenderStateDirty();
+			UE_LOG(LogVertexMaskForge, Log, TEXT("Vertex Mask Forge: Accept -- '%s': Build completed."), *Mesh->GetName());
 		}
 
 		return true;
@@ -4471,16 +4186,27 @@ namespace VertexMaskForgePanel
 
 	/**
 	 * Writes render-order preview colors into the transient PreviewComponent's own
-	 * OverrideVertexColors and swaps every material slot to the debug material. PreviewComponent is
-	 * always our own freshly-created object, so there is no pre-existing state to snapshot or
-	 * preserve here -- unlike SourceComponent, which this function never touches.
+	 * OverrideVertexColors and configures its material slots. PreviewComponent is always our own
+	 * freshly-created object, so there is no pre-existing state to snapshot or preserve here -- unlike
+	 * SourceComponent, which this function never touches (reads its materials only, when
+	 * bUseOriginalMaterials).
+	 *
+	 * AUDITED (Original Textures fix): when bUseOriginalMaterials is true (Preview Mode ==
+	 * OriginalMaterial), every slot is set to SourceComponent->GetMaterial(SlotIndex) instead of
+	 * DebugMaterial -- same slot count/order as SourceComponent (PreviewComponent->GetNumMaterials()
+	 * already mirrors it exactly, since EnsurePreviewComponent's SetStaticMesh gives it the identical
+	 * mesh asset/material slot layout, and per-instance overrides are resolved by GetMaterial() itself).
+	 * OverrideVertexColors is populated identically regardless of mode -- the transient PreviewComponent
+	 * always shows the CURRENT WorkingColors, live; only which material reads/reduces that data differs.
 	 */
 	static void ApplyPreviewColorsToPreviewComponent(
 		UStaticMeshComponent* PreviewComponent,
 		const TArray<FColor>& RenderOrderColors,
-		UMaterialInterface* DebugMaterial)
+		UMaterialInterface* DebugMaterial,
+		const UStaticMeshComponent* SourceComponent,
+		const bool bUseOriginalMaterials)
 	{
-		if (!IsValid(PreviewComponent) || !DebugMaterial)
+		if (!IsValid(PreviewComponent) || (!bUseOriginalMaterials && !DebugMaterial))
 		{
 			return;
 		}
@@ -4500,8 +4226,16 @@ namespace VertexMaskForgePanel
 		const int32 NumSlots = PreviewComponent->GetNumMaterials();
 		for (int32 SlotIndex = 0; SlotIndex < NumSlots; ++SlotIndex)
 		{
-			PreviewComponent->SetMaterial(SlotIndex, DebugMaterial);
+			UMaterialInterface* SlotMaterial = (bUseOriginalMaterials && IsValid(SourceComponent))
+				? SourceComponent->GetMaterial(SlotIndex)
+				: DebugMaterial;
+			PreviewComponent->SetMaterial(SlotIndex, SlotMaterial);
 		}
+
+		UE_LOG(LogVertexMaskForge, Verbose,
+			TEXT("Vertex Mask Forge: Preview (Render Vertex) -- component=%s, materials=%d, colors=%d, originalTextures=%s."),
+			*PreviewComponent->GetName(), NumSlots, RenderOrderColors.Num(),
+			bUseOriginalMaterials ? TEXT("true") : TEXT("false"));
 
 		PreviewComponent->MarkRenderStateDirty();
 	}
@@ -4545,7 +4279,23 @@ namespace VertexMaskForgePanel
 		TStrongObjectPtr<UDynamicMeshComponent> StrongPreviewComponent(NewPreviewComponent);
 
 		NewPreviewComponent->SetMesh(UE::Geometry::FDynamicMesh3(SourceMesh));
-		NewPreviewComponent->SetColorOverrideMode(EDynamicMeshComponentColorOverrideMode::VertexColors);
+		// AUDITED (Original Textures fix): ColorOverrideMode::VertexColors (the previous setting) does
+		// NOT merely "make vertex colors visible" -- FBaseDynamicMeshSceneProxy::GetViewRelevance/
+		// GetDynamicMeshElements force EVERY triangle's material to
+		// UBaseDynamicMeshComponent::GetDefaultVertexColorMaterial_RenderThread() (the ENGINE's own
+		// global vertex-color-view-mode material, GEngine->VertexColorViewModeMaterial_ColorOnly) --
+		// completely ignoring whatever material this component's own ConfigureMaterialSet configured,
+		// debug or original. This silently worked for the RGB/Channel debug modes only because that
+		// engine material happens to be visually similar to this plugin's own DebugMaterial (loaded
+		// from the same "/Engine/EngineDebugMaterials/VertexColorMaterial" asset) -- but it makes
+		// "Original Textures" impossible: the real per-slot material, once configured, would still
+		// never actually render. ColorOverrideMode::None does not affect vertex color upload at all
+		// (MeshRenderBufferSetConverter.bIgnoreVertexColors is only set true for Constant mode) -- the
+		// Primary Color Overlay is always converted into the render vertex color buffer regardless of
+		// this setting; None only stops the material force-override, letting whichever material
+		// ApplySourceTopologyColorsToPreviewComponent actually configures (debug or original) genuinely
+		// render and read that vertex color data via its own material graph.
+		NewPreviewComponent->SetColorOverrideMode(EDynamicMeshComponentColorOverrideMode::None);
 		NewPreviewComponent->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 		NewPreviewComponent->SetCastShadow(false);
 		NewPreviewComponent->bSelectable = false;
@@ -4573,11 +4323,23 @@ namespace VertexMaskForgePanel
 	 * used to build WorkingColors) -- so ElementID == CornerIndex by construction, needing no separate
 	 * persisted lookup. Cheap relative to a raycast pass; simpler and less error-prone than maintaining
 	 * a stable per-corner element mapping across updates.
+	 *
+	 * AUDITED (Original Textures fix): the material set configured here is what actually renders now
+	 * that EnsureSourceTopologyPreviewComponent leaves ColorOverrideMode at None (see its own doc
+	 * comment) -- previously it was silently discarded by the ColorOverrideMode force-override. When
+	 * bUseOriginalMaterials is true, one entry per SourceComponent material slot is configured
+	 * (SourceComponent->GetMaterial(i), preserving slot count/order/instances/overrides exactly), so
+	 * the mesh's own per-triangle MaterialID attribute (populated from the source's polygon groups at
+	 * working-mesh build time -- see ValidateWorkingMesh) selects the correct original material per
+	 * triangle, exactly matching the source asset's sections. Otherwise (debug modes), DebugMaterial is
+	 * applied to every slot via a single-entry material set, same as before.
 	 */
 	static void ApplySourceTopologyColorsToPreviewComponent(
 		UDynamicMeshComponent* PreviewComponent,
 		const TArray<FColor>& WorkingColors,
-		UMaterialInterface* DebugMaterial)
+		UMaterialInterface* DebugMaterial,
+		const UStaticMeshComponent* SourceComponent,
+		const bool bUseOriginalMaterials)
 	{
 		using namespace UE::Geometry;
 
@@ -4615,10 +4377,34 @@ namespace VertexMaskForgePanel
 			}
 		});
 
-		if (DebugMaterial)
+		if (bUseOriginalMaterials && IsValid(SourceComponent))
+		{
+			const int32 NumSlots = SourceComponent->GetNumMaterials();
+			TArray<UMaterialInterface*> OriginalMaterials;
+			OriginalMaterials.Reserve(FMath::Max(NumSlots, 1));
+			for (int32 SlotIndex = 0; SlotIndex < NumSlots; ++SlotIndex)
+			{
+				OriginalMaterials.Add(SourceComponent->GetMaterial(SlotIndex));
+			}
+			if (OriginalMaterials.IsEmpty())
+			{
+				// No slots at all (pathological content only): configure nothing rather than an empty
+				// set ConfigureMaterialSet might not handle gracefully.
+			}
+			else
+			{
+				PreviewComponent->ConfigureMaterialSet(OriginalMaterials);
+			}
+		}
+		else if (DebugMaterial)
 		{
 			PreviewComponent->ConfigureMaterialSet(TArray<UMaterialInterface*>{ DebugMaterial });
 		}
+
+		UE_LOG(LogVertexMaskForge, Verbose,
+			TEXT("Vertex Mask Forge: Preview (Source Topology) -- component=%s, materials=%d, colors=%d, originalTextures=%s."),
+			*PreviewComponent->GetName(), PreviewComponent->GetNumMaterials(), WorkingColors.Num(),
+			bUseOriginalMaterials ? TEXT("true") : TEXT("false"));
 
 		PreviewComponent->FastNotifyColorsUpdated();
 		PreviewComponent->SetVisibility(true);
@@ -4721,6 +4507,7 @@ namespace VertexMaskForgePanel
 		FVertexMaskForgePreviewComponentState& State,
 		const TArray<FColor>& RenderOrderColors,
 		UMaterialInterface* DebugMaterial,
+		const bool bUseOriginalMaterials,
 		TMap<TWeakObjectPtr<AActor>, FVertexMaskForgeActorHideState>& ActorHideStates)
 	{
 		UStaticMeshComponent* SourceComponent = State.SourceComponent.Get();
@@ -4735,7 +4522,7 @@ namespace VertexMaskForgePanel
 			return;
 		}
 
-		ApplyPreviewColorsToPreviewComponent(PreviewComponent, RenderOrderColors, DebugMaterial);
+		ApplyPreviewColorsToPreviewComponent(PreviewComponent, RenderOrderColors, DebugMaterial, SourceComponent, bUseOriginalMaterials);
 		PreviewComponent->SetVisibility(true);
 
 		// Deliberately the LAST step: the hide-reference is only acquired once PreviewComponent
@@ -4766,12 +4553,19 @@ namespace VertexMaskForgePanel
 	 * intentionally NOT implemented for the Source-Topology preview in this checkpoint (RGB Vertex
 	 * Color only); the underlying WorkingColors data Accept reads is unaffected either way, matching the
 	 * render-vertex path's own "Preview Mode never affects Accept" guarantee.
+	 *
+	 * AUDITED (Original Textures fix): bUseOriginalMaterials forwarded verbatim to
+	 * ApplySourceTopologyColorsToPreviewComponent -- see that function's own doc comment. This is the
+	 * SAME transient PreviewComponent used for every Preview Mode (debug or original); Original
+	 * Textures no longer tears it down (see ApplyPreviewToEntry's own doc comment on removing the old
+	 * OriginalMaterial early-return).
 	 */
 	static void ActivateSourceTopologyPreviewForComponent(
 		FVertexMaskForgePreviewComponentState& State,
 		const UE::Geometry::FDynamicMesh3& SourceMesh,
 		const TArray<FColor>& WorkingColors,
 		UMaterialInterface* DebugMaterial,
+		const bool bUseOriginalMaterials,
 		TMap<TWeakObjectPtr<AActor>, FVertexMaskForgeActorHideState>& ActorHideStates)
 	{
 		UStaticMeshComponent* SourceComponent = State.SourceComponent.Get();
@@ -4786,7 +4580,7 @@ namespace VertexMaskForgePanel
 			return;
 		}
 
-		ApplySourceTopologyColorsToPreviewComponent(PreviewComponent, WorkingColors, DebugMaterial);
+		ApplySourceTopologyColorsToPreviewComponent(PreviewComponent, WorkingColors, DebugMaterial, SourceComponent, bUseOriginalMaterials);
 
 		if (!State.bHasAcquiredActorHide)
 		{
@@ -4930,8 +4724,8 @@ namespace VertexMaskForgePanel
 	 * Full session-end restore: RestorePreviewVisualOnly's steps 1-5, PLUS resetting BaselineColors/
 	 * CommittedColors/WorkingColors/AOCache together (step 6) -- see those fields' own doc comments.
 	 * Called ONLY when a whole session genuinely concludes or a genuine geometric invalidation demands
-	 * a fresh capture: Cancel, Accept (success), Accept as Instance Override (success), a
-	 * RefreshSelection about to rebuild, World cleanup (all via DestroyAllPreviews) -- never for a
+	 * a fresh capture: Cancel, Accept (success), a RefreshSelection about to rebuild, World cleanup
+	 * (all via DestroyAllPreviews) -- never for a
 	 * momentary mid-session fallback (see RestorePreviewVisualOnly's own doc comment for that case,
 	 * used by ApplyPreviewToEntry instead since the raw/composition separation checkpoint).
 	 */
@@ -4959,8 +4753,8 @@ namespace VertexMaskForgePanel
 		State.SourceTopologyWorkingColors.Reset();
 
 		// DIAGNOSTICS (raw/composition separation checkpoint): low-volume -- this function is only
-		// ever called at genuine session-end points (Cancel, Accept, Accept as Instance Override,
-		// RefreshSelection, World cleanup), never per-tick/per-recomposition, so Log level is safe here.
+		// ever called at genuine session-end points (Cancel, Accept, RefreshSelection, World cleanup),
+		// never per-tick/per-recomposition, so Log level is safe here.
 		if (State.AOCache.IsValid())
 		{
 			UE_LOG(LogVertexMaskForge, Log,
@@ -5123,6 +4917,17 @@ void SVertexMaskForgePanel::OnAOInvertChanged(const ECheckBoxState NewState)
 	// ApplyPreviewToEntry's own doc comment on the Invert live-override) directly from
 	// FVertexMaskForgeAOCache::RawValues. Zero raycasts, zero Tree rebuild, works identically
 	// regardless of Auto Update Preview.
+	RecomposeWorkingColors();
+}
+
+void SVertexMaskForgePanel::OnAOLevelsChanged()
+{
+	// AUDITED (AO Levels checkpoint): PURE composition, same contract as OnAOInvertChanged -- RawValues
+	// in AOCache/SourceTopologyAOCache are NEVER touched; Levels is applied fresh, live, every
+	// recomposition (see ApplyAOLevelsAndInvert and its two live-override call sites in
+	// ApplyPreviewToEntry) directly from RawValues. Zero raycasts, zero Tree rebuild, zero
+	// GeometryFingerprint invalidation, works identically regardless of Auto Update Preview or domain
+	// (Render-Vertex/Source-Topology).
 	RecomposeWorkingColors();
 }
 
@@ -5348,6 +5153,19 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 	// "Refresh Selection" button is gone (see OnEditorSelectionChanged's own audit note).
 	SelectionChangedDelegateHandle = USelection::SelectionChangedEvent.AddRaw(this, &SVertexMaskForgePanel::OnEditorSelectionChanged);
 
+	// AUDITED (Undo/Redo fix): FEditorUndoClient::PostUndo/PostRedo are the engine's own official
+	// notification for "an Undo or Redo transaction just finished" (used the same way by, e.g., Actor
+	// detail panels and other Editor tool widgets) -- registered/unregistered explicitly via
+	// GEditor->RegisterForUndo/UnregisterForUndo, paired with UnregisterForUndo in the destructor, same
+	// lifecycle discipline as WorldCleanupDelegateHandle/SelectionChangedDelegateHandle above. This is
+	// for INTERNAL PANEL STATE RESYNC ONLY (see PostUndo/PostRedo's own doc comment) -- it is never a
+	// substitute for the transaction itself; Accept's own ModifyMeshDescription() call is what makes
+	// Undo/Redo actually restore the Static Mesh's colors in the first place.
+	if (GEditor)
+	{
+		GEditor->RegisterForUndo(this);
+	}
+
 	PreviewModeOptions.Add(MakeShared<EVertexMaskForgePreviewMode>(EVertexMaskForgePreviewMode::OriginalMaterial));
 	PreviewModeOptions.Add(MakeShared<EVertexMaskForgePreviewMode>(EVertexMaskForgePreviewMode::RGBVertexColor));
 	PreviewModeOptions.Add(MakeShared<EVertexMaskForgePreviewMode>(EVertexMaskForgePreviewMode::RedChannel));
@@ -5400,22 +5218,37 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 				SNew(SSeparator)
 			]
 
+			// AUDITED (UI reorganization checkpoint): "Active layers" moved here from inside the
+			// Ambient Occlusion Mask panel -- it reports the GLOBAL composition stack (Bounding Box
+			// and/or Ambient Occlusion, whichever are currently active), not something owned by AO
+			// specifically, so it now reads as a neutral, panel-agnostic status line above both mask
+			// panels instead of implying it belongs to AO alone. Same widget/binding as before
+			// (GetActiveMaskSourceText, unchanged, still purely a live readout -- no new state), same
+			// subdued/secondary text style, no border/background of its own, single occurrence only.
+			+ SVerticalBox::Slot()
+			.AutoHeight()
+			.Padding(FMargin(0.f, 0.f, 0.f, 8.f))
+			[
+				SNew(STextBlock)
+				.Text(this, &SVertexMaskForgePanel::GetActiveMaskSourceText)
+				.ColorAndOpacity(FSlateColor::UseSubduedForeground())
+			]
+
 			+ SVerticalBox::Slot()
 			.AutoHeight()
 			[
-				SNew(SBorder)
+				SNew(SExpandableArea)
+				.InitiallyCollapsed(false)
 				.Padding(FMargin(8.f))
+				.HeaderContent()
+				[
+					SNew(STextBlock)
+					.Text(LOCTEXT("BBoxMaskSectionTitle", "Bounding Box Mask"))
+					.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
+				]
+				.BodyContent()
 				[
 					SNew(SVerticalBox)
-
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					.Padding(FMargin(0.f, 0.f, 0.f, 4.f))
-					[
-						SNew(STextBlock)
-						.Text(LOCTEXT("BBoxMaskSectionTitle", "Bounding Box Mask"))
-						.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
-					]
 
 					// Blend Mode + Opacity: apply to this Bounding Box Mask layer's composition with the
 					// input Vertex Color, AFTER the mask itself is generated from Local X/Y/Z below --
@@ -5557,60 +5390,42 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 			// Bounding Box rather than replacing it (see bAOEnabled's own doc comment). Placed
 			// immediately BELOW the Bounding Box Mask panel above.
 			//
-			// AUDITED (UI decision, explicitly documented per the pre-test correction): uses the SAME
-			// fixed SBorder + bold-title layout as Bounding Box, not a collapsible/expandable panel --
-			// this tool has NO collapsible/expandable widget anywhere yet (Bounding Box is fixed too),
-			// so introducing one only for AO would be a new UI paradigm applied inconsistently, not
-			// "the same visual language" the checkpoint asked for. Turning BOTH Bounding Box and
-			// Ambient Occlusion into collapsible panels is left as a separate, future UI improvement --
-			// deliberately not done here, to avoid scope creep into a second checkpoint's worth of work.
+			// AUDITED (UI reorganization checkpoint): now a collapsible SExpandableArea, matching
+			// Bounding Box exactly -- same header style/pattern, same InitiallyCollapsed(false) default.
+			// The header shows ONLY the title (matching Bounding Box's header exactly); Enable moved
+			// into the body's first row (it is a mask PARAMETER, not always-visible chrome -- collapsing
+			// the area must never look like it disabled the layer, and it doesn't: bAOEnabled is
+			// untouched by expand/collapse either way). "Active layers" moved out entirely -- see the
+			// new top-level status line above the Bounding Box panel.
 			+ SVerticalBox::Slot()
 			.AutoHeight()
 			.Padding(FMargin(0.f, 12.f, 0.f, 0.f))
 			[
-				SNew(SBorder)
+				SNew(SExpandableArea)
+				.InitiallyCollapsed(false)
 				.Padding(FMargin(8.f))
+				.HeaderContent()
+				[
+					SNew(STextBlock)
+					.Text(LOCTEXT("AOSectionTitle", "Ambient Occlusion Mask"))
+					.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
+				]
+				.BodyContent()
 				[
 					SNew(SVerticalBox)
 
 					+ SVerticalBox::Slot()
 					.AutoHeight()
-					.Padding(FMargin(0.f, 0.f, 0.f, 4.f))
-					[
-						SNew(SHorizontalBox)
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 8.f, 0.f))
-						[
-							SNew(STextBlock)
-							.Text(LOCTEXT("AOSectionTitle", "Ambient Occlusion Mask"))
-							.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						[
-							SNew(SCheckBox)
-							.IsChecked(this, &SVertexMaskForgePanel::GetAOEnableState)
-							.OnCheckStateChanged(this, &SVertexMaskForgePanel::OnAOEnableChanged)
-							.Content()
-							[
-								SNew(STextBlock)
-								.Text(LOCTEXT("AOEnableLabel", "Enable"))
-							]
-						]
-					]
-
-					+ SVerticalBox::Slot()
-					.AutoHeight()
 					.Padding(FMargin(0.f, 0.f, 0.f, 6.f))
 					[
-						SNew(STextBlock)
-						.Text(this, &SVertexMaskForgePanel::GetActiveMaskSourceText)
-						.ColorAndOpacity(FSlateColor::UseSubduedForeground())
+						SNew(SCheckBox)
+						.IsChecked(this, &SVertexMaskForgePanel::GetAOEnableState)
+						.OnCheckStateChanged(this, &SVertexMaskForgePanel::OnAOEnableChanged)
+						.Content()
+						[
+							SNew(STextBlock)
+							.Text(LOCTEXT("AOEnableLabel", "Enable"))
+						]
 					]
 
 					// AUDITED (composition-stack checkpoint): Blend Mode + Opacity, same Slate
@@ -5809,6 +5624,70 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 								AOBias = FMath::Clamp(NewValue, 0.001f, 10.0f);
 								InvalidateAODerivedMask();
 								ScheduleAutoUpdatePreview();
+							})
+						]
+					]
+
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(FMargin(0.f, 4.f, 0.f, 0.f))
+					[
+						SNew(SHorizontalBox)
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
+						[
+							SNew(STextBlock)
+							.Text(LOCTEXT("AOLevelsMinLabel", "Levels Min"))
+							.ToolTipText(LOCTEXT("AOLevelsMinTooltip", "Values at or below this threshold become black."))
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 12.f, 0.f))
+						[
+							SNew(SSpinBox<float>)
+							.MinDesiredWidth(52.f)
+							.MinValue(0.0f)
+							.MaxValue(1.0f)
+							.Delta(0.01f)
+							.ToolTipText(LOCTEXT("AOLevelsMinTooltip", "Values at or below this threshold become black."))
+							.Value_Lambda([this]() { return AOLevelsMin; })
+							.OnValueChanged_Lambda([this](const float NewValue)
+							{
+								AOLevelsMin = FMath::Clamp(NewValue, 0.0f, 1.0f);
+								OnAOLevelsChanged();
+							})
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
+						[
+							SNew(STextBlock)
+							.Text(LOCTEXT("AOLevelsMaxLabel", "Levels Max"))
+							.ToolTipText(LOCTEXT("AOLevelsMaxTooltip", "Values at or above this threshold become white."))
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						[
+							SNew(SSpinBox<float>)
+							.MinDesiredWidth(52.f)
+							.MinValue(0.0f)
+							.MaxValue(1.0f)
+							.Delta(0.01f)
+							.ToolTipText(LOCTEXT("AOLevelsMaxTooltip", "Values at or above this threshold become white."))
+							.Value_Lambda([this]() { return AOLevelsMax; })
+							.OnValueChanged_Lambda([this](const float NewValue)
+							{
+								AOLevelsMax = FMath::Clamp(NewValue, 0.0f, 1.0f);
+								OnAOLevelsChanged();
 							})
 						]
 					]
@@ -6025,43 +5904,6 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 						]
 					]
 
-					// Secondary row, explicitly alternative to the native Accept/Cancel row above: two
-					// related-but-independent per-instance override actions, sharing the row's width
-					// evenly so neither reads as more "primary" than the other. Kept on its own row
-					// (not folded into the native Accept/Cancel row) so the whole pair still reads as
-					// an alternative, not a third/fourth equally-weighted primary action. Each keeps
-					// its own tooltip, enabled condition, and callback -- never combined.
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					.Padding(FMargin(0.f, 0.f, 0.f, 4.f))
-					[
-						SNew(SHorizontalBox)
-
-						+ SHorizontalBox::Slot()
-						.FillWidth(1.f)
-						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
-						[
-							SNew(SButton)
-							.HAlign(HAlign_Center)
-							.Text(LOCTEXT("AcceptAsInstanceOverride", "Accept as Instance Override"))
-							.ToolTipText(this, &SVertexMaskForgePanel::GetAcceptAsInstanceOverrideTooltip)
-							.OnClicked(this, &SVertexMaskForgePanel::OnAcceptAsInstanceOverrideClicked)
-							.IsEnabled(this, &SVertexMaskForgePanel::CanAcceptAsInstanceOverride)
-						]
-
-						+ SHorizontalBox::Slot()
-						.FillWidth(1.f)
-						.Padding(FMargin(4.f, 0.f, 0.f, 0.f))
-						[
-							SNew(SButton)
-							.HAlign(HAlign_Center)
-							.Text(LOCTEXT("RemoveInstanceOverride", "Remove Instance Override"))
-							.ToolTipText(LOCTEXT("RemoveInstanceOverrideTooltip", "Removes Vertex Color overrides from the selected component instances. The components will return to the Vertex Colors stored in their Source Static Mesh. The Source Static Mesh will not be modified."))
-							.OnClicked(this, &SVertexMaskForgePanel::OnRemoveInstanceOverrideClicked)
-							.IsEnabled(this, &SVertexMaskForgePanel::CanRemoveInstanceOverride)
-						]
-					]
-
 					+ SVerticalBox::Slot()
 					.AutoHeight()
 					.Padding(FMargin(0.f, 0.f, 0.f, 4.f))
@@ -6099,6 +5941,13 @@ SVertexMaskForgePanel::~SVertexMaskForgePanel()
 	// Same rationale, for the same reason: no callback into a partially-destructed panel.
 	USelection::SelectionChangedEvent.Remove(SelectionChangedDelegateHandle);
 
+	// Same rationale as the two unregistrations above: no PostUndo/PostRedo callback into a
+	// partially-destructed panel. Paired with GEditor->RegisterForUndo(this) in Construct().
+	if (GEditor)
+	{
+		GEditor->UnregisterForUndo(this);
+	}
+
 	// Explicit cancel, even though ScheduleAutoUpdatePreview() also binds weak-safe (CreateSP) --
 	// this guarantees no pending debounce fires even one more Slate tick after this point.
 	if (GEditor)
@@ -6126,7 +5975,7 @@ void SVertexMaskForgePanel::OnEditorSelectionChanged(UObject* NewSelection)
 	// Safety against an unresolved Preview (audited, replaces the old manual-refresh YesNoCancel
 	// prompt from the removed OnRefreshSelectionClicked): a modal dialog firing on every incidental
 	// selection change while a Preview is pending would be disruptive and is unnecessary, since
-	// Accept / Accept as Instance Override / Cancel are always visible and available regardless of
+	// Accept / Cancel are always visible and available regardless of
 	// the scene selection. So instead of prompting, this simply DECLINES to refresh at all while
 	// OperationState != Idle (PendingChanges: an unaccepted Preview exists; Applying: mid-Accept,
 	// never actually observable across a Slate tick since Accept is synchronous; Failed: the last
@@ -6139,12 +5988,11 @@ void SVertexMaskForgePanel::OnEditorSelectionChanged(UObject* NewSelection)
 	// DEFERRED SYNC (audited): rather than requiring another viewport/World Outliner click after the
 	// user resolves the pending operation, this records that a sync is owed
 	// (bSceneSelectionChangedDuringActiveOperation = true). SyncSelectionIfChangedDuringOperation(),
-	// called at the tail of OnCancelChangesClicked() / AcceptPendingChanges() /
-	// AcceptPendingChangesAsInstanceOverride() (and ONLY there -- see its own doc comment), consumes
-	// this flag and calls RefreshSelection() automatically once the operation has fully concluded
-	// against its ORIGINAL targets. So Accept/Cancel/Accept as Instance Override remain fully able to
-	// act on the original selection at any time, and the panel still catches up with a changed scene
-	// selection automatically, without ever retargeting the operation itself.
+	// called at the tail of OnCancelChangesClicked() / AcceptPendingChanges() (and ONLY there -- see
+	// its own doc comment), consumes this flag and calls RefreshSelection() automatically once the
+	// operation has fully concluded against its ORIGINAL targets. So Accept/Cancel remain fully able
+	// to act on the original selection at any time, and the panel still catches up with a changed
+	// scene selection automatically, without ever retargeting the operation itself.
 	if (OperationState != EVertexMaskForgeOperationState::Idle)
 	{
 		bSceneSelectionChangedDuringActiveOperation = true;
@@ -6153,10 +6001,10 @@ void SVertexMaskForgePanel::OnEditorSelectionChanged(UObject* NewSelection)
 
 	// Already Idle: this call itself is about to sync SelectedMeshes with the current scene selection
 	// directly, so any flag left over from an earlier session (e.g. OperationState settled back to
-	// Idle through a path other than Cancel/Accept/Accept as Instance Override, such as a mask being
+	// Idle through a path other than Cancel/Accept, such as a mask being
 	// invalidated with no PreviewComponents left) is moot -- clear it defensively so a later Cancel/
-	// Accept/Accept as Instance Override never performs a redundant extra refresh for a selection
-	// change this call already picked up.
+	// Accept never performs a redundant extra refresh for a selection change this call already
+	// picked up.
 	bSceneSelectionChangedDuringActiveOperation = false;
 
 	RefreshSelection();
@@ -6545,6 +6393,8 @@ FReply SVertexMaskForgePanel::OnGenerateBoundingBoxMaskClicked()
 				Params.MaxDistance = FMath::Clamp(AOMaxDistance, 0.01f, 10000.0f);
 				Params.Bias = FMath::Clamp(AOBias, 0.001f, 10.0f);
 				Params.bInvert = bAOInvert;
+				Params.LevelsMin = AOLevelsMin;
+				Params.LevelsMax = AOLevelsMax;
 				Entry->WorkingMesh.AmbientOcclusionMask.UsedAOParams = Params;
 				Entry->WorkingMesh.AmbientOcclusionMask.RenderVertexCount = Entry->bUseSourceTopology
 					? Entry->WorkingMesh.Mesh->VertexCount()
@@ -7007,6 +6857,8 @@ void SVertexMaskForgePanel::RunAutoUpdatePreview(const bool bIncludeAO)
 					Params.MaxDistance = FMath::Clamp(AOMaxDistance, 0.01f, 10000.0f);
 					Params.Bias = FMath::Clamp(AOBias, 0.001f, 10.0f);
 					Params.bInvert = bAOInvert;
+					Params.LevelsMin = AOLevelsMin;
+					Params.LevelsMax = AOLevelsMax;
 					Entry->WorkingMesh.AmbientOcclusionMask.UsedAOParams = Params;
 					Entry->WorkingMesh.AmbientOcclusionMask.RenderVertexCount = Entry->bUseSourceTopology
 						? Entry->WorkingMesh.Mesh->VertexCount()
@@ -7151,6 +7003,65 @@ UMaterialInterface* SVertexMaskForgePanel::GetPreviewDebugMaterial()
 	return Loaded;
 }
 
+void SVertexMaskForgePanel::PostUndo(bool bSuccess)
+{
+	HandlePostUndoRedo(bSuccess, /*bIsRedo=*/false);
+}
+
+void SVertexMaskForgePanel::PostRedo(bool bSuccess)
+{
+	HandlePostUndoRedo(bSuccess, /*bIsRedo=*/true);
+}
+
+/**
+ * AUDITED (Undo/Redo fix): fires for EVERY Undo/Redo in the Editor, not only ones this tool created --
+ * there is no cheap way to tell from here whether the transaction that just (un)did actually touched
+ * one of this panel's own Static Mesh assets, so this is INTENTIONALLY conservative rather than
+ * reactive. It never re-applies WorkingColors, never regenerates a mask, never opens a transaction of
+ * its own, and never touches the Redo stack -- its ONLY job is to make sure this panel's own cached
+ * state (BaselineColors/CommittedColors/WorkingColors, the Source-Topology equivalents, AO/BBox caches,
+ * OperationState) never silently drifts from whatever the Static Mesh asset(s) actually contain after
+ * the Transaction Buffer finishes restoring/reapplying them:
+ *   - OperationState == Idle (no active PendingChanges/Failed session): safe to resync immediately.
+ *     RefreshSelection() is the SAME function OnEditorSelectionChanged already calls for an ordinary
+ *     scene selection change -- it only READS the current state of the selected components/assets to
+ *     rebuild working meshes and re-capture fresh baselines; it never re-applies a mask or creates
+ *     PendingChanges by itself (that only happens later, if the user explicitly clicks Generate Mask /
+ *     enables Auto Update Preview). So this can never itself fire another Accept, open a transaction,
+ *     or reintroduce stale colors.
+ *   - OperationState != Idle (an active PendingChanges/Failed session exists, e.g. a generated-but-not-
+ *     yet-accepted mask): never disrupt it just because SOME unrelated Undo/Redo fired elsewhere in the
+ *     Editor -- same non-disruptive policy OnEditorSelectionChanged already uses for a scene selection
+ *     change during an active operation (see its own audit note). Instead, this defers the resync via
+ *     the SAME bSceneSelectionChangedDuringActiveOperation flag / SyncSelectionIfChangedDuringOperation()
+ *     mechanism already used for that case: once the user concludes the CURRENT session through their
+ *     own Accept or Cancel, the panel automatically re-syncs against whatever the asset(s) actually
+ *     contain at that point -- never silently mid-session.
+ */
+void SVertexMaskForgePanel::HandlePostUndoRedo(bool bSuccess, bool bIsRedo)
+{
+	if (!bSuccess)
+	{
+		return;
+	}
+
+	const bool bResyncedImmediately = (OperationState == EVertexMaskForgeOperationState::Idle);
+	if (bResyncedImmediately)
+	{
+		RefreshSelection();
+	}
+	else
+	{
+		bSceneSelectionChangedDuringActiveOperation = true;
+	}
+
+	UE_LOG(LogVertexMaskForge, Log,
+		TEXT("Vertex Mask Forge: Post%s (OperationState=%d) -- %s."),
+		bIsRedo ? TEXT("Redo") : TEXT("Undo"),
+		static_cast<int32>(OperationState),
+		bResyncedImmediately ? TEXT("resynced immediately") : TEXT("resync deferred until the active session concludes"));
+}
+
 void SVertexMaskForgePanel::RecomputeOperationState()
 {
 	if (OperationState == EVertexMaskForgeOperationState::Applying)
@@ -7158,18 +7069,23 @@ void SVertexMaskForgePanel::RecomputeOperationState()
 		return;
 	}
 
+	// AUDITED (Accept-in-Original-Material fix): previously gated entirely behind
+	// `CurrentPreviewMode != OriginalMaterial`, from when Original Material meant "no active preview,
+	// showing the real SourceComponent" and therefore had nothing valid to accept. Since the Original
+	// Textures fix, Original Material is a real preview state (transient preview component, live
+	// WorkingColors, original materials) exactly like every other Preview Mode -- Preview Mode only
+	// selects presentation (see ApplyPreviewToEntry's bUseOriginalMaterials) and must never affect
+	// whether pending changes exist. bHasPending is therefore now computed identically regardless of
+	// CurrentPreviewMode.
 	bool bHasPending = false;
-	if (CurrentPreviewMode != EVertexMaskForgePreviewMode::OriginalMaterial)
+	for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
 	{
-		for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
+		if (Entry.IsValid() && !Entry->PreviewComponents.IsEmpty()
+			&& (Entry->WorkingMesh.BoundingBoxMask.State == EVertexMaskForgeScalarMaskState::Ready
+				|| Entry->WorkingMesh.AmbientOcclusionMask.State == EVertexMaskForgeScalarMaskState::Ready))
 		{
-			if (Entry.IsValid() && !Entry->PreviewComponents.IsEmpty()
-				&& (Entry->WorkingMesh.BoundingBoxMask.State == EVertexMaskForgeScalarMaskState::Ready
-					|| Entry->WorkingMesh.AmbientOcclusionMask.State == EVertexMaskForgeScalarMaskState::Ready))
-			{
-				bHasPending = true;
-				break;
-			}
+			bHasPending = true;
+			break;
 		}
 	}
 
@@ -7186,21 +7102,13 @@ FText SVertexMaskForgePanel::GetOperationStatusText() const
 	switch (OperationState)
 	{
 	case EVertexMaskForgeOperationState::PendingChanges:
-		return LOCTEXT("OperationStatePending", "Pending Changes: Accept writes Vertex Colors to the Source Static Mesh asset (affects every instance); Accept as Instance Override writes only to the selected component(s); Cancel discards.");
+		return LOCTEXT("OperationStatePending", "Pending Changes: Accept writes Vertex Colors to the Source Static Mesh asset (affects every instance); Cancel discards.");
 	case EVertexMaskForgeOperationState::Applying:
 		return LOCTEXT("OperationStateApplying", "Applying...");
 	case EVertexMaskForgeOperationState::Failed:
 		return LOCTEXT("OperationStateFailed", "Accept failed (see message above).");
 	case EVertexMaskForgeOperationState::Idle:
 	default:
-		if (!LastRemoveOverrideStatusText.IsEmpty())
-		{
-			return LastRemoveOverrideStatusText;
-		}
-		if (!LastInstanceOverrideStatusText.IsEmpty())
-		{
-			return LastInstanceOverrideStatusText;
-		}
 		return LOCTEXT("OperationStateIdle", "No pending changes.");
 	}
 }
@@ -7243,8 +7151,6 @@ FReply SVertexMaskForgePanel::OnCancelChangesClicked()
 	SelectedMeshes.Empty();
 	LastOperationErrorText = FText::GetEmpty();
 	LastMaskActionStatusText = FText::GetEmpty();
-	LastInstanceOverrideStatusText = FText::GetEmpty();
-	LastRemoveOverrideStatusText = FText::GetEmpty();
 
 	// 10. Ready for a new session: OperationState recomputes to Idle from the now-empty
 	// SelectedMeshes (idempotent -- calling Cancel again finds everything already empty/idle and
@@ -7272,8 +7178,6 @@ bool SVertexMaskForgePanel::AcceptPendingChanges()
 
 	LastOperationErrorText = FText::GetEmpty();
 	LastMaskActionStatusText = FText::GetEmpty();
-	LastInstanceOverrideStatusText = FText::GetEmpty();
-	LastRemoveOverrideStatusText = FText::GetEmpty();
 
 	UE_LOG(LogVertexMaskForge, Log, TEXT("Vertex Mask Forge: Accept started (%d selected entries)."), SelectedMeshes.Num());
 
@@ -7342,21 +7246,44 @@ bool SVertexMaskForgePanel::AcceptPendingChanges()
 
 	OperationState = EVertexMaskForgeOperationState::Applying;
 
-	// AUDITED: two nested FScopedTransaction calls (one per domain, only for the domain(s) actually
-	// present) merge into ONE Undo step via UE's transaction nesting -- see
-	// WriteSourceTopologyAcceptTargets' own doc comment.
-	if (!Targets.IsEmpty() && !VertexMaskForgePanel::WriteAcceptTargets(Targets, ErrorText))
+	// AUDITED (Undo/Redo fix, root cause of "Accept doesn't undo"): ONE single top-level
+	// FScopedTransaction, opened here and closed at the end of this scope block -- BEFORE any
+	// RenderData/Nanite rebuild runs (see BuildModifiedMeshes' own doc comment for why the rebuild
+	// must stay outside it). Both domains' writes (render-vertex and Source-Topology/Nanite) happen
+	// inside this SAME transaction, so a mixed-domain Accept still produces exactly one Undo History
+	// entry ("Apply Vertex Mask"), never two. WriteAcceptTargets/WriteSourceTopologyAcceptTargets no
+	// longer open their own transactions or call Build() -- see their own doc comments for the
+	// Mesh->ModifyMeshDescription() fix that makes the actual color change participate in the
+	// Transaction Buffer at all (Mesh->Modify() alone was never enough).
+	TArray<UStaticMesh*> ModifiedMeshes;
+	ModifiedMeshes.Reserve(TotalTargetCount);
 	{
-		OperationState = EVertexMaskForgeOperationState::Failed;
-		LastOperationErrorText = ErrorText;
-		UE_LOG(LogVertexMaskForge, Error, TEXT("Vertex Mask Forge: Accept failed while writing: %s"), *ErrorText.ToString());
-		return false;
+		FScopedTransaction Transaction(LOCTEXT("AcceptVertexMaskForgeChanges", "Apply Vertex Mask"));
+
+		if (!Targets.IsEmpty() && !VertexMaskForgePanel::WriteAcceptTargets(Targets, ModifiedMeshes, ErrorText))
+		{
+			OperationState = EVertexMaskForgeOperationState::Failed;
+			LastOperationErrorText = ErrorText;
+			UE_LOG(LogVertexMaskForge, Error, TEXT("Vertex Mask Forge: Accept failed while writing: %s"), *ErrorText.ToString());
+			return false;
+		}
+		if (!SourceTopologyTargets.IsEmpty() && !VertexMaskForgePanel::WriteSourceTopologyAcceptTargets(SourceTopologyTargets, ModifiedMeshes, ErrorText))
+		{
+			OperationState = EVertexMaskForgeOperationState::Failed;
+			LastOperationErrorText = ErrorText;
+			UE_LOG(LogVertexMaskForge, Error, TEXT("Vertex Mask Forge: Accept (Source Topology) failed while writing: %s"), *ErrorText.ToString());
+			return false;
+		}
 	}
-	if (!SourceTopologyTargets.IsEmpty() && !VertexMaskForgePanel::WriteSourceTopologyAcceptTargets(SourceTopologyTargets, ErrorText))
+	// Transaction closed above -- the source MeshDescription change for every target is now a single,
+	// complete Undo History entry. Everything from here on (RenderData/Nanite rebuild, preview
+	// teardown) is DERIVED or transient and must never be captured inside it.
+
+	if (!VertexMaskForgePanel::BuildModifiedMeshes(ModifiedMeshes, ErrorText))
 	{
 		OperationState = EVertexMaskForgeOperationState::Failed;
 		LastOperationErrorText = ErrorText;
-		UE_LOG(LogVertexMaskForge, Error, TEXT("Vertex Mask Forge: Accept (Source Topology) failed while writing: %s"), *ErrorText.ToString());
+		UE_LOG(LogVertexMaskForge, Error, TEXT("Vertex Mask Forge: Accept failed while rebuilding: %s"), *ErrorText.ToString());
 		return false;
 	}
 
@@ -7393,84 +7320,6 @@ bool SVertexMaskForgePanel::AcceptPendingChanges()
 	return true;
 }
 
-FReply SVertexMaskForgePanel::OnAcceptAsInstanceOverrideClicked()
-{
-	AcceptPendingChangesAsInstanceOverride();
-	return FReply::Handled();
-}
-
-bool SVertexMaskForgePanel::AcceptPendingChangesAsInstanceOverride()
-{
-	if (OperationState != EVertexMaskForgeOperationState::PendingChanges)
-	{
-		return false;
-	}
-
-	LastOperationErrorText = FText::GetEmpty();
-	LastMaskActionStatusText = FText::GetEmpty();
-	LastInstanceOverrideStatusText = FText::GetEmpty();
-	LastRemoveOverrideStatusText = FText::GetEmpty();
-
-	TArray<VertexMaskForgePanel::FVertexMaskForgeInstanceOverrideTarget> Targets;
-	FText ErrorText;
-	if (!VertexMaskForgePanel::BuildInstanceOverrideTargets(
-		SelectedMeshes,
-		Targets, ErrorText))
-	{
-		OperationState = EVertexMaskForgeOperationState::Failed;
-		LastOperationErrorText = ErrorText;
-		UE_LOG(LogVertexMaskForge, Warning, TEXT("Vertex Mask Forge: Accept as Instance Override blocked: %s"), *ErrorText.ToString());
-		return false;
-	}
-
-	// Confirm the (permanent, per-instance, asset-safe) destination before the first write -- same
-	// "only at the point of an actually permanent operation" rule as native Accept's confirmation.
-	const EAppReturnType::Type Choice = FMessageDialog::Open(
-		EAppMsgType::OkCancel,
-		FText::Format(
-			LOCTEXT("InstanceOverrideConfirmFormat",
-				"Vertex Colors will be stored as per-instance overrides on {0} selected component(s). "
-				"The Source Static Mesh assets will not be modified. The result persists when the level "
-				"is saved.\n\nProceed?"),
-			FText::AsNumber(Targets.Num())));
-	if (Choice != EAppReturnType::Ok)
-	{
-		// User declined at the confirmation step -- Preview and state are untouched, not a failure.
-		return false;
-	}
-
-	OperationState = EVertexMaskForgeOperationState::Applying;
-
-	if (!VertexMaskForgePanel::WriteInstanceOverrideTargets(Targets, ErrorText))
-	{
-		OperationState = EVertexMaskForgeOperationState::Failed;
-		LastOperationErrorText = ErrorText;
-		UE_LOG(LogVertexMaskForge, Error, TEXT("Vertex Mask Forge: Accept as Instance Override failed while writing: %s"), *ErrorText.ToString());
-		return false;
-	}
-
-	UE_LOG(LogVertexMaskForge, Log,
-		TEXT("Vertex Mask Forge: Accepted Vertex Color changes as instance overrides on %d component(s). Source Static Mesh assets were not modified."),
-		Targets.Num());
-
-	// Success: destroy the transient Preview (its job is done -- the colors now live permanently on
-	// the real component(s)) and return to Idle, exactly like native Accept, but WITHOUT ever calling
-	// into AcceptPendingChanges()/WriteAcceptTargets() -- this path never touches the Static Mesh asset.
-	DestroyAllPreviews();
-	OperationState = EVertexMaskForgeOperationState::Idle;
-	LastOperationErrorText = FText::GetEmpty();
-	LastInstanceOverrideStatusText = FText::Format(
-		LOCTEXT("InstanceOverrideSuccessFormat", "Vertex Colors saved as instance overrides on {0} component(s). Source Static Mesh assets were not modified."),
-		FText::AsNumber(Targets.Num()));
-
-	// Deferred sync: the write above already completed against the ORIGINAL SelectedMeshes/Targets
-	// captured before this call; only now, with OperationState settled back to Idle, is it safe to
-	// catch up with a scene selection that may have changed while this operation was pending.
-	SyncSelectionIfChangedDuringOperation();
-
-	return true;
-}
-
 bool SVertexMaskForgePanel::HasNaniteMeshInSelection() const
 {
 	for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
@@ -7486,109 +7335,6 @@ bool SVertexMaskForgePanel::HasNaniteMeshInSelection() const
 		}
 	}
 	return false;
-}
-
-FText SVertexMaskForgePanel::GetAcceptAsInstanceOverrideTooltip() const
-{
-	if (HasNaniteMeshInSelection())
-	{
-		return LOCTEXT("AcceptAsInstanceOverrideNaniteBlockedTooltip",
-			"Disabled: this selection includes a Nanite-enabled Static Mesh. Nanite requires vertex colors to be saved to the Static Mesh Asset -- per-instance overrides are never read by Nanite's renderer. Use Accept instead.");
-	}
-	return LOCTEXT("AcceptAsInstanceOverrideTooltip", "Stores the generated Vertex Colors as overrides on the selected component instances without modifying the Source Static Mesh. The result persists when the level is saved.");
-}
-
-bool SVertexMaskForgePanel::CanRemoveInstanceOverride() const
-{
-	if (OperationState != EVertexMaskForgeOperationState::Idle)
-	{
-		// An unresolved PendingChanges/Failed Preview decision must be concluded via Accept, Accept
-		// as Instance Override, or Cancel first -- this never discards a pending Preview itself.
-		return false;
-	}
-
-	for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
-	{
-		if (!Entry.IsValid())
-		{
-			continue;
-		}
-
-		for (const FVertexMaskForgePreviewComponentState& State : Entry->PreviewComponents)
-		{
-			if (VertexMaskForgePanel::HasRemovableLOD0Override(State.SourceComponent.Get()))
-			{
-				return true;
-			}
-		}
-	}
-
-	return false;
-}
-
-FReply SVertexMaskForgePanel::OnRemoveInstanceOverrideClicked()
-{
-	RemoveInstanceOverrides();
-	return FReply::Handled();
-}
-
-bool SVertexMaskForgePanel::RemoveInstanceOverrides()
-{
-	if (!CanRemoveInstanceOverride())
-	{
-		return false;
-	}
-
-	LastOperationErrorText = FText::GetEmpty();
-	LastMaskActionStatusText = FText::GetEmpty();
-	LastInstanceOverrideStatusText = FText::GetEmpty();
-	LastRemoveOverrideStatusText = FText::GetEmpty();
-
-	TArray<VertexMaskForgePanel::FVertexMaskForgeRemoveOverrideTarget> Targets;
-	FText ErrorText;
-	if (!VertexMaskForgePanel::BuildRemoveInstanceOverrideTargets(SelectedMeshes, Targets, ErrorText))
-	{
-		LastOperationErrorText = ErrorText;
-		UE_LOG(LogVertexMaskForge, Warning, TEXT("Vertex Mask Forge: Remove Instance Override blocked: %s"), *ErrorText.ToString());
-		return false;
-	}
-
-	// Confirm before the first write -- same "only at the point of an actually permanent operation"
-	// rule as Accept / Accept as Instance Override's own confirmations.
-	const EAppReturnType::Type Choice = FMessageDialog::Open(
-		EAppMsgType::OkCancel,
-		FText::Format(
-			LOCTEXT("RemoveOverrideConfirmFormat",
-				"Vertex Color overrides will be removed from {0} selected component(s). These "
-				"components will return to the Vertex Colors stored in their Source Static Mesh. "
-				"The Source Static Mesh assets will not be modified.\n\nProceed?"),
-			FText::AsNumber(Targets.Num())));
-	if (Choice != EAppReturnType::Ok)
-	{
-		// User declined at the confirmation step -- nothing was modified, not a failure.
-		return false;
-	}
-
-	if (!VertexMaskForgePanel::RemoveInstanceOverrideTargets(Targets, ErrorText))
-	{
-		LastOperationErrorText = ErrorText;
-		UE_LOG(LogVertexMaskForge, Error, TEXT("Vertex Mask Forge: Remove Instance Override failed while writing: %s"), *ErrorText.ToString());
-		return false;
-	}
-
-	UE_LOG(LogVertexMaskForge, Log,
-		TEXT("Vertex Mask Forge: Removed Instance Vertex Color overrides from %d component(s). Source Static Mesh assets were not modified."),
-		Targets.Num());
-
-	// Success: this operation never involves a Preview or PendingChanges session (CanRemoveInstanceOverride
-	// only allows it while already Idle), so there is no OperationState transition and no
-	// DestroyAllPreviews() call here -- the original selection and OperationState are left exactly as
-	// they were.
-	LastRemoveOverrideStatusText = FText::Format(
-		LOCTEXT("RemoveOverrideSuccessFormat", "Instance Vertex Color overrides removed from {0} component(s). Source Static Mesh assets were not modified."),
-		FText::AsNumber(Targets.Num()));
-
-	return true;
 }
 
 void SVertexMaskForgePanel::RestorePreviewForEntry(FVertexMaskForgeSelectedMesh& Entry)
@@ -7617,13 +7363,21 @@ void SVertexMaskForgePanel::ApplyPreviewToEntry(
 		return;
 	}
 
-	if (CurrentPreviewMode == EVertexMaskForgePreviewMode::OriginalMaterial)
-	{
-		// AUDITED (raw/composition separation checkpoint): Preview Mode is PURE composition -- visual-
-		// only restore, AOCache/color arrays survive untouched (see RestorePreviewForEntryVisualOnly).
-		RestorePreviewForEntryVisualOnly(*Entry);
-		return;
-	}
+	// AUDITED (Original Textures fix): Preview Mode == OriginalMaterial used to short-circuit HERE,
+	// destroying the transient preview and un-hiding SourceComponent -- SourceComponent's own materials
+	// (correct) but its own PERSISTED colors (never the current WorkingColors), so Original Textures
+	// could only ever show stale/already-committed data, never live edits. That contract violation is
+	// the root cause of the reported bug (RGB/Red/Green/Blue update live, Original Textures does not):
+	// those three modes all flow through the SAME per-component composition/preview path below;
+	// OriginalMaterial alone bailed out before ever reaching it. Fixed by removing this early return --
+	// OriginalMaterial now flows through the identical path as every other mode (same WorkingColors,
+	// same live per-component BBox/AO re-evaluation, same "nothing valid yet -> visual-only restore"
+	// fallback below), differing ONLY in which material each component's preview is configured with
+	// (bUseOriginalMaterials, computed below and threaded through to
+	// ApplyPreviewColorsToPreviewComponent / ApplySourceTopologyColorsToPreviewComponent) -- see those
+	// functions' own doc comments. This never recomputes BBox/AO, never raycasts, never touches the
+	// cache, Channel Filter, pending state, or Accept/Cancel -- it is purely which material renders the
+	// SAME already-composed WorkingColors that were already being computed for every other mode anyway.
 
 	if (Entry->PreviewComponents.IsEmpty())
 	{
@@ -7673,8 +7427,12 @@ void SVertexMaskForgePanel::ApplyPreviewToEntry(
 		return;
 	}
 
+	// AUDITED (Original Textures fix): Original Textures never needs DebugMaterial at all (it configures
+	// each slot from SourceComponent's own materials instead -- see ApplyPreviewColorsToPreviewComponent
+	// / ApplySourceTopologyColorsToPreviewComponent), so a missing DebugMaterial asset must not block it.
+	const bool bUseOriginalMaterials = (CurrentPreviewMode == EVertexMaskForgePreviewMode::OriginalMaterial);
 	UMaterialInterface* DebugMaterial = GetPreviewDebugMaterial();
-	if (!DebugMaterial)
+	if (!bUseOriginalMaterials && !DebugMaterial)
 	{
 		RestorePreviewForEntryVisualOnly(*Entry);
 		return;
@@ -7756,9 +7514,14 @@ void SVertexMaskForgePanel::ApplyPreviewToEntry(
 				{
 					// Same "exactly one real computation site per component per update" contract as the
 					// render-vertex path below -- see its own AUDITED note for the full history. bInvert
-					// is the same live override, for the same reason.
+					// is the same live override, for the same reason. AUDITED (AO Levels): LevelsMin/Max
+					// are LIVE overrides too, for the identical reason -- purely compositional, applied
+					// fresh from AOCache.RawValues every call (see ApplyAOLevelsAndInvert), never
+					// requiring a raycast/Tree rebuild.
 					FVertexMaskForgeAOParams EffectiveAOParams = WorkingMesh.AmbientOcclusionMask.UsedAOParams;
 					EffectiveAOParams.bInvert = bAOInvert;
+					EffectiveAOParams.LevelsMin = AOLevelsMin;
+					EffectiveAOParams.LevelsMax = AOLevelsMax;
 					PerComponentAOMask = VertexMaskForgePanel::GenerateAmbientOcclusionMaskFromDynamicMesh(
 						State.SourceTopologyAOCache, *WorkingMesh.Mesh, WorkingMesh.GeometryFingerprint,
 						SourceComponent->GetComponentTransform(), EffectiveAOParams);
@@ -7795,7 +7558,7 @@ void SVertexMaskForgePanel::ApplyPreviewToEntry(
 				NumComposed, WorkingMesh.Mesh->TriangleCount() * 3, *Entry->AssetName, *SourceComponent->GetName());
 
 			VertexMaskForgePanel::ActivateSourceTopologyPreviewForComponent(
-				State, *WorkingMesh.Mesh, State.SourceTopologyWorkingColors, DebugMaterial, ActorHideStates);
+				State, *WorkingMesh.Mesh, State.SourceTopologyWorkingColors, DebugMaterial, bUseOriginalMaterials, ActorHideStates);
 			continue;
 		}
 
@@ -7872,8 +7635,13 @@ void SVertexMaskForgePanel::ApplyPreviewToEntry(
 				// toggle until the next real regeneration. GenerateAmbientOcclusionMask applies Invert
 				// fresh from AOCache.RawValues every call regardless (see its own doc comment) -- this
 				// override only makes sure it uses the CURRENT checkbox state, never a stale one.
+				// AUDITED (AO Levels): LevelsMin/Max are LIVE overrides too, same reasoning as bInvert --
+				// purely compositional, applied fresh from AOCache.RawValues every call (see
+				// ApplyAOLevelsAndInvert), never requiring a raycast/Tree rebuild.
 				FVertexMaskForgeAOParams EffectiveAOParams = WorkingMesh.AmbientOcclusionMask.UsedAOParams;
 				EffectiveAOParams.bInvert = bAOInvert;
+				EffectiveAOParams.LevelsMin = AOLevelsMin;
+				EffectiveAOParams.LevelsMax = AOLevelsMax;
 				PerComponentAOMask = VertexMaskForgePanel::GenerateAmbientOcclusionMask(
 					State.AOCache, Mesh, RenderData->LODResources[0], SourceComponent->GetComponentTransform(),
 					EffectiveAOParams);
@@ -7908,8 +7676,8 @@ void SVertexMaskForgePanel::ApplyPreviewToEntry(
 		// the preview is (re)applied.
 		//
 		// AUDITED (recompute-at-Accept fix / Channel Filter toggle fix): mutates
-		// State.BaselineColors/CommittedColors/WorkingColors in place -- the SAME arrays Accept/
-		// Accept as Instance Override read (never write). bCommit forwarded from this call's own
+		// State.BaselineColors/CommittedColors/WorkingColors in place -- the SAME arrays Accept reads
+		// (never writes). bCommit forwarded from this call's own
 		// caller (UpdateAllPreviews) -- true ONLY for an explicit Generate Mask click or Fill. See
 		// UpdateWorkingColors' own doc comment for the full baseline/committed/working contract.
 		int32 NumComposed = 0;
@@ -7922,10 +7690,11 @@ void SVertexMaskForgePanel::ApplyPreviewToEntry(
 
 		const int32 NumRenderVertsForLog = static_cast<int32>(RenderData->LODResources[0].VertexBuffers.PositionVertexBuffer.GetNumVertices());
 		UE_LOG(LogVertexMaskForge, Verbose,
-			TEXT("Vertex Mask Forge: composed %d/%d render vertices for '%s' on component '%s'."),
-			NumComposed, NumRenderVertsForLog, *Entry->AssetName, *SourceComponent->GetName());
+			TEXT("Vertex Mask Forge: composed %d/%d render vertices for '%s' on component '%s' (Preview Mode=%d, originalTextures=%s)."),
+			NumComposed, NumRenderVertsForLog, *Entry->AssetName, *SourceComponent->GetName(),
+			static_cast<int32>(CurrentPreviewMode), bUseOriginalMaterials ? TEXT("true") : TEXT("false"));
 
-		VertexMaskForgePanel::ActivatePreviewForComponent(State, RenderOrderColors, DebugMaterial, ActorHideStates);
+		VertexMaskForgePanel::ActivatePreviewForComponent(State, RenderOrderColors, DebugMaterial, bUseOriginalMaterials, ActorHideStates);
 	}
 }
 
