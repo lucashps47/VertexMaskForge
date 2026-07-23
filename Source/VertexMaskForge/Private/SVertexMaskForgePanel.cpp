@@ -703,6 +703,212 @@ namespace VertexMaskForgePanel
 		return IsValid(Mesh) && Mesh->IsNaniteEnabled();
 	}
 
+	// --- Material Slot Mask (V2-D) -------------------------------------------------------------------
+
+	/** "Slot {Index}: {SlotName} — {MaterialAssetName}" -- never just the material name (the same
+	 *  material can appear in several slots) and never just the slot name (names can duplicate). */
+	static FText GetMaterialSlotLabel(const FVertexMaskForgeMaterialSlotInfo& Info)
+	{
+		const FText SlotNameText = Info.MaterialSlotName.IsNone()
+			? LOCTEXT("MaterialSlotUnnamed", "(unnamed)")
+			: FText::FromName(Info.MaterialSlotName);
+		return FText::Format(
+			LOCTEXT("MaterialSlotLabelFormat", "Slot {0}: {1} — {2}"),
+			FText::AsNumber(Info.SlotIndex), SlotNameText, FText::FromString(Info.MaterialAssetName));
+	}
+
+	/**
+	 * AUDITED (V2-D, M0-A): resolves EVERY FPolygonGroupID actually present in MeshDescriptionCopy to a
+	 * REAL Static Material Slot index, via the SAME correspondence UStaticMesh's own reimport code uses
+	 * (UStaticMesh::GetMaterialIndexFromImportedMaterialSlotName, StaticMesh.cpp -- confirmed by reading
+	 * the engine source: reimport slot remapping resolves
+	 * `GetMaterialIndexFromImportedMaterialSlotName(ExistingMaterialSlotNames[PolygonGroupID])`, the
+	 * EXACT SAME PolygonGroupID -> ImportedMaterialSlotName -> StaticMaterials-index chain used here).
+	 * UNLIKE that native function (a plain linear first-match scan, confirmed by reading its body --
+	 * it does NOT itself detect duplicate ImportedMaterialSlotName values), this wrapper explicitly
+	 * checks for duplicates FIRST and refuses to resolve through an ambiguous name at all -- per the
+	 * explicit "não aceitar uma correspondência ambígua silenciosamente" requirement. Never uses
+	 * MaterialIDAttrib/compacted Polygon Group IDs -- only real FPolygonGroupID objects and real name
+	 * matching. Returns one resolved index (or INDEX_NONE) per FPolygonGroupID actually returned by
+	 * MeshDescriptionCopy.PolygonGroups().GetElementIDs().
+	 */
+	static TMap<FPolygonGroupID, int32> ResolvePolygonGroupsToMaterialSlots(
+		const UStaticMesh* Mesh,
+		const FMeshDescription& MeshDescriptionCopy,
+		bool& bOutAllResolved)
+	{
+		bOutAllResolved = true;
+		TMap<FPolygonGroupID, int32> Result;
+
+		if (!IsValid(Mesh))
+		{
+			bOutAllResolved = false;
+			return Result;
+		}
+
+		// Duplicate-safe name -> index map: a name seen more than once (including NAME_None appearing
+		// on two or more slots) is stored as INDEX_NONE, never silently resolved to "whichever came
+		// first" the way the native GetMaterialIndexFromImportedMaterialSlotName would.
+		TMap<FName, int32> NameToUniqueSlotIndex;
+		const TArray<FStaticMaterial>& StaticMaterials = Mesh->GetStaticMaterials();
+		for (int32 SlotIndex = 0; SlotIndex < StaticMaterials.Num(); ++SlotIndex)
+		{
+			const FName SlotName = StaticMaterials[SlotIndex].ImportedMaterialSlotName;
+			if (const int32* Existing = NameToUniqueSlotIndex.Find(SlotName))
+			{
+				NameToUniqueSlotIndex.Add(SlotName, INDEX_NONE); // Duplicate -- permanently ambiguous.
+				(void)Existing;
+			}
+			else
+			{
+				NameToUniqueSlotIndex.Add(SlotName, SlotIndex);
+			}
+		}
+
+		const FStaticMeshConstAttributes Attributes(MeshDescriptionCopy);
+		const TPolygonGroupAttributesConstRef<FName> GroupSlotNames = Attributes.GetPolygonGroupMaterialSlotNames();
+
+		for (const FPolygonGroupID GroupID : MeshDescriptionCopy.PolygonGroups().GetElementIDs())
+		{
+			const FName GroupSlotName = GroupSlotNames.IsValid() && GroupSlotNames.GetNumElements() > 0
+				? GroupSlotNames.Get(GroupID)
+				: NAME_None;
+			const int32* Resolved = NameToUniqueSlotIndex.Find(GroupSlotName);
+			const int32 ResolvedIndex = (Resolved && *Resolved != INDEX_NONE && StaticMaterials.IsValidIndex(*Resolved))
+				? *Resolved
+				: INDEX_NONE;
+			Result.Add(GroupID, ResolvedIndex);
+			if (ResolvedIndex == INDEX_NONE)
+			{
+				bOutAllResolved = false;
+			}
+		}
+
+		return Result;
+	}
+
+	/**
+	 * AUDITED (V2-D, M0-A/M0-B): builds BOTH domains' Material Slot lookups for one working mesh, once,
+	 * at BuildWorkingMeshForStaticMesh time (while MeshDescriptionCopy/TriIDMap/LOD0 are all still in
+	 * scope) -- never recomputed per generation, only rebuilt on the next RefreshSelection. Populates
+	 * WorkingMesh.MaterialSlotOptions (the dropdown's own data source) from Mesh->GetStaticMaterials()
+	 * directly (real indices, real names -- a null material's slot reports "None").
+	 */
+	static void BuildMaterialSlotLookups(
+		FVertexMaskForgeWorkingMesh& WorkingMesh,
+		const UStaticMesh* Mesh,
+		const FMeshDescription& MeshDescriptionCopy,
+		const TArray<FTriangleID>& TriIDMap,
+		const FStaticMeshLODResources* LOD0)
+	{
+		WorkingMesh.MaterialSlotOptions.Reset();
+		WorkingMesh.DynamicTriangleToMaterialSlot.Reset();
+		WorkingMesh.RenderVertexToMaterialSlot.Reset();
+		WorkingMesh.bMaterialSlotResolutionValid = true;
+		WorkingMesh.bRenderVertexMaterialSlotAmbiguous = false;
+
+		if (!IsValid(Mesh) || !WorkingMesh.Mesh.IsValid())
+		{
+			WorkingMesh.bMaterialSlotResolutionValid = false;
+			return;
+		}
+
+		const TArray<FStaticMaterial>& StaticMaterials = Mesh->GetStaticMaterials();
+		WorkingMesh.MaterialSlotOptions.Reserve(StaticMaterials.Num());
+		for (int32 SlotIndex = 0; SlotIndex < StaticMaterials.Num(); ++SlotIndex)
+		{
+			FVertexMaskForgeMaterialSlotInfo Info;
+			Info.SlotIndex = SlotIndex;
+			Info.MaterialSlotName = StaticMaterials[SlotIndex].MaterialSlotName;
+			const UMaterialInterface* MaterialAsset = StaticMaterials[SlotIndex].MaterialInterface;
+			Info.MaterialAssetName = IsValid(MaterialAsset) ? MaterialAsset->GetName() : TEXT("None");
+			WorkingMesh.MaterialSlotOptions.Add(MoveTemp(Info));
+		}
+
+		// --- M0-A: Dynamic TriangleID -> real Material Slot, via TriIDMap + PolygonGroup resolution ---
+		bool bAllGroupsResolved = false;
+		const TMap<FPolygonGroupID, int32> GroupToSlot = ResolvePolygonGroupsToMaterialSlots(Mesh, MeshDescriptionCopy, bAllGroupsResolved);
+
+		const UE::Geometry::FDynamicMesh3& DynMesh = *WorkingMesh.Mesh;
+		const int32 MaxTriangleID = DynMesh.MaxTriangleID();
+		WorkingMesh.DynamicTriangleToMaterialSlot.Init(INDEX_NONE, MaxTriangleID);
+
+		bool bAnyTriangleUnresolved = false;
+		for (const int32 DynamicTriangleID : DynMesh.TriangleIndicesItr())
+		{
+			if (!TriIDMap.IsValidIndex(DynamicTriangleID))
+			{
+				bAnyTriangleUnresolved = true;
+				continue;
+			}
+			const FTriangleID SourceTriangleID = TriIDMap[DynamicTriangleID];
+			if (!MeshDescriptionCopy.IsTriangleValid(SourceTriangleID))
+			{
+				bAnyTriangleUnresolved = true;
+				continue;
+			}
+			const FPolygonGroupID GroupID = MeshDescriptionCopy.GetTrianglePolygonGroup(SourceTriangleID);
+			const int32* ResolvedSlot = GroupToSlot.Find(GroupID);
+			if (!ResolvedSlot || *ResolvedSlot == INDEX_NONE)
+			{
+				bAnyTriangleUnresolved = true;
+				continue;
+			}
+			WorkingMesh.DynamicTriangleToMaterialSlot[DynamicTriangleID] = *ResolvedSlot;
+		}
+		WorkingMesh.bMaterialSlotResolutionValid = bAllGroupsResolved && !bAnyTriangleUnresolved;
+
+		// --- M0-B: LOD0 Render Vertex Index -> real Material Slot, via Sections + IndexBuffer -------
+		if (!LOD0)
+		{
+			return; // Source-Topology entry: non-Nanite lookup intentionally left empty/unused.
+		}
+		const int32 NumRenderVerts = static_cast<int32>(LOD0->VertexBuffers.PositionVertexBuffer.GetNumVertices());
+		if (NumRenderVerts <= 0)
+		{
+			return;
+		}
+		WorkingMesh.RenderVertexToMaterialSlot.Init(INDEX_NONE, NumRenderVerts);
+
+		for (const FStaticMeshSection& Section : LOD0->Sections)
+		{
+			if (!StaticMaterials.IsValidIndex(Section.MaterialIndex))
+			{
+				continue; // Never guess -- a Section pointing outside the slot table resolves nothing.
+			}
+			const uint32 FirstIndex = Section.FirstIndex;
+			const uint32 NumIndices = Section.NumTriangles * 3u;
+			if (FirstIndex + NumIndices > static_cast<uint32>(LOD0->IndexBuffer.GetNumIndices()))
+			{
+				continue; // Malformed section range -- never read out of bounds.
+			}
+			for (uint32 i = 0; i < NumIndices; ++i)
+			{
+				const uint32 RenderIndexU = LOD0->IndexBuffer.GetIndex(FirstIndex + i);
+				if (RenderIndexU >= static_cast<uint32>(NumRenderVerts))
+				{
+					continue;
+				}
+				const int32 RenderIndex = static_cast<int32>(RenderIndexU);
+				const int32 Existing = WorkingMesh.RenderVertexToMaterialSlot[RenderIndex];
+				if (Existing == INDEX_NONE)
+				{
+					WorkingMesh.RenderVertexToMaterialSlot[RenderIndex] = Section.MaterialIndex;
+				}
+				else if (Existing != Section.MaterialIndex)
+				{
+					// AUDITED (M0-B): this render vertex is referenced by triangles from two DIFFERENT
+					// Sections/MaterialIndex values -- never resolved to first/last/min/max. Marked
+					// permanently ambiguous for this vertex AND the whole entry (see
+					// bRenderVertexMaterialSlotAmbiguous's own doc comment); the non-Nanite Material
+					// Slot Mask refuses to generate for this entry rather than risk bleeding.
+					WorkingMesh.RenderVertexToMaterialSlot[RenderIndex] = INDEX_NONE;
+					WorkingMesh.bRenderVertexMaterialSlotAmbiguous = true;
+				}
+			}
+		}
+	}
+
 	/**
 	 * Orchestrates the full read-only pipeline for one mesh: resolve, fetch MeshDescription,
 	 * copy it, convert the copy, then validate. Never mutates Mesh or its package.
@@ -765,6 +971,20 @@ namespace VertexMaskForgePanel
 		}
 
 		ValidateWorkingMesh(WorkingMesh, *MeshDescriptionCopy, TriIDMap, Diagnostics);
+
+		// AUDITED (V2-D): built here, while MeshDescriptionCopy/TriIDMap/LOD0 are all still in scope --
+		// see BuildMaterialSlotLookups' own doc comment. LOD0 is only available for a non-Source-
+		// Topology mesh with valid render data; passing nullptr there is intentional (the render-vertex
+		// lookup is simply left empty/unused for a Source-Topology entry, exactly like TriIDMap is
+		// unused the other direction).
+		{
+			const FStaticMeshRenderData* RenderDataForMaterialSlots = Mesh->GetRenderData();
+			const FStaticMeshLODResources* LOD0ForMaterialSlots =
+				(RenderDataForMaterialSlots && RenderDataForMaterialSlots->LODResources.IsValidIndex(0))
+				? &RenderDataForMaterialSlots->LODResources[0]
+				: nullptr;
+			BuildMaterialSlotLookups(WorkingMesh, Mesh, *MeshDescriptionCopy, TriIDMap, LOD0ForMaterialSlots);
+		}
 
 		// AUDITED (Nanite source-topology support): persisted for the Accept commit path -- see
 		// FVertexMaskForgeWorkingMesh::TriIDMap's own doc comment. Moved (not copied): TriIDMap is a
@@ -3169,6 +3389,122 @@ namespace VertexMaskForgePanel
 	}
 
 	/**
+	 * AUDITED (V2-D): the binary raw mask, render-vertex domain -- RawMask[i] = 1.0 iff
+	 * WorkingMesh.RenderVertexToMaterialSlot[i] == SelectedSlotIndex, else 0.0; Invert complements
+	 * (1.0<->0.0) AFTER that comparison, per the explicit formula. Refuses to generate (Unavailable) if
+	 * the lookup itself is invalid/ambiguous (see BuildMaterialSlotLookups) or SelectedSlotIndex is out
+	 * of range -- never silently produces a wrong/empty mask.
+	 */
+	static FVertexMaskForgeScalarMask GenerateMaterialSlotMask(
+		const FVertexMaskForgeWorkingMesh& WorkingMesh,
+		const FStaticMeshLODResources& LOD0,
+		const int32 SelectedSlotIndex,
+		const bool bInvert)
+	{
+		FVertexMaskForgeScalarMask Mask;
+		Mask.Source = EVertexMaskForgeScalarMaskSource::MaterialSlot;
+
+		const int32 NumRenderVerts = static_cast<int32>(LOD0.VertexBuffers.PositionVertexBuffer.GetNumVertices());
+		Mask.RenderVertexCount = NumRenderVerts;
+
+		if (NumRenderVerts <= 0
+			|| !WorkingMesh.bMaterialSlotResolutionValid
+			|| WorkingMesh.bRenderVertexMaterialSlotAmbiguous
+			|| WorkingMesh.RenderVertexToMaterialSlot.Num() != NumRenderVerts
+			|| !WorkingMesh.MaterialSlotOptions.IsValidIndex(SelectedSlotIndex))
+		{
+			Mask.State = EVertexMaskForgeScalarMaskState::Unavailable;
+			return Mask;
+		}
+
+		Mask.Values.SetNumUninitialized(NumRenderVerts);
+		Mask.bHasValue.Init(true, NumRenderVerts);
+
+		double Sum = 0.0;
+		for (int32 i = 0; i < NumRenderVerts; ++i)
+		{
+			const bool bSelected = WorkingMesh.RenderVertexToMaterialSlot[i] == SelectedSlotIndex;
+			const float Value = (bSelected != bInvert) ? 1.0f : 0.0f;
+			Mask.Values[i] = Value;
+			++Mask.NumValidValues;
+			Sum += Value;
+			Mask.MinValue = (Mask.NumValidValues == 1) ? Value : FMath::Min(Mask.MinValue, Value);
+			Mask.MaxValue = (Mask.NumValidValues == 1) ? Value : FMath::Max(Mask.MaxValue, Value);
+			if (Value <= FVertexMaskForgeScalarMask::Tolerance) { ++Mask.NumNearZero; }
+			if (Value >= 1.0f - FVertexMaskForgeScalarMask::Tolerance) { ++Mask.NumNearOne; }
+		}
+		Mask.MeanValue = (Mask.NumValidValues > 0) ? static_cast<float>(Sum / Mask.NumValidValues) : 0.0f;
+		Mask.State = (Mask.NumValidValues > 0) ? EVertexMaskForgeScalarMaskState::Ready : EVertexMaskForgeScalarMaskState::Unavailable;
+
+		return Mask;
+	}
+
+	/**
+	 * AUDITED (V2-D): sibling of GenerateMaterialSlotMask for Source-Topology (Nanite) entries --
+	 * CORNER-EXACT (Mesh.TriangleCount()*3, indexed by CornerIndex directly), deliberately NOT
+	 * Dynamic-Mesh-Vertex-domain like Curvature/Noise: all three corners of a triangle share that
+	 * triangle's OWN resolved slot (WorkingMesh.DynamicTriangleToMaterialSlot[TriangleID]), so two
+	 * corners at the same position/VertexID on opposite sides of a material boundary correctly read
+	 * different values -- see UpdateWorkingColorsSourceTopology's own IndexOverride switch (CornerIndex
+	 * case) for how this is consumed.
+	 */
+	static FVertexMaskForgeScalarMask GenerateMaterialSlotMaskFromDynamicMesh(
+		const FVertexMaskForgeWorkingMesh& WorkingMesh,
+		const int32 SelectedSlotIndex,
+		const bool bInvert)
+	{
+		using namespace UE::Geometry;
+
+		FVertexMaskForgeScalarMask Mask;
+		Mask.Source = EVertexMaskForgeScalarMaskSource::MaterialSlot;
+
+		if (!WorkingMesh.Mesh.IsValid() || !WorkingMesh.bMaterialSlotResolutionValid
+			|| !WorkingMesh.MaterialSlotOptions.IsValidIndex(SelectedSlotIndex))
+		{
+			Mask.State = EVertexMaskForgeScalarMaskState::Unavailable;
+			return Mask;
+		}
+
+		const FDynamicMesh3& Mesh = *WorkingMesh.Mesh;
+		const int32 NumCorners = Mesh.TriangleCount() * 3;
+		Mask.RenderVertexCount = NumCorners;
+
+		if (NumCorners <= 0)
+		{
+			Mask.State = EVertexMaskForgeScalarMaskState::Unavailable;
+			return Mask;
+		}
+
+		Mask.Values.SetNumUninitialized(NumCorners);
+		Mask.bHasValue.Init(true, NumCorners);
+
+		double Sum = 0.0;
+		int32 CornerIndex = 0;
+		for (const int32 TriangleID : Mesh.TriangleIndicesItr())
+		{
+			const int32 ResolvedSlot = WorkingMesh.DynamicTriangleToMaterialSlot.IsValidIndex(TriangleID)
+				? WorkingMesh.DynamicTriangleToMaterialSlot[TriangleID]
+				: INDEX_NONE;
+			const bool bSelected = ResolvedSlot == SelectedSlotIndex;
+			const float Value = (bSelected != bInvert) ? 1.0f : 0.0f;
+			for (int32 Corner = 0; Corner < 3; ++Corner, ++CornerIndex)
+			{
+				Mask.Values[CornerIndex] = Value;
+				++Mask.NumValidValues;
+				Sum += Value;
+				Mask.MinValue = (Mask.NumValidValues == 1) ? Value : FMath::Min(Mask.MinValue, Value);
+				Mask.MaxValue = (Mask.NumValidValues == 1) ? Value : FMath::Max(Mask.MaxValue, Value);
+				if (Value <= FVertexMaskForgeScalarMask::Tolerance) { ++Mask.NumNearZero; }
+				if (Value >= 1.0f - FVertexMaskForgeScalarMask::Tolerance) { ++Mask.NumNearOne; }
+			}
+		}
+		Mask.MeanValue = (Mask.NumValidValues > 0) ? static_cast<float>(Sum / Mask.NumValidValues) : 0.0f;
+		Mask.State = (Mask.NumValidValues > 0) ? EVertexMaskForgeScalarMaskState::Ready : EVertexMaskForgeScalarMaskState::Unavailable;
+
+		return Mask;
+	}
+
+	/**
 	 * Generates the Ambient Occlusion Mask directly in RENDER VERTEX order for one component, using
 	 * CPU hemisphere raycasts against the component's OWN geometry via a GeometryCore
 	 * UE::Geometry::FDynamicMeshAABBTree3 (UE 5.8's stable, Runtime-module mesh spatial index).
@@ -4839,6 +5175,13 @@ namespace VertexMaskForgePanel
 						// source mesh vertex all read the identical value.
 						Layer.IndexOverride = VertTri[Corner];
 						break;
+					case EVertexMaskForgeScalarMaskSource::MaterialSlot:
+						// AUDITED (V2-D): deliberately NOT VertTri[Corner] -- Material Slot Mask is
+						// CORNER-EXACT (see GenerateMaterialSlotMaskFromDynamicMesh's own doc comment),
+						// same domain as the Fill/Constant case below, so two corners sharing a position/
+						// VertexID on opposite sides of a material boundary correctly read different values.
+						Layer.IndexOverride = CornerIndex;
+						break;
 					default: // ConstantWhite / ConstantBlack (Fill) -- corner-domain mask, see
 						// GenerateConstantMaskForCornerDomain.
 						Layer.IndexOverride = CornerIndex;
@@ -4986,7 +5329,8 @@ namespace VertexMaskForgePanel
 				|| (Entry->WorkingMesh.BoundingBoxMask.State != EVertexMaskForgeScalarMaskState::Ready
 					&& Entry->WorkingMesh.AmbientOcclusionMask.State != EVertexMaskForgeScalarMaskState::Ready
 					&& Entry->WorkingMesh.CurvatureMask.State != EVertexMaskForgeScalarMaskState::Ready
-					&& Entry->WorkingMesh.NoiseMask.State != EVertexMaskForgeScalarMaskState::Ready))
+					&& Entry->WorkingMesh.NoiseMask.State != EVertexMaskForgeScalarMaskState::Ready
+					&& Entry->WorkingMesh.MaterialSlotMask.State != EVertexMaskForgeScalarMaskState::Ready))
 			{
 				continue;
 			}
@@ -5337,7 +5681,8 @@ namespace VertexMaskForgePanel
 				|| (Entry->WorkingMesh.BoundingBoxMask.State != EVertexMaskForgeScalarMaskState::Ready
 					&& Entry->WorkingMesh.AmbientOcclusionMask.State != EVertexMaskForgeScalarMaskState::Ready
 					&& Entry->WorkingMesh.CurvatureMask.State != EVertexMaskForgeScalarMaskState::Ready
-					&& Entry->WorkingMesh.NoiseMask.State != EVertexMaskForgeScalarMaskState::Ready))
+					&& Entry->WorkingMesh.NoiseMask.State != EVertexMaskForgeScalarMaskState::Ready
+					&& Entry->WorkingMesh.MaterialSlotMask.State != EVertexMaskForgeScalarMaskState::Ready))
 			{
 				continue;
 			}
@@ -6647,6 +6992,209 @@ void SVertexMaskForgePanel::InvalidateNoiseRawMask()
 	}
 }
 
+// --- Material Slot Mask (V2-D) -------------------------------------------------------------------
+
+void SVertexMaskForgePanel::ReconcileMaterialSlotSelection()
+{
+	MaterialSlotOptions.Reset();
+
+	if (IsMaterialSlotMaskAvailableForSelection())
+	{
+		const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry = SelectedMeshes[0];
+		if (Entry.IsValid())
+		{
+			for (const FVertexMaskForgeMaterialSlotInfo& Info : Entry->WorkingMesh.MaterialSlotOptions)
+			{
+				MaterialSlotOptions.Add(MakeShared<FVertexMaskForgeMaterialSlotInfo>(Info));
+			}
+
+			// Preserve the previous index if it still exists in the new list (e.g. an ordinary,
+			// non-destructive re-selection of the SAME mesh); otherwise fall back to Slot 0 -- never
+			// leaves a stale index that belonged to a DIFFERENT mesh's slot table silently selected
+			// against this one.
+			if (!Entry->WorkingMesh.MaterialSlotOptions.IsValidIndex(SelectedMaterialSlotIndex))
+			{
+				SelectedMaterialSlotIndex = 0;
+			}
+		}
+	}
+	// Zero or multiple selected meshes (or an invalid single entry): MaterialSlotOptions stays empty.
+	// Deliberately does NOT touch bMaterialSlotMaskEnabled -- the checkbox state is preserved so
+	// re-selecting a single mesh later resumes with the user's own choice, exactly like every other
+	// generator's Enable state survives a selection change.
+
+	// The OptionsSource pointer (&MaterialSlotOptions) never changes, only its contents -- RefreshOptions
+	// (not a widget recreation) is the correct, Slate-native way to notify an already-constructed
+	// SComboBox that its bound array was repopulated.
+	if (MaterialSlotComboBox.IsValid())
+	{
+		MaterialSlotComboBox->RefreshOptions();
+	}
+}
+
+FText SVertexMaskForgePanel::GetMaterialSlotMaskDiagnosticText() const
+{
+	if (!IsMaterialSlotMaskAvailableForSelection())
+	{
+		return LOCTEXT("MaterialSlotMaskRequiresSingleMesh", "Material Slot Mask currently requires a single selected mesh.");
+	}
+	const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry = SelectedMeshes[0];
+	if (!Entry.IsValid())
+	{
+		return FText::GetEmpty();
+	}
+	if (Entry->WorkingMesh.MaterialSlotOptions.IsEmpty())
+	{
+		return LOCTEXT("MaterialSlotMaskNoSlots", "The selected mesh has no usable Material Slots.");
+	}
+	if (!Entry->WorkingMesh.bMaterialSlotResolutionValid)
+	{
+		return LOCTEXT("MaterialSlotMaskResolutionInvalid", "Material Slot Mask unavailable: one or more Material Slots could not be resolved unambiguously (duplicate or missing slot names). Preview/Accept for this layer are blocked.");
+	}
+	if (Entry->WorkingMesh.bRenderVertexMaterialSlotAmbiguous && !Entry->bUseSourceTopology)
+	{
+		return LOCTEXT("MaterialSlotMaskRenderVertexAmbiguous", "Material Slot Mask unavailable: this mesh has render vertices shared between different Material Slots. Preview/Accept for this layer are blocked.");
+	}
+	return FText::GetEmpty();
+}
+
+TSharedRef<SWidget> SVertexMaskForgePanel::OnGenerateMaterialSlotRow(TSharedPtr<FVertexMaskForgeMaterialSlotInfo> InOption) const
+{
+	return SNew(STextBlock)
+		.Text(InOption.IsValid() ? VertexMaskForgePanel::GetMaterialSlotLabel(*InOption) : FText::GetEmpty());
+}
+
+void SVertexMaskForgePanel::OnMaterialSlotSelectionChanged(TSharedPtr<FVertexMaskForgeMaterialSlotInfo> NewSelection, ESelectInfo::Type SelectInfo)
+{
+	if (!NewSelection.IsValid())
+	{
+		return;
+	}
+
+	SelectedMaterialSlotIndex = NewSelection->SlotIndex;
+	OnMaterialSlotMaskGenerativeParamChanged();
+}
+
+FText SVertexMaskForgePanel::GetMaterialSlotButtonText() const
+{
+	for (const TSharedPtr<FVertexMaskForgeMaterialSlotInfo>& Option : MaterialSlotOptions)
+	{
+		if (Option.IsValid() && Option->SlotIndex == SelectedMaterialSlotIndex)
+		{
+			return VertexMaskForgePanel::GetMaterialSlotLabel(*Option);
+		}
+	}
+	return FText::GetEmpty();
+}
+
+void SVertexMaskForgePanel::InvalidateMaterialSlotMaskRawMask()
+{
+	LastMaskActionStatusText = FText::GetEmpty();
+
+	for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
+	{
+		if (Entry.IsValid())
+		{
+			Entry->WorkingMesh.MaterialSlotMask = FVertexMaskForgeScalarMask();
+		}
+	}
+
+	if (!bAutoUpdatePreview)
+	{
+		UpdateAllPreviews(/*bCommit=*/false);
+	}
+}
+
+void SVertexMaskForgePanel::OnMaterialSlotMaskGenerativeParamChanged()
+{
+	// AUDITED (V2-D): mirrors OnNoiseGenerativeParamChanged's exact pattern -- Slot selection/Invert
+	// change WHAT the raw binary pattern looks like, so they invalidate every selected entry's
+	// MaterialSlotMask and either regenerate immediately (Auto Update Preview on, cancelling any stale
+	// debounce first) or wait for an explicit Generate Mask (off). Never touches AO/Curvature/Noise/
+	// Alligator state or caches.
+	InvalidateMaterialSlotMaskRawMask();
+	if (bAutoUpdatePreview)
+	{
+		if (GEditor)
+		{
+			GEditor->GetTimerManager()->ClearTimer(AutoUpdateDebounceTimerHandle);
+		}
+		RunAutoUpdatePreview();
+	}
+}
+
+void SVertexMaskForgePanel::OnMaterialSlotMaskEnableChanged(const ECheckBoxState NewState)
+{
+	const bool bWasEnabled = bMaterialSlotMaskEnabled;
+	bMaterialSlotMaskEnabled = (NewState == ECheckBoxState::Checked);
+
+	// Same enable/disable contract as OnCurvatureEnableChanged/OnNoiseEnableChanged: turning OFF is
+	// always pure composition; turning ON reuses an already-Ready entry immediately and only
+	// regenerates if genuinely needed, gated by Auto Update Preview.
+	if (!bMaterialSlotMaskEnabled || bWasEnabled)
+	{
+		RecomposeWorkingColors();
+		return;
+	}
+
+	bool bAnyEntryNeedsGeneration = false;
+	for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
+	{
+		if (Entry.IsValid() && Entry->WorkingMesh.MaterialSlotMask.State != EVertexMaskForgeScalarMaskState::Ready)
+		{
+			bAnyEntryNeedsGeneration = true;
+			break;
+		}
+	}
+
+	if (!bAnyEntryNeedsGeneration || !IsMaterialSlotMaskAvailableForSelection())
+	{
+		RecomposeWorkingColors();
+		return;
+	}
+
+	if (bAutoUpdatePreview)
+	{
+		if (GEditor)
+		{
+			GEditor->GetTimerManager()->ClearTimer(AutoUpdateDebounceTimerHandle);
+		}
+		RunAutoUpdatePreview();
+	}
+	else
+	{
+		RecomposeWorkingColors();
+	}
+}
+
+void SVertexMaskForgePanel::OnMaterialSlotMaskInvertChanged(const ECheckBoxState NewState)
+{
+	bMaterialSlotMaskInvert = (NewState == ECheckBoxState::Checked);
+	OnMaterialSlotMaskGenerativeParamChanged();
+}
+
+TSharedRef<SWidget> SVertexMaskForgePanel::OnGenerateMaterialSlotMaskBlendModeRow(TSharedPtr<EVertexMaskForgeBlendMode> InOption) const
+{
+	return SNew(STextBlock)
+		.Text(InOption.IsValid() ? VertexMaskForgePanel::GetBlendModeLabel(*InOption) : FText::GetEmpty());
+}
+
+void SVertexMaskForgePanel::OnMaterialSlotMaskBlendModeSelectionChanged(TSharedPtr<EVertexMaskForgeBlendMode> NewSelection, ESelectInfo::Type SelectInfo)
+{
+	if (!NewSelection.IsValid())
+	{
+		return;
+	}
+
+	MaterialSlotMaskBlendMode = *NewSelection;
+	RecomposeWorkingColors();
+}
+
+FText SVertexMaskForgePanel::GetMaterialSlotMaskBlendModeButtonText() const
+{
+	return VertexMaskForgePanel::GetBlendModeLabel(MaterialSlotMaskBlendMode);
+}
+
 void SVertexMaskForgePanel::OnNoiseEnableChanged(const ECheckBoxState NewState)
 {
 	const bool bWasEnabled = bNoiseEnabled;
@@ -6859,7 +7407,7 @@ FText SVertexMaskForgePanel::GetActiveMaskSourceText() const
 		}
 	}
 
-	TArray<FText, TInlineAllocator<4>> ActiveLayerNames;
+	TArray<FText, TInlineAllocator<5>> ActiveLayerNames;
 	if (bAnyAxisEnabled)
 	{
 		ActiveLayerNames.Add(LOCTEXT("ActiveLayerBBox", "Bounding Box"));
@@ -6876,10 +7424,14 @@ FText SVertexMaskForgePanel::GetActiveMaskSourceText() const
 	{
 		ActiveLayerNames.Add(LOCTEXT("ActiveLayerNoise", "Noise"));
 	}
+	if (bMaterialSlotMaskEnabled)
+	{
+		ActiveLayerNames.Add(LOCTEXT("ActiveLayerMaterialSlot", "Material Slot Mask"));
+	}
 
 	if (ActiveLayerNames.IsEmpty())
 	{
-		return LOCTEXT("ActiveMaskSourceNone", "Active layers: None -- enable a Bounding Box axis, Ambient Occlusion, Curvature, or Noise");
+		return LOCTEXT("ActiveMaskSourceNone", "Active layers: None -- enable a Bounding Box axis, Ambient Occlusion, Curvature, Noise, or Material Slot Mask");
 	}
 
 	TArray<FString> LayerStrings;
@@ -8575,6 +9127,185 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 				]
 			]
 
+			// Material Slot Mask (V2-D): the tool's fifth, independent, optional composition-stack layer
+			// -- same collapsible panel pattern as Bounding Box/Ambient Occlusion/Curvature/Noise above.
+			// V1 SCOPE: requires exactly one selected mesh -- see IsMaterialSlotMaskAvailableForSelection.
+			+ SVerticalBox::Slot()
+			.AutoHeight()
+			.Padding(FMargin(0.f, 12.f, 0.f, 0.f))
+			[
+				SNew(SExpandableArea)
+				.InitiallyCollapsed(false)
+				.Padding(FMargin(8.f))
+				.HeaderContent()
+				[
+					SNew(STextBlock)
+					.Text(LOCTEXT("MaterialSlotMaskSectionTitle", "Material Slot Mask"))
+					.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
+				]
+				.BodyContent()
+				[
+					SNew(SVerticalBox)
+
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(FMargin(0.f, 0.f, 0.f, 6.f))
+					[
+						SNew(SCheckBox)
+						.IsChecked(this, &SVertexMaskForgePanel::GetMaterialSlotMaskEnableState)
+						.OnCheckStateChanged(this, &SVertexMaskForgePanel::OnMaterialSlotMaskEnableChanged)
+						.Content()
+						[
+							SNew(STextBlock)
+							.Text(LOCTEXT("MaterialSlotMaskEnableLabel", "Enable"))
+						]
+					]
+
+					// Blend Mode + Opacity: same Slate controls/dimensions/alignment/labels/tooltips/
+					// limits as the other four layers' own (see those sections above).
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(FMargin(0.f, 0.f, 0.f, 2.f))
+					[
+						SNew(SHorizontalBox)
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
+						[
+							SNew(STextBlock).Text(LOCTEXT("MaterialSlotMaskBlendModeLabel", "Blend Mode:"))
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						[
+							SAssignNew(MaterialSlotMaskBlendModeComboBox, SComboBox<TSharedPtr<EVertexMaskForgeBlendMode>>)
+							.OptionsSource(&BlendModeOptions)
+							.InitiallySelectedItem(BlendModeOptions[0])
+							.OnGenerateWidget(this, &SVertexMaskForgePanel::OnGenerateMaterialSlotMaskBlendModeRow)
+							.OnSelectionChanged(this, &SVertexMaskForgePanel::OnMaterialSlotMaskBlendModeSelectionChanged)
+							[
+								SNew(STextBlock)
+								.Text(this, &SVertexMaskForgePanel::GetMaterialSlotMaskBlendModeButtonText)
+							]
+						]
+					]
+
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(FMargin(0.f, 0.f, 0.f, 6.f))
+					[
+						SNew(SHorizontalBox)
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
+						[
+							SNew(STextBlock).Text(LOCTEXT("MaterialSlotMaskOpacityLabel", "Blend:"))
+						]
+
+						+ SHorizontalBox::Slot()
+						.FillWidth(1.f)
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 8.f, 0.f))
+						[
+							SNew(SSlider)
+							.MinValue(0.0f)
+							.MaxValue(1.0f)
+							.Value_Lambda([this]() { return MaterialSlotMaskOpacity; })
+							.OnValueChanged_Lambda([this](const float NewValue)
+							{
+								MaterialSlotMaskOpacity = FMath::Clamp(NewValue, 0.0f, 1.0f);
+								RecomposeWorkingColors();
+							})
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						[
+							SNew(SSpinBox<float>)
+							.MinDesiredWidth(52.f)
+							.MinValue(0.0f)
+							.MaxValue(1.0f)
+							.Delta(0.01f)
+							.MinFractionalDigits(2)
+							.MaxFractionalDigits(2)
+							.Value_Lambda([this]() { return MaterialSlotMaskOpacity; })
+							.OnValueChanged_Lambda([this](const float NewValue)
+							{
+								MaterialSlotMaskOpacity = FMath::Clamp(NewValue, 0.0f, 1.0f);
+								RecomposeWorkingColors();
+							})
+						]
+					]
+
+					// Material Slot dropdown + Invert -- disabled entirely when the V1 single-mesh scope
+					// requirement is not met (see IsMaterialSlotMaskAvailableForSelection), same visual
+					// "disabled, not hidden" convention as every other conditionally-relevant control in
+					// this panel (e.g. Octaves/Roughness/Lacunarity under Noise).
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(FMargin(0.f, 0.f, 0.f, 6.f))
+					[
+						SNew(SHorizontalBox)
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
+						[
+							SNew(STextBlock).Text(LOCTEXT("MaterialSlotLabel", "Material Slot:"))
+						]
+
+						+ SHorizontalBox::Slot()
+						.FillWidth(1.f)
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 12.f, 0.f))
+						[
+							SAssignNew(MaterialSlotComboBox, SComboBox<TSharedPtr<FVertexMaskForgeMaterialSlotInfo>>)
+							.IsEnabled_Lambda([this]() { return IsMaterialSlotMaskAvailableForSelection(); })
+							.OptionsSource(&MaterialSlotOptions)
+							.OnGenerateWidget(this, &SVertexMaskForgePanel::OnGenerateMaterialSlotRow)
+							.OnSelectionChanged(this, &SVertexMaskForgePanel::OnMaterialSlotSelectionChanged)
+							[
+								SNew(STextBlock)
+								.Text(this, &SVertexMaskForgePanel::GetMaterialSlotButtonText)
+							]
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						[
+							SNew(SCheckBox)
+							.IsEnabled_Lambda([this]() { return IsMaterialSlotMaskAvailableForSelection(); })
+							.IsChecked(this, &SVertexMaskForgePanel::GetMaterialSlotMaskInvertState)
+							.OnCheckStateChanged(this, &SVertexMaskForgePanel::OnMaterialSlotMaskInvertChanged)
+							.Content()
+							[
+								SNew(STextBlock)
+								.Text(LOCTEXT("MaterialSlotMaskInvertLabel", "Invert"))
+							]
+						]
+					]
+
+					// Diagnostic: single-mesh-scope / unresolved-mapping reasons Material Slot Mask may
+					// currently be unavailable -- empty (renders nothing) when available and valid.
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					[
+						SNew(STextBlock)
+						.Text(this, &SVertexMaskForgePanel::GetMaterialSlotMaskDiagnosticText)
+						.ColorAndOpacity(FSlateColor::UseSubduedForeground())
+						.AutoWrapText(true)
+					]
+				]
+			]
+
 			+ SVerticalBox::Slot()
 			.AutoHeight()
 			.Padding(FMargin(0.f, 12.f, 0.f, 0.f))
@@ -8924,6 +9655,11 @@ void SVertexMaskForgePanel::RefreshSelection()
 
 	SelectedMeshes = MoveTemp(NewSelection);
 
+	// AUDITED (V2-D): rebuilds the Material Slot dropdown from the (possibly new) single-mesh
+	// selection and reconciles SelectedMaterialSlotIndex against it -- see this function's own doc
+	// comment. Must run AFTER SelectedMeshes is assigned (it reads SelectedMeshes.Num()/[0]).
+	ReconcileMaterialSlotSelection();
+
 	UE_LOG(LogVertexMaskForge, Log, TEXT("Refreshed selection: %d unique Static Mesh asset(s)"), SelectedMeshes.Num());
 
 	// New entries always start with BoundingBoxMask == NotGenerated; if a Vertex Color preview
@@ -9135,11 +9871,11 @@ FReply SVertexMaskForgePanel::OnGenerateBoundingBoxMaskClicked()
 			break;
 		}
 	}
-	if (!bAnyAxisEnabled && !bAOEnabled && !bCurvatureEnabled && !bNoiseEnabled)
+	if (!bAnyAxisEnabled && !bAOEnabled && !bCurvatureEnabled && !bNoiseEnabled && !bMaterialSlotMaskEnabled)
 	{
 		// Per the explicit requirement: never generate an empty mask silently, never replace the
 		// previous Preview, never enter Pending Changes with invalid data.
-		LastOperationErrorText = LOCTEXT("NoMaskSourceEnabled", "Enable at least one Bounding Box axis, Ambient Occlusion, Curvature, or Noise.");
+		LastOperationErrorText = LOCTEXT("NoMaskSourceEnabled", "Enable at least one Bounding Box axis, Ambient Occlusion, Curvature, Noise, or Material Slot Mask.");
 		RecomputeOperationState();
 		return FReply::Handled();
 	}
@@ -9165,6 +9901,7 @@ FReply SVertexMaskForgePanel::OnGenerateBoundingBoxMaskClicked()
 	int32 NumAOReady = 0, NumAOUnavailable = 0;
 	int32 NumCurvatureReady = 0, NumCurvatureUnavailable = 0;
 	int32 NumNoiseReady = 0, NumNoiseUnavailable = 0;
+	int32 NumMaterialSlotReady = 0, NumMaterialSlotUnavailable = 0;
 
 	// AUDITED (Noise V1): computed ONCE for this whole click, before touching any entry -- Noise's raw
 	// pattern generation only needs the CURRENT UI values, never per-entry state.
@@ -9221,10 +9958,13 @@ FReply SVertexMaskForgePanel::OnGenerateBoundingBoxMaskClicked()
 			Entry->WorkingMesh.CurvatureMask.State = EVertexMaskForgeScalarMaskState::Unavailable;
 			Entry->WorkingMesh.NoiseMask = FVertexMaskForgeScalarMask();
 			Entry->WorkingMesh.NoiseMask.State = EVertexMaskForgeScalarMaskState::Unavailable;
+			Entry->WorkingMesh.MaterialSlotMask = FVertexMaskForgeScalarMask();
+			Entry->WorkingMesh.MaterialSlotMask.State = EVertexMaskForgeScalarMaskState::Unavailable;
 			++NumBBoxUnavailable;
 			++NumAOUnavailable;
 			++NumCurvatureUnavailable;
 			++NumNoiseUnavailable;
+			++NumMaterialSlotUnavailable;
 			continue;
 		}
 
@@ -9386,14 +10126,41 @@ FReply SVertexMaskForgePanel::OnGenerateBoundingBoxMaskClicked()
 			Entry->WorkingMesh.NoiseMask = FVertexMaskForgeScalarMask();
 			++NumNoiseUnavailable;
 		}
+
+		// AUDITED (V2-D): Material Slot Mask -- SAME "real, entry-level computation" contract as
+		// Curvature/Noise above, but ONLY when exactly one mesh is selected (V1 scope -- see
+		// IsMaterialSlotMaskAvailableForSelection's own doc comment). With multiple meshes selected,
+		// this block is skipped entirely for every entry, leaving MaterialSlotMask at NotGenerated --
+		// correctly excluded from composition, never guessed against the wrong mesh's slot table.
+		if (bMaterialSlotMaskEnabled && IsMaterialSlotMaskAvailableForSelection())
+		{
+			Entry->WorkingMesh.MaterialSlotMask = Entry->bUseSourceTopology
+				? VertexMaskForgePanel::GenerateMaterialSlotMaskFromDynamicMesh(
+					Entry->WorkingMesh, SelectedMaterialSlotIndex, bMaterialSlotMaskInvert)
+				: VertexMaskForgePanel::GenerateMaterialSlotMask(
+					Entry->WorkingMesh, RenderData->LODResources[0], SelectedMaterialSlotIndex, bMaterialSlotMaskInvert);
+			if (Entry->WorkingMesh.MaterialSlotMask.State == EVertexMaskForgeScalarMaskState::Ready)
+			{
+				++NumMaterialSlotReady;
+			}
+			else
+			{
+				++NumMaterialSlotUnavailable;
+			}
+		}
+		else
+		{
+			Entry->WorkingMesh.MaterialSlotMask = FVertexMaskForgeScalarMask();
+			++NumMaterialSlotUnavailable;
+		}
 	}
 
 	// Log (explicit operation summary): this function is only reached by an explicit Generate Mask
 	// click -- RunAutoUpdatePreview has its own separate loop and never calls this one, so this line
 	// cannot fire on every slider tick.
 	UE_LOG(LogVertexMaskForge, Log,
-		TEXT("Vertex Mask Forge: Generate Mask: Bounding Box %d ready/%d unavailable/%d degenerate/%d invalid; Ambient Occlusion %d ready/%d unavailable; Curvature %d ready/%d unavailable; Noise %d ready/%d unavailable."),
-		NumBBoxReady, NumBBoxUnavailable, NumBBoxDegenerate, NumBBoxInvalid, NumAOReady, NumAOUnavailable, NumCurvatureReady, NumCurvatureUnavailable, NumNoiseReady, NumNoiseUnavailable);
+		TEXT("Vertex Mask Forge: Generate Mask: Bounding Box %d ready/%d unavailable/%d degenerate/%d invalid; Ambient Occlusion %d ready/%d unavailable; Curvature %d ready/%d unavailable; Noise %d ready/%d unavailable; Material Slot Mask %d ready/%d unavailable."),
+		NumBBoxReady, NumBBoxUnavailable, NumBBoxDegenerate, NumBBoxInvalid, NumAOReady, NumAOUnavailable, NumCurvatureReady, NumCurvatureUnavailable, NumNoiseReady, NumNoiseUnavailable, NumMaterialSlotReady, NumMaterialSlotUnavailable);
 
 	// If a Vertex Color preview mode is active, recompose and reapply immediately using the
 	// mask(s) just persisted -- the user should not have to reselect the dropdown. bCommit=true:
@@ -9704,11 +10471,11 @@ void SVertexMaskForgePanel::RunAutoUpdatePreview(const bool bIncludeAO)
 	// AUDITED (BBox Invert exception): when bIncludeAO is false (OnAxisInvertChanged's scoped call),
 	// Ambient Occlusion is treated as irrelevant to this call regardless of bAOEnabled's actual value
 	// -- see the AO block below, which is skipped entirely in that case.
-	if (!bAnyAxisEnabled && !(bIncludeAO && bAOEnabled) && !bCurvatureEnabled && !bNoiseEnabled)
+	if (!bAnyAxisEnabled && !(bIncludeAO && bAOEnabled) && !bCurvatureEnabled && !bNoiseEnabled && !bMaterialSlotMaskEnabled)
 	{
 		// Preserve every entry's existing masks untouched and surface the specific message -- do not
 		// fall through to the generic "could not be regenerated" wording below.
-		LastOperationErrorText = LOCTEXT("NoMaskSourceEnabledAutoUpdate", "Enable at least one Bounding Box axis, Ambient Occlusion, Curvature, or Noise.");
+		LastOperationErrorText = LOCTEXT("NoMaskSourceEnabledAutoUpdate", "Enable at least one Bounding Box axis, Ambient Occlusion, Curvature, Noise, or Material Slot Mask.");
 		UpdateAllPreviews(/*bCommit=*/false);
 		return;
 	}
@@ -9914,6 +10681,28 @@ void SVertexMaskForgePanel::RunAutoUpdatePreview(const bool bIncludeAO)
 		{
 			Entry->WorkingMesh.NoiseMask = FVertexMaskForgeScalarMask();
 		}
+
+		// AUDITED (V2-D): same "real, entry-level computation" contract as Curvature/Noise above, but
+		// only when exactly one mesh is selected (V1 scope) -- see IsMaterialSlotMaskAvailableForSelection.
+		// Never gated by bIncludeAO (same rationale as Curvature/Noise).
+		if (bMaterialSlotMaskEnabled && IsMaterialSlotMaskAvailableForSelection())
+		{
+			FVertexMaskForgeScalarMask NewMaterialSlotMask = Entry->bUseSourceTopology
+				? VertexMaskForgePanel::GenerateMaterialSlotMaskFromDynamicMesh(
+					Entry->WorkingMesh, SelectedMaterialSlotIndex, bMaterialSlotMaskInvert)
+				: VertexMaskForgePanel::GenerateMaterialSlotMask(
+					Entry->WorkingMesh, RenderData->LODResources[0], SelectedMaterialSlotIndex, bMaterialSlotMaskInvert);
+			if (NewMaterialSlotMask.State == EVertexMaskForgeScalarMaskState::Ready)
+			{
+				Entry->WorkingMesh.MaterialSlotMask = MoveTemp(NewMaterialSlotMask);
+			}
+			// else: preserve whatever MaterialSlotMask this entry already had -- same "auto-update never
+			// replaces a valid Preview with incomplete/degenerate data" contract as the other generators.
+		}
+		else
+		{
+			Entry->WorkingMesh.MaterialSlotMask = FVertexMaskForgeScalarMask();
+		}
 	}
 
 	if (NumFailed > 0)
@@ -10001,7 +10790,8 @@ FText SVertexMaskForgePanel::GetPreviewStatusText() const
 		if (Entry->WorkingMesh.BoundingBoxMask.State == EVertexMaskForgeScalarMaskState::Ready
 			|| Entry->WorkingMesh.AmbientOcclusionMask.State == EVertexMaskForgeScalarMaskState::Ready
 			|| Entry->WorkingMesh.CurvatureMask.State == EVertexMaskForgeScalarMaskState::Ready
-			|| Entry->WorkingMesh.NoiseMask.State == EVertexMaskForgeScalarMaskState::Ready)
+			|| Entry->WorkingMesh.NoiseMask.State == EVertexMaskForgeScalarMaskState::Ready
+			|| Entry->WorkingMesh.MaterialSlotMask.State == EVertexMaskForgeScalarMaskState::Ready)
 		{
 			bAnyReady = true;
 		}
@@ -10125,7 +10915,8 @@ void SVertexMaskForgePanel::RecomputeOperationState()
 			&& (Entry->WorkingMesh.BoundingBoxMask.State == EVertexMaskForgeScalarMaskState::Ready
 				|| Entry->WorkingMesh.AmbientOcclusionMask.State == EVertexMaskForgeScalarMaskState::Ready
 				|| Entry->WorkingMesh.CurvatureMask.State == EVertexMaskForgeScalarMaskState::Ready
-				|| Entry->WorkingMesh.NoiseMask.State == EVertexMaskForgeScalarMaskState::Ready))
+				|| Entry->WorkingMesh.NoiseMask.State == EVertexMaskForgeScalarMaskState::Ready
+				|| Entry->WorkingMesh.MaterialSlotMask.State == EVertexMaskForgeScalarMaskState::Ready))
 		{
 			bHasPending = true;
 			break;
@@ -10447,9 +11238,12 @@ void SVertexMaskForgePanel::ApplyPreviewToEntry(
 	// AUDITED (Noise V1): same live-gating rationale as bCurvatureEntryReady above -- Noise is also
 	// entry-level, real values, no per-component re-evaluation needed.
 	const bool bNoiseEntryReady = bNoiseEnabled && WorkingMesh.NoiseMask.State == EVertexMaskForgeScalarMaskState::Ready;
+	// AUDITED (V2-D): same live-gating rationale as bCurvatureEntryReady/bNoiseEntryReady above --
+	// Material Slot Mask is also entry-level, real values, no per-component re-evaluation needed.
+	const bool bMaterialSlotMaskEntryReady = bMaterialSlotMaskEnabled && WorkingMesh.MaterialSlotMask.State == EVertexMaskForgeScalarMaskState::Ready;
 	if (WorkingMesh.State != EVertexMaskForgeWorkingMeshState::Ready
 		|| !WorkingMesh.Mesh.IsValid()
-		|| (!bBBoxEntryReady && !bAOEntryReady && !bCurvatureEntryReady && !bNoiseEntryReady))
+		|| (!bBBoxEntryReady && !bAOEntryReady && !bCurvatureEntryReady && !bNoiseEntryReady && !bMaterialSlotMaskEntryReady))
 	{
 		// Nothing safe to preview yet (both slots NotGenerated/Unavailable/DegenerateBounds/Invalid):
 		// show the original colors/materials rather than a stale or fabricated result. AUDITED
@@ -10604,6 +11398,16 @@ void SVertexMaskForgePanel::ApplyPreviewToEntry(
 				{
 					Layers.Add({ &WorkingMesh.NoiseMask, NoiseBlendMode, NoiseOpacity });
 				}
+				// AUDITED (V2-D): same "no per-component re-evaluation" contract as Curvature/Noise above
+				// -- WorkingMesh.MaterialSlotMask already holds the REAL, final, CORNER-EXACT values (see
+				// its own doc comment) for every component of this entry. IndexOverride is resolved
+				// per-corner by UpdateWorkingColorsSourceTopology's own switch (MaterialSlot -> CornerIndex,
+				// NOT Dynamic Mesh Vertex ID -- unlike Curvature/Noise, since two corners at the same
+				// position on opposite sides of a material boundary must read different values).
+				if (!bAnyLayerFailed && bMaterialSlotMaskEntryReady)
+				{
+					Layers.Add({ &WorkingMesh.MaterialSlotMask, MaterialSlotMaskBlendMode, MaterialSlotMaskOpacity });
+				}
 			}
 
 			if (bAnyLayerFailed || Layers.IsEmpty())
@@ -10739,6 +11543,15 @@ void SVertexMaskForgePanel::ApplyPreviewToEntry(
 			if (!bAnyLayerFailed && bNoiseEntryReady)
 			{
 				Layers.Add({ &WorkingMesh.NoiseMask, NoiseBlendMode, NoiseOpacity });
+			}
+			// AUDITED (V2-D): same "no per-component re-evaluation needed" contract as Curvature/Noise
+			// above -- WorkingMesh.MaterialSlotMask already holds the REAL, final per-render-vertex
+			// values; IndexOverride stays at its default (-1), looked up by the shared render vertex
+			// index (this is the RENDER-VERTEX domain, unlike the Source-Topology branch's corner-exact
+			// one -- see GenerateMaterialSlotMask's own doc comment).
+			if (!bAnyLayerFailed && bMaterialSlotMaskEntryReady)
+			{
+				Layers.Add({ &WorkingMesh.MaterialSlotMask, MaterialSlotMaskBlendMode, MaterialSlotMaskOpacity });
 			}
 		}
 

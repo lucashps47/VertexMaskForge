@@ -97,6 +97,21 @@ struct FVertexMaskForgeMeshDiagnostics
 	bool bAllowCPUAccess = false;
 };
 
+/**
+ * One entry of a mesh's Material Slot list (V2-D), for the Material Slot Mask dropdown. SlotIndex is
+ * the REAL, authoritative index into UStaticMesh::GetStaticMaterials() -- the identity used both for
+ * lookups and for display; never inferred from name or position. MaterialSlotName/MaterialAssetName
+ * are display-only (names can duplicate or be NAME_None -- see VertexMaskForgePanel::
+ * GetMaterialSlotLabel).
+ */
+struct FVertexMaskForgeMaterialSlotInfo
+{
+	int32 SlotIndex = INDEX_NONE;
+	FName MaterialSlotName = NAME_None;
+	/** "None" if the slot's material is null. */
+	FString MaterialAssetName;
+};
+
 /** Result of attempting to build a transient working copy of a mesh's LOD 0. */
 enum class EVertexMaskForgeWorkingMeshState : uint8
 {
@@ -241,6 +256,21 @@ enum class EVertexMaskForgeScalarMaskSource : uint8
 	 * so every component of the same asset shares the identical Noise contribution.
 	 */
 	Noise,
+
+	/**
+	 * GenerateMaterialSlotMask / GenerateMaterialSlotMaskFromDynamicMesh (V2-D): a binary mask -- 1.0
+	 * for every corner/render vertex resolved to belong to the chosen Static Material Slot, 0.0
+	 * everywhere else (optionally complemented by Invert) -- see VertexMaskForgePanel::
+	 * GetMaterialSlotForCorner/BuildMaterialSlotLookups for the exact Polygon Group -> real slot
+	 * resolution. A true generator/layer like Curvature/Noise (participates in ComposeMaskStack with
+	 * its own Blend Mode/Opacity), NOT a global eligibility filter -- it never suppresses or restores
+	 * baseline colors on its own; a slot the user wants untouched is achieved artistically, by the
+	 * user's own Blend Mode choice (e.g. Multiply), exactly like any other mask. Corner-EXACT in the
+	 * Source-Topology domain (never collapsed to Dynamic Mesh Vertex ID, unlike Curvature/Noise) so two
+	 * corners sharing a position/VertexID on opposite sides of a material boundary can correctly read
+	 * different values. Computed ONCE PER ENTRY (transform-independent, like Curvature/Noise).
+	 */
+	MaterialSlot,
 };
 
 /** Which of FVertexMaskForgeWorkingMesh::CurvatureRawConvexCache/CurvatureRawConcaveCache (or their
@@ -828,6 +858,60 @@ struct FVertexMaskForgeWorkingMesh
 	/** Generative parameters NoiseRawCache was last built from -- see NoiseRawCache's own doc comment.
 	 *  Compared by value (FVertexMaskForgeNoiseGenerativeParams::operator==) every regeneration. */
 	FVertexMaskForgeNoiseGenerativeParams NoiseCacheUsedParams;
+
+	// --- Material Slot Mask (V2-D) -----------------------------------------------------------
+
+	/**
+	 * The Material Slot Mask slot's ENTRY-LEVEL mask -- same "holds REAL, final values directly usable
+	 * by every component" contract as CurvatureMask/NoiseMask, EXCEPT this one is corner-EXACT in the
+	 * Source-Topology domain (Values sized Mesh.TriangleCount()*3, indexed by CornerIndex directly --
+	 * see GenerateMaterialSlotMaskFromDynamicMesh) rather than Dynamic Mesh Vertex ID, because two
+	 * corners sharing a position/VertexID on opposite sides of a material boundary must be able to read
+	 * different values. Populated by VertexMaskForgePanel::GenerateMaterialSlotMask (render-vertex
+	 * domain) or GenerateMaterialSlotMaskFromDynamicMesh (Source-Topology domain).
+	 */
+	FVertexMaskForgeScalarMask MaterialSlotMask;
+
+	/** This entry's mesh's real Material Slots (from UStaticMesh::GetStaticMaterials()), rebuilt every
+	 *  BuildWorkingMeshForStaticMesh call -- the source of truth the panel's dropdown is built from. */
+	TArray<FVertexMaskForgeMaterialSlotInfo> MaterialSlotOptions;
+
+	/**
+	 * AUDITED (V2-D, M0-A): Dynamic Mesh TriangleID -> REAL Static Material Slot index, resolved via
+	 * TriIDMap -> source FTriangleID -> source FPolygonID -> PolygonGroupID -> PolygonGroupMaterialSlotName
+	 * -> name-matched index in GetStaticMaterials() -- NEVER the compacted MaterialID attribute value
+	 * directly (see EnsureMaterialIDAttribute's own doc note on bUseCompactedPolygonGroupIDValues not
+	 * proving Section Index == Material Slot index). INDEX_NONE for any triangle whose Polygon Group
+	 * could not be resolved unambiguously to exactly one Static Material Slot (see
+	 * bMaterialSlotResolutionValid below). Sized Mesh->MaxTriangleID(); built once in
+	 * BuildWorkingMeshForStaticMesh, alongside TriIDMap.
+	 */
+	TArray<int32> DynamicTriangleToMaterialSlot;
+
+	/** False if ANY Polygon Group actually used by this mesh's triangles could not be resolved to
+	 *  exactly one Static Material Slot by name (ambiguous duplicate name, NAME_None with more than one
+	 *  candidate, or no match at all) -- see DynamicTriangleToMaterialSlot's own doc comment. When
+	 *  false, Material Slot Mask must refuse to generate (State stays Unavailable) rather than risk a
+	 *  silently wrong slot assignment; every other generator is completely unaffected. */
+	bool bMaterialSlotResolutionValid = true;
+
+	/**
+	 * AUDITED (V2-D, M0-B): LOD0 Render Vertex Index -> REAL Static Material Slot index, derived from
+	 * FStaticMeshLODResources::Sections (Section.MaterialIndex + its own IndexBuffer triangle range) --
+	 * the RenderData authority for the non-Nanite/render-vertex domain (MeshDescription's Polygon Groups
+	 * are not indexed by render vertex at all). INDEX_NONE for a render vertex this mesh's Sections
+	 * never reference, OR for one explicitly detected as referenced by MORE THAN ONE distinct
+	 * MaterialIndex (see bRenderVertexMaterialSlotAmbiguous) -- never guessed via first/last/min/max.
+	 * Sized to LOD0's own render vertex count; built once in BuildWorkingMeshForStaticMesh.
+	 */
+	TArray<int32> RenderVertexToMaterialSlot;
+
+	/** True if BuildMaterialSlotLookups found at least one render vertex referenced by triangles from
+	 *  Sections with two (or more) DIFFERENT MaterialIndex values -- see RenderVertexToMaterialSlot's
+	 *  own doc comment. When true, the non-Nanite Material Slot Mask must refuse to generate for THIS
+	 *  entry (State stays Unavailable, with a specific diagnostic) rather than risk bleeding between
+	 *  slots; every other generator, and the Source-Topology domain, are completely unaffected. */
+	bool bRenderVertexMaterialSlotAmbiguous = false;
 };
 
 /**
@@ -1681,6 +1765,82 @@ private:
 	 * changes (OnNoiseGenerativeParamChanged), never by artistic ones.
 	 */
 	void InvalidateNoiseRawMask();
+
+	// --- Material Slot Mask (V2-D) -----------------------------------------------------------
+	// A fifth, independent, optional composition-stack layer -- a structural peer of Bounding Box, AO,
+	// Curvature, and Noise (see EVertexMaskForgeScalarMaskSource::MaterialSlot). Transform-independent
+	// like Curvature/Noise (generated once per entry, real values, no per-component re-evaluation).
+	// V1 SCOPE: requires exactly one selected mesh (the dropdown represents "the slots of THAT mesh") --
+	// see IsMaterialSlotMaskAvailableForSelection.
+
+	ECheckBoxState GetMaterialSlotMaskEnableState() const { return bMaterialSlotMaskEnabled ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; }
+
+	/** Same enable/disable contract as OnCurvatureEnableChanged/OnNoiseEnableChanged: turning OFF is
+	 *  always pure composition; turning ON reuses an already-Ready entry immediately and only
+	 *  regenerates if genuinely needed, gated by Auto Update Preview. */
+	void OnMaterialSlotMaskEnableChanged(ECheckBoxState NewState);
+	bool bMaterialSlotMaskEnabled = false;
+
+	/** True only when exactly one entry is selected -- the V1 scope requirement (see this section's own
+	 *  header comment). Never true for zero or multiple selected meshes, regardless of bMaterialSlotMaskEnabled. */
+	bool IsMaterialSlotMaskAvailableForSelection() const { return SelectedMeshes.Num() == 1; }
+
+	/** Short, user-facing reason Material Slot Mask is currently unavailable/invalid for the current
+	 *  single-mesh selection (empty if available and valid). Never touches any other generator. */
+	FText GetMaterialSlotMaskDiagnosticText() const;
+
+	TSharedRef<SWidget> OnGenerateMaterialSlotRow(TSharedPtr<FVertexMaskForgeMaterialSlotInfo> InOption) const;
+	void OnMaterialSlotSelectionChanged(TSharedPtr<FVertexMaskForgeMaterialSlotInfo> NewSelection, ESelectInfo::Type SelectInfo);
+	FText GetMaterialSlotButtonText() const;
+
+	/** Rebuilt every RefreshSelection from the single selected entry's WorkingMesh.MaterialSlotOptions
+	 *  (see ReconcileMaterialSlotSelection) -- never stale across a mesh/selection change. */
+	TArray<TSharedPtr<FVertexMaskForgeMaterialSlotInfo>> MaterialSlotOptions;
+	TSharedPtr<SComboBox<TSharedPtr<FVertexMaskForgeMaterialSlotInfo>>> MaterialSlotComboBox;
+
+	/** Real index into GetStaticMaterials() for the currently selected mesh. GENERATIVE -- see
+	 *  OnMaterialSlotMaskGenerativeParamChanged. Reconciled (never left stale/out-of-range) by
+	 *  ReconcileMaterialSlotSelection every RefreshSelection. */
+	int32 SelectedMaterialSlotIndex = 0;
+
+	/**
+	 * Shared handler for Material Slot Mask's generative parameters (which slot is selected, Invert --
+	 * both change WHAT the raw binary mask looks like): invalidates the entry's MaterialSlotMask (reset
+	 * to NotGenerated) and either regenerates immediately (Auto Update Preview on) or waits for an
+	 * explicit Generate Mask (off) -- same contract as OnNoiseGenerativeParamChanged.
+	 */
+	void OnMaterialSlotMaskGenerativeParamChanged();
+	void InvalidateMaterialSlotMaskRawMask();
+
+	ECheckBoxState GetMaterialSlotMaskInvertState() const { return bMaterialSlotMaskInvert ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; }
+	void OnMaterialSlotMaskInvertChanged(ECheckBoxState NewState);
+	bool bMaterialSlotMaskInvert = false;
+
+	TSharedRef<SWidget> OnGenerateMaterialSlotMaskBlendModeRow(TSharedPtr<EVertexMaskForgeBlendMode> InOption) const;
+	void OnMaterialSlotMaskBlendModeSelectionChanged(TSharedPtr<EVertexMaskForgeBlendMode> NewSelection, ESelectInfo::Type SelectInfo);
+	FText GetMaterialSlotMaskBlendModeButtonText() const;
+	TSharedPtr<SComboBox<TSharedPtr<EVertexMaskForgeBlendMode>>> MaterialSlotMaskBlendModeComboBox;
+
+	/** Same "every new layer defaults to Copy" convention as every other generator. ARTISTIC (pure
+	 *  composition, see RecomposeWorkingColors) -- never regenerates the raw mask. */
+	EVertexMaskForgeBlendMode MaterialSlotMaskBlendMode = EVertexMaskForgeBlendMode::Copy;
+
+	/** Same contract/range/default as BoundingBoxOpacity/AOOpacity/CurvatureOpacity/NoiseOpacity,
+	 *  independent of them. Applied ONLY during final composition (ComposeMaskStack), never to
+	 *  MaterialSlotMask.Values itself. ARTISTIC. */
+	float MaterialSlotMaskOpacity = 1.0f;
+
+	/**
+	 * AUDITED (V2-D): rebuilds MaterialSlotOptions (the dropdown's own list) from the single selected
+	 * entry's WorkingMesh.MaterialSlotOptions, and validates/reconciles SelectedMaterialSlotIndex
+	 * against it -- preserves the previous index if it still exists in the new list, otherwise falls
+	 * back to the first available slot (index 0 of GetStaticMaterials()), never leaving a stale index
+	 * from a different mesh selected. Called at the end of RefreshSelection, unconditionally (cheap:
+	 * only touches this section's own UI-facing arrays, never any other generator's state). A zero- or
+	 * multi-mesh selection clears MaterialSlotOptions to empty (IsMaterialSlotMaskAvailableForSelection
+	 * already gates the UI/generation in that case).
+	 */
+	void ReconcileMaterialSlotSelection();
 
 	// --- Fill White / Fill Black utility masks ----------------------------------------------
 
