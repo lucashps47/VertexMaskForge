@@ -28,6 +28,10 @@ public class VertexMaskForge : ModuleRules
 				"StaticMeshDescription",
 				"MeshConversion",
 				"GeometryCore",
+				// UDynamicMeshComponent -- the Source-Topology (Nanite) preview component, the same
+				// mechanism UE's own Paint Vertex Colors tool uses to render an FDynamicMesh3 directly
+				// (never a UStaticMeshComponent, whose OverrideVertexColors Nanite's renderer ignores).
+				"GeometryFramework",
 				// Required for BeginInitResource(FRenderResource*) (RenderCore/Public/RenderResource.h),
 				// used to initialize the transient FColorVertexBuffer allocated for the non-destructive
 				// component-level Vertex Color preview (FStaticMeshComponentLODInfo::OverrideVertexColors).

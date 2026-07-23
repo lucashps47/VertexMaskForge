@@ -6,6 +6,7 @@
 #include "Delegates/IDelegateInstance.h"
 #include "Engine/TimerHandle.h"
 #include "Math/Vector4.h"
+#include "MeshTypes.h"
 #include "UObject/SoftObjectPtr.h"
 #include "UObject/StrongObjectPtr.h"
 #include "UObject/WeakObjectPtr.h"
@@ -17,11 +18,28 @@ class AActor;
 class UMaterialInterface;
 class UStaticMesh;
 class UStaticMeshComponent;
+class UDynamicMeshComponent;
 template <typename OptionType> class SComboBox;
 enum class ECheckBoxState : uint8;
 namespace ESelectInfo { enum Type : int; }
 
 namespace UE::Geometry { class FDynamicMesh3; }
+
+/**
+ * Opaque per-component Ambient Occlusion cache (world-space-baked occluder geometry + spatial index
+ * + last-computed raw per-render-vertex AO values), owned exclusively by one
+ * FVertexMaskForgePreviewComponentState. Forward-declared here and fully defined in the .cpp, exactly
+ * mirroring FVertexMaskForgeWorkingMesh::Mesh's TUniquePtr<FDynamicMesh3> pattern -- this header never
+ * needs GeometryCore's DynamicMeshAABBTree3.h to be complete, only SVertexMaskForgePanel.cpp (which
+ * VertexMaskForgeModule.cpp never bypasses; it only ever constructs/destroys SVertexMaskForgePanel
+ * itself, whose own destructor is already declared here and defined there for the same reason -- see
+ * VertexMaskForgePanel::GenerateAmbientOcclusionMask for the cache's actual contents/contract).
+ */
+struct FVertexMaskForgeAOCache;
+
+/** Sibling of FVertexMaskForgeAOCache for Source-Topology (Nanite) entries -- see
+ *  VertexMaskForgePanel::GenerateAmbientOcclusionMaskFromDynamicMesh in the .cpp for the full contract. */
+struct FVertexMaskForgeSourceTopologyAOCache;
 
 /**
  * Explicit state of the Pending Changes workflow (Accept/Cancel). Never inferred merely from
@@ -183,6 +201,40 @@ enum class EVertexMaskForgeScalarMaskSource : uint8
 
 	/** GenerateConstantMask(0.0): every render vertex set to 0.0 (Fill Black). */
 	ConstantBlack,
+
+	/** GenerateAmbientOcclusionMask: per-render-vertex hemisphere-raycast occlusion fraction.
+	 *  Convention (before Invert): 0.0 = exposed (no occluders found), 1.0 = fully occluded/cavity --
+	 *  i.e. the OPPOSITE of the common "black = occluded" texture-baking convention. FVertexMaskForgeAOParams::bInvert
+	 *  swaps it. */
+	AmbientOcclusion,
+};
+
+/**
+ * Panel-level parameters for the Ambient Occlusion mask source (SVertexMaskForgePanel::AOSamples/
+ * AOMaxDistance/AOBias/bAOInvert), snapshotted onto FVertexMaskForgeScalarMask::UsedAOParams at
+ * generation time -- exactly the same "snapshot for diagnostics, composition only reads Values"
+ * relationship FVertexMaskForgeAxisMaskParams already has via UsedAxisParams. Clamped defensively
+ * again inside VertexMaskForgePanel::GenerateAmbientOcclusionMask itself (never trusts the UI clamp
+ * alone -- see that function's own doc comment).
+ */
+struct FVertexMaskForgeAOParams
+{
+	/** Hemisphere sample count per render vertex. UI range [8, 256]; default 64. */
+	int32 Samples = 64;
+
+	/** Maximum occluder search distance, in Unreal units (World Space -- see
+	 *  VertexMaskForgePanel::GenerateAmbientOcclusionMask for why this must be World Space, not Local,
+	 *  under non-uniform component scale). UI range (0, 10000]; default 100.0. */
+	float MaxDistance = 100.0f;
+
+	/** Ray origin offset along the vertex normal, in Unreal units (same World Space as MaxDistance),
+	 *  applied BEFORE the acceleration-structure query so it never requires rebuilding the tree. UI
+	 *  range [0.001, 10.0]; default 0.1. */
+	float Bias = 0.1f;
+
+	/** Applied AFTER the raw occlusion fraction is computed (Result = 1 - AO) -- never requires
+	 *  recomputing raw samples or rebuilding the tree; see GenerateAmbientOcclusionMask. */
+	bool bInvert = false;
 };
 
 /**
@@ -287,8 +339,9 @@ struct FVertexMaskForgeAxisBoundsResult
  * FVertexMaskForgeWorkingMesh. Exists only in memory; never written to the Primary Color Overlay,
  * MeshDescription, RenderData, or the source asset.
  *
- * AUDITED: the Bounding Box Mask (the only spatial generator that exists so far) is computed
- * directly in RENDER VERTEX order (see VertexMaskForgePanel::GenerateBoundingBoxMask), so for it,
+ * AUDITED: the Bounding Box Mask and the Ambient Occlusion Mask (the two spatial generators that
+ * exist so far) are both computed directly in RENDER VERTEX order (see
+ * VertexMaskForgePanel::GenerateBoundingBoxMask / GenerateAmbientOcclusionMask), so for them,
  * Values/bHasValue are indexed by Render Vertex Index and are always dense (Values.Num() ==
  * bHasValue.Num() == RenderVertexCount == the LOD's PositionVertexBuffer.GetNumVertices(), every
  * slot written). This struct itself stays domain-agnostic (a future, genuinely topology-dependent
@@ -339,6 +392,10 @@ struct FVertexMaskForgeScalarMask
 	 * were active). Never affects composition; composition only ever reads Values/bHasValue.
 	 */
 	TStaticArray<FVertexMaskForgeAxisMaskParams, 3> UsedAxisParams;
+
+	/** Snapshot of the AO parameters used to generate this mask (Source == AmbientOcclusion only;
+	 *  left default-constructed otherwise) -- same diagnostic-only relationship as UsedAxisParams. */
+	FVertexMaskForgeAOParams UsedAOParams;
 
 	// --- Temporary diagnostics (audited render-vertex-order fix) ---------------------------
 	// Added to make the Values.Num() == PositionVertexBuffer.GetNumVertices() invariant directly
@@ -392,6 +449,31 @@ struct FVertexMaskForgeWorkingMesh
 	/** Null unless State == Ready. Explicit, exclusive ownership; never shared or persisted elsewhere. */
 	TUniquePtr<UE::Geometry::FDynamicMesh3> Mesh;
 
+	/**
+	 * AUDITED (Nanite source-topology support, AO cache robustness fix): a content fingerprint of Mesh
+	 * (positions + normal overlay elements, combined via GetTypeHash/HashCombine), computed ONCE when
+	 * Mesh is built (see VertexMaskForgePanel::ComputeDynamicMeshGeometryFingerprint /
+	 * BuildWorkingMeshForStaticMesh) and never recomputed afterward -- Mesh itself is never mutated
+	 * in place after this point (the one defensive exception, filling in a missing Normal Overlay, also
+	 * happens BEFORE this fingerprint is taken). Used as part of FVertexMaskForgeSourceTopologyAOCache's
+	 * identity check: vertex/triangle COUNTS alone are not sufficient (two genuinely different
+	 * geometries can share the same counts), so the cache compares this fingerprint instead of/in
+	 * addition to counts. Zero only if Mesh itself is null/not Ready.
+	 */
+	uint32 GeometryFingerprint = 0;
+
+	/**
+	 * AUDITED (Nanite source-topology support): Dynamic Mesh TriangleID -> source FMeshDescription
+	 * FTriangleID, exactly as produced by FMeshDescriptionToDynamicMesh::Convert (see ConvertToDynamicMesh
+	 * in the .cpp). Persisted here (computed once, at working-mesh build time) so the Source-Topology
+	 * Accept commit path (WriteSourceTopologyAcceptTargets) can re-derive the same TriangleID -> source
+	 * FVertexInstanceID correspondence ReconstructOmittedColorOverlay already proved correct, without
+	 * re-running the conversion. Valid against Mesh->GetMeshDescription(0) directly: MeshDescriptionCopy
+	 * (the conversion input) is an EXACT copy of the source, so FTriangleID/FVertexInstanceID values are
+	 * identical in both. Empty unless State == Ready.
+	 */
+	TArray<FTriangleID> TriIDMap;
+
 	int32 DynamicVertexCount = 0;
 	int32 DynamicTriangleCount = 0;
 
@@ -420,8 +502,9 @@ struct FVertexMaskForgeWorkingMesh
 	FVertexMaskForgeColorStats ColorStats;
 
 	/**
-	 * The active mask (Bounding Box across up to 3 axes, or a Constant Fill), if generated. This is
-	 * the ENTRY-LEVEL reference: generated using the first live PreviewComponent's transform (or
+	 * The Bounding Box slot's mask (across up to 3 axes), OR a Constant Fill result -- the two are
+	 * mutually exclusive WITHIN this one field/slot (Source discriminates which). This is the
+	 * ENTRY-LEVEL reference: generated using the first live PreviewComponent's transform (or
 	 * FTransform::Identity if none), used for gating (Ready check), the row summary text, and
 	 * Content-Browser-only entries. When Source == BoundingBox and at least one axis uses World
 	 * Space, actual Preview/Accept composition RE-EVALUATES the mask per component with that
@@ -432,8 +515,33 @@ struct FVertexMaskForgeWorkingMesh
 	 * BuildWorkingMeshForStaticMesh), so this starts at NotGenerated automatically every time the
 	 * working mesh itself is rebuilt -- there is no separate invalidation step needed for that case.
 	 * Parameter-change invalidation is handled by the panel explicitly resetting this field.
+	 *
+	 * AUDITED (composition-stack checkpoint): NO LONGER mutually exclusive with AmbientOcclusionMask
+	 * below -- Bounding Box and Ambient Occlusion are independent, optional STACK LAYERS that can both
+	 * be Ready and both contribute to composition at once (see VertexMaskForgePanel::ApplyPreviewToEntry
+	 * building an ordered Layers list from whichever of the two slots below are Ready, and
+	 * ComposeMaskStack/UpdateWorkingColors applying each enabled layer sequentially). Only a Constant
+	 * Fill result (Source == ConstantWhite/ConstantBlack, stored in THIS field) remains a hard override
+	 * that supersedes both slots entirely for that one pass -- see ApplyPreviewToEntry's own doc note.
 	 */
 	FVertexMaskForgeScalarMask BoundingBoxMask;
+
+	/**
+	 * The Ambient Occlusion slot's ENTRY-LEVEL mask -- populated ONLY as a cheap, geometry-cache-free
+	 * VALIDATION result (NumRenderVerts/triangles/normal-buffer sanity, and UsedAOParams snapshot with
+	 * Samples already resolved to either the full user-chosen value (explicit Generate Mask) or the
+	 * interactive cap (Auto Update Preview) -- see OnGenerateBoundingBoxMaskClicked/
+	 * RunAutoUpdatePreview). Values/bHasValue are ALWAYS left empty here -- this field is NEVER used to
+	 * read actual per-vertex AO values; ApplyPreviewToEntry unconditionally re-evaluates the REAL,
+	 * per-component result (using that component's own AOCache) from UsedAOParams, exactly once per
+	 * component, every time. This is what guarantees Ambient Occlusion is ever computed in exactly ONE
+	 * place (ApplyPreviewToEntry) -- see that function's own doc comment for the audited fix this
+	 * replaced (a redundant entry-level real computation that could double the raycast cost per
+	 * update). Independent of BoundingBoxMask -- see that field's own doc comment on the composition
+	 * stack. Reset together with BoundingBoxMask by the same invalidation points (parameter changes,
+	 * RefreshSelection).
+	 */
+	FVertexMaskForgeScalarMask AmbientOcclusionMask;
 };
 
 /**
@@ -498,6 +606,25 @@ struct FVertexMaskForgeActorHideState
  */
 struct FVertexMaskForgePreviewComponentState
 {
+	FVertexMaskForgePreviewComponentState() = default;
+
+	/**
+	 * Declared here, defined in the .cpp (after FVertexMaskForgeAOCache is a complete type) --
+	 * exactly the same reason and pattern as FVertexMaskForgeWorkingMesh's own destructor/move
+	 * operations, now needed here too because of the AOCache member (TUniquePtr<FVertexMaskForgeAOCache>).
+	 */
+	~FVertexMaskForgePreviewComponentState();
+
+	/** Exclusive ownership of AOCache via TUniquePtr; copying would be ambiguous/unsafe. Every actual
+	 *  usage site in the .cpp already only ever moves this struct (TArray::Add(MoveTemp(...)) at
+	 *  construction, by-reference iteration everywhere else), so deleting copy costs nothing real. */
+	FVertexMaskForgePreviewComponentState(const FVertexMaskForgePreviewComponentState&) = delete;
+	FVertexMaskForgePreviewComponentState& operator=(const FVertexMaskForgePreviewComponentState&) = delete;
+
+	/** Declared here, defined in the .cpp for the same reason as the destructor. */
+	FVertexMaskForgePreviewComponentState(FVertexMaskForgePreviewComponentState&&);
+	FVertexMaskForgePreviewComponentState& operator=(FVertexMaskForgePreviewComponentState&&);
+
 	/** The real, selected component. Read-only source for mesh/transform; never mutated. */
 	TWeakObjectPtr<UStaticMeshComponent> SourceComponent;
 
@@ -604,6 +731,57 @@ struct FVertexMaskForgePreviewComponentState
 	 * approximation of pending, ungenerated UI parameters.
 	 */
 	TArray<FColor> WorkingColors;
+
+	/**
+	 * Per-component Ambient Occlusion memoization: the world-space-baked occluder tree (rebuilt only
+	 * when this component's geometry/transform actually changes) and the last-computed raw
+	 * per-render-vertex AO values (rebuilt only when Samples/MaxDistance/Bias actually change) -- see
+	 * VertexMaskForgePanel::GenerateAmbientOcclusionMask for the full cache contract. Null until AO is
+	 * generated at least once for this component. Lazily created inside GenerateAmbientOcclusionMask;
+	 * never read or written anywhere else.
+	 *
+	 * Reset (destroyed) together with BaselineColors/CommittedColors/WorkingColors -- see
+	 * BaselineColors' own doc comment for every reset point -- so a brand new session always rebuilds
+	 * AO from scratch rather than risking a stale tree from a concluded operation. Within one active
+	 * session this is deliberately NOT invalidated by Blend Mode/Opacity/Channel Filter/Preview Mode
+	 * changes (those never touch this field at all), which is what lets repeated recomposition reuse
+	 * the expensive raycast results instead of recomputing them on every unrelated parameter change.
+	 */
+	TUniquePtr<FVertexMaskForgeAOCache> AOCache;
+
+	/** Sibling of AOCache, used ONLY when this entry is in Source-Topology mode (see
+	 *  FVertexMaskForgeSelectedMesh::bUseSourceTopology). Same reset/lifecycle points as AOCache. */
+	TUniquePtr<FVertexMaskForgeSourceTopologyAOCache> SourceTopologyAOCache;
+
+	/**
+	 * AUDITED (Nanite source-topology support): transient duplicate used ONLY when this entry is in
+	 * Source-Topology mode, in place of PreviewComponent (a UStaticMeshComponent, which Nanite's
+	 * renderer never reads OverrideVertexColors from). Renders WorkingMesh.Mesh directly (the SAME
+	 * FDynamicMesh3 that will be committed), with its own Primary Color Overlay set from
+	 * SourceTopologyWorkingColors -- the exact mechanism UE's own Paint Vertex Colors tool uses for its
+	 * live preview (a UDynamicMeshComponent, never a UStaticMeshComponent -- see the native-tool audit).
+	 * Same ownership/lifetime discipline as PreviewComponent (TStrongObjectPtr, RF_Transient, outer
+	 * GetTransientPackage(), attached to SourceComponent for transform propagation only, never added to
+	 * any Actor's serialized component list). Never both PreviewComponent and this are active for the
+	 * same State at once -- see ApplyPreviewToEntry's domain branch.
+	 */
+	TStrongObjectPtr<UDynamicMeshComponent> SourceTopologyPreviewComponent;
+
+	/**
+	 * AUDITED (Nanite source-topology support): per-TRIANGLE-CORNER (not per render vertex, not per
+	 * Dynamic Mesh vertex) baseline/committed/working colors -- domain mirrors exactly what gets
+	 * committed (MeshDescription VertexInstanceColors, one slot per triangle corner), so two corners
+	 * that happen to share a vertex position (a UV seam or hard edge) NEVER collapse onto a single
+	 * slot, preserving their independently-authored baseline colors through composition exactly like
+	 * the render-vertex arrays already do for render vertices. Same reset/seeding contract as
+	 * BaselineColors/CommittedColors/WorkingColors (see those fields' own doc comments) -- only the
+	 * indexing domain differs. Built/consumed by VertexMaskForgePanel::UpdateWorkingColorsSourceTopology.
+	 * Reset together with the render-vertex arrays and AOCache/SourceTopologyAOCache at the same session
+	 * end points.
+	 */
+	TArray<FColor> SourceTopologyBaselineColors;
+	TArray<FColor> SourceTopologyCommittedColors;
+	TArray<FColor> SourceTopologyWorkingColors;
 };
 
 /**
@@ -625,6 +803,27 @@ struct FVertexMaskForgeSelectedMesh
 	FVertexMaskForgeMeshDiagnostics Diagnostics;
 
 	FVertexMaskForgeWorkingMesh WorkingMesh;
+
+	/**
+	 * True iff this entry's Static Mesh has Nanite enabled (Mesh->IsNaniteEnabled()) -- see
+	 * VertexMaskForgePanel::ShouldUseSourceTopology. Computed once per Refresh Selection / Build
+	 * Working Meshes, never inferred ad hoc elsewhere.
+	 *
+	 * AUDITED (domain-selection correction): deliberately NOT conditioned on WedgeMap validity. A
+	 * Nanite mesh with an explicit High Res Source Model DOES have a valid WedgeMap on LOD 0, but
+	 * Nanite's runtime renderer still never reads per-instance OverrideVertexColors (that limitation is
+	 * about Nanite rendering, not about WedgeMap availability) -- routing such a mesh back to the
+	 * render-vertex/OverrideVertexColors preview path would silently show nothing again, and Accept as
+	 * Instance Override would silently produce no visible effect, the exact bug this whole feature
+	 * fixes. So EVERY Nanite-enabled mesh uses Source-Topology mode, unconditionally, for both
+	 * behaviors: Bounding Box/Ambient Occlusion are generated against WorkingMesh.Mesh (the SOURCE-
+	 * topology FDynamicMesh3) via GenerateBoundingBoxMaskFromDynamicMesh /
+	 * GenerateAmbientOcclusionMaskFromDynamicMesh -- the same domain UE's own Paint Vertex Colors tool
+	 * uses, proven correct for Nanite by the native-tool audit -- and Accept as Instance Override is
+	 * never valid (see HasNaniteMeshInSelection). Render-Vertex mode is reserved for non-Nanite meshes
+	 * only in this phase.
+	 */
+	bool bUseSourceTopology = false;
 
 	/**
 	 * Static Mesh Components in the tracked scene selection that reference this asset, with their
@@ -752,25 +951,70 @@ private:
 	TSharedRef<SWidget> BuildBoundingBoxAxisRow(EVertexMaskForgeBoundsAxis Axis, const FText& Title);
 
 	/**
-	 * Shared handler for a DISCRETE per-axis control change (Enable/Invert/Mirror/World Space --
-	 * anything that isn't a continuously-dragged slider): invalidates the current mask, then, if
-	 * Auto Update Preview is on, cancels any pending debounce (a stale continuous-slider callback
-	 * must never apply after a discrete change) and regenerates immediately.
+	 * Shared handler for a DISCRETE per-axis control change (Enable/Mirror/World Space -- anything
+	 * that isn't a continuously-dragged slider and isn't per-axis Invert, see OnAxisInvertChanged for
+	 * that exception): invalidates the current mask, then, if Auto Update Preview is on, cancels any
+	 * pending debounce (a stale continuous-slider callback must never apply after a discrete change)
+	 * and regenerates immediately.
 	 */
 	void OnAxisParamChangedDiscrete();
+
+	/**
+	 * AUDITED (BBox Invert exception, follow-up audit): per-axis Invert's OWN handler, deliberately
+	 * NOT OnAxisParamChangedDiscrete. Each axis's Invert flag is baked into GenerateBoundingBoxMask's
+	 * per-axis gradient BEFORE the max-combination across axes -- three independent per-axis flags
+	 * cannot be correctly represented as a single post-hoc, composition-time invert (see
+	 * ComposeMaskStack), so Option A (preserve raw un-inverted values, invert during composition) was
+	 * judged disproportionate for this axis-based design; Option B is implemented instead: Invert
+	 * ALWAYS regenerates BoundingBoxMask immediately, unconditionally bypassing the normal
+	 * Auto-Update-gated "wait for Generate Mask" contract every other Bounding Box raw parameter still
+	 * follows (regeneration itself is cheap here -- unlike Ambient Occlusion, Bounding Box has no
+	 * persistent geometry cache to needlessly rebuild). Calls RunAutoUpdatePreview with bIncludeAO
+	 * false so Ambient Occlusion's own slot/AOCache are never touched, not even a harmless re-validation.
+	 */
+	void OnAxisInvertChanged(int32 AxisIndex, ECheckBoxState NewState);
 
 	/** Processes every selected entry's working mesh, generating or clearing its Bounding Box Mask. */
 	FReply OnGenerateBoundingBoxMaskClicked();
 
 	/**
-	 * Resets every selected entry's Bounding Box Mask back to NotGenerated, without touching the
-	 * working mesh (FDynamicMesh3) itself. Called whenever any axis parameter changes, so stale
-	 * statistics are never left looking current; the user must click Generate Mask again (if Auto
-	 * Update Preview is off), or ScheduleAutoUpdatePreview()/RunAutoUpdatePreview() take over
-	 * automatically (if it is on). Never touches a Constant Fill mask's meaning -- Fill results are
-	 * independent of these axis parameters (only Generate Mask/Auto Update read them).
+	 * AUDITED (raw/composition separation checkpoint): resets ONLY every selected entry's
+	 * BoundingBoxMask slot back to NotGenerated (AmbientOcclusionMask is completely untouched), without
+	 * touching the working mesh (FDynamicMesh3) itself. Called whenever a Bounding Box RAW/geometric
+	 * parameter changes (axis Position/Falloff/Invert/Mirror/World Space/Enable, Unified Bounds) --
+	 * NEVER for a purely compositional change (Blend Mode, Opacity -- see RecomposeWorkingColors
+	 * instead). Calls UpdateAllPreviews(false) synchronously ONLY when Auto Update Preview is off (see
+	 * the .cpp definition for why); the user must click Generate Mask again in that case, or
+	 * ScheduleAutoUpdatePreview()/RunAutoUpdatePreview() take over automatically otherwise. Never
+	 * touches a Constant Fill mask's meaning -- Fill results are independent of these axis parameters.
 	 */
-	void InvalidateBoundingBoxMasks();
+	void InvalidateBoundingBoxRawMask();
+
+	/**
+	 * AUDITED (renamed for precision per explicit follow-up audit -- was InvalidateAORawMask, which
+	 * was misleading). Resets ONLY the ENTRY-LEVEL DERIVED slot, FVertexMaskForgeWorkingMesh::
+	 * AmbientOcclusionMask (a cheap Ready/Unavailable + UsedAOParams snapshot -- see that field's own
+	 * doc comment; it never holds real per-vertex Values). Does NOT invalidate FVertexMaskForgeAOCache::
+	 * RawValues (the actual raycast results) -- those are preserved; GenerateAmbientOcclusionMask's own
+	 * cache key (Mesh identity/DerivedDataKey/counts/Transform/Samples/MaxDistance/Bias) transparently
+	 * decides, the next time it runs, whether RawValues still match and can be reused (zero raycasts)
+	 * or must be recomputed. BoundingBoxMask is completely untouched either way. Called when an AO RAW
+	 * parameter changes (Samples, Max Distance, Bias) or when AO Enable turns on for an entry with no
+	 * valid derived slot yet (see OnAOEnableChanged -- an entry that already has a Ready derived slot
+	 * is deliberately NOT passed through this function at all, so its AOCache is never even queried).
+	 * Never for AO Blend Mode/Opacity/Invert/Enable-when-already-Ready -- see RecomposeWorkingColors.
+	 */
+	void InvalidateAODerivedMask();
+
+	/**
+	 * AUDITED (raw/composition separation checkpoint): the PURE composition path -- Blend Mode,
+	 * Opacity, Invert (Bounding Box or Ambient Occlusion), Enable/Disable of an already-Ready layer,
+	 * Channel Filter, Preview Mode. Touches NEITHER BoundingBoxMask NOR AmbientOcclusionMask/AOCache --
+	 * simply calls UpdateAllPreviews(false), which re-reads all compositional state live every call.
+	 * Recomposes immediately and correctly with ZERO raycasts and ZERO Tree rebuilds, identically
+	 * whether Auto Update Preview is on or off.
+	 */
+	void RecomposeWorkingColors();
 
 	/** Panel-level parameters for each of the 3 axes, indexed by EVertexMaskForgeBoundsAxis. Shared
 	 *  across every selected entry; per-instance World Space evaluation reads a component's own
@@ -802,11 +1046,75 @@ private:
 	 *  Default Copy: with Opacity 1.0, exactly reproduces the tool's pre-Blend-Mode behavior. */
 	EVertexMaskForgeBlendMode BoundingBoxBlendMode = EVertexMaskForgeBlendMode::Copy;
 
-	/** Opacity slider's continuous-drag handler -- mirrors the Position/Falloff spinboxes exactly
-	 *  (InvalidateBoundingBoxMasks() + ScheduleAutoUpdatePreview() inline in Construct(), no separate
-	 *  named function needed), gated by Auto Update Preview the same way. Clamped to [0, 1]; default
-	 *  1.0 (full effect of the Blend Mode -- matches the pre-Blend-Mode behavior when Mode == Copy). */
+	/** Opacity slider/spinbox's inline lambda calls RecomposeWorkingColors() directly (raw/composition
+	 *  separation checkpoint) -- PURE composition, recomposes immediately regardless of Auto Update
+	 *  Preview, no separate named handler needed. Clamped to [0, 1]; default 1.0 (full effect of the
+	 *  Blend Mode -- matches the pre-Blend-Mode behavior when Mode == Copy). */
 	float BoundingBoxOpacity = 1.0f;
+
+	// --- Ambient Occlusion Mask --------------------------------------------------------------
+	// AUDITED (composition-stack checkpoint): bAOEnabled is NO LONGER mutually exclusive with
+	// Bounding Box -- it simply controls whether the Ambient Occlusion layer participates in the
+	// composition stack (see ApplyPreviewToEntry). Bounding Box participates whenever at least one
+	// axis is enabled, completely independently of bAOEnabled. Both can be Ready and both compose
+	// together; either can be the only one active; both can be off. See GetActiveMaskSourceText() for
+	// the UI readout of which layer(s) currently participate.
+
+	ECheckBoxState GetAOEnableState() const { return bAOEnabled ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; }
+
+	/** AUDITED (re-examined per explicit follow-up audit): turning OFF is always pure composition.
+	 *  Turning ON is pure composition TOO when every entry already has a Ready AmbientOcclusionMask
+	 *  (reuses it verbatim, zero raycasts, works immediately even with Auto Update Preview off) --
+	 *  only entries WITHOUT a valid derived mask trigger real (re)generation, gated by Auto Update
+	 *  Preview like any other raw parameter. Enabling, by itself, is never treated as a reason to
+	 *  invalidate an already-valid mask. See the .cpp definition for the exact per-entry decision. */
+	void OnAOEnableChanged(ECheckBoxState NewState);
+
+	ECheckBoxState GetAOInvertState() const { return bAOInvert ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; }
+
+	/** Invert never touches the AO acceleration structure or the raw per-vertex samples (applied only
+	 *  when FVertexMaskForgeScalarMask::Values is populated from the cached raw values -- see
+	 *  VertexMaskForgePanel::GenerateAmbientOcclusionMask) -- still invalidates/regenerates through the
+	 *  normal discrete-parameter path so the composed Preview picks up the new Values immediately. */
+	void OnAOInvertChanged(ECheckBoxState NewState);
+
+	/** Describes which layer(s) currently participate in the composition stack -- e.g. "Bounding Box +
+	 *  Ambient Occlusion", "Bounding Box only", "Ambient Occlusion only", "None". */
+	FText GetActiveMaskSourceText() const;
+
+	TSharedRef<SWidget> OnGenerateAOBlendModeRow(TSharedPtr<EVertexMaskForgeBlendMode> InOption) const;
+
+	/** Same treatment as OnBlendModeSelectionChanged (Bounding Box's own Blend Mode combo) -- a
+	 *  discrete, generation-adjacent change; waits for Generate Mask when Auto Update Preview is off. */
+	void OnAOBlendModeSelectionChanged(TSharedPtr<EVertexMaskForgeBlendMode> NewSelection, ESelectInfo::Type SelectInfo);
+	FText GetAOBlendModeButtonText() const;
+
+	TSharedPtr<SComboBox<TSharedPtr<EVertexMaskForgeBlendMode>>> AOBlendModeComboBox;
+
+	/** How the Ambient Occlusion layer's scalar value combines with the RUNNING accumulated channel
+	 *  value (i.e. whatever the Bounding Box layer, if also enabled, already produced -- see
+	 *  ComposeMaskStack) -- independent of BoundingBoxBlendMode. Default Copy, matching
+	 *  BoundingBoxBlendMode's own default/rationale. */
+	EVertexMaskForgeBlendMode AOBlendMode = EVertexMaskForgeBlendMode::Copy;
+
+	/** Same contract/range/default as BoundingBoxOpacity, independent of it. */
+	float AOOpacity = 1.0f;
+
+	/** Default false: preserves the tool's pre-AO behavior exactly (Ambient Occlusion does not
+	 *  participate) until the user explicitly opts in. */
+	bool bAOEnabled = false;
+
+	bool bAOInvert = false;
+
+	/** Clamped again in GenerateAmbientOcclusionMask itself; UI SpinBox already clamps to the same
+	 *  [8, 256] range. */
+	int32 AOSamples = 64;
+
+	/** Unreal units (World Space); clamped again in GenerateAmbientOcclusionMask to (0, 10000]. */
+	float AOMaxDistance = 100.0f;
+
+	/** Unreal units (World Space); clamped again in GenerateAmbientOcclusionMask to [0.001, 10.0]. */
+	float AOBias = 0.1f;
 
 	// --- Fill White / Fill Black utility masks ----------------------------------------------
 
@@ -864,8 +1172,16 @@ private:
 	 * while Applying (guarded defensively; not reachable in practice since Accept is synchronous).
 	 * Called by the debounce timer, or immediately for discrete parameter changes
 	 * (Enable/Invert/Mirror/World Space).
+	 *
+	 * bIncludeAO (AUDITED, BBox Invert exception -- default true, preserves all pre-existing call
+	 * sites' behavior unchanged): when false, the Ambient Occlusion slot (AmbientOcclusionMask) is
+	 * left COMPLETELY untouched for every entry -- not re-validated, not cleared, not re-snapshotted.
+	 * Used exclusively by OnAxisInvertChanged (BBox per-axis Invert's immediate-regeneration
+	 * exception), so that regenerating BoundingBoxMask immediately (bypassing the normal Auto-Update-
+	 * gated wait) can never have any observable effect -- not even a harmless entry-level
+	 * re-validation -- on Ambient Occlusion.
 	 */
-	void RunAutoUpdatePreview();
+	void RunAutoUpdatePreview(bool bIncludeAO = true);
 
 	bool bAutoUpdatePreview = true;
 	FTimerHandle AutoUpdateDebounceTimerHandle;
@@ -876,7 +1192,7 @@ private:
 
 	/**
 	 * Toggling Unified Bounds never recomputes just one mesh: it cancels any pending debounce,
-	 * invalidates every entry's current Bounding-Box-sourced mask (InvalidateBoundingBoxMasks()), and
+	 * invalidates every entry's current Bounding-Box-sourced mask (InvalidateBoundingBoxRawMask()), and
 	 * -- only if Auto Update Preview is on -- immediately regenerates every eligible entry as one
 	 * coherent batch (RunAutoUpdatePreview(), which itself computes the collective domain once, if
 	 * applicable, and reuses it for every participant). If Auto Update Preview is off, parameters are
@@ -941,8 +1257,20 @@ private:
 		const TStaticArray<FVertexMaskForgeAxisBoundsResult, 3>* CollectiveBoundsPtr,
 		bool bCommit);
 
-	/** Restores original materials and vertex colors on every tracked component of one entry. Idempotent. */
+	/** Restores original materials and vertex colors on every tracked component of one entry --
+	 *  session-end variant (resets BaselineColors/CommittedColors/WorkingColors/AOCache too). Idempotent.
+	 *  Only called from DestroyAllPreviews() (Cancel, Accept, Accept as Instance Override, RefreshSelection,
+	 *  World cleanup) -- a genuine session end. See RestorePreviewForEntryVisualOnly for the
+	 *  mid-session/compositional case. */
 	void RestorePreviewForEntry(FVertexMaskForgeSelectedMesh& Entry);
+
+	/** AUDITED (raw/composition separation checkpoint): visual-only restore on every tracked component
+	 *  of one entry -- BaselineColors/CommittedColors/WorkingColors/AOCache are left completely
+	 *  untouched (see VertexMaskForgePanel::RestorePreviewVisualOnly). Used by ApplyPreviewToEntry's
+	 *  own early-return paths (Preview Mode == Original Material, working mesh not Ready, Mesh/
+	 *  RenderData/debug material failed to resolve) -- none of these are a session end or a genuine
+	 *  geometric invalidation, so the AO geometry cache must survive them untouched. */
+	void RestorePreviewForEntryVisualOnly(FVertexMaskForgeSelectedMesh& Entry);
 
 	/**
 	 * Restores every currently-tracked entry's preview components. Called before Refresh Selection
@@ -977,9 +1305,30 @@ private:
 	 * in the .cpp for the audited, engine-sourced justification). Shares Accept's PendingChanges gate
 	 * -- both are valid, mutually exclusive ways to conclude the same session; this one never calls
 	 * into AcceptPendingChanges() or vice versa.
+	 *
+	 * AUDITED (Nanite): additionally requires !HasNaniteMeshInSelection() -- Nanite's runtime renderer
+	 * never reads FStaticMeshComponentLODInfo::OverrideVertexColors (confirmed against the UE 5.8
+	 * Mesh Vertex Paint Tool / Nanite rendering source), so writing an instance override onto a
+	 * Nanite-enabled component would silently produce no visible result. Accept (writing to the
+	 * Source Static Mesh) is the only route that can affect a Nanite mesh's rendering.
 	 */
-	bool CanAcceptAsInstanceOverride() const { return OperationState == EVertexMaskForgeOperationState::PendingChanges; }
+	bool CanAcceptAsInstanceOverride() const { return OperationState == EVertexMaskForgeOperationState::PendingChanges && !HasNaniteMeshInSelection(); }
 	FReply OnAcceptAsInstanceOverrideClicked();
+
+	/**
+	 * True if any currently selected entry's already-resolved Static Mesh has Nanite enabled
+	 * (UStaticMesh::IsNaniteEnabled()). Cheap: reads Entry->Mesh.Get() only (never forces a
+	 * synchronous load) -- by the time an entry exists in SelectedMeshes, RefreshSelection/
+	 * BuildWorkingMeshes has already resolved it, so this is a pointer check, not an asset load.
+	 */
+	bool HasNaniteMeshInSelection() const;
+
+	/** Explains why the button is disabled when HasNaniteMeshInSelection() is true; the normal
+	 *  tooltip otherwise. */
+	FText GetAcceptAsInstanceOverrideTooltip() const;
+
+	/** Visible only while HasNaniteMeshInSelection() is true -- shown next to the Accept row. */
+	EVisibility GetNaniteNoticeVisibility() const { return HasNaniteMeshInSelection() ? EVisibility::Visible : EVisibility::Collapsed; }
 
 	bool CanCancelChanges() const { return OperationState == EVertexMaskForgeOperationState::PendingChanges || OperationState == EVertexMaskForgeOperationState::Failed; }
 	FReply OnCancelChangesClicked();

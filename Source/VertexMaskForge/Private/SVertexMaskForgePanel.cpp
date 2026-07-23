@@ -1,14 +1,20 @@
 #include "SVertexMaskForgePanel.h"
 
+#include "Async/ParallelFor.h"
+#include "Components/DynamicMeshComponent.h"
 #include "Components/SceneComponent.h"
 #include "Components/StaticMeshComponent.h"
 #include "Containers/Set.h"
 #include "DynamicMesh/DynamicMesh3.h"
+#include "DynamicMesh/DynamicMeshAABBTree3.h"
 #include "DynamicMesh/DynamicMeshAttributeSet.h"
+#include "DynamicMesh/MeshNormals.h"
 #include "Editor.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/World.h"
 #include "GameFramework/Actor.h"
+#include "HAL/PlatformTime.h"
+#include "HAL/ThreadSafeCounter.h"
 #include "Logging/LogMacros.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Math/NumericLimits.h"
@@ -46,6 +52,96 @@ DEFINE_LOG_CATEGORY_STATIC(LogVertexMaskForge, Log, All);
 FVertexMaskForgeWorkingMesh::~FVertexMaskForgeWorkingMesh() = default;
 FVertexMaskForgeWorkingMesh::FVertexMaskForgeWorkingMesh(FVertexMaskForgeWorkingMesh&&) = default;
 FVertexMaskForgeWorkingMesh& FVertexMaskForgeWorkingMesh::operator=(FVertexMaskForgeWorkingMesh&&) = default;
+
+/**
+ * Full definition of the opaque cache forward-declared in the header (see the header's own doc
+ * comment on FVertexMaskForgePreviewComponentState::AOCache). One instance per component, created
+ * lazily by VertexMaskForgePanel::GenerateAmbientOcclusionMask.
+ *
+ * Two independently-invalidated layers, exactly matching the checkpoint's cache-invalidation
+ * contract (see that function's own doc comment for the full matrix of what does/doesn't invalidate
+ * each layer):
+ *   - WorldMesh/Tree: the occluder geometry and its spatial index, baked in WORLD SPACE for this
+ *     specific component's transform (see GenerateAmbientOcclusionMask for why World Space, not
+ *     Local, is required for correctness under non-uniform scale). Rebuilt whenever ANY of
+ *     CachedMesh/CachedDerivedDataKey/CachedNumRenderVerts/CachedNumIndices/CachedTransform no
+ *     longer match -- see GenerateAmbientOcclusionMask's own doc comment (AUDITED, geometry cache
+ *     key fix) for exactly what each field catches and why.
+ *   - RawValues: the raw (pre-Invert) occlusion fraction per render vertex, in [0, 1]. Rebuilt only
+ *     when Samples/MaxDistance/Bias actually change, OR when WorldMesh/Tree above was just rebuilt
+ *     (new geometry/transform invalidates any previously-computed samples too).
+ */
+struct FVertexMaskForgeAOCache
+{
+	TUniquePtr<UE::Geometry::FDynamicMesh3> WorldMesh;
+	TUniquePtr<UE::Geometry::FDynamicMeshAABBTree3> Tree;
+	bool bTreeValid = false;
+
+	/** Geometric identity WorldMesh/Tree were last built from -- ALL fields below must match the
+	 *  CURRENT inputs for a cache hit; see GenerateAmbientOcclusionMask for the exact comparison.
+	 *  AUDITED (DerivedDataKey false-mismatch fix): CachedDerivedDataKey is compared by PLAIN equality
+	 *  -- "both empty" IS a match (an asset whose LOD never populates this field is not, by itself,
+	 *  evidence of a change), never an automatic veto; Mesh/NumRenderVerts/NumIndices/Transform remain
+	 *  independent safeguards in the same AND-chain regardless of this field's availability. */
+	TWeakObjectPtr<const UStaticMesh> CachedMesh;
+	FString CachedDerivedDataKey;
+	int32 CachedNumRenderVerts = 0;
+	int32 CachedNumIndices = 0;
+	FTransform CachedTransform = FTransform::Identity;
+
+	TArray<float> RawValues;
+	int32 CachedSamples = 0;
+	float CachedMaxDistance = 0.f;
+	float CachedBias = 0.f;
+	bool bValuesValid = false;
+};
+
+/**
+ * AUDITED (Nanite source-topology support): sibling of FVertexMaskForgeAOCache, used ONLY for entries
+ * in Source-Topology mode (every Nanite-enabled Static Mesh -- see
+ * FVertexMaskForgeSelectedMesh::bUseSourceTopology). Same two-layer contract (WorldMesh/Tree geometric
+ * cache + RawValues per-parameter cache) as FVertexMaskForgeAOCache, but keyed against WorkingMesh.Mesh
+ * (the FDynamicMesh3 built from the SOURCE MeshDescription) instead of FStaticMeshLODResources.
+ *
+ * AUDITED (cache-key robustness fix): identity is CachedSourceMesh (the FDynamicMesh3 pointer, address
+ * only, never dereferenced when stale) AND CachedGeometryFingerprint (see
+ * VertexMaskForgePanel::ComputeDynamicMeshGeometryFingerprint) -- vertex/triangle COUNTS alone are
+ * insufficient (two genuinely different geometries, or the same geometry with only its normals
+ * changed, can share identical counts), so the fingerprint (hash of every vertex position AND every
+ * Normal Overlay element) is what actually proves the geometry AND the normals used by the AO rays
+ * are unchanged. Never used for, and never shared with, an entry in the render-vertex domain.
+ */
+struct FVertexMaskForgeSourceTopologyAOCache
+{
+	TUniquePtr<UE::Geometry::FDynamicMesh3> WorldMesh;
+	TUniquePtr<UE::Geometry::FDynamicMeshAABBTree3> Tree;
+	bool bTreeValid = false;
+
+	/** Compared by address only -- WorkingMesh.Mesh is rebuilt (new object) on every Refresh Selection,
+	 *  and this cache is always destroyed together with the session (see
+	 *  FVertexMaskForgePreviewComponentState::SourceTopologyAOCache) before a new WorkingMesh could
+	 *  ever be built while this pointer is still alive, so a stale address is never dereferenced. */
+	const UE::Geometry::FDynamicMesh3* CachedSourceMesh = nullptr;
+	uint32 CachedGeometryFingerprint = 0;
+	FTransform CachedTransform = FTransform::Identity;
+
+	/** Indexed by Normal Overlay Element ID -- see GenerateAmbientOcclusionMaskFromDynamicMesh's own
+	 *  doc comment for why (hard-edge preservation: two corners at the same vertex position but with
+	 *  different normals must never share a raw AO value). Sized to the overlay's MaxElementID(),
+	 *  sparse-safe (an index that was never IsElement() is simply never written or read). */
+	TArray<float> RawValues;
+	int32 CachedSamples = 0;
+	float CachedMaxDistance = 0.f;
+	float CachedBias = 0.f;
+	bool bValuesValid = false;
+};
+
+// FVertexMaskForgeAOCache is only forward-declared in the header; these special member functions are
+// defined here, now that it is a complete type -- same pattern and reason as
+// FVertexMaskForgeWorkingMesh's own special members just above.
+FVertexMaskForgePreviewComponentState::~FVertexMaskForgePreviewComponentState() = default;
+FVertexMaskForgePreviewComponentState::FVertexMaskForgePreviewComponentState(FVertexMaskForgePreviewComponentState&&) = default;
+FVertexMaskForgePreviewComponentState& FVertexMaskForgePreviewComponentState::operator=(FVertexMaskForgePreviewComponentState&&) = default;
 
 #define LOCTEXT_NAMESPACE "SVertexMaskForgePanel"
 
@@ -227,6 +323,139 @@ namespace VertexMaskForgePanel
 		OutTriIDMap = MoveTemp(Converter.TriIDMap);
 
 		return DynamicMesh;
+	}
+
+	/**
+	 * AUDITED (Nanite source-topology support): guarantees Mesh has a Normal Overlay before any AO
+	 * generation reads it (see GenerateAmbientOcclusionMaskFromDynamicMesh, which indexes AO raw values
+	 * by Normal Overlay Element ID specifically to preserve hard-edge normal splits). The normal case
+	 * (the overwhelming majority of authored assets) is a no-op: FMeshDescriptionToDynamicMesh::Convert
+	 * already creates and populates this overlay from the source's own VertexInstanceNormals, hard
+	 * edges and all. Only synthesizes smooth per-vertex normals -- logged, since it is a genuine (if
+	 * rare) data-quality fallback -- when the source MeshDescription had no usable normals to begin
+	 * with, in which case there is no hard-edge data to lose in the first place. Idempotent; safe to
+	 * call on any working mesh, Nanite or not (a no-op whenever normals already exist).
+	 */
+	static void EnsureNormalOverlay(UE::Geometry::FDynamicMesh3& Mesh, const FString& AssetNameForLog)
+	{
+		using namespace UE::Geometry;
+
+		if (Mesh.HasAttributes() && Mesh.Attributes()->PrimaryNormals() != nullptr)
+		{
+			return;
+		}
+
+		UE_LOG(LogVertexMaskForge, Warning,
+			TEXT("Vertex Mask Forge: '%s' has no usable Normal Overlay after conversion -- synthesizing smooth per-vertex normals for Ambient Occlusion (any hard edges in the source could not be preserved because none were found)."),
+			*AssetNameForLog);
+
+		if (!Mesh.HasAttributes())
+		{
+			Mesh.EnableAttributes();
+		}
+		if (Mesh.Attributes()->NumNormalLayers() == 0)
+		{
+			Mesh.Attributes()->SetNumNormalLayers(1);
+		}
+
+		FMeshNormals TempNormals(&Mesh);
+		TempNormals.ComputeVertexNormals();
+		TempNormals.CopyToOverlay(Mesh.Attributes()->PrimaryNormals());
+	}
+
+	/**
+	 * AUDITED (Nanite source-topology support, AO cache robustness fix -- CORRECTED per follow-up
+	 * review): content fingerprint of Mesh, covering everything that can affect the AABBTree/raycast
+	 * result: vertex positions, triangle CONNECTIVITY (not just counts), the normals used for ray
+	 * origins, and the corner -> Normal Element association. Combined via GetTypeHash/HashCombine in a
+	 * fixed, deterministic order (VertexIndicesItr / TriangleIndicesItr / ElementIndicesItr, all stable
+	 * for an unedited mesh -- never assumed dense; TriangleIndicesItr never assumed to be enumerated by
+	 * TriangleID value alone, see below). Computed ONCE, at working-mesh build time (see
+	 * BuildWorkingMeshForStaticMesh), and reused for the rest of the session -- Mesh is never mutated in
+	 * place afterward (EnsureNormalOverlay, the one exception, always runs BEFORE this is computed).
+	 *
+	 * CORRECTED: the original version hashed only positions and normal VALUES, in isolation from each
+	 * other and from topology -- two meshes with identical vertex positions/normal values but different
+	 * TRIANGLE CONNECTIVITY (e.g. a re-triangulated quad, or a corner rewired to a different Normal
+	 * Element) would have produced the SAME fingerprint despite the raycast result genuinely differing
+	 * (different triangles occlude different rays; a corner's ray now originates from a different
+	 * normal). Fixed by additionally hashing, per triangle (iterated via TriangleIndicesItr(), which
+	 * never assumes TriangleID is dense): the triangle's own ordinal position in that iteration (an
+	 * explicit delimiter -- see below) plus its three VertexIDs (Mesh.GetTriangle(TriangleID), corner
+	 * order preserved) plus, when a Normal Overlay is present and this triangle is set in it
+	 * (NormalOverlay->IsSetTriangle(TriangleID)), its three Normal Element IDs
+	 * (NormalOverlay->GetTriangle(TriangleID), corner order preserved).
+	 *
+	 * DELIMITER (per explicit requirement -- "impedir sequências ambíguas"): the running per-triangle
+	 * ordinal (0, 1, 2, ...) is hashed in BEFORE each triangle's own three-ID group, and the final
+	 * ordinal count is hashed in once more at the very end. This binds every VertexID/Normal Element ID
+	 * triple to its exact position in the iteration, so two different triangulations cannot produce the
+	 * same flattened ID sequence by coincidence (e.g. triangle boundaries shifting) the way an
+	 * undelimited flat concatenation of IDs could.
+	 */
+	static uint32 ComputeDynamicMeshGeometryFingerprint(const UE::Geometry::FDynamicMesh3& Mesh)
+	{
+		using namespace UE::Geometry;
+
+		const FDynamicMeshNormalOverlay* NormalOverlay =
+			(Mesh.HasAttributes() && Mesh.Attributes()->PrimaryNormals() != nullptr)
+			? Mesh.Attributes()->PrimaryNormals() : nullptr;
+
+		uint32 Hash = GetTypeHash(Mesh.VertexCount());
+		Hash = HashCombine(Hash, GetTypeHash(Mesh.TriangleCount()));
+
+		for (const int32 VertexID : Mesh.VertexIndicesItr())
+		{
+			const FVector3d P = Mesh.GetVertex(VertexID);
+			Hash = HashCombine(Hash, GetTypeHash(P.X));
+			Hash = HashCombine(Hash, GetTypeHash(P.Y));
+			Hash = HashCombine(Hash, GetTypeHash(P.Z));
+		}
+
+		if (NormalOverlay)
+		{
+			for (const int32 ElementID : NormalOverlay->ElementIndicesItr())
+			{
+				const FVector3f N = NormalOverlay->GetElement(ElementID);
+				Hash = HashCombine(Hash, GetTypeHash(N.X));
+				Hash = HashCombine(Hash, GetTypeHash(N.Y));
+				Hash = HashCombine(Hash, GetTypeHash(N.Z));
+			}
+		}
+
+		// Triangle connectivity + corner -> Normal Element association, delimited by ordinal position.
+		int32 TriangleOrdinal = 0;
+		for (const int32 TriangleID : Mesh.TriangleIndicesItr())
+		{
+			Hash = HashCombine(Hash, GetTypeHash(TriangleOrdinal));
+
+			const FIndex3i Tri = Mesh.GetTriangle(TriangleID);
+			Hash = HashCombine(Hash, GetTypeHash(Tri.A));
+			Hash = HashCombine(Hash, GetTypeHash(Tri.B));
+			Hash = HashCombine(Hash, GetTypeHash(Tri.C));
+
+			if (NormalOverlay && NormalOverlay->IsSetTriangle(TriangleID))
+			{
+				const FIndex3i NormalTri = NormalOverlay->GetTriangle(TriangleID);
+				Hash = HashCombine(Hash, GetTypeHash(NormalTri.A));
+				Hash = HashCombine(Hash, GetTypeHash(NormalTri.B));
+				Hash = HashCombine(Hash, GetTypeHash(NormalTri.C));
+			}
+			else
+			{
+				// Explicit "no Normal Element association" marker -- distinguishes this case from a
+				// genuine (0,0,0)-valued triple, and from the branch above being taken at all.
+				Hash = HashCombine(Hash, GetTypeHash(INDEX_NONE));
+			}
+
+			++TriangleOrdinal;
+		}
+		// Final delimiter: total triangle count actually iterated (as opposed to Mesh.TriangleCount(),
+		// which was already hashed above but is being re-affirmed here as a terminator specifically for
+		// the per-triangle sequence just written).
+		Hash = HashCombine(Hash, GetTypeHash(TriangleOrdinal));
+
+		return Hash;
 	}
 
 	/**
@@ -457,6 +686,21 @@ namespace VertexMaskForgePanel
 	}
 
 	/**
+	 * AUDITED (domain-selection correction): EVERY Nanite-enabled Static Mesh uses Source-Topology
+	 * mode, unconditionally -- deliberately NOT conditioned on WedgeMap validity. A Nanite mesh WITH a
+	 * valid WedgeMap (an explicit High Res Source Model) would still never show anything via per-
+	 * instance OverrideVertexColors, since Nanite's runtime renderer never reads that buffer at all
+	 * regardless of WedgeMap availability -- routing such a mesh back to the render-vertex path would
+	 * silently reintroduce the exact "no visible result" bug this feature fixes. See
+	 * FVertexMaskForgeSelectedMesh::bUseSourceTopology's own doc comment for the full rationale.
+	 * Render-Vertex mode (OverrideVertexColors/WedgeMap) is reserved for non-Nanite meshes only.
+	 */
+	static bool ShouldUseSourceTopology(const UStaticMesh* Mesh)
+	{
+		return IsValid(Mesh) && Mesh->IsNaniteEnabled();
+	}
+
+	/**
 	 * Orchestrates the full read-only pipeline for one mesh: resolve, fetch MeshDescription,
 	 * copy it, convert the copy, then validate. Never mutates Mesh or its package.
 	 *
@@ -518,6 +762,18 @@ namespace VertexMaskForgePanel
 		}
 
 		ValidateWorkingMesh(WorkingMesh, *MeshDescriptionCopy, TriIDMap, Diagnostics);
+
+		// AUDITED (Nanite source-topology support): persisted for the Accept commit path -- see
+		// FVertexMaskForgeWorkingMesh::TriIDMap's own doc comment. Moved (not copied): TriIDMap is a
+		// local variable, never read again after this point in this function.
+		WorkingMesh.TriIDMap = MoveTemp(TriIDMap);
+
+		// AUDITED (Nanite source-topology support): guarantee a Normal Overlay exists, then compute the
+		// geometry fingerprint AFTER it -- both must happen exactly once, here, before Mesh is ever
+		// handed to a generator or cache. See EnsureNormalOverlay/ComputeDynamicMeshGeometryFingerprint
+		// for why (hard-edge AO correctness / cache identity robustness).
+		EnsureNormalOverlay(*WorkingMesh.Mesh, Mesh->GetName());
+		WorkingMesh.GeometryFingerprint = ComputeDynamicMeshGeometryFingerprint(*WorkingMesh.Mesh);
 
 		WorkingMesh.State = EVertexMaskForgeWorkingMeshState::Ready;
 		return WorkingMesh;
@@ -1238,6 +1494,1058 @@ namespace VertexMaskForgePanel
 		return Mask;
 	}
 
+	/** Sibling of GenerateConstantMask for Source-Topology entries -- indexed by CORNER INDEX (see
+	 *  UpdateWorkingColorsSourceTopology's own doc comment for the domain), constant everywhere, so
+	 *  NumCorners is simply 3 * WorkingMesh.Mesh->TriangleCount(). */
+	static FVertexMaskForgeScalarMask GenerateConstantMaskForCornerDomain(
+		const int32 NumCorners,
+		const float ConstantValue,
+		const EVertexMaskForgeScalarMaskSource Source)
+	{
+		FVertexMaskForgeScalarMask Mask;
+		Mask.Source = Source;
+		Mask.RenderVertexCount = NumCorners;
+
+		if (NumCorners <= 0)
+		{
+			Mask.State = EVertexMaskForgeScalarMaskState::Unavailable;
+			return Mask;
+		}
+
+		Mask.Values.Init(ConstantValue, NumCorners);
+		Mask.bHasValue.Init(true, NumCorners);
+
+		Mask.NumValidValues = NumCorners;
+		Mask.MinValue = ConstantValue;
+		Mask.MaxValue = ConstantValue;
+		Mask.MeanValue = ConstantValue;
+		Mask.NumNearZero = FMath::IsNearlyZero(ConstantValue, FVertexMaskForgeScalarMask::Tolerance) ? NumCorners : 0;
+		Mask.NumNearOne = FMath::IsNearlyEqual(ConstantValue, 1.f, FVertexMaskForgeScalarMask::Tolerance) ? NumCorners : 0;
+
+		Mask.State = (Mask.Values.Num() == NumCorners && Mask.bHasValue.Num() == NumCorners)
+			? EVertexMaskForgeScalarMaskState::Ready
+			: EVertexMaskForgeScalarMaskState::Invalid;
+		return Mask;
+	}
+
+	// --- Ambient Occlusion Mask ---------------------------------------------------------------
+
+	/** Auto Update Preview never raycasts at full Samples -- see GenerateAmbientOcclusionMask's own
+	 *  doc comment (EFFECTIVE SAMPLES). An explicit Generate Mask click always uses the full,
+	 *  user-chosen Samples value; only the interactive/live-preview path is capped. */
+	static constexpr int32 AOAutoUpdateMaxSamples = 16;
+
+	/**
+	 * Cheap, geometry-cache-FREE structural validation for the Ambient Occlusion slot's ENTRY-LEVEL
+	 * gating (see FVertexMaskForgeWorkingMesh::AmbientOcclusionMask's own doc comment) -- mirrors
+	 * GenerateAmbientOcclusionMask's own early-exit checks (NumRenderVerts>0, at least one triangle,
+	 * normal buffer count matches) WITHOUT touching FVertexMaskForgeAOCache, building a WorldMesh/Tree,
+	 * or running a single raycast. AUDITED (double-AO-execution fix): this is what lets
+	 * OnGenerateBoundingBoxMaskClicked/RunAutoUpdatePreview determine Ready/Unavailable for the AO slot
+	 * WITHOUT ever calling GenerateAmbientOcclusionMask at entry level -- the ONLY call site that ever
+	 * performs the real (expensive) computation is ApplyPreviewToEntry, exactly once per component, per
+	 * update. See ApplyPreviewToEntry's own doc comment for the full audit of the bug this replaced.
+	 */
+	static bool IsAmbientOcclusionInputValid(const FStaticMeshLODResources& LOD0)
+	{
+		const int32 NumRenderVerts = static_cast<int32>(LOD0.VertexBuffers.PositionVertexBuffer.GetNumVertices());
+		return NumRenderVerts > 0
+			&& LOD0.IndexBuffer.GetNumIndices() >= 3
+			&& static_cast<int32>(LOD0.VertexBuffers.StaticMeshVertexBuffer.GetNumVertices()) == NumRenderVerts;
+	}
+
+	/** Sibling of IsAmbientOcclusionInputValid for Source-Topology (Nanite) entries -- validates
+	 *  WorkingMesh.Mesh (the SOURCE-topology FDynamicMesh3) instead of LOD0 render buffers. AUDITED
+	 *  (index-safety correction): never requires compactness (see
+	 *  GenerateAmbientOcclusionMaskFromDynamicMesh's own INDEX SAFETY note); checks for a usable Normal
+	 *  Overlay instead, since that is what AO in this domain actually reads (EnsureNormalOverlay
+	 *  guarantees one exists for any Ready working mesh, so this only fails for a genuinely empty mesh). */
+	static bool IsAmbientOcclusionInputValidForDynamicMesh(const UE::Geometry::FDynamicMesh3* Mesh)
+	{
+		return Mesh != nullptr
+			&& Mesh->VertexCount() > 0 && Mesh->TriangleCount() > 0
+			&& Mesh->HasAttributes() && Mesh->Attributes()->PrimaryNormals() != nullptr
+			&& Mesh->Attributes()->PrimaryNormals()->ElementCount() > 0;
+	}
+
+	/**
+	 * Deterministic, COSINE-WEIGHTED hemisphere sample directions (Z-up local tangent frame: X/Y span
+	 * the hemisphere's base, Z is the pole/normal direction), via Malley's method (uniform disk sample
+	 * -> project to hemisphere) combined with a golden-angle Fibonacci spiral for the disk sample
+	 * itself -- no random number generator, no seed, no dependency on evaluation order, so
+	 * regenerating with the same Samples count always reproduces the EXACT same directions (Test D's
+	 * "regenerate with equal parameters produces identical results" requirement).
+	 *
+	 * AUDITED (sampling-quality fix, re-examined per explicit correction): previously UNIFORM over the
+	 * hemisphere (Z = 1 - T); now COSINE-WEIGHTED (R = sqrt(T), Z = sqrt(1 - T)), which concentrates
+	 * more samples near the normal direction and fewer at grazing angles -- physically appropriate for
+	 * AO (a grazing-angle occluder contributes less to perceived occlusion than one near the normal),
+	 * and reduces the visible noise/banding a uniform distribution produced at low Samples counts.
+	 * Computed ONCE per GenerateAmbientOcclusionMask call (not once per render vertex); reoriented AND
+	 * rotated per-vertex by the caller -- see ComputeDeterministicScrambleAngle and the caller's own
+	 * SAMPLING doc note for why a per-vertex azimuthal rotation is applied on top of this fixed set.
+	 */
+	static TArray<FVector> BuildHemisphereSampleDirections(const int32 NumSamples)
+	{
+		TArray<FVector> Directions;
+		Directions.Reserve(NumSamples);
+
+		const double GoldenAngle = PI * (3.0 - FMath::Sqrt(5.0));
+		for (int32 i = 0; i < NumSamples; ++i)
+		{
+			const double U1 = (static_cast<double>(i) + 0.5) / static_cast<double>(NumSamples);
+			const double R = FMath::Sqrt(U1);
+			const double Theta = GoldenAngle * static_cast<double>(i);
+			const double Z = FMath::Sqrt(FMath::Max(0.0, 1.0 - U1));
+			Directions.Add(FVector(R * FMath::Cos(Theta), R * FMath::Sin(Theta), Z));
+		}
+		return Directions;
+	}
+
+	/**
+	 * Deterministic azimuthal scramble angle (radians, [0, 2*PI)) for one render vertex's sample set,
+	 * derived from a QUANTIZED WORLD POSITION key -- the same "quantize to a grid, hash the cell"
+	 * idiom BuildPositionBuckets already uses elsewhere in this file for stable geometric grouping,
+	 * applied here for a different purpose (a per-position pseudo-random-but-deterministic rotation,
+	 * not vertex matching).
+	 *
+	 * AUDITED (sampling-quality fix): deliberately keyed by POSITION, never by render vertex INDEX --
+	 * FVector::FindBestAxisVectors picks a tangent basis that can discontinuously "flip" between
+	 * neighboring vertices with only slightly different normals, which combined with every vertex
+	 * reusing the IDENTICAL, unrotated sample set previously produced visible coherent banding /
+	 * structured patterns across the surface (the artifact reported in manual testing). Rotating each
+	 * vertex's samples by a position-derived angle breaks that coherence. Keying by POSITION (not
+	 * index) is what keeps hard-edge/UV-seam-coincident render vertices (same position, different
+	 * render vertex IDs) receiving the SAME scramble, so a seam never introduces an artificial
+	 * discontinuity in the noise pattern that isn't actually present in the underlying geometry --
+	 * exactly the requirement that seam-splitting must never change AO behavior (see the function's
+	 * SELF-HIT doc note for the same principle applied to occlusion itself).
+	 */
+	static float ComputeDeterministicScrambleAngle(const FVector& WorldPos)
+	{
+		constexpr double QuantizeScale = 1000.0; // 1/1000 Unreal unit grid.
+		const FIntVector Key(
+			FMath::RoundToInt(WorldPos.X * QuantizeScale),
+			FMath::RoundToInt(WorldPos.Y * QuantizeScale),
+			FMath::RoundToInt(WorldPos.Z * QuantizeScale));
+		const uint32 Hash = HashCombine(HashCombine(GetTypeHash(Key.X), GetTypeHash(Key.Y)), GetTypeHash(Key.Z));
+		return (static_cast<float>(Hash) / static_cast<float>(MAX_uint32)) * 2.0f * UE_PI;
+	}
+
+	/**
+	 * Generates the Ambient Occlusion Mask directly in RENDER VERTEX order for one component, using
+	 * CPU hemisphere raycasts against the component's OWN geometry via a GeometryCore
+	 * UE::Geometry::FDynamicMeshAABBTree3 (UE 5.8's stable, Runtime-module mesh spatial index).
+	 *
+	 * AUDITED (space, per the checkpoint's explicit requirement): the occluder tree, sample origins,
+	 * and sample directions are ALL built and evaluated in WORLD SPACE, using THIS component's own
+	 * ComponentTransform -- never Local Space. This is a deliberate departure from
+	 * GenerateBoundingBoxMask's Local-Space-by-default convention: a Bounding Box axis gradient is
+	 * scale-invariant by construction (it normalizes by its own measured extent), but Ambient
+	 * Occlusion is NOT -- Max Distance and Bias are absolute distances, and under NON-UNIFORM component
+	 * scale a Local-Space sphere of radius MaxDistance does not correspond to any sphere in World
+	 * Space (it becomes direction-dependent), which would silently make Max Distance mean different
+	 * things along different axes. Baking geometry into World Space once per component sidesteps that
+	 * entirely: Max Distance and Bias are then simply literal Unreal units, correct under uniform OR
+	 * non-uniform scale, with no per-axis correction needed anywhere else in this function. The cost is
+	 * that the tree is cached PER COMPONENT (see FVertexMaskForgeAOCache), not shared across multiple
+	 * instances of the same asset the way the Bounding Box Mask's entry-level reference is -- an
+	 * accepted, documented limitation of this first version (see the checkpoint report).
+	 *
+	 * NORMALS (audited): read directly from LOD0.VertexBuffers.StaticMeshVertexBuffer.VertexTangentZ --
+	 * i.e. the REAL RENDER NORMAL, in the SAME render-vertex order/domain as BaselineColors/
+	 * WorkingColors (so hard-edge/UV-seam vertices that share a position but have different render
+	 * normals are correctly evaluated independently, exactly like BaselineColors already preserves
+	 * seams -- see UpdateWorkingColors). Deliberately NOT the Dynamic Mesh's normal overlay: that lives
+	 * in a different, POSITION-MATCHED vertex domain (FindMatchingVertexID), which the codebase already
+	 * documents as reserved/unused for spatial-only generators (see the audit note above
+	 * BuildPositionBuckets) -- reintroducing it here would be exactly the mistake that note warns
+	 * against. Transformed to World Space with the inverse-transpose of the component's matrix (the
+	 * mathematically correct normal transform under non-uniform scale -- a plain TransformVector would
+	 * skew the normal off-perpendicular). A vertex whose render normal fails to normalize (degenerate/
+	 * zero -- pathological content only) falls back to the geometric face normal of one of its own
+	 * incident triangles in the just-baked WorldMesh (UE::Geometry::FDynamicMesh3::GetTriNormal),
+	 * itself a safe, always-available fallback since every render vertex used here is guaranteed to
+	 * have at least one incident triangle (degenerate triangles are skipped when the mesh is built, but
+	 * a render vertex referenced only by degenerate triangles simply keeps FVector::UpVector as the
+	 * final fallback -- never a NaN or unnormalized vector). BOTH fallback paths are counted in
+	 * NumDegenerateNormals and logged in aggregate -- never silently substituted without a trace (see
+	 * DIAGNOSTICS below).
+	 *
+	 * SELF-HIT (AUDITED AGAIN, per the "10s wait + black regions" pre-test correction -- supersedes the
+	 * PREVIOUS round's FindNearestHitTriangle-plus-epsilon fix): that fix had its own bug -- rejecting
+	 * a too-close FindNearestHitTriangle result silently treated the sample as "not occluded", but
+	 * since FindNearestHitTriangle only ever returns the SINGLE closest hit, a spurious near-origin
+	 * self-intersection could hide a genuine, farther, legitimate occluder on that exact ray -- the
+	 * ray was never re-queried past the rejected hit. This under-counted occlusion (AO too LOW) in
+	 * exactly the concave/creased regions where self-intersection noise is most likely, which is what
+	 * manual testing saw as incoherent "black" patches (this mask's convention is 0 = exposed, so an
+	 * artificially-low value reads as if the surface were unoccluded/black even where it visibly is
+	 * not -- see EVertexMaskForgeScalarMaskSource::AmbientOcclusion's own doc note on the convention).
+	 * It was also markedly slower: FindNearestHitTriangle cannot early-out the way an any-hit query can.
+	 * FIX: back to TestAnyHitTriangle (any-hit, early-out), trusting Bias alone -- no epsilon, no
+	 * triangle-identity filtering of any kind. Bias (artist-controlled, World Space Unreal units,
+	 * minimum 0.001) is solely responsible for moving the ray origin definitively off the originating
+	 * surface; if a specific asset still shows self-shadowing artifacts, the fix is a larger Bias, not
+	 * more code here -- exactly the contract the original checkpoint request specified for Bias, and
+	 * the option this round's correction explicitly said to prefer if it produces a correct result.
+	 * This is topology-independent (no dependency on hard-edge/UV-seam splits, since no triangle ID or
+	 * vertex ID plays any role in the decision) and never hides a legitimate second occluder, since the
+	 * FIRST hit found (any hit) is by definition a real surface at or beyond the Bias-offset origin.
+	 *
+	 * CORRESPONDENCE (audited): WorldMesh/Tree are built directly from LOD0.VertexBuffers.
+	 * PositionVertexBuffer (one AppendVertex per render vertex, in order) and LOD0.IndexBuffer (one
+	 * AppendTriangle per LOD0 triangle, using the SAME render vertex indices) -- never MeshDescription,
+	 * never FDynamicMesh3 position-matching, never the WedgeMap. This guarantees Mask.Values.Num() ==
+	 * NumRenderVerts exactly, by the same "dense by construction" contract GenerateBoundingBoxMask
+	 * already relies on, and needs no separate correspondence step at all.
+	 *
+	 * CACHE: WorldMesh/Tree are rebuilt whenever Mesh identity, LOD0.DerivedDataKey, NumRenderVerts,
+	 * NumIndices, or ComponentTransform no longer match what they were last built from (see
+	 * FVertexMaskForgeAOCache's own doc comment for the full matrix -- AUDITED, DerivedDataKey
+	 * false-mismatch fix: the key is now plain-equality compared, so an asset whose DerivedDataKey is
+	 * never populated no longer permanently defeats the cache); RawValues are rebuilt only when
+	 * Samples/MaxDistance/Bias actually changed, or Layer 1 was just rebuilt. Invert is applied AFTER
+	 * this cache lookup, every call, directly from RawValues
+	 * -- never touches the tree or recomputes a single raycast. Blend Mode/Opacity/Channel Filter/
+	 * Preview Mode never call this function at all (they operate entirely downstream on already-
+	 * composed WorkingColors), so they can never trigger either layer's rebuild.
+	 *
+	 * EFFECTIVE SAMPLES (AUDITED, interactive-performance fix): the caller (OnGenerateBoundingBoxMaskClicked
+	 * / RunAutoUpdatePreview) is responsible for capping Params.Samples to AOAutoUpdateMaxSamples for
+	 * an AUTO UPDATE-triggered call, and passing the full, user-chosen Samples value for an explicit
+	 * GENERATE MASK click -- this function itself always raycasts at whatever Params.Samples it is
+	 * given (it has no notion of "interactive vs final" on its own) and reports the ACTUAL value used
+	 * in Mask.UsedAOParams.Samples (diagnostic-accurate, matching UsedAxisParams' own contract). This
+	 * is what makes Auto Update responsive without ever silently overwriting the user's chosen Samples
+	 * UI value -- AOSamples itself is never mutated by Auto Update, only what gets PASSED for that one
+	 * call. A switch between interactive and final quality is a genuine parameter change from this
+	 * function's point of view, so the RawValues cache correctly treats it as one (Layer 2 rebuilds).
+	 *
+	 * SAMPLING (AUDITED, banding fix): BuildHemisphereSampleDirections is now COSINE-WEIGHTED (see its
+	 * own doc comment), and every render vertex's copy of that fixed direction set is additionally
+	 * rotated about the normal by ComputeDeterministicScrambleAngle(WorldPos) -- a position-keyed,
+	 * deterministic azimuthal offset -- before being transformed into World Space via that vertex's own
+	 * tangent frame. This breaks up the structured/coherent banding a single, unrotated direction set
+	 * produced when combined with FindBestAxisVectors' basis discontinuities between neighboring
+	 * vertices, while remaining fully deterministic (Test D) and seam-consistent (position-keyed, not
+	 * index-keyed -- see ComputeDeterministicScrambleAngle's own doc comment).
+	 *
+	 * PARALLELIZATION (AUDITED, per explicit source-level confirmation): the per-vertex raycast loop
+	 * runs via ParallelFor. TMeshAABBTree3 (UE::Geometry::FDynamicMeshAABBTree3's template) declares no
+	 * `mutable` members anywhere in Spatial/MeshAABBTree3.h, and its query methods (TestAnyHitTriangle/
+	 * FindNearestHitTriangle) are const and read-only over BoxToIndex/Mesh/RootIndex, all populated
+	 * once at Build() time and never touched again -- confirmed by reading the real UE 5.8 header, not
+	 * assumed. This exact pattern (ParallelFor over render vertices, querying one shared, already-built
+	 * FDynamicMeshAABBTree3 per worker) is Epic's own established idiom in the SAME engine version --
+	 * e.g. Engine/Plugins/Runtime/MeshModelingToolset's RenderCaptureFunctions.cpp (occlusion/capture
+	 * baking) and MeshVertexPaintTool.cpp both do exactly this. Each worker here writes only its own
+	 * render vertex index into Cache.RawValues (pre-sized before the ParallelFor, never reallocated
+	 * during it); WorldMesh/Tree/RenderTangents/NormalMatrix/LocalSampleDirs/Options are all read-only,
+	 * captured by reference; no UObject is touched inside the parallel body (only FDynamicMesh3/
+	 * FStaticMeshVertexBuffer/FMatrix/FDynamicMeshAABBTree3, none of them UObjects) -- so no Game
+	 * Thread/GC safety concern applies. Determinism is preserved: each vertex's own result depends only
+	 * on its own index/position/normal and the shared, already-built, read-only Tree -- never on
+	 * execution order between vertices.
+	 *
+	 * LOGGING (post-cleanup checkpoint): silent on cache hits and on routine parameter changes. A
+	 * single compact Verbose line reports WHY a cache layer missed (no addresses/hashes/full transform
+	 * dumps); a single Log-level "AO generated: N vertices, S samples, T ms" line fires only when a
+	 * real raycast pass actually runs (never on a RawValues cache hit); a Warning fires only if the
+	 * raycast pass itself produces NaN/out-of-range values (a genuine data anomaly).
+	 */
+	static FVertexMaskForgeScalarMask GenerateAmbientOcclusionMask(
+		TUniquePtr<FVertexMaskForgeAOCache>& CachePtr,
+		const UStaticMesh* Mesh,
+		const FStaticMeshLODResources& LOD0,
+		const FTransform& ComponentTransform,
+		const FVertexMaskForgeAOParams& RawParams)
+	{
+		FVertexMaskForgeScalarMask Mask;
+		Mask.Source = EVertexMaskForgeScalarMaskSource::AmbientOcclusion;
+
+		// Never trust the UI clamp alone (same defensive posture as every other generator's inputs).
+		FVertexMaskForgeAOParams Params = RawParams;
+		Params.Samples = FMath::Clamp(Params.Samples, 8, 256);
+		Params.MaxDistance = FMath::Clamp(Params.MaxDistance, 0.01f, 10000.0f);
+		Params.Bias = FMath::Clamp(Params.Bias, 0.001f, 10.0f);
+		Mask.UsedAOParams = Params;
+
+		const FPositionVertexBuffer& RenderPositions = LOD0.VertexBuffers.PositionVertexBuffer;
+		const FStaticMeshVertexBuffer& RenderTangents = LOD0.VertexBuffers.StaticMeshVertexBuffer;
+		const int32 NumRenderVerts = static_cast<int32>(RenderPositions.GetNumVertices());
+		Mask.RenderVertexCount = NumRenderVerts;
+
+		if (NumRenderVerts <= 0
+			|| LOD0.IndexBuffer.GetNumIndices() < 3
+			|| static_cast<int32>(RenderTangents.GetNumVertices()) != NumRenderVerts)
+		{
+			// No geometry, no triangles, or a normal buffer that doesn't match the render vertex
+			// count (partial/invalid, same treatment as a mismatched Color Vertex Buffer elsewhere in
+			// this file) -- never guessed or index-clamped.
+			Mask.State = EVertexMaskForgeScalarMaskState::Unavailable;
+			return Mask;
+		}
+
+		if (!CachePtr.IsValid())
+		{
+			CachePtr = MakeUnique<FVertexMaskForgeAOCache>();
+		}
+		FVertexMaskForgeAOCache& Cache = *CachePtr;
+
+		const double GenerationStartSeconds = FPlatformTime::Seconds();
+
+		// Layer 1: occluder geometry + spatial index. See the function's own CACHE doc comment for
+		// exactly what each comparison catches.
+		//
+		// AUDITED (DerivedDataKey false-mismatch fix, per explicit root-cause confirmation): the key
+		// comparison is now a PLAIN equality (FString::operator== already treats "both empty" as
+		// equal, which is the mathematically correct answer -- two unknown/unavailable keys are not
+		// evidence of a change). The PREVIOUS policy additionally required the CURRENT key to be
+		// non-empty, which meant any asset whose LOD0.DerivedDataKey is never populated (confirmed by
+		// the checkpoint's own diagnostic logs: oldEmpty=true, newEmpty=true, equal=true, logged as a
+		// "mismatch" every single call) could NEVER hit the Tree cache -- a permanent, silent full
+		// rebuild on every call, not a real geometry change. The corrected policy, exactly as
+		// specified:
+		//   - old empty + new empty            -> compatible (this is the case that was broken)
+		//   - old non-empty + new non-empty, == -> compatible
+		//   - one empty, other non-empty        -> incompatible (a key appeared or disappeared)
+		//   - both non-empty, different         -> incompatible (real content change)
+		// DerivedDataKey is therefore an OPTIONAL, best-effort field within the cache key -- never an
+		// absolute veto. Safety against reimport/rebuild does NOT depend on this field alone even when
+		// it is unavailable: Mesh identity, NumRenderVerts, NumIndices, and Transform are independent,
+		// already-audited fields in the SAME AND-chain (see below) -- a reimport that changes vertex/
+		// triangle counts is still caught by bVertCountMatches/bIndexCountMatches regardless of
+		// DerivedDataKey's availability. A reimport that preserves both counts AND leaves
+		// DerivedDataKey empty is a known, accepted residual gap for that specific (rare) asset
+		// category -- not solvable by any stable identifier already available on this code path
+		// without inventing a new one, which was explicitly out of scope for this fix.
+		const int32 NumIndices = LOD0.IndexBuffer.GetNumIndices();
+		const bool bMeshMatches = Cache.CachedMesh.Get() == Mesh;
+		const bool bKeyMatches = Cache.CachedDerivedDataKey == LOD0.DerivedDataKey;
+		const bool bVertCountMatches = Cache.CachedNumRenderVerts == NumRenderVerts;
+		const bool bIndexCountMatches = Cache.CachedNumIndices == NumIndices;
+		const bool bTransformMatches = Cache.CachedTransform.Equals(ComponentTransform, 1e-5);
+		const bool bTreeStillValid = Cache.bTreeValid
+			&& bMeshMatches
+			&& bKeyMatches
+			&& bVertCountMatches
+			&& bIndexCountMatches
+			&& bTransformMatches;
+
+		// Fires ONLY on a genuine miss -- Cache.bTreeValid was already true (a Tree existed from a
+		// PREVIOUS call) but at least one field no longer matches. Never fires on the legitimate first
+		// build of a session. One compact Verbose line, no addresses/hashes/full transform dumps.
+		if (Cache.bTreeValid && !bTreeStillValid)
+		{
+			TArray<FString> Reasons;
+			if (!bMeshMatches) { Reasons.Add(TEXT("Mesh changed")); }
+			if (!bKeyMatches) { Reasons.Add(TEXT("DerivedDataKey changed")); }
+			if (!bVertCountMatches || !bIndexCountMatches) { Reasons.Add(TEXT("Vertex/index count changed")); }
+			if (!bTransformMatches) { Reasons.Add(TEXT("Transform changed")); }
+			UE_LOG(LogVertexMaskForge, Verbose,
+				TEXT("Vertex Mask Forge: AO Tree cache miss: %s"), *FString::Join(Reasons, TEXT(", ")));
+		}
+
+		if (!bTreeStillValid)
+		{
+			Cache.WorldMesh = MakeUnique<UE::Geometry::FDynamicMesh3>();
+			Cache.WorldMesh->EnableTriangleGroups();
+
+			for (int32 i = 0; i < NumRenderVerts; ++i)
+			{
+				const FVector WorldPos = ComponentTransform.TransformPosition(FVector(RenderPositions.VertexPosition(i)));
+				Cache.WorldMesh->AppendVertex(WorldPos);
+			}
+
+			const int32 NumTriangles = NumIndices / 3;
+			for (int32 TriIndex = 0; TriIndex < NumTriangles; ++TriIndex)
+			{
+				const int32 I0 = static_cast<int32>(LOD0.IndexBuffer.GetIndex(TriIndex * 3 + 0));
+				const int32 I1 = static_cast<int32>(LOD0.IndexBuffer.GetIndex(TriIndex * 3 + 1));
+				const int32 I2 = static_cast<int32>(LOD0.IndexBuffer.GetIndex(TriIndex * 3 + 2));
+				if (I0 == I1 || I1 == I2 || I0 == I2)
+				{
+					continue; // Degenerate triangle (zero area): never fed to the occluder tree.
+				}
+				Cache.WorldMesh->AppendTriangle(I0, I1, I2);
+			}
+
+			Cache.Tree = MakeUnique<UE::Geometry::FDynamicMeshAABBTree3>(Cache.WorldMesh.Get());
+			Cache.CachedMesh = Mesh;
+			Cache.CachedDerivedDataKey = LOD0.DerivedDataKey;
+			Cache.CachedTransform = ComponentTransform;
+			Cache.CachedNumRenderVerts = NumRenderVerts;
+			Cache.CachedNumIndices = NumIndices;
+			Cache.bTreeValid = true;
+			Cache.bValuesValid = false; // Geometry changed: any previously-cached raw values are stale.
+		}
+
+		// Layer 2: raw occlusion fraction per render vertex. Rebuilt only if Samples/MaxDistance/Bias
+		// actually changed (or Layer 1 was just rebuilt above).
+		const bool bSamplesMatch = Cache.CachedSamples == Params.Samples;
+		const bool bMaxDistanceMatches = FMath::IsNearlyEqual(Cache.CachedMaxDistance, Params.MaxDistance, 1e-4f);
+		const bool bBiasMatches = FMath::IsNearlyEqual(Cache.CachedBias, Params.Bias, 1e-6f);
+		const bool bValuesStillValid = Cache.bValuesValid && bSamplesMatch && bMaxDistanceMatches && bBiasMatches;
+
+		// Fires only on a genuine miss where the Tree survived (if the Tree itself was just rebuilt
+		// above, RawValues are correctly and unconditionally invalidated too -- not a separate,
+		// unexplained miss, so it is not logged again here).
+		if (bTreeStillValid && Cache.bValuesValid && !bValuesStillValid)
+		{
+			TArray<FString> Reasons;
+			if (!bSamplesMatch) { Reasons.Add(FString::Printf(TEXT("Samples %d -> %d"), Cache.CachedSamples, Params.Samples)); }
+			if (!bMaxDistanceMatches) { Reasons.Add(TEXT("MaxDistance changed")); }
+			if (!bBiasMatches) { Reasons.Add(TEXT("Bias changed")); }
+			UE_LOG(LogVertexMaskForge, Verbose,
+				TEXT("Vertex Mask Forge: AO RawValues cache miss: %s"), *FString::Join(Reasons, TEXT(", ")));
+		}
+		if (!bValuesStillValid)
+		{
+			const TArray<FVector> LocalSampleDirs = BuildHemisphereSampleDirections(Params.Samples);
+			const UE::Geometry::FDynamicMesh3& WorldMesh = *Cache.WorldMesh;
+			const UE::Geometry::FDynamicMeshAABBTree3& Tree = *Cache.Tree;
+			const FMatrix NormalMatrix = ComponentTransform.ToMatrixWithScale().Inverse().GetTransposed();
+
+			Cache.RawValues.SetNumUninitialized(NumRenderVerts);
+
+			UE::Geometry::IMeshSpatial::FQueryOptions Options;
+			Options.MaxDistance = Params.MaxDistance;
+
+			// AUDITED (parallelization): see the function's own PARALLELIZATION doc comment for the
+			// source-level confirmation this is safe. Tree/WorldMesh/RenderTangents/NormalMatrix/
+			// LocalSampleDirs/Options are read-only; each worker writes only Cache.RawValues[i].
+			ParallelFor(NumRenderVerts, [&](const int32 i)
+			{
+				const FVector WorldPos = WorldMesh.GetVertex(i);
+
+				const FVector4f LocalNormal4 = RenderTangents.VertexTangentZ(i);
+				FVector WorldNormal = NormalMatrix.TransformVector(FVector(LocalNormal4));
+				if (!WorldNormal.Normalize())
+				{
+					// Degenerate render normal (pathological content only): fall back to this
+					// vertex's own first incident triangle's geometric normal, never a guess.
+					WorldNormal = FVector::UpVector;
+					for (const int32 TriID : WorldMesh.VtxTrianglesItr(i))
+					{
+						WorldNormal = WorldMesh.GetTriNormal(TriID);
+						break;
+					}
+				}
+
+				FVector TangentX, TangentY;
+				WorldNormal.FindBestAxisVectors(TangentX, TangentY);
+
+				const FVector Origin = WorldPos + WorldNormal * Params.Bias;
+
+				// AUDITED (sampling-quality fix): position-keyed deterministic scramble -- see
+				// ComputeDeterministicScrambleAngle's own doc comment.
+				const float ScrambleAngle = ComputeDeterministicScrambleAngle(WorldPos);
+				const float CosS = FMath::Cos(ScrambleAngle);
+				const float SinS = FMath::Sin(ScrambleAngle);
+
+				int32 NumOccluded = 0;
+				int32 NumValidSamples = 0;
+				for (const FVector& LocalDir : LocalSampleDirs)
+				{
+					const float RotatedX = LocalDir.X * CosS - LocalDir.Y * SinS;
+					const float RotatedY = LocalDir.X * SinS + LocalDir.Y * CosS;
+					const FVector WorldDir = TangentX * RotatedX + TangentY * RotatedY + WorldNormal * LocalDir.Z;
+					const FVector NormalizedDir = WorldDir.GetSafeNormal();
+					if (NormalizedDir.IsNearlyZero())
+					{
+						continue;
+					}
+					++NumValidSamples;
+
+					// AUDITED (self-hit fix, re-examined): any-hit, trusting Bias alone -- see the
+					// function's own SELF-HIT doc comment for why FindNearestHitTriangle+epsilon was
+					// reverted.
+					const FRay3d Ray(FVector3d(Origin), FVector3d(NormalizedDir), /*bDirectionIsNormalized=*/true);
+					if (Tree.TestAnyHitTriangle(Ray, Options))
+					{
+						++NumOccluded;
+					}
+				}
+
+				const float AO = (NumValidSamples > 0)
+					? (static_cast<float>(NumOccluded) / static_cast<float>(NumValidSamples))
+					: 0.0f;
+				Cache.RawValues[i] = FMath::Clamp(AO, 0.0f, 1.0f);
+			});
+
+			Cache.CachedSamples = Params.Samples;
+			Cache.CachedMaxDistance = Params.MaxDistance;
+			Cache.CachedBias = Params.Bias;
+			Cache.bValuesValid = true;
+
+			// Genuine anomaly only (never routine): a raycast pass that produced a NaN or
+			// out-of-[0,1] value indicates bad mesh/normal data, not a normal cache event.
+			int32 NumNaNOrOutOfRange = 0;
+			for (const float RawValue : Cache.RawValues)
+			{
+				if (!FMath::IsFinite(RawValue) || RawValue < 0.0f || RawValue > 1.0f)
+				{
+					++NumNaNOrOutOfRange;
+				}
+			}
+			if (NumNaNOrOutOfRange > 0)
+			{
+				UE_LOG(LogVertexMaskForge, Warning,
+					TEXT("Vertex Mask Forge: AO raycast produced %d NaN/out-of-range value(s) out of %d render vert(s) -- check mesh/normal data."),
+					NumNaNOrOutOfRange, NumRenderVerts);
+			}
+
+			// Explicit operation summary: fires only when a real raycast pass actually ran (never on
+			// a RawValues cache hit).
+			UE_LOG(LogVertexMaskForge, Log,
+				TEXT("Vertex Mask Forge: AO generated: %d vertices, %d samples, %.1f ms"),
+				NumRenderVerts, Params.Samples, (FPlatformTime::Seconds() - GenerationStartSeconds) * 1000.0);
+		}
+
+		// Populate Mask.Values from the cached raw values, applying Invert here (display/compose
+		// contract only -- never touches Cache.RawValues, the tree, or triggers a rebuild of either).
+		Mask.Values.SetNumUninitialized(NumRenderVerts);
+		Mask.bHasValue.Init(true, NumRenderVerts);
+
+		double Sum = 0.0;
+		float MinValue = 1.f;
+		float MaxValue = 0.f;
+		int32 NumNearZero = 0;
+		int32 NumNearOne = 0;
+
+		for (int32 i = 0; i < NumRenderVerts; ++i)
+		{
+			const float Raw = Cache.RawValues[i];
+			const float Value = FMath::Clamp(Params.bInvert ? (1.0f - Raw) : Raw, 0.0f, 1.0f);
+			Mask.Values[i] = Value;
+
+			Sum += Value;
+			MinValue = FMath::Min(MinValue, Value);
+			MaxValue = FMath::Max(MaxValue, Value);
+			if (FMath::IsNearlyZero(Value, FVertexMaskForgeScalarMask::Tolerance))
+			{
+				++NumNearZero;
+			}
+			if (FMath::IsNearlyEqual(Value, 1.f, FVertexMaskForgeScalarMask::Tolerance))
+			{
+				++NumNearOne;
+			}
+		}
+
+		Mask.NumValidValues = NumRenderVerts;
+		Mask.MinValue = MinValue;
+		Mask.MaxValue = MaxValue;
+		Mask.MeanValue = static_cast<float>(Sum / NumRenderVerts);
+		Mask.NumNearZero = NumNearZero;
+		Mask.NumNearOne = NumNearOne;
+		Mask.State = EVertexMaskForgeScalarMaskState::Ready;
+		return Mask;
+	}
+
+	/**
+	 * AUDITED (Nanite source-topology support -- CORRECTED per hard-edge review): sibling of
+	 * GenerateAmbientOcclusionMask, used ONLY for entries in Source-Topology mode. Same algorithm end
+	 * to end (cosine-weighted hemisphere sampling, position-keyed deterministic scramble,
+	 * TestAnyHitTriangle any-hit self-hit handling, ParallelFor parallelization -- see
+	 * GenerateAmbientOcclusionMask's own doc comments, unchanged and not repeated here) -- the source of
+	 * geometry is SourceMesh (WorkingMesh.Mesh, built from the asset's SOURCE MeshDescription) instead
+	 * of FStaticMeshLODResources' render buffers, which is what makes AO correct for a Nanite mesh:
+	 * SourceMesh is the SAME full-fidelity topology Paint Vertex Colors itself reads and writes (see
+	 * the native-tool audit), never the reduced/re-clustered LOD 0 fallback proxy.
+	 *
+	 * INDEXED BY NORMAL OVERLAY ELEMENT ID, NOT VERTEX ID (corrected): a raw AO value is a pure
+	 * function of (position, normal) -- so two corners at the SAME vertex position with DIFFERENT
+	 * normals (a hard edge) must get independently-cast rays and independently-cached results, exactly
+	 * like the old render-vertex path preserved via one array slot per render vertex (which already
+	 * duplicates positions at seams). NormalOverlay->GetElement(id) gives that exact (position, normal)
+	 * pair directly (position via GetParentVertex), so this function computes and caches one raw value
+	 * per Normal Overlay element -- never an averaged per-DynamicMesh-vertex normal, which would
+	 * silently smooth hard edges. A caller resolves a given triangle corner's AO value via
+	 * NormalOverlay->GetTriangle(TriangleID)[corner] as the lookup index (see
+	 * UpdateWorkingColorsSourceTopology). See EnsureNormalOverlay for the one narrow exception (source
+	 * genuinely has no normals at all) where a synthesized, smooth fallback is used and logged.
+	 *
+	 * INDEX SAFETY (corrected): never assumes SourceMesh or its Normal Overlay is compact. Sized by
+	 * NormalOverlay->MaxElementID() (sparse-safe via IsElement()); WorldMesh (a fresh, always-compact
+	 * mesh built purely for raycasting) is populated via an explicit VertexID -> dense-WorldMesh-index
+	 * remap (VertexIdToWorldIndex), never assuming SourceMesh's own VertexID/TriangleID are already
+	 * dense.
+	 *
+	 * CACHE IDENTITY (corrected): keyed by CachedSourceMesh (address) AND CachedGeometryFingerprint
+	 * (positions + normals content hash, see ComputeDynamicMeshGeometryFingerprint) -- vertex/triangle
+	 * counts alone are not proof of identical geometry.
+	 */
+	static FVertexMaskForgeScalarMask GenerateAmbientOcclusionMaskFromDynamicMesh(
+		TUniquePtr<FVertexMaskForgeSourceTopologyAOCache>& CachePtr,
+		const UE::Geometry::FDynamicMesh3& SourceMesh,
+		const uint32 SourceGeometryFingerprint,
+		const FTransform& ComponentTransform,
+		const FVertexMaskForgeAOParams& RawParams)
+	{
+		using namespace UE::Geometry;
+
+		FVertexMaskForgeScalarMask Mask;
+		Mask.Source = EVertexMaskForgeScalarMaskSource::AmbientOcclusion;
+
+		FVertexMaskForgeAOParams Params = RawParams;
+		Params.Samples = FMath::Clamp(Params.Samples, 8, 256);
+		Params.MaxDistance = FMath::Clamp(Params.MaxDistance, 0.01f, 10000.0f);
+		Params.Bias = FMath::Clamp(Params.Bias, 0.001f, 10.0f);
+		Mask.UsedAOParams = Params;
+
+		const FDynamicMeshNormalOverlay* NormalOverlay =
+			(SourceMesh.HasAttributes() && SourceMesh.Attributes()->PrimaryNormals() != nullptr)
+			? SourceMesh.Attributes()->PrimaryNormals() : nullptr;
+		if (!NormalOverlay || NormalOverlay->ElementCount() <= 0
+			|| SourceMesh.VertexCount() <= 0 || SourceMesh.TriangleCount() <= 0)
+		{
+			// EnsureNormalOverlay (called once at working-mesh build time) guarantees a Normal Overlay
+			// exists for any Ready working mesh -- reaching here means the mesh itself has no geometry.
+			Mask.State = EVertexMaskForgeScalarMaskState::Unavailable;
+			return Mask;
+		}
+		const int32 NumElements = NormalOverlay->MaxElementID();
+		Mask.RenderVertexCount = NormalOverlay->ElementCount(); // Domain note: Normal Overlay element count -- see doc comment.
+
+		if (!CachePtr.IsValid())
+		{
+			CachePtr = MakeUnique<FVertexMaskForgeSourceTopologyAOCache>();
+		}
+		FVertexMaskForgeSourceTopologyAOCache& Cache = *CachePtr;
+
+		const double GenerationStartSeconds = FPlatformTime::Seconds();
+
+		const bool bMeshMatches = Cache.CachedSourceMesh == &SourceMesh;
+		const bool bFingerprintMatches = Cache.CachedGeometryFingerprint == SourceGeometryFingerprint;
+		const bool bTransformMatches = Cache.CachedTransform.Equals(ComponentTransform, 1e-5);
+		const bool bTreeStillValid = Cache.bTreeValid
+			&& bMeshMatches && bFingerprintMatches && bTransformMatches;
+
+		if (Cache.bTreeValid && !bTreeStillValid)
+		{
+			TArray<FString> Reasons;
+			if (!bMeshMatches) { Reasons.Add(TEXT("Source mesh changed")); }
+			if (bMeshMatches && !bFingerprintMatches) { Reasons.Add(TEXT("Geometry/normals changed")); }
+			if (!bTransformMatches) { Reasons.Add(TEXT("Transform changed")); }
+			UE_LOG(LogVertexMaskForge, Verbose,
+				TEXT("Vertex Mask Forge: AO (Source Topology) Tree cache miss: %s"), *FString::Join(Reasons, TEXT(", ")));
+		}
+
+		if (!bTreeStillValid)
+		{
+			Cache.WorldMesh = MakeUnique<FDynamicMesh3>();
+			Cache.WorldMesh->EnableTriangleGroups();
+
+			// Explicit VertexID -> dense WorldMesh index remap -- never assumes SourceMesh's own
+			// VertexIDs are already dense/compact (see the function's own INDEX SAFETY doc note).
+			TArray<int32> VertexIdToWorldIndex;
+			VertexIdToWorldIndex.Init(INDEX_NONE, SourceMesh.MaxVertexID());
+			for (const int32 VertexID : SourceMesh.VertexIndicesItr())
+			{
+				const FVector WorldPos = ComponentTransform.TransformPosition(FVector(SourceMesh.GetVertex(VertexID)));
+				VertexIdToWorldIndex[VertexID] = Cache.WorldMesh->AppendVertex(WorldPos);
+			}
+			for (const int32 TriangleID : SourceMesh.TriangleIndicesItr())
+			{
+				const FIndex3i Tri = SourceMesh.GetTriangle(TriangleID);
+				Cache.WorldMesh->AppendTriangle(
+					VertexIdToWorldIndex[Tri.A], VertexIdToWorldIndex[Tri.B], VertexIdToWorldIndex[Tri.C]);
+			}
+
+			Cache.Tree = MakeUnique<FDynamicMeshAABBTree3>(Cache.WorldMesh.Get());
+			Cache.CachedSourceMesh = &SourceMesh;
+			Cache.CachedGeometryFingerprint = SourceGeometryFingerprint;
+			Cache.CachedTransform = ComponentTransform;
+			Cache.bTreeValid = true;
+			Cache.bValuesValid = false;
+		}
+
+		const bool bSamplesMatch = Cache.CachedSamples == Params.Samples;
+		const bool bMaxDistanceMatches = FMath::IsNearlyEqual(Cache.CachedMaxDistance, Params.MaxDistance, 1e-4f);
+		const bool bBiasMatches = FMath::IsNearlyEqual(Cache.CachedBias, Params.Bias, 1e-6f);
+		const bool bValuesStillValid = Cache.bValuesValid && bSamplesMatch && bMaxDistanceMatches && bBiasMatches;
+
+		if (bTreeStillValid && Cache.bValuesValid && !bValuesStillValid)
+		{
+			TArray<FString> Reasons;
+			if (!bSamplesMatch) { Reasons.Add(FString::Printf(TEXT("Samples %d -> %d"), Cache.CachedSamples, Params.Samples)); }
+			if (!bMaxDistanceMatches) { Reasons.Add(TEXT("MaxDistance changed")); }
+			if (!bBiasMatches) { Reasons.Add(TEXT("Bias changed")); }
+			UE_LOG(LogVertexMaskForge, Verbose,
+				TEXT("Vertex Mask Forge: AO (Source Topology) RawValues cache miss: %s"), *FString::Join(Reasons, TEXT(", ")));
+		}
+
+		if (!bValuesStillValid)
+		{
+			const TArray<FVector> LocalSampleDirs = BuildHemisphereSampleDirections(Params.Samples);
+			const FDynamicMesh3& WorldMesh = *Cache.WorldMesh;
+			const FDynamicMeshAABBTree3& Tree = *Cache.Tree;
+			// Same non-uniform-scale-correct normal transform GenerateAmbientOcclusionMask itself uses.
+			const FMatrix NormalMatrix = ComponentTransform.ToMatrixWithScale().Inverse().GetTransposed();
+
+			// Explicit VertexID -> dense WorldMesh index remap, rebuilt here too (independent of the
+			// Tree-rebuild branch above, since a RawValues-only miss -- e.g. Bias changed -- must not
+			// require rebuilding WorldMesh/Tree, but still needs this same lookup for Origin positions).
+			// AUDITED: WorldMesh's own vertex order was assigned by AppendVertex during the (possibly
+			// earlier) Tree-build pass above, in SourceMesh.VertexIndicesItr() order -- rebuilding the
+			// same mapping by re-walking that same iterator is deterministic and exact, since
+			// AppendVertex returns sequential indices 0,1,2,... in call order.
+			TArray<int32> VertexIdToWorldIndex;
+			VertexIdToWorldIndex.Init(INDEX_NONE, SourceMesh.MaxVertexID());
+			{
+				int32 NextWorldIndex = 0;
+				for (const int32 VertexID : SourceMesh.VertexIndicesItr())
+				{
+					VertexIdToWorldIndex[VertexID] = NextWorldIndex++;
+				}
+			}
+
+			Cache.RawValues.SetNumUninitialized(NumElements);
+
+			IMeshSpatial::FQueryOptions Options;
+			Options.MaxDistance = Params.MaxDistance;
+
+			// AUDITED (parallelization): identical safety argument as GenerateAmbientOcclusionMask's
+			// own PARALLELIZATION doc comment -- Tree/WorldMesh/LocalSampleDirs/Options/NormalOverlay/
+			// NormalMatrix/VertexIdToWorldIndex are read-only; each worker writes only Cache.RawValues[e].
+			ParallelFor(NumElements, [&](const int32 ElementID)
+			{
+				if (!NormalOverlay->IsElement(ElementID))
+				{
+					// Sparse slot: never written, never read (see TryGetValue/bHasValue on the returned
+					// Mask -- this array itself has no "has value" bit, so an unused slot is simply
+					// never touched; downstream code only ever reads indices proven IsElement() true).
+					return;
+				}
+
+				const int32 ParentVertexID = NormalOverlay->GetParentVertex(ElementID);
+				const int32 WorldIndex = VertexIdToWorldIndex.IsValidIndex(ParentVertexID) ? VertexIdToWorldIndex[ParentVertexID] : INDEX_NONE;
+				if (WorldIndex == INDEX_NONE)
+				{
+					Cache.RawValues[ElementID] = 0.0f;
+					return;
+				}
+
+				const FVector WorldPos = WorldMesh.GetVertex(WorldIndex);
+
+				const FVector3f LocalNormal = NormalOverlay->GetElement(ElementID);
+				FVector WorldNormal = NormalMatrix.TransformVector(FVector(LocalNormal));
+				if (!WorldNormal.Normalize())
+				{
+					// Degenerate normal (pathological content only): fall back to this vertex's own
+					// first incident triangle's geometric normal, never a guess.
+					WorldNormal = FVector::UpVector;
+					for (const int32 TriID : WorldMesh.VtxTrianglesItr(WorldIndex))
+					{
+						WorldNormal = WorldMesh.GetTriNormal(TriID);
+						break;
+					}
+				}
+
+				FVector TangentX, TangentY;
+				WorldNormal.FindBestAxisVectors(TangentX, TangentY);
+
+				const FVector Origin = WorldPos + WorldNormal * Params.Bias;
+
+				const float ScrambleAngle = ComputeDeterministicScrambleAngle(WorldPos);
+				const float CosS = FMath::Cos(ScrambleAngle);
+				const float SinS = FMath::Sin(ScrambleAngle);
+
+				int32 NumOccluded = 0;
+				int32 NumValidSamples = 0;
+				for (const FVector& LocalDir : LocalSampleDirs)
+				{
+					const float RotatedX = LocalDir.X * CosS - LocalDir.Y * SinS;
+					const float RotatedY = LocalDir.X * SinS + LocalDir.Y * CosS;
+					const FVector WorldDir = TangentX * RotatedX + TangentY * RotatedY + WorldNormal * LocalDir.Z;
+					const FVector NormalizedDir = WorldDir.GetSafeNormal();
+					if (NormalizedDir.IsNearlyZero())
+					{
+						continue;
+					}
+					++NumValidSamples;
+
+					const FRay3d Ray(FVector3d(Origin), FVector3d(NormalizedDir), /*bDirectionIsNormalized=*/true);
+					if (Tree.TestAnyHitTriangle(Ray, Options))
+					{
+						++NumOccluded;
+					}
+				}
+
+				const float AO = (NumValidSamples > 0)
+					? (static_cast<float>(NumOccluded) / static_cast<float>(NumValidSamples))
+					: 0.0f;
+				Cache.RawValues[ElementID] = FMath::Clamp(AO, 0.0f, 1.0f);
+			});
+
+			Cache.CachedSamples = Params.Samples;
+			Cache.CachedMaxDistance = Params.MaxDistance;
+			Cache.CachedBias = Params.Bias;
+			Cache.bValuesValid = true;
+
+			int32 NumNaNOrOutOfRange = 0;
+			for (const int32 ElementID : NormalOverlay->ElementIndicesItr())
+			{
+				const float RawValue = Cache.RawValues[ElementID];
+				if (!FMath::IsFinite(RawValue) || RawValue < 0.0f || RawValue > 1.0f)
+				{
+					++NumNaNOrOutOfRange;
+				}
+			}
+			if (NumNaNOrOutOfRange > 0)
+			{
+				UE_LOG(LogVertexMaskForge, Warning,
+					TEXT("Vertex Mask Forge: AO (Source Topology) raycast produced %d NaN/out-of-range value(s) out of %d element(s) -- check mesh/normal data."),
+					NumNaNOrOutOfRange, NormalOverlay->ElementCount());
+			}
+
+			UE_LOG(LogVertexMaskForge, Log,
+				TEXT("Vertex Mask Forge: AO (Source Topology) generated: %d normal element(s), %d samples, %.1f ms"),
+				NormalOverlay->ElementCount(), Params.Samples, (FPlatformTime::Seconds() - GenerationStartSeconds) * 1000.0);
+		}
+
+		Mask.Values.SetNumZeroed(NumElements);
+		Mask.bHasValue.Init(false, NumElements);
+
+		double Sum = 0.0;
+		float MinValue = 1.f;
+		float MaxValue = 0.f;
+		int32 NumNearZero = 0;
+		int32 NumNearOne = 0;
+		int32 NumValid = 0;
+
+		for (const int32 ElementID : NormalOverlay->ElementIndicesItr())
+		{
+			const float Raw = Cache.RawValues[ElementID];
+			const float Value = FMath::Clamp(Params.bInvert ? (1.0f - Raw) : Raw, 0.0f, 1.0f);
+			Mask.Values[ElementID] = Value;
+			Mask.bHasValue[ElementID] = true;
+			++NumValid;
+
+			Sum += Value;
+			MinValue = FMath::Min(MinValue, Value);
+			MaxValue = FMath::Max(MaxValue, Value);
+			if (FMath::IsNearlyZero(Value, FVertexMaskForgeScalarMask::Tolerance))
+			{
+				++NumNearZero;
+			}
+			if (FMath::IsNearlyEqual(Value, 1.f, FVertexMaskForgeScalarMask::Tolerance))
+			{
+				++NumNearOne;
+			}
+		}
+
+		Mask.NumValidValues = NumValid;
+		Mask.MinValue = MinValue;
+		Mask.MaxValue = MaxValue;
+		Mask.MeanValue = NumValid > 0 ? static_cast<float>(Sum / NumValid) : 0.f;
+		Mask.NumNearZero = NumNearZero;
+		Mask.NumNearOne = NumNearOne;
+		Mask.State = EVertexMaskForgeScalarMaskState::Ready;
+		return Mask;
+	}
+
+	/**
+	 * AUDITED (Nanite source-topology support): sibling of GenerateBoundingBoxMask, used ONLY for
+	 * entries in Source-Topology mode. INDIVIDUAL BOUNDS ONLY -- Unified Bounds is not supported for
+	 * this domain in this checkpoint (an explicit, scoped-down decision, not an oversight: combining a
+	 * render-vertex-domain bounds pass with a Dynamic-Mesh-vertex-domain one in the same collective
+	 * bounds computation would require its own design, and the common case is one Nanite mesh edited at
+	 * a time). CollectiveBounds is therefore never accepted here; ComponentTransform is always this
+	 * specific instance's own transform (never a shared/identity reference the way the render-vertex
+	 * path's entry-level evaluation uses).
+	 *
+	 * Otherwise identical math to GenerateBoundingBoxMask (same ResolveAxisCoordinate/
+	 * EvaluateAxisBaseGradient/Mirror/Invert/axis-combination-by-maximum contract, unchanged and not
+	 * repeated here) -- the only difference is the vertex source: SourceMesh.GetVertex(VertexID)
+	 * (world-transformed) instead of LOD0's PositionVertexBuffer.
+	 *
+	 * INDEX SAFETY (corrected): indexed by Dynamic Mesh Vertex ID, but NEVER assumes SourceMesh is
+	 * compact -- Mask.Values/bHasValue are sized by SourceMesh.MaxVertexID() (not VertexCount()) and
+	 * written only at indices actually yielded by VertexIndicesItr() (which never yields an invalid
+	 * ID); a caller must use TryGetValue(), never index Values directly, exactly per
+	 * FVertexMaskForgeScalarMask's own struct-level contract for a sparse domain.
+	 */
+	static FVertexMaskForgeScalarMask GenerateBoundingBoxMaskFromDynamicMesh(
+		const UE::Geometry::FDynamicMesh3& SourceMesh,
+		const TStaticArray<FVertexMaskForgeAxisMaskParams, 3>& AxisParams,
+		const FTransform& ComponentTransform)
+	{
+		using namespace UE::Geometry;
+
+		FVertexMaskForgeScalarMask Mask;
+		Mask.Source = EVertexMaskForgeScalarMaskSource::BoundingBox;
+		Mask.UsedAxisParams = AxisParams;
+		Mask.bUnifiedBounds = false; // Never Unified in this domain -- see the function's own doc comment.
+
+		if (SourceMesh.VertexCount() <= 0)
+		{
+			Mask.State = EVertexMaskForgeScalarMaskState::Unavailable;
+			return Mask;
+		}
+		const int32 NumVerts = SourceMesh.VertexCount();
+		const int32 ArraySize = SourceMesh.MaxVertexID();
+		Mask.RenderVertexCount = NumVerts; // Domain note: Dynamic Mesh vertex count -- see doc comment.
+
+		bool bAnyAxisEnabled = false;
+		for (int32 AxisIndex = 0; AxisIndex < 3; ++AxisIndex)
+		{
+			if (AxisParams[AxisIndex].bEnabled)
+			{
+				bAnyAxisEnabled = true;
+				break;
+			}
+		}
+		if (!bAnyAxisEnabled)
+		{
+			Mask.State = EVertexMaskForgeScalarMaskState::Unavailable;
+			return Mask;
+		}
+
+#if !UE_BUILD_SHIPPING
+		for (int32 AxisIndex = 0; AxisIndex < 3; ++AxisIndex)
+		{
+			if (AxisParams[AxisIndex].bEnabled && AxisParams[AxisIndex].bMirror)
+			{
+				VerifyMirrorSymmetryOnce();
+				break;
+			}
+		}
+#endif
+
+		constexpr double MinExtent = 1e-5;
+
+		TStaticArray<FVertexMaskForgeAxisBoundsResult, 3> AxisBounds;
+		for (int32 AxisIndex = 0; AxisIndex < 3; ++AxisIndex)
+		{
+			if (!AxisParams[AxisIndex].bEnabled)
+			{
+				continue;
+			}
+			const EVertexMaskForgeBoundsAxis Axis = static_cast<EVertexMaskForgeBoundsAxis>(AxisIndex);
+			const bool bWorldSpace = AxisParams[AxisIndex].bWorldSpace;
+			FVertexMaskForgeAxisBoundsResult& BoundsResult = AxisBounds[AxisIndex];
+			BoundsResult.MinCoord = TNumericLimits<double>::Max();
+			BoundsResult.MaxCoord = TNumericLimits<double>::Lowest();
+
+			for (const int32 VertexID : SourceMesh.VertexIndicesItr())
+			{
+				const FVector3f LocalPosition(SourceMesh.GetVertex(VertexID));
+				// Individual bounds only in this domain (never Unified) -- bUseUnifiedBounds is always
+				// false, matching Individual mode's own contract in GenerateBoundingBoxMask.
+				const double Coord = ResolveAxisCoordinate(
+					LocalPosition, ComponentTransform, Axis, bWorldSpace, /*bUseUnifiedBounds=*/false,
+					FVector::ZeroVector, 1.0);
+				BoundsResult.MinCoord = FMath::Min(BoundsResult.MinCoord, Coord);
+				BoundsResult.MaxCoord = FMath::Max(BoundsResult.MaxCoord, Coord);
+			}
+
+			const double Extent = BoundsResult.MaxCoord - BoundsResult.MinCoord;
+			if (!FMath::IsFinite(Extent) || Extent <= MinExtent)
+			{
+				BoundsResult.bDegenerate = true;
+			}
+		}
+
+		for (int32 AxisIndex = 0; AxisIndex < 3; ++AxisIndex)
+		{
+			if (AxisParams[AxisIndex].bEnabled && AxisBounds[AxisIndex].bDegenerate)
+			{
+				Mask.State = EVertexMaskForgeScalarMaskState::DegenerateBounds;
+				return Mask;
+			}
+		}
+
+		Mask.Values.SetNumZeroed(ArraySize);
+		Mask.bHasValue.Init(false, ArraySize);
+
+		double Sum = 0.0;
+		float MinValue = 1.f;
+		float MaxValue = 0.f;
+		int32 NumNearZero = 0;
+		int32 NumNearOne = 0;
+		bool bAllFinite = true;
+		bool bAllInRange = true;
+
+		for (const int32 VertexID : SourceMesh.VertexIndicesItr())
+		{
+			const FVector3f LocalPosition(SourceMesh.GetVertex(VertexID));
+
+			float CombinedMask = 0.f;
+			for (int32 AxisIndex = 0; AxisIndex < 3; ++AxisIndex)
+			{
+				const FVertexMaskForgeAxisMaskParams& Params = AxisParams[AxisIndex];
+				if (!Params.bEnabled)
+				{
+					continue;
+				}
+				const EVertexMaskForgeBoundsAxis Axis = static_cast<EVertexMaskForgeBoundsAxis>(AxisIndex);
+				const FVertexMaskForgeAxisBoundsResult& BoundsResult = AxisBounds[AxisIndex];
+
+				const double Coord = ResolveAxisCoordinate(
+					LocalPosition, ComponentTransform, Axis, Params.bWorldSpace, /*bUseUnifiedBounds=*/false,
+					FVector::ZeroVector, 1.0);
+
+				const double Extent = BoundsResult.MaxCoord - BoundsResult.MinCoord;
+				const float T = static_cast<float>((Coord - BoundsResult.MinCoord) / Extent);
+
+				const float SafeTransitionWidth = FMath::Max(Params.TransitionWidth, 1e-4f);
+				const float EvaluationT = Params.bMirror ? (1.f - FMath::Abs(2.f * T - 1.f)) : T;
+				float AxisMask = EvaluateAxisBaseGradient(EvaluationT, Params.Position, SafeTransitionWidth);
+
+				if (Params.bInvert)
+				{
+					AxisMask = 1.f - AxisMask;
+				}
+				AxisMask = FMath::Clamp(AxisMask, 0.f, 1.f);
+
+				CombinedMask = FMath::Max(CombinedMask, AxisMask);
+			}
+
+			if (!FMath::IsFinite(CombinedMask))
+			{
+				bAllFinite = false;
+			}
+			if (CombinedMask < 0.f || CombinedMask > 1.f)
+			{
+				bAllInRange = false;
+			}
+
+			Mask.Values[VertexID] = CombinedMask;
+			Mask.bHasValue[VertexID] = true;
+
+			Sum += CombinedMask;
+			MinValue = FMath::Min(MinValue, CombinedMask);
+			MaxValue = FMath::Max(MaxValue, CombinedMask);
+
+			if (FMath::IsNearlyZero(CombinedMask, FVertexMaskForgeScalarMask::Tolerance))
+			{
+				++NumNearZero;
+			}
+			if (FMath::IsNearlyEqual(CombinedMask, 1.f, FVertexMaskForgeScalarMask::Tolerance))
+			{
+				++NumNearOne;
+			}
+		}
+
+		Mask.NumValidValues = NumVerts;
+		Mask.MinValue = MinValue;
+		Mask.MaxValue = MaxValue;
+		Mask.MeanValue = static_cast<float>(Sum / NumVerts);
+		Mask.NumNearZero = NumNearZero;
+		Mask.NumNearOne = NumNearOne;
+
+		if (!bAllFinite || !bAllInRange || Mask.NumValidValues != NumVerts || Mask.Values.Num() != ArraySize)
+		{
+			Mask.State = EVertexMaskForgeScalarMaskState::Invalid;
+			return Mask;
+		}
+
+		Mask.State = EVertexMaskForgeScalarMaskState::Ready;
+		return Mask;
+	}
+
 	// --- Preview: Preview Mode / Channel Filter ----------------------------------------------
 
 	static FText GetPreviewModeLabel(const EVertexMaskForgePreviewMode Mode)
@@ -1288,9 +2596,7 @@ namespace VertexMaskForgePanel
 
 	/**
 	 * The raw, un-opacitized blend-mode formula for one channel, operating on already-normalized
-	 * [0,1] Base ("B")/Mask ("M") values. Pure function -- mutates nothing, never clamps (clamping
-	 * is BlendMaskValue's job, AFTER Opacity, never here: an intermediate clamp on Add/Subtract's
-	 * result would corrupt what Opacity < 1.0 is supposed to blend back from). Linear is
+	 * [0,1] Base ("B")/Mask ("M") values. Pure function -- mutates nothing, never clamps. Linear is
 	 * deliberately NOT an alias of Copy, even though lerp(B, M, M) at M=1 equals M exactly like
 	 * Copy does -- for M < 1 the two diverge (Linear also factors in B), which is the whole point of
 	 * offering it as a distinct mode.
@@ -1321,55 +2627,239 @@ namespace VertexMaskForgePanel
 	}
 
 	/**
-	 * One full per-channel layer step: ApplyMaskBlendMode, then lerp back toward Base by (1 -
-	 * Opacity), then ONE final clamp to [0,1]. Opacity == 0 returns exactly Base (lerp's own
-	 * identity, not a special-cased branch); Mode == Copy with Opacity == 1 returns exactly Mask
-	 * (lerp(Base, Mask, 1) == Mask). This is the exact per-layer step a future mask stack's
-	 * ComposeMaskLayer would repeat once per enabled layer, accumulating -- see that function's own
-	 * doc comment for the full future-stack model; today it runs exactly once, for the single
-	 * Bounding Box Mask layer that exists in this checkpoint.
+	 * AUDITED (peer-mask composition checkpoint): the Opacity lerp, WITHOUT any clamp. Renamed from
+	 * BlendMaskValue (which used to clamp every call) -- clamping every single-layer step is exactly
+	 * what breaks the associativity/commutativity proofs the multi-mask composition below relies on
+	 * (demonstrated numerically in the checkpoint report: Add-then-Subtract vs Subtract-then-Add only
+	 * agree if intermediate saturation is never clamped away mid-fold). Clamping now happens ONLY at
+	 * the two audited boundaries inside ComposeMaskStack -- see that function's own doc comment.
 	 */
-	static float BlendMaskValue(const float Base, const float Mask, const EVertexMaskForgeBlendMode Mode, const float Opacity)
+	static float BlendMaskValueUnclamped(const float Base, const float Mask, const EVertexMaskForgeBlendMode Mode, const float Opacity)
 	{
 		const float BlendResult = ApplyMaskBlendMode(Base, Mask, Mode);
-		return FMath::Clamp(FMath::Lerp(Base, BlendResult, Opacity), 0.0f, 1.0f);
+		return FMath::Lerp(Base, BlendResult, Opacity);
 	}
 
 	/**
-	 * ComposeMaskLayer: the conceptual "one layer of the future mask stack" step (see the header's
-	 * doc note on a future mask stack model), applied to ONE render vertex's channels.
-	 *
-	 * AUDITED (channel-preservation fix): takes TWO distinct color inputs, never conflated --
-	 *   - BaselineColor: the STABLE input for this operation/session (never mutated by preview or
-	 *     Auto Update -- see UpdateWorkingColors), used ONLY to compute a channel that IS currently
-	 *     enabled in the Channel Filter. A channel is always blended from this SAME baseline every
-	 *     single recomposition, never from CurrentWorkingColor's own prior value for that channel --
-	 *     this is what makes repeated recomposition of the SAME channel non-accumulating (see
-	 *     BlendMaskValue).
-	 *   - CurrentWorkingColor: the multi-channel working result carried over from the last
-	 *     composition (or the baseline itself, on the very first composition of a session -- see
-	 *     UpdateWorkingColors), used verbatim for any channel that is NOT currently enabled in the
-	 *     Channel Filter -- this is what preserves an intentional result a PREVIOUS composition (with
-	 *     a different Channel Filter) already produced for that channel, rather than reverting it to
-	 *     the baseline.
-	 * Alpha is always taken fresh from BaselineColor.W, unconditionally -- Blend Mode/Opacity never
-	 * write Alpha (explicitly out of scope this checkpoint; see EVertexMaskForgeBlendMode's doc
-	 * comment). There is no bFilterA parameter: Alpha is not a function of any Channel Filter toggle
-	 * in this composition step (the "A" toggle no longer exists in the UI at all -- removed together
-	 * with this correction, see the panel's Channel Filter row).
+	 * ONE mask generator's contribution to the composition -- Bounding Box, Ambient Occlusion, and any
+	 * future generator (Curvature, Thickness, ...) are STRUCTURALLY IDENTICAL peers here: this struct
+	 * carries no notion of "spatial" vs "content", no fixed role, and no UI-derived position. Already
+	 * resolved to the PER-COMPONENT effective mask for this call (World Space Bounding Box axes and
+	 * Ambient Occlusion are both re-evaluated per component by the caller -- see ApplyPreviewToEntry --
+	 * before being wrapped here). Mask is a non-owning pointer into a caller-owned
+	 * FVertexMaskForgeScalarMask that must outlive the UpdateWorkingColors call it is passed to.
+	 * Mask->Source doubles as the fixed, stable "generator identifier" used to break ties between two
+	 * masks sharing the same Blend Mode (see ComposeMaskStack) -- never reused for anything else, never
+	 * exposed in the UI, never configurable.
 	 */
-	static FVector4f ComposeMaskLayer(
-		const FVector4f& BaselineColor,
-		const FVector4f& CurrentWorkingColor,
-		const float MaskValue,
-		const EVertexMaskForgeBlendMode BlendMode,
-		const float Opacity,
-		const bool bFilterR, const bool bFilterG, const bool bFilterB)
+	struct FVertexMaskForgeMaskLayerParams
 	{
+		const FVertexMaskForgeScalarMask* Mask = nullptr;
+		EVertexMaskForgeBlendMode BlendMode = EVertexMaskForgeBlendMode::Copy;
+		float Opacity = 1.0f;
+
+		/**
+		 * AUDITED (Nanite source-topology support): when >= 0, ComposeMaskStack looks up THIS value
+		 * instead of its own shared VertexIndex parameter for this one layer -- needed because Source-
+		 * Topology masks are not all indexed by the same domain (Bounding Box by Dynamic Mesh Vertex ID;
+		 * Ambient Occlusion by Normal Overlay Element ID, to preserve hard-edge AO correctness -- see
+		 * GenerateAmbientOcclusionMaskFromDynamicMesh's own doc comment). -1 (default) preserves the
+		 * original, single-shared-index behavior every existing (render-vertex domain) caller already
+		 * relies on -- unchanged, since every layer there is indexed identically by render vertex index.
+		 */
+		int32 IndexOverride = -1;
+	};
+
+	/**
+	 * AUDITED (peer-mask composition checkpoint -- supersedes the previous, UI-position-ordered fold
+	 * this same function used to implement). Combines an UNORDERED set of mask generators (Bounding
+	 * Box, Ambient Occlusion, future Curvature/Thickness/...) into ONE result per channel, starting
+	 * from BaselineColor's own channel value ("Base") -- never a neutral 1.0/0.0 seed, and Base is
+	 * NEVER itself a peer entry in Layers (no generator, no Enable, no Invert, no Blend Mode, no
+	 * Opacity of its own) -- it is simply the accumulator the canonical-order operations below act on.
+	 * Proof this must be Base (not a neutral seed): a single Multiply-mode mask at Opacity 0 must
+	 * leave the channel completely unchanged ("Opacity 0 = no influence", the pre-existing, still-
+	 * approved contract) -- lerp(Base, Base*Mask, 0) = Base only holds when the fold's own base
+	 * already equals Base; lerp(1, 1*Mask, 0) = 1 would incorrectly turn the channel white instead.
+	 *
+	 * CANONICAL ORDER (approved convention -- internal, mathematical, never a UI/artistic stack; see
+	 * the checkpoint report for the full derivation and proofs): every enabled mask is processed in
+	 * FIXED STAGES, by Blend Mode, in this exact sequence -- Copy, {Add+Subtract combined}, Multiply,
+	 * Overlay, Screen, Linear (the EVertexMaskForgeBlendMode enum's own declaration order, with
+	 * Add/Subtract merged into one stage). This ordering is NEVER configurable, NEVER derived from
+	 * section position in the UI, and NEVER derived from the order masks were enabled in -- two masks
+	 * sharing the exact same Blend Mode are tie-broken by Mask->Source (a fixed, stable generator
+	 * identifier, itself never configurable). No generator (Bounding Box, Ambient Occlusion, or any
+	 * future one) has any special role -- ALL of them go through the exact same per-stage logic below,
+	 * selected purely by which Blend Mode each one's own panel setting currently uses.
+	 *
+	 * Per stage:
+	 *   - Copy: sequential fold (BlendMaskValueUnclamped), Mask->Source order -- proven NON-
+	 *     commutative even among only Copy-mode masks (two different Opacity<1 Copy layers do not
+	 *     commute), so this is the one stage with no closed-form reduction.
+	 *   - Add+Subtract: closed form, order-irrelevant -- Result = R + Sum(AddValue*AddOpacity) -
+	 *     Sum(SubValue*SubOpacity). Proven: BlendMaskValueUnclamped(R,M,Add,Op) = R + M*Op and
+	 *     (R,M,Subtract,Op) = R - M*Op are both purely additive per-term, so summing every Add/Subtract
+	 *     mask's own term, in ANY order, reproduces the exact same total. No clamp within this stage
+	 *     (per the checkpoint's explicit instruction) -- the running total may legitimately leave
+	 *     [0,1] here.
+	 *   - Multiply: closed form, order-irrelevant -- Result = R * Product(lerp(1,MaskValue,Opacity)).
+	 *     Proven algebraically associative/commutative among Multiply-mode masks regardless of R's own
+	 *     magnitude (the proof needs no assumption that R is normalized), so it safely consumes
+	 *     whatever the Add/Subtract stage produced, in or out of [0,1], with no clamp beforehand.
+	 *   - CLAMP BOUNDARY: R is clamped to [0,1] here, and ONLY here (plus the final defensive clamp) --
+	 *     this is the one clamp the checkpoint's audit proved is actually required: Overlay's branch
+	 *     (R < 0.5), and Screen/Linear's (1-R)-based formulas, are only proven to map [0,1] back into
+	 *     [0,1] when their OWN input is already in [0,1] (see the checkpoint report's worked
+	 *     Add/Subtract-then-Overlay example, which shows what happens without this clamp: Overlay
+	 *     receiving R=1.4 produces 1.56, compounding out-of-domain error instead of correcting it).
+	 *   - Overlay: sequential fold (BlendMaskValueUnclamped), Mask->Source order -- proven NON-
+	 *     commutative (worked counter-example in the checkpoint report: swapping two Overlay masks
+	 *     changes the result from 0.84 to 0.36 for the same inputs).
+	 *   - Screen: closed form, order-irrelevant -- (1-Result) = (1-R) * Product(1-MaskValue*Opacity).
+	 *     Proven algebraically (De Morgan dual of Multiply). Input is already in [0,1] from the clamp
+	 *     boundary above (and Overlay's own output stays in [0,1] given [0,1] input -- proven), so no
+	 *     further clamp is needed before this stage.
+	 *   - Linear: sequential fold (BlendMaskValueUnclamped), Mask->Source order -- proven NON-
+	 *     commutative (f(B,M) != f(M,B) whenever B != M and B+M != 1). Proven to stay in [0,1] given
+	 *     [0,1] input (B(1-M)+M^2 in [0,1] for B,M in [0,1]), so still no clamp needed entering this
+	 *     stage; a final defensive clamp still closes out the whole channel computation.
+	 *
+	 * AUDITED (non-accumulation preserved): Base is re-read from BaselineColor fresh on EVERY single
+	 * UpdateWorkingColors call (never from a previous WorkingColors/Accumulator value -- see that
+	 * function's own doc comment), so regenerating the SAME set of masks with the SAME parameters
+	 * always reproduces the EXACT same final result, never drifting across repeated recompositions.
+	 *
+	 * A "Fill/Constant" layer (Mask->Source == ConstantWhite/ConstantBlack) is handled entirely by the
+	 * CALLER (ApplyPreviewToEntry) as a single Copy@1.0 layer, never combined with any other generator
+	 * in the same pass -- this function has no special knowledge of Fill/Constant sources at all; it
+	 * just sees one Copy-mode layer in that case, same as any other generator would look if configured
+	 * that way.
+	 *
+	 * Channels NOT enabled in the Channel Filter (bFilterR/G/B false) are read verbatim from
+	 * CommittedColor -- untouched by any layer or stage. Alpha is always BaselineColor.W,
+	 * unconditionally. bOutAnyLayerContributed is true iff at least one layer had a value for this
+	 * vertex -- the caller uses it to decide whether to write this vertex's R/G/B into WorkingColors at
+	 * all, or leave it exactly as the CommittedColors copy left it.
+	 */
+	static FVector4f ComposeMaskStack(
+		const FVector4f& BaselineColor,
+		const FVector4f& CommittedColor,
+		const int32 VertexIndex,
+		TArrayView<const FVertexMaskForgeMaskLayerParams> SortedLayers,
+		const bool bFilterR, const bool bFilterG, const bool bFilterB,
+		bool& bOutAnyLayerContributed)
+	{
+		bOutAnyLayerContributed = false;
+
+		// Resolved ONCE per vertex -- MaskValue does not vary per channel, so every channel below
+		// reuses the exact same set of (MaskValue, Mode, Opacity) contributions. SortedLayers is
+		// already ordered by Mask->Source (the caller sorts once, outside the per-vertex loop) --
+		// preserved here, which is what gives the Copy/Overlay/Linear stages their deterministic,
+		// generator-ID tie-break order.
+		struct FResolvedContribution
+		{
+			float MaskValue;
+			EVertexMaskForgeBlendMode Mode;
+			float Opacity;
+		};
+		TArray<FResolvedContribution, TInlineAllocator<8>> Contributions;
+		for (const FVertexMaskForgeMaskLayerParams& Layer : SortedLayers)
+		{
+			float MaskValue = 0.f;
+			const int32 LookupIndex = (Layer.IndexOverride >= 0) ? Layer.IndexOverride : VertexIndex;
+			if (!Layer.Mask || !Layer.Mask->TryGetValue(LookupIndex, MaskValue))
+			{
+				continue;
+			}
+			bOutAnyLayerContributed = true;
+			Contributions.Add({ MaskValue, Layer.BlendMode, Layer.Opacity });
+		}
+
+		if (!bOutAnyLayerContributed)
+		{
+			return FVector4f(CommittedColor.X, CommittedColor.Y, CommittedColor.Z, BaselineColor.W);
+		}
+
+		auto ComposeChannel = [&Contributions](const float Base) -> float
+		{
+			float R = Base;
+
+			// Stage 1: Copy -- sequential fold, Mask->Source order (non-commutative, no closed form).
+			for (const FResolvedContribution& C : Contributions)
+			{
+				if (C.Mode == EVertexMaskForgeBlendMode::Copy)
+				{
+					R = BlendMaskValueUnclamped(R, C.MaskValue, EVertexMaskForgeBlendMode::Copy, C.Opacity);
+				}
+			}
+
+			// Stage 2: Add + Subtract -- closed form, order-irrelevant. No clamp within this stage.
+			for (const FResolvedContribution& C : Contributions)
+			{
+				if (C.Mode == EVertexMaskForgeBlendMode::Add)
+				{
+					R += C.MaskValue * C.Opacity;
+				}
+				else if (C.Mode == EVertexMaskForgeBlendMode::Subtract)
+				{
+					R -= C.MaskValue * C.Opacity;
+				}
+			}
+
+			// Stage 3: Multiply -- closed form, order-irrelevant. Safely consumes an out-of-[0,1] R
+			// from Stage 2 (the algebraic proof needs no [0,1] assumption on R).
+			for (const FResolvedContribution& C : Contributions)
+			{
+				if (C.Mode == EVertexMaskForgeBlendMode::Multiply)
+				{
+					R *= FMath::Lerp(1.0f, C.MaskValue, C.Opacity);
+				}
+			}
+
+			// CLAMP BOUNDARY (audited, required): Overlay/Screen/Linear's own formulas are only
+			// proven to stay in [0,1] when their input already is -- see this function's own doc
+			// comment for the worked counter-example without this clamp.
+			R = FMath::Clamp(R, 0.0f, 1.0f);
+
+			// Stage 4: Overlay -- sequential fold, Mask->Source order (non-commutative, no closed form).
+			for (const FResolvedContribution& C : Contributions)
+			{
+				if (C.Mode == EVertexMaskForgeBlendMode::Overlay)
+				{
+					R = BlendMaskValueUnclamped(R, C.MaskValue, EVertexMaskForgeBlendMode::Overlay, C.Opacity);
+				}
+			}
+
+			// Stage 5: Screen -- closed form (De Morgan dual of Multiply), order-irrelevant. No
+			// additional clamp needed: R is already in [0,1] from the boundary above, and Overlay's
+			// own output stays in [0,1] given [0,1] input (proven).
+			for (const FResolvedContribution& C : Contributions)
+			{
+				if (C.Mode == EVertexMaskForgeBlendMode::Screen)
+				{
+					R = 1.0f - (1.0f - R) * (1.0f - C.MaskValue * C.Opacity);
+				}
+			}
+
+			// Stage 6: Linear -- sequential fold, Mask->Source order (non-commutative, no closed form).
+			for (const FResolvedContribution& C : Contributions)
+			{
+				if (C.Mode == EVertexMaskForgeBlendMode::Linear)
+				{
+					R = BlendMaskValueUnclamped(R, C.MaskValue, EVertexMaskForgeBlendMode::Linear, C.Opacity);
+				}
+			}
+
+			// Final defensive clamp (float precision only -- every stage above is already proven to
+			// leave R in [0,1] by this point under normal inputs).
+			return FMath::Clamp(R, 0.0f, 1.0f);
+		};
+
 		return FVector4f(
-			bFilterR ? BlendMaskValue(BaselineColor.X, MaskValue, BlendMode, Opacity) : CurrentWorkingColor.X,
-			bFilterG ? BlendMaskValue(BaselineColor.Y, MaskValue, BlendMode, Opacity) : CurrentWorkingColor.Y,
-			bFilterB ? BlendMaskValue(BaselineColor.Z, MaskValue, BlendMode, Opacity) : CurrentWorkingColor.Z,
+			bFilterR ? ComposeChannel(BaselineColor.X) : CommittedColor.X,
+			bFilterG ? ComposeChannel(BaselineColor.Y) : CommittedColor.Y,
+			bFilterB ? ComposeChannel(BaselineColor.Z) : CommittedColor.Z,
 			BaselineColor.W);
 	}
 
@@ -1535,18 +3025,19 @@ namespace VertexMaskForgePanel
 	 * AUDITED (Channel Filter toggle fix): on EVERY call (not just the first), WorkingColors is
 	 * rebuilt FRESH from CommittedColors -- `WorkingColors = CommittedColors;` -- BEFORE any channel
 	 * is composed, never carried forward from WorkingColors' own previous value. Each channel
-	 * currently enabled in the Channel Filter (see ComposeMaskLayer) is then overwritten with
-	 * BlendMaskValue(BaselineColors.Channel, mask, BlendMode, Opacity) -- ALWAYS computed from
-	 * BaselineColors, never from CommittedColors or WorkingColors' prior value, which is what
-	 * prevents that channel from ever accumulating across repeated recompositions (Auto Update
-	 * Preview re-running, toggling Opacity/Blend Mode/any axis parameter, Generate Mask). A channel
-	 * NOT currently enabled is simply whatever CommittedColors already holds -- so unchecking a
-	 * channel that was never consolidated immediately, visibly reverts it to BaselineColors; one
-	 * that WAS consolidated (by an earlier Generate Mask or Fill) reverts to that consolidated
-	 * result, never to a leftover transient value. Mask indexed DIRECTLY by render vertex index (see
-	 * GenerateBoundingBoxMask) -- OutNumComposed reports how many vertices actually got a mask value
-	 * this call (Mask.TryGetValue succeeded); a vertex without one keeps WorkingColors[i] exactly as
-	 * the CommittedColors copy left it (R/G/B), with Alpha still refreshed from BaselineColors.
+	 * currently enabled in the Channel Filter (see ComposeMaskStack) is then recomputed from
+	 * BaselineColors.Channel through the WHOLE layer stack -- ALWAYS starting from BaselineColors,
+	 * never from CommittedColors or WorkingColors' prior value, which is what prevents that channel
+	 * from ever accumulating ACROSS repeated recompositions (Auto Update Preview re-running, toggling
+	 * Opacity/Blend Mode/any axis parameter, Generate Mask) -- see ComposeMaskStack's own doc comment
+	 * for why building on the PREVIOUS LAYER's result WITHIN one pass is a different thing and fully
+	 * intended. A channel NOT currently enabled is simply whatever CommittedColors already holds -- so
+	 * unchecking a channel that was never consolidated immediately, visibly reverts it to
+	 * BaselineColors; one that WAS consolidated (by an earlier Generate Mask or Fill) reverts to that
+	 * consolidated result, never to a leftover transient value. OutNumComposed reports how many
+	 * vertices had AT LEAST ONE layer contribute a value this call; a vertex where every layer skipped
+	 * it (Mask.TryGetValue failed for all of them) keeps WorkingColors[i] exactly as the
+	 * CommittedColors copy left it (R/G/B), with Alpha still refreshed from BaselineColors.
 	 *
 	 * bCommit: if true, CommittedColors is promoted to WorkingColors' just-composed result at the end
 	 * of this call -- ONLY an explicit Generate Mask click or a Fill White/Black action passes true
@@ -1554,37 +3045,46 @@ namespace VertexMaskForgePanel
 	 * value); Auto Update Preview and Channel Filter toggles always pass false, so a transient edit
 	 * is never silently consolidated.
 	 *
-	 * AUDITED (Blend Modes checkpoint): BlendMode/Opacity apply ONLY when Mask.Source == BoundingBox
-	 * -- Fill White/Fill Black (Mask.Source == ConstantWhite/ConstantBlack) always compose as
-	 * EVertexMaskForgeBlendMode::Copy at Opacity 1.0 regardless of the panel's current
-	 * BoundingBoxBlendMode/BoundingBoxOpacity, so Fill's pre-existing "hard replace with 1.0/0.0"
-	 * behavior (on whichever channels the Channel Filter has enabled -- Fill was never all-channel
-	 * unconditionally, even before Blend Modes existed) is completely unaffected by this checkpoint.
-	 * Fill is called with bCommit == true (see RunConstantFill), so it counts as an effectively-
-	 * generated, consolidated update exactly like a Generate Mask click -- Accept can persist it with
-	 * no further recomposition. Fill never redefines BaselineColors (only ever mutates
-	 * CommittedColors/WorkingColors) -- a later Bounding Box Mask generation on a DIFFERENT channel
-	 * than Fill touched preserves Fill's consolidated result on that channel; generating on the SAME
-	 * channel overwrites it using BaselineColors, never Fill's result.
+	 * AUDITED (peer-mask composition checkpoint): Layers is an UNORDERED set of every enabled+Ready
+	 * mask generator for this component, resolved entirely by the caller (ApplyPreviewToEntry) BEFORE
+	 * this call -- Bounding Box and Ambient Occlusion are STRUCTURAL PEERS here, neither one has a
+	 * fixed position; each carries its own per-component-evaluated FVertexMaskForgeScalarMask plus its
+	 * own BlendMode/Opacity. (A single Fill/Constant layer, when that is the active result for this
+	 * pass, is just one more Layers entry the caller already set to Copy@1.0 -- see ApplyPreviewToEntry
+	 * -- nothing here treats it specially.) This function sorts Layers ONCE by Mask->Source (a fixed,
+	 * stable generator identifier -- never UI position, never enable order) before the per-vertex loop,
+	 * then hands the same sorted view to ComposeMaskStack for every vertex -- see that function's own
+	 * doc comment for the full canonical-order/stage-grouping contract this sort enables. This function
+	 * itself has NO knowledge of Bounding Box or Ambient Occlusion specifically -- it only ever sees an
+	 * opaque set of (Mask, BlendMode, Opacity) layers, which is exactly what lets a future generator
+	 * (Curvature, Thickness, ...) participate in this SAME pipeline by simply appearing as one more
+	 * Layers entry, with no special-cased combination code anywhere in this function.
 	 */
 	static void UpdateWorkingColors(
 		TArray<FColor>& BaselineColors,
 		TArray<FColor>& CommittedColors,
 		TArray<FColor>& WorkingColors,
-		const FVertexMaskForgeScalarMask& Mask,
+		TArrayView<const FVertexMaskForgeMaskLayerParams> Layers,
 		const FStaticMeshLODResources& LOD0,
 		const FColorVertexBuffer* InstanceOverrideColors,
-		const EVertexMaskForgeBlendMode BlendMode,
-		const float Opacity,
 		const bool bFilterR, const bool bFilterG, const bool bFilterB,
 		const bool bCommit,
 		int32& OutNumComposed)
 	{
 		OutNumComposed = 0;
 
-		const bool bIsBoundingBoxLayer = (Mask.Source == EVertexMaskForgeScalarMaskSource::BoundingBox);
-		const EVertexMaskForgeBlendMode EffectiveBlendMode = bIsBoundingBoxLayer ? BlendMode : EVertexMaskForgeBlendMode::Copy;
-		const float EffectiveOpacity = bIsBoundingBoxLayer ? Opacity : 1.0f;
+		// AUDITED (peer-mask composition checkpoint): sorted ONCE here, by Mask->Source (the fixed
+		// generator identifier), never per-vertex -- the canonical order ComposeMaskStack relies on is
+		// the SAME for every render vertex in this component (only each mask's per-vertex VALUE
+		// changes, never the set of generators or their Blend Modes/Opacities), so sorting once here
+		// and reusing the sorted view for every vertex is both correct and the efficient choice.
+		TArray<FVertexMaskForgeMaskLayerParams, TInlineAllocator<8>> SortedLayers(Layers.GetData(), Layers.Num());
+		SortedLayers.Sort([](const FVertexMaskForgeMaskLayerParams& A, const FVertexMaskForgeMaskLayerParams& B)
+		{
+			const uint8 SourceA = A.Mask ? static_cast<uint8>(A.Mask->Source) : 0;
+			const uint8 SourceB = B.Mask ? static_cast<uint8>(B.Mask->Source) : 0;
+			return SourceA < SourceB;
+		});
 
 		const FPositionVertexBuffer& RenderPositions = LOD0.VertexBuffers.PositionVertexBuffer;
 		const uint32 NumRenderVerts = RenderPositions.GetNumVertices();
@@ -1623,18 +3123,9 @@ namespace VertexMaskForgePanel
 		{
 			const FColor& BaselineRenderColor = BaselineColors[i];
 
-			// Alpha always tracks the baseline unconditionally, whether or not this vertex has a
-			// mask value this call.
+			// Alpha always tracks the baseline unconditionally, whether or not any layer has a value
+			// for this vertex this call.
 			WorkingColors[i].A = BaselineRenderColor.A;
-
-			float MaskValue = 0.f;
-			if (!Mask.TryGetValue(static_cast<int32>(i), MaskValue))
-			{
-				// Nothing new to compose for this vertex -- R/G/B already carry CommittedColors[i]
-				// from the copy above.
-				continue;
-			}
-			++OutNumComposed;
 
 			const FVector4f BaselineColorF(
 				BaselineRenderColor.R / 255.f, BaselineRenderColor.G / 255.f,
@@ -1644,14 +3135,168 @@ namespace VertexMaskForgePanel
 				CommittedRenderColor.R / 255.f, CommittedRenderColor.G / 255.f,
 				CommittedRenderColor.B / 255.f, CommittedRenderColor.A / 255.f);
 
-			const FVector4f Composite = ComposeMaskLayer(
-				BaselineColorF, CommittedColorF, MaskValue, EffectiveBlendMode, EffectiveOpacity,
-				bFilterR, bFilterG, bFilterB);
+			bool bAnyLayerContributed = false;
+			const FVector4f Composite = ComposeMaskStack(
+				BaselineColorF, CommittedColorF, static_cast<int32>(i), SortedLayers,
+				bFilterR, bFilterG, bFilterB, bAnyLayerContributed);
+			if (!bAnyLayerContributed)
+			{
+				// No layer had a value for this vertex -- R/G/B already carry CommittedColors[i]
+				// from the copy above; nothing new to compose.
+				continue;
+			}
+			++OutNumComposed;
 			WorkingColors[i] = ToDisplayFColor(Composite);
 		}
 
 		// Consolidate: ONLY an explicit Generate Mask click or a Fill action requests this (bCommit
 		// == true) -- Auto Update Preview and Channel Filter toggles never do.
+		if (bCommit)
+		{
+			CommittedColors = WorkingColors;
+		}
+	}
+
+	/**
+	 * AUDITED (Nanite source-topology support): sibling of UpdateWorkingColors for Source-Topology
+	 * entries. Operates in TRIANGLE-CORNER domain (one slot per (TriangleID, corner) pair, enumerated
+	 * by iterating Mesh.TriangleIndicesItr() in a fixed, deterministic order, corners 0/1/2 in that
+	 * same order every call) instead of render vertex index -- this is the EXACT granularity that gets
+	 * committed (MeshDescription VertexInstanceColors, one slot per triangle corner -- see
+	 * WriteSourceTopologyAcceptTargets), so two corners sharing a vertex position (a UV seam or hard
+	 * edge) never collapse onto one slot and never lose an independently-authored baseline color.
+	 *
+	 * Per corner:
+	 *   - Baseline color: read from Mesh's own Primary Color Overlay (this corner's own authored
+	 *     color), or white if the source has no color overlay at all -- same "own effective original
+	 *     color, never borrowed from a different corner" contract UpdateWorkingColors already
+	 *     guarantees for render vertices, just at corner granularity here. No per-instance
+	 *     OverrideVertexColors priority in this domain (unlike UpdateWorkingColors): Nanite's renderer
+	 *     never reads per-instance overrides at all (see HasNaniteMeshInSelection/
+	 *     CanAcceptAsInstanceOverride), so there is no per-instance baseline to prioritize -- baseline
+	 *     always comes from the asset's own source color overlay.
+	 *   - Bounding Box layer's value: looked up by DYNAMIC MESH VERTEX ID (Mesh.GetTriangle(tid)[corner])
+	 *     -- BBox is a pure function of position, so corner-level granularity is not needed for the
+	 *     VALUE itself, only for where it gets written.
+	 *   - Ambient Occlusion layer's value: looked up by NORMAL OVERLAY ELEMENT ID
+	 *     (NormalOverlay->GetTriangle(tid)[corner]) -- preserves hard-edge AO correctness, see
+	 *     GenerateAmbientOcclusionMaskFromDynamicMesh's own doc comment.
+	 *   - A Fill/Constant layer's value: looked up by CORNER INDEX itself (GenerateConstantMaskForCornerDomain
+	 *     is built in this exact domain already).
+	 * Every lookup is wired through FVertexMaskForgeMaskLayerParams::IndexOverride (see its own doc
+	 * comment), set per corner just before each ComposeMaskStack call -- the composition math itself
+	 * (ComposeMaskStack) is completely unmodified/unaware of any of this; it just sees whatever index
+	 * each layer asks it to look up. Layers is sorted ONCE, by Mask->Source, exactly like
+	 * UpdateWorkingColors -- IndexOverride is mutated per corner on that SAME sorted array afterward,
+	 * which never changes sort order (sort key is Source, never IndexOverride).
+	 */
+	static void UpdateWorkingColorsSourceTopology(
+		TArray<FColor>& BaselineColors,
+		TArray<FColor>& CommittedColors,
+		TArray<FColor>& WorkingColors,
+		TArrayView<const FVertexMaskForgeMaskLayerParams> Layers,
+		const UE::Geometry::FDynamicMesh3& Mesh,
+		const bool bFilterR, const bool bFilterG, const bool bFilterB,
+		const bool bCommit,
+		int32& OutNumComposed)
+	{
+		using namespace UE::Geometry;
+
+		OutNumComposed = 0;
+
+		TArray<FVertexMaskForgeMaskLayerParams, TInlineAllocator<8>> SortedLayers(Layers.GetData(), Layers.Num());
+		SortedLayers.Sort([](const FVertexMaskForgeMaskLayerParams& A, const FVertexMaskForgeMaskLayerParams& B)
+		{
+			const uint8 SourceA = A.Mask ? static_cast<uint8>(A.Mask->Source) : 0;
+			const uint8 SourceB = B.Mask ? static_cast<uint8>(B.Mask->Source) : 0;
+			return SourceA < SourceB;
+		});
+
+		const FDynamicMeshColorOverlay* ColorOverlay = Mesh.HasAttributes() ? Mesh.Attributes()->PrimaryColors() : nullptr;
+		const FDynamicMeshNormalOverlay* NormalOverlay = Mesh.HasAttributes() ? Mesh.Attributes()->PrimaryNormals() : nullptr;
+
+		const int32 NumCorners = Mesh.TriangleCount() * 3;
+
+		// ONE-TIME capture (session's first composition, or a genuine reconstruction -- corner count
+		// changed since, e.g. Refresh Selection rebuilt WorkingMesh). ColorOverlay is read HERE ONLY;
+		// every other line below reads BaselineColors/CommittedColors exclusively.
+		if (BaselineColors.Num() != NumCorners)
+		{
+			BaselineColors.SetNumUninitialized(NumCorners);
+			int32 SeedCornerIndex = 0;
+			for (const int32 TriangleID : Mesh.TriangleIndicesItr())
+			{
+				const FIndex3i ColorTri = ColorOverlay ? ColorOverlay->GetTriangle(TriangleID) : FIndex3i(INDEX_NONE, INDEX_NONE, INDEX_NONE);
+				for (int32 Corner = 0; Corner < 3; ++Corner)
+				{
+					FColor Color = FColor::White;
+					const int32 ElementID = ColorTri[Corner];
+					if (ColorOverlay && ElementID != INDEX_NONE && ColorOverlay->IsElement(ElementID))
+					{
+						Color = ToDisplayFColor(ColorOverlay->GetElement(ElementID));
+					}
+					BaselineColors[SeedCornerIndex] = Color;
+					++SeedCornerIndex;
+				}
+			}
+			CommittedColors = BaselineColors;
+		}
+
+		WorkingColors = CommittedColors;
+
+		int32 CornerIndex = 0;
+		for (const int32 TriangleID : Mesh.TriangleIndicesItr())
+		{
+			const FIndex3i VertTri = Mesh.GetTriangle(TriangleID);
+			const FIndex3i NormalTri = NormalOverlay ? NormalOverlay->GetTriangle(TriangleID) : FIndex3i(INDEX_NONE, INDEX_NONE, INDEX_NONE);
+
+			for (int32 Corner = 0; Corner < 3; ++Corner, ++CornerIndex)
+			{
+				for (FVertexMaskForgeMaskLayerParams& Layer : SortedLayers)
+				{
+					if (!Layer.Mask)
+					{
+						continue;
+					}
+					switch (Layer.Mask->Source)
+					{
+					case EVertexMaskForgeScalarMaskSource::BoundingBox:
+						Layer.IndexOverride = VertTri[Corner];
+						break;
+					case EVertexMaskForgeScalarMaskSource::AmbientOcclusion:
+						Layer.IndexOverride = NormalTri[Corner];
+						break;
+					default: // ConstantWhite / ConstantBlack (Fill) -- corner-domain mask, see
+						// GenerateConstantMaskForCornerDomain.
+						Layer.IndexOverride = CornerIndex;
+						break;
+					}
+				}
+
+				const FColor& BaselineRenderColor = BaselineColors[CornerIndex];
+				WorkingColors[CornerIndex].A = BaselineRenderColor.A;
+
+				const FVector4f BaselineColorF(
+					BaselineRenderColor.R / 255.f, BaselineRenderColor.G / 255.f,
+					BaselineRenderColor.B / 255.f, BaselineRenderColor.A / 255.f);
+				const FColor& CommittedRenderColor = CommittedColors[CornerIndex];
+				const FVector4f CommittedColorF(
+					CommittedRenderColor.R / 255.f, CommittedRenderColor.G / 255.f,
+					CommittedRenderColor.B / 255.f, CommittedRenderColor.A / 255.f);
+
+				bool bAnyLayerContributed = false;
+				const FVector4f Composite = ComposeMaskStack(
+					BaselineColorF, CommittedColorF, CornerIndex, SortedLayers,
+					bFilterR, bFilterG, bFilterB, bAnyLayerContributed);
+				if (!bAnyLayerContributed)
+				{
+					continue;
+				}
+				++OutNumComposed;
+				WorkingColors[CornerIndex] = ToDisplayFColor(Composite);
+			}
+		}
+
 		if (bCommit)
 		{
 			CommittedColors = WorkingColors;
@@ -1756,8 +3401,20 @@ namespace VertexMaskForgePanel
 
 		for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
 		{
-			if (!Entry.IsValid() || Entry->PreviewComponents.IsEmpty()
-				|| Entry->WorkingMesh.BoundingBoxMask.State != EVertexMaskForgeScalarMaskState::Ready)
+			// AUDITED (composition-stack checkpoint): eligible if EITHER slot is Ready -- this gate is
+			// only a coarse pre-filter anyway; the actual data persisted is always State.WorkingColors
+			// (read verbatim below), never re-derived from either mask here.
+			//
+			// AUDITED (Nanite source-topology support): a Source-Topology entry (every Nanite-enabled
+			// mesh -- see FVertexMaskForgeSelectedMesh::bUseSourceTopology) is handled EXCLUSIVELY by
+			// BuildSourceTopologyAcceptTargets/WriteSourceTopologyAcceptTargets, never by this function
+			// -- skip it here unconditionally, rather than letting it fall through to the WedgeMap
+			// check below (which would incorrectly reject a Nanite mesh that happens to have a valid
+			// WedgeMap too, since Source-Topology mode is chosen unconditionally for Nanite, not just
+			// when WedgeMap is invalid).
+			if (!Entry.IsValid() || Entry->bUseSourceTopology || Entry->PreviewComponents.IsEmpty()
+				|| (Entry->WorkingMesh.BoundingBoxMask.State != EVertexMaskForgeScalarMaskState::Ready
+					&& Entry->WorkingMesh.AmbientOcclusionMask.State != EVertexMaskForgeScalarMaskState::Ready))
 			{
 				continue;
 			}
@@ -1829,16 +3486,41 @@ namespace VertexMaskForgePanel
 			// Deterministic wedge->render-vertex mapping check (audited): never approximate by
 			// position. Read-only check here (element count only); the mutable pass happens in
 			// WriteAcceptTargets.
+			//
+			// AUDITED (Nanite): confirmed against the actual UE 5.8 Nanite build source
+			// (StaticMeshBuilder.cpp's BuildNanite()) that for a Nanite-enabled asset WITHOUT an
+			// explicit HiRes Source Model (the common/default case), LODResources[0] is NOT a
+			// full-fidelity copy of the source mesh -- it is Nanite's own decimated/re-clustered
+			// fallback proxy (FallbackRelativeError defaults to 1.0, i.e. reduction IS applied), and
+			// FStaticMeshLODResources::WedgeMap for LOD 0 is never populated on that path at all (the
+			// Nanite build explicitly passes bNeedWedgeMap=false -- "mainly used by non-Nanite mesh
+			// painting"). So this same WedgeMap check that already protects every other asset ALSO
+			// correctly refuses Nanite assets on that default path -- it must NOT be bypassed or
+			// "fixed" with a position-based remap, which would silently paint the wrong (reduced)
+			// vertex set. Only the message differs, so the user is told the true, actionable reason
+			// instead of the generic "try rebuilding" text (rebuilding will not fix this for Nanite --
+			// the fallback is decimated by design).
 			const FMeshDescription* MeshDescription = Mesh->GetMeshDescription(0);
-			if (!MeshDescription
-				|| LOD0.WedgeMap.Num() == 0
-				|| LOD0.WedgeMap.Num() != MeshDescription->VertexInstances().Num()
-				|| ReferenceColors.Num() != static_cast<int32>(LOD0.GetNumVertices()))
+			const bool bWedgeMapValid = MeshDescription
+				&& LOD0.WedgeMap.Num() != 0
+				&& LOD0.WedgeMap.Num() == MeshDescription->VertexInstances().Num()
+				&& ReferenceColors.Num() == static_cast<int32>(LOD0.GetNumVertices());
+			if (!bWedgeMapValid)
 			{
-				OutErrorText = FText::Format(
-					LOCTEXT("AcceptNoWedgeMapFormat",
-						"'{0}': no deterministic wedge-to-render-vertex mapping is available (FStaticMeshLODResources::WedgeMap missing or stale for LOD 0). Refusing to write -- an approximate position-based remap could paint seams incorrectly. Try rebuilding this Static Mesh (Build) and Accept again."),
-					FText::FromString(Entry->AssetName));
+				if (Mesh->IsNaniteEnabled())
+				{
+					OutErrorText = FText::Format(
+						LOCTEXT("AcceptNaniteReducedFallbackFormat",
+							"'{0}': this Static Mesh has Nanite enabled and its LOD 0 fallback is a reduced/re-clustered proxy (not 1:1 with the source mesh), so Vertex Mask Forge cannot currently write results back into it safely. Assigning an explicit High Res Source Model to this asset (Nanite Settings) restores a full-fidelity LOD 0 and may allow Accept to succeed; otherwise, source-topology write support for Nanite is not yet implemented."),
+						FText::FromString(Entry->AssetName));
+				}
+				else
+				{
+					OutErrorText = FText::Format(
+						LOCTEXT("AcceptNoWedgeMapFormat",
+							"'{0}': no deterministic wedge-to-render-vertex mapping is available (FStaticMeshLODResources::WedgeMap missing or stale for LOD 0). Refusing to write -- an approximate position-based remap could paint seams incorrectly. Try rebuilding this Static Mesh (Build) and Accept again."),
+						FText::FromString(Entry->AssetName));
+				}
 				return false;
 			}
 
@@ -1849,12 +3531,17 @@ namespace VertexMaskForgePanel
 			OutTargets.Add(MoveTemp(Target));
 		}
 
-		if (OutTargets.IsEmpty())
-		{
-			OutErrorText = LOCTEXT("AcceptNothingEligible", "No eligible pending changes to accept.");
-			return false;
-		}
-
+		// AUDITED (BUG FIX -- Nanite Accept root cause): this function used to treat an empty
+		// OutTargets as a hard failure on its own ("AcceptNothingEligible"). That was correct back when
+		// this was the ONLY Accept target builder, but since the Source-Topology split, a selection
+		// that is ENTIRELY Nanite (bUseSourceTopology, skipped above unconditionally) legitimately
+		// produces zero render-vertex targets while still having real, valid Source-Topology targets
+		// waiting in BuildSourceTopologyAcceptTargets. Returning false HERE made AcceptPendingChanges
+		// bail out immediately -- before BuildSourceTopologyAcceptTargets was ever called -- so a
+		// pure-Nanite Accept always failed with "No eligible pending changes to accept.", even though
+		// nothing had actually been validated yet, let alone written. "Nothing eligible in EITHER
+		// domain" is now decided ONCE, by the caller, after combining both builders' results -- see
+		// AcceptPendingChanges. An empty result here is not, by itself, an error.
 		return true;
 	}
 
@@ -1935,6 +3622,391 @@ namespace VertexMaskForgePanel
 		return true;
 	}
 
+	// --- Accept (Source-Topology / Nanite): permanent write to the SOURCE MeshDescription -----
+
+	/**
+	 * AUDITED (Nanite source-topology support): sibling of FVertexMaskForgeAcceptTarget/
+	 * BuildAcceptTargets/WriteAcceptTargets for Source-Topology entries (every Nanite-enabled mesh --
+	 * see FVertexMaskForgeSelectedMesh::bUseSourceTopology). Same validate-then-write, all-or-nothing
+	 * contract; same divergent-per-instance-baseline blocking rule; same shared-asset dedup (one
+	 * target per entry, entries are already 1-per-asset by construction). The only structural
+	 * difference: colors are in CORNER domain (see UpdateWorkingColorsSourceTopology), and the commit
+	 * itself writes via the TriangleID+corner correspondence (Entry->WorkingMesh.TriIDMap) instead of
+	 * FStaticMeshLODResources::WedgeMap -- exactly the route the native UE Paint Vertex Colors tool
+	 * uses (FDynamicMeshToMeshDescription::UpdateVertexColors), proven correct for Nanite by the
+	 * native-tool audit. Entry is kept alive (TSharedPtr) so WorkingMesh.Mesh/TriIDMap remain valid
+	 * from preflight through the write pass.
+	 */
+	struct FVertexMaskForgeSourceTopologyAcceptTarget
+	{
+		TWeakObjectPtr<UStaticMesh> Mesh;
+		FString AssetName;
+		/** Corner-domain colors (Entry->WorkingMesh.Mesh's own TriangleIndicesItr()+corner order),
+		 *  exactly as shown in Preview -- the data actually written. */
+		TArray<FColor> FinalColors;
+		TSharedPtr<FVertexMaskForgeSelectedMesh> Entry;
+	};
+
+	/**
+	 * AUDITED (Nanite source-topology support, commit preflight correction): full formal validation of
+	 * the TriangleID -> source FTriangleID -> VertexInstanceID correspondence a Source-Topology Accept
+	 * is about to rely on, BEFORE any write. Checks:
+	 *   - TriIDMap has a VALID entry for every triangle actually enumerated by WorkingMesh's own
+	 *     TriangleIndicesItr() (not just "non-empty") -- a partially-populated map is refused outright,
+	 *     never silently skipped mid-write the way the write loop's own defensive guards do (those
+	 *     exist as a last-resort safety net, not as the intended detection point).
+	 *   - Each mapped FTriangleID still exists in the LIVE MeshDescription
+	 *     (MeshDescription.IsTriangleValid) -- catches a stale TriIDMap if the asset's MeshDescription
+	 *     was ever rebuilt/edited since WorkingMesh was built, without WorkingMesh itself being rebuilt.
+	 *   - No two WorkingMesh triangles map to the SAME destination FTriangleID (TSet-based uniqueness) --
+	 *     two different corners silently writing into the same three VertexInstanceIDs would corrupt the
+	 *     write (last-write-wins on a shared slot) without ever raising an error otherwise.
+	 *   - Each destination triangle provides EXACTLY three VertexInstanceIDs, each itself still valid in
+	 *     the live MeshDescription (MeshDescription.IsVertexInstanceValid).
+	 * The corner ORDER itself is not a runtime check here -- it is a structural invariant: both
+	 * composition (UpdateWorkingColorsSourceTopology) and the write (WriteSourceTopologyAcceptTargets)
+	 * iterate the EXACT SAME Mesh.TriangleIndicesItr() + corner 0..2 sequence, so corner i of a given
+	 * TriangleID always means the same thing in both places by construction, not by a value that could
+	 * silently drift between them.
+	 */
+	static bool ValidateSourceTopologyCorrespondence(
+		const UE::Geometry::FDynamicMesh3& Mesh,
+		const TArray<FTriangleID>& TriIDMap,
+		const FMeshDescription& MeshDescription,
+		const FString& AssetName,
+		FText& OutErrorText)
+	{
+		TSet<int32> SeenDestinationTriangles;
+		SeenDestinationTriangles.Reserve(Mesh.TriangleCount());
+
+		for (const int32 TriangleID : Mesh.TriangleIndicesItr())
+		{
+			if (!TriIDMap.IsValidIndex(TriangleID))
+			{
+				OutErrorText = FText::Format(
+					LOCTEXT("AcceptSourceTopologyMissingTriIDMapEntryFormat",
+						"'{0}': the triangle/corner correspondence is missing an entry for one or more triangles. Try Refresh Selection and Generate Mask again."),
+					FText::FromString(AssetName));
+				return false;
+			}
+
+			const FTriangleID SourceTriangleID = TriIDMap[TriangleID];
+			if (!MeshDescription.IsTriangleValid(SourceTriangleID))
+			{
+				OutErrorText = FText::Format(
+					LOCTEXT("AcceptSourceTopologyStaleTriangleFormat",
+						"'{0}': the correspondence points to a triangle that no longer exists in the Static Mesh's source data (it may have been rebuilt or reimported since Generate Mask ran). Try Refresh Selection and Generate Mask again."),
+					FText::FromString(AssetName));
+				return false;
+			}
+
+			bool bAlreadySeen = false;
+			SeenDestinationTriangles.Add(SourceTriangleID.GetValue(), &bAlreadySeen);
+			if (bAlreadySeen)
+			{
+				OutErrorText = FText::Format(
+					LOCTEXT("AcceptSourceTopologyDuplicateTriangleFormat",
+						"'{0}': two different triangles map to the same source triangle -- refusing to write an ambiguous correspondence. Try Refresh Selection and Generate Mask again."),
+					FText::FromString(AssetName));
+				return false;
+			}
+
+			const TArrayView<const FVertexInstanceID> SourceInstances = MeshDescription.GetTriangleVertexInstances(SourceTriangleID);
+			if (SourceInstances.Num() != 3)
+			{
+				OutErrorText = FText::Format(
+					LOCTEXT("AcceptSourceTopologyBadInstanceCountFormat",
+						"'{0}': a destination triangle does not have exactly three Vertex Instances. Try Refresh Selection and Generate Mask again."),
+					FText::FromString(AssetName));
+				return false;
+			}
+			for (const FVertexInstanceID InstanceID : SourceInstances)
+			{
+				if (!MeshDescription.IsVertexInstanceValid(InstanceID))
+				{
+					OutErrorText = FText::Format(
+						LOCTEXT("AcceptSourceTopologyInvalidInstanceFormat",
+							"'{0}': the correspondence points to a Vertex Instance that no longer exists. Try Refresh Selection and Generate Mask again."),
+						FText::FromString(AssetName));
+					return false;
+				}
+			}
+		}
+
+		return true;
+	}
+
+	/**
+	 * Sibling of BuildAcceptTargets for Source-Topology entries. Only ever produces targets for
+	 * entries with bUseSourceTopology == true; BuildAcceptTargets skips those entries entirely (see
+	 * its own doc comment), so the two functions' outputs never overlap for the same asset.
+	 */
+	static bool BuildSourceTopologyAcceptTargets(
+		const TArray<TSharedPtr<FVertexMaskForgeSelectedMesh>>& SelectedMeshes,
+		TArray<FVertexMaskForgeSourceTopologyAcceptTarget>& OutTargets,
+		FText& OutErrorText)
+	{
+		OutTargets.Reset();
+
+		for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
+		{
+			if (!Entry.IsValid() || !Entry->bUseSourceTopology || Entry->PreviewComponents.IsEmpty()
+				|| (Entry->WorkingMesh.BoundingBoxMask.State != EVertexMaskForgeScalarMaskState::Ready
+					&& Entry->WorkingMesh.AmbientOcclusionMask.State != EVertexMaskForgeScalarMaskState::Ready))
+			{
+				continue;
+			}
+
+			UStaticMesh* Mesh = Entry->Mesh.LoadSynchronous();
+			if (!IsValid(Mesh) || !Entry->WorkingMesh.Mesh.IsValid())
+			{
+				OutErrorText = FText::Format(
+					LOCTEXT("AcceptSourceTopologyInvalidMeshFormat", "'{0}': Static Mesh or its working topology could not be resolved."),
+					FText::FromString(Entry->AssetName));
+				return false;
+			}
+
+			// Compose independently per component and require agreement -- same divergent-baseline
+			// rule as BuildAcceptTargets' own doc comment (no per-instance override in this domain, but
+			// World Space Bounding Box axes and Ambient Occlusion are both still per-instance-transform-
+			// dependent, so two components CAN legitimately disagree).
+			TArray<FColor> ReferenceColors;
+			bool bHaveReference = false;
+			for (const FVertexMaskForgePreviewComponentState& State : Entry->PreviewComponents)
+			{
+				const UStaticMeshComponent* SourceComponent = State.SourceComponent.Get();
+				if (!IsValid(SourceComponent))
+				{
+					continue;
+				}
+				if (State.SourceTopologyWorkingColors.IsEmpty())
+				{
+					continue;
+				}
+				TArray<FColor> ComponentColors = State.SourceTopologyWorkingColors;
+
+				if (!bHaveReference)
+				{
+					ReferenceColors = MoveTemp(ComponentColors);
+					bHaveReference = true;
+				}
+				else if (ComponentColors != ReferenceColors)
+				{
+					OutErrorText = FText::Format(
+						LOCTEXT("AcceptSourceTopologyDivergentBaselineFormat",
+							"'{0}': different instances of this asset produced different Preview results (World Space Bounding Box and/or Ambient Occlusion depend on each instance's own transform), so writing to the shared Static Mesh asset would be ambiguous. Accept is blocked for this operation; make the instances' transforms/results consistent, or Cancel."),
+						FText::FromString(Entry->AssetName));
+					return false;
+				}
+			}
+
+			if (!bHaveReference)
+			{
+				continue;
+			}
+
+			// Correspondence check: FinalColors must match the CURRENT corner count exactly -- never
+			// approximate -- and the full TriIDMap -> FTriangleID -> VertexInstanceID chain must be
+			// formally valid against the LIVE MeshDescription (see ValidateSourceTopologyCorrespondence
+			// for the complete list of what this proves).
+			const int32 NumCorners = Entry->WorkingMesh.Mesh->TriangleCount() * 3;
+			const FMeshDescription* LiveMeshDescription = Mesh->GetMeshDescription(0);
+			if (!LiveMeshDescription || ReferenceColors.Num() != NumCorners)
+			{
+				OutErrorText = FText::Format(
+					LOCTEXT("AcceptSourceTopologyCorrespondenceFormat",
+						"'{0}': the triangle/corner correspondence needed to write vertex colors is unavailable or stale. Try Refresh Selection and Generate Mask again."),
+					FText::FromString(Entry->AssetName));
+				return false;
+			}
+			if (!ValidateSourceTopologyCorrespondence(
+				*Entry->WorkingMesh.Mesh, Entry->WorkingMesh.TriIDMap, *LiveMeshDescription, Entry->AssetName, OutErrorText))
+			{
+				return false;
+			}
+
+			FVertexMaskForgeSourceTopologyAcceptTarget Target;
+			Target.Mesh = Mesh;
+			Target.AssetName = Entry->AssetName;
+			Target.FinalColors = MoveTemp(ReferenceColors);
+			Target.Entry = Entry;
+			OutTargets.Add(MoveTemp(Target));
+		}
+
+		return true;
+	}
+
+	/**
+	 * Sibling of WriteAcceptTargets for Source-Topology entries. Writes ONLY VertexInstanceColors on
+	 * the SOURCE MeshDescription (Mesh->GetMeshDescription(0)) -- never positions, topology, normals,
+	 * UVs, polygon groups, or any other attribute -- via the TriangleID+corner correspondence
+	 * (Entry->WorkingMesh.TriIDMap), reproducing exactly what
+	 * UE::Geometry::FDynamicMeshToMeshDescription::UpdateVertexColors does for the native Paint Vertex
+	 * Colors tool's own commit (see the native-tool audit), without re-running a full mesh conversion
+	 * (which could risk touching other attributes). Same two-pass (re-validate everything, THEN write)
+	 * discipline as WriteAcceptTargets -- if this returns false, nothing was modified.
+	 */
+	static bool WriteSourceTopologyAcceptTargets(const TArray<FVertexMaskForgeSourceTopologyAcceptTarget>& Targets, FText& OutErrorText)
+	{
+		using namespace UE::Geometry;
+
+		for (const FVertexMaskForgeSourceTopologyAcceptTarget& Target : Targets)
+		{
+			UStaticMesh* Mesh = Target.Mesh.Get();
+			const bool bEntryValid = Target.Entry.IsValid() && Target.Entry->WorkingMesh.Mesh.IsValid()
+				&& !Target.Entry->WorkingMesh.TriIDMap.IsEmpty();
+			const FMeshDescription* MeshDescription = IsValid(Mesh) ? Mesh->GetMeshDescription(0) : nullptr;
+			const int32 NumCorners = bEntryValid ? Target.Entry->WorkingMesh.Mesh->TriangleCount() * 3 : 0;
+
+			if (!MeshDescription || !bEntryValid || Target.FinalColors.Num() != NumCorners)
+			{
+				OutErrorText = FText::Format(
+					LOCTEXT("AcceptSourceTopologyWriteRevalidationFailedFormat", "'{0}' failed re-validation immediately before writing; aborting Accept (nothing was modified)."),
+					FText::FromString(Target.AssetName));
+				return false;
+			}
+			// AUDITED (commit preflight correction): full correspondence re-check, same as
+			// BuildSourceTopologyAcceptTargets' own preflight -- nothing else can have touched these
+			// assets between preflight and here (synchronous, same call), but re-proving it immediately
+			// before the first Modify() matches WriteAcceptTargets' own re-validation discipline exactly.
+			if (!ValidateSourceTopologyCorrespondence(
+				*Target.Entry->WorkingMesh.Mesh, Target.Entry->WorkingMesh.TriIDMap, *MeshDescription, Target.AssetName, OutErrorText))
+			{
+				return false;
+			}
+		}
+
+		// AUDITED: nests inside the caller's own outer FScopedTransaction (AcceptPendingChanges) when
+		// both a render-vertex and a Source-Topology write happen in the same Accept -- UE's transaction
+		// system merges nested Begin/End pairs into the single outermost Undo step, so this is still
+		// exactly ONE coherent Undo step for the whole operation, same as WriteAcceptTargets' own
+		// (identical) pattern.
+		FScopedTransaction Transaction(LOCTEXT("AcceptVertexMaskForgeSourceTopologyChanges", "Accept Vertex Mask Forge Changes (Source Topology)"));
+
+		TArray<UStaticMesh*> ModifiedMeshes;
+		ModifiedMeshes.Reserve(Targets.Num());
+
+		for (const FVertexMaskForgeSourceTopologyAcceptTarget& Target : Targets)
+		{
+			UStaticMesh* Mesh = Target.Mesh.Get();
+			FMeshDescription* MeshDescription = Mesh->GetMeshDescription(0);
+			const FDynamicMesh3& WorkingDynamicMesh = *Target.Entry->WorkingMesh.Mesh;
+			const TArray<FTriangleID>& TriIDMap = Target.Entry->WorkingMesh.TriIDMap;
+
+			Mesh->Modify();
+
+			FStaticMeshAttributes Attributes(*MeshDescription);
+			TVertexInstanceAttributesRef<FVector4f> Colors = Attributes.GetVertexInstanceColors();
+
+			int32 CornerIndex = 0;
+			for (const int32 TriangleID : WorkingDynamicMesh.TriangleIndicesItr())
+			{
+				if (!TriIDMap.IsValidIndex(TriangleID))
+				{
+					// Re-validated above; never reachable in practice, but never crash or misalign the
+					// remaining corners if it somehow were.
+					CornerIndex += 3;
+					continue;
+				}
+				const FTriangleID SourceTriangleID = TriIDMap[TriangleID];
+				const TArrayView<const FVertexInstanceID> SourceInstances = MeshDescription->GetTriangleVertexInstances(SourceTriangleID);
+				if (SourceInstances.Num() != 3)
+				{
+					CornerIndex += 3;
+					continue;
+				}
+				for (int32 Corner = 0; Corner < 3; ++Corner, ++CornerIndex)
+				{
+					if (Target.FinalColors.IsValidIndex(CornerIndex))
+					{
+						Colors[SourceInstances[Corner]] = FLinearColor(Target.FinalColors[CornerIndex]);
+					}
+				}
+			}
+
+			Mesh->CommitMeshDescription(0);
+
+			// AUDITED (BUG FIX round -- persistence verification, per explicit requirement): re-read
+			// VertexInstanceColors from the LIVE MeshDescription (re-fetched, not the stale local
+			// pointer/attributes-ref from before Commit) and compare against what was just written, via
+			// the EXACT SAME TriangleID+corner walk -- never trust the preview's appearance alone as
+			// proof the asset was actually updated. Aborts BEFORE Build()/notifying anything if the
+			// write did not actually stick.
+			{
+				const FMeshDescription* VerifyMeshDescription = Mesh->GetMeshDescription(0);
+				const FStaticMeshConstAttributes VerifyAttributes(*VerifyMeshDescription);
+				const TVertexInstanceAttributesConstRef<FVector4f> VerifyColors = VerifyAttributes.GetVertexInstanceColors();
+
+				int32 VerifyCornerIndex = 0;
+				int32 NumMismatched = 0;
+				for (const int32 TriangleID : WorkingDynamicMesh.TriangleIndicesItr())
+				{
+					if (!TriIDMap.IsValidIndex(TriangleID)) { VerifyCornerIndex += 3; continue; }
+					const FTriangleID VerifySourceTriangleID = TriIDMap[TriangleID];
+					const TArrayView<const FVertexInstanceID> VerifySourceInstances = VerifyMeshDescription->GetTriangleVertexInstances(VerifySourceTriangleID);
+					if (VerifySourceInstances.Num() != 3) { VerifyCornerIndex += 3; continue; }
+					for (int32 Corner = 0; Corner < 3; ++Corner, ++VerifyCornerIndex)
+					{
+						if (!Target.FinalColors.IsValidIndex(VerifyCornerIndex)) { continue; }
+						const FVector4f Expected(FLinearColor(Target.FinalColors[VerifyCornerIndex]));
+						const FVector4f Actual = VerifyColors.Get(VerifySourceInstances[Corner]);
+						if (!Expected.Equals(Actual, 1.0f / 512.0f))
+						{
+							++NumMismatched;
+						}
+					}
+				}
+
+				if (NumMismatched > 0)
+				{
+					OutErrorText = FText::Format(
+						LOCTEXT("AcceptSourceTopologyPersistenceVerificationFailedFormat",
+							"'{0}': {1} Vertex Instance color(s) did not match what was written immediately after CommitMeshDescription; aborting Accept before Build/notify (the write did not persist as expected)."),
+						FText::FromString(Target.AssetName), FText::AsNumber(NumMismatched));
+					UE_LOG(LogVertexMaskForge, Error,
+						TEXT("Vertex Mask Forge: Accept (Source Topology) persistence verification FAILED for '%s' -- %d mismatched Vertex Instance color(s)."),
+						*Target.AssetName, NumMismatched);
+					return false;
+				}
+			}
+
+			UE_LOG(LogVertexMaskForge, Log,
+				TEXT("Vertex Mask Forge: Accept (Source Topology) -- '%s': colors written, CommitMeshDescription succeeded, persistence verified."),
+				*Target.AssetName);
+
+			ModifiedMeshes.Add(Mesh);
+		}
+
+		// Rebuild once per asset, after all of its colors are committed -- regenerates RenderData AND
+		// Nanite cluster data from the edited source MeshDescription, in the SAME build pass (see the
+		// native Nanite build audit: MeshBuilderModule.BuildMesh() reads VertexInstanceColors directly
+		// from this same source MeshDescription when constructing Nanite's cluster input).
+		//
+		// AUDITED (BUG FIX round -- Build failure detection, per explicit requirement): OutErrors is
+		// passed and checked -- Mesh->Build() is void and does not throw, so this is the only way to
+		// learn a build genuinely failed rather than silently leaving stale RenderData/Nanite data in
+		// place while the caller believes Accept succeeded.
+		for (UStaticMesh* Mesh : ModifiedMeshes)
+		{
+			TArray<FText> BuildErrors;
+			Mesh->Build(/*bInSilent=*/true, &BuildErrors);
+			if (!BuildErrors.IsEmpty())
+			{
+				OutErrorText = FText::Format(
+					LOCTEXT("AcceptSourceTopologyBuildFailedFormat",
+						"'{0}': Build failed after committing Vertex Colors: {1}"),
+					FText::FromString(Mesh->GetName()), BuildErrors[0]);
+				UE_LOG(LogVertexMaskForge, Error,
+					TEXT("Vertex Mask Forge: Accept (Source Topology) Build FAILED for '%s': %s"),
+					*Mesh->GetName(), *BuildErrors[0].ToString());
+				return false;
+			}
+			UE_LOG(LogVertexMaskForge, Log, TEXT("Vertex Mask Forge: Accept (Source Topology) -- '%s': Build completed."), *Mesh->GetName());
+		}
+
+		return true;
+	}
+
 	// --- Accept as Instance Override: permanent write to component(s), Source Static Mesh untouched --
 
 	/**
@@ -1990,8 +4062,12 @@ namespace VertexMaskForgePanel
 
 		for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
 		{
+			// AUDITED (composition-stack checkpoint): eligible if EITHER slot is Ready -- this gate is
+			// only a coarse pre-filter anyway; the actual data persisted is always State.WorkingColors
+			// (read verbatim below), never re-derived from either mask here.
 			if (!Entry.IsValid() || Entry->PreviewComponents.IsEmpty()
-				|| Entry->WorkingMesh.BoundingBoxMask.State != EVertexMaskForgeScalarMaskState::Ready)
+				|| (Entry->WorkingMesh.BoundingBoxMask.State != EVertexMaskForgeScalarMaskState::Ready
+					&& Entry->WorkingMesh.AmbientOcclusionMask.State != EVertexMaskForgeScalarMaskState::Ready))
 			{
 				continue;
 			}
@@ -2357,6 +4433,21 @@ namespace VertexMaskForgePanel
 		NewPreviewComponent->bSelectable = false;
 		NewPreviewComponent->SetMobility(EComponentMobility::Movable);
 
+		// AUDITED (Nanite preview fix): Nanite's runtime renderer does not read
+		// FStaticMeshComponentLODInfo::OverrideVertexColors at all -- only the non-Nanite fallback
+		// rendering path does. Forcing ONLY this transient PreviewComponent onto its fallback mesh
+		// (same mechanism the Static Mesh Editor's own "Show Nanite Fallback" viewport toggle uses,
+		// see SStaticMeshEditorViewport::ToggleShowNaniteFallback -- per-component only, never touches
+		// SourceComponent or the asset's own Nanite settings/data) makes the instance-override preview
+		// visible again for Nanite-enabled assets. Harmless no-op for non-Nanite assets.
+		if (const UStaticMesh* PreviewMesh = NewPreviewComponent->GetStaticMesh())
+		{
+			if (PreviewMesh->IsNaniteEnabled())
+			{
+				NewPreviewComponent->SetForceDisableNanite(true);
+			}
+		}
+
 		NewPreviewComponent->SetupAttachment(SourceComponent);
 		NewPreviewComponent->SetRelativeTransform(FTransform::Identity);
 
@@ -2413,6 +4504,148 @@ namespace VertexMaskForgePanel
 		}
 
 		PreviewComponent->MarkRenderStateDirty();
+	}
+
+	/**
+	 * AUDITED (Nanite source-topology support): sibling of EnsurePreviewComponent for Source-Topology
+	 * entries -- a transient UDynamicMeshComponent instead of UStaticMeshComponent, since that is the
+	 * mechanism UE's own Paint Vertex Colors tool uses for its live preview (renders an FDynamicMesh3
+	 * directly; never depends on Nanite/OverrideVertexColors at all -- see the native-tool audit).
+	 * SourceMesh is COPIED (never moved -- WorkingMesh.Mesh is entry-level, shared by every component of
+	 * this entry, and is still needed later for Accept) into the new component's own UDynamicMesh, since
+	 * each component's composed colors can legitimately differ (World Space Bounding Box axes and
+	 * Ambient Occlusion are both transform-dependent, evaluated per component) even though the
+	 * TOPOLOGY/positions are identical across every component of the same entry. Same ownership/
+	 * lifetime discipline as EnsurePreviewComponent (TStrongObjectPtr, RF_Transient, attached to
+	 * SourceComponent for transform propagation only, never added to any Actor's serialized component
+	 * list) -- see that function's own doc comment for the full audit.
+	 */
+	static UDynamicMeshComponent* EnsureSourceTopologyPreviewComponent(
+		FVertexMaskForgePreviewComponentState& State,
+		const UE::Geometry::FDynamicMesh3& SourceMesh)
+	{
+		if (UDynamicMeshComponent* Existing = State.SourceTopologyPreviewComponent.Get())
+		{
+			return Existing;
+		}
+
+		UStaticMeshComponent* SourceComponent = State.SourceComponent.Get();
+		if (!IsValid(SourceComponent) || !IsValid(SourceComponent->GetWorld()))
+		{
+			return nullptr;
+		}
+
+		UDynamicMeshComponent* NewPreviewComponent = NewObject<UDynamicMeshComponent>(
+			GetTransientPackage(), NAME_None, RF_Transient);
+		if (!NewPreviewComponent)
+		{
+			return nullptr;
+		}
+
+		TStrongObjectPtr<UDynamicMeshComponent> StrongPreviewComponent(NewPreviewComponent);
+
+		NewPreviewComponent->SetMesh(UE::Geometry::FDynamicMesh3(SourceMesh));
+		NewPreviewComponent->SetColorOverrideMode(EDynamicMeshComponentColorOverrideMode::VertexColors);
+		NewPreviewComponent->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+		NewPreviewComponent->SetCastShadow(false);
+		NewPreviewComponent->bSelectable = false;
+		NewPreviewComponent->SetMobility(EComponentMobility::Movable);
+
+		NewPreviewComponent->SetupAttachment(SourceComponent);
+		NewPreviewComponent->SetRelativeTransform(FTransform::Identity);
+
+		NewPreviewComponent->RegisterComponentWithWorld(SourceComponent->GetWorld());
+		if (!NewPreviewComponent->IsRegistered())
+		{
+			NewPreviewComponent->DetachFromComponent(FDetachmentTransformRules::KeepRelativeTransform);
+			NewPreviewComponent->DestroyComponent();
+			return nullptr;
+		}
+
+		State.SourceTopologyPreviewComponent = MoveTemp(StrongPreviewComponent);
+		return NewPreviewComponent;
+	}
+
+	/**
+	 * Writes SourceTopologyWorkingColors into the preview component's own Primary Color Overlay. The
+	 * overlay is fully rebuilt every call (cleared, then one AppendElement + SetTriangle per triangle
+	 * corner, in the SAME Mesh.TriangleIndicesItr()-then-corner-0..2 order UpdateWorkingColorsSourceTopology
+	 * used to build WorkingColors) -- so ElementID == CornerIndex by construction, needing no separate
+	 * persisted lookup. Cheap relative to a raycast pass; simpler and less error-prone than maintaining
+	 * a stable per-corner element mapping across updates.
+	 */
+	static void ApplySourceTopologyColorsToPreviewComponent(
+		UDynamicMeshComponent* PreviewComponent,
+		const TArray<FColor>& WorkingColors,
+		UMaterialInterface* DebugMaterial)
+	{
+		using namespace UE::Geometry;
+
+		if (!IsValid(PreviewComponent))
+		{
+			return;
+		}
+
+		PreviewComponent->EditMesh([&WorkingColors](FDynamicMesh3& Mesh)
+		{
+			if (!Mesh.HasAttributes())
+			{
+				Mesh.EnableAttributes();
+			}
+			// Rebuild fresh every call -- see the function's own doc comment.
+			Mesh.Attributes()->DisablePrimaryColors();
+			Mesh.Attributes()->EnablePrimaryColors();
+			FDynamicMeshColorOverlay* ColorOverlay = Mesh.Attributes()->PrimaryColors();
+			if (!ColorOverlay)
+			{
+				return;
+			}
+
+			int32 CornerIndex = 0;
+			for (const int32 TriangleID : Mesh.TriangleIndicesItr())
+			{
+				FIndex3i ElementTri;
+				for (int32 Corner = 0; Corner < 3; ++Corner, ++CornerIndex)
+				{
+					const FColor& Color = WorkingColors.IsValidIndex(CornerIndex) ? WorkingColors[CornerIndex] : FColor::White;
+					const FVector4f ColorF(Color.R / 255.f, Color.G / 255.f, Color.B / 255.f, Color.A / 255.f);
+					ElementTri[Corner] = ColorOverlay->AppendElement(ColorF);
+				}
+				ColorOverlay->SetTriangle(TriangleID, ElementTri);
+			}
+		});
+
+		if (DebugMaterial)
+		{
+			PreviewComponent->ConfigureMaterialSet(TArray<UMaterialInterface*>{ DebugMaterial });
+		}
+
+		PreviewComponent->FastNotifyColorsUpdated();
+		PreviewComponent->SetVisibility(true);
+	}
+
+	/** Sibling of DetachAndDestroyPreviewComponent for the Source-Topology preview component --
+	 *  identical attachment-consistency handling, see that function's own audit note. */
+	static void DetachAndDestroySourceTopologyPreviewComponent(UDynamicMeshComponent* PreviewComponentPtr)
+	{
+		if (!PreviewComponentPtr)
+		{
+			return;
+		}
+
+		USceneComponent* PreviewAttachParent = PreviewComponentPtr->GetAttachParent();
+		const bool bConsistentlyAttached =
+			PreviewAttachParent && PreviewAttachParent->GetAttachChildren().Contains(PreviewComponentPtr);
+
+		if (PreviewComponentPtr->IsRegistered() && PreviewAttachParent && !bConsistentlyAttached)
+		{
+			PreviewComponentPtr->UnregisterComponent();
+		}
+		if (PreviewAttachParent)
+		{
+			PreviewComponentPtr->DetachFromComponent(FDetachmentTransformRules::KeepRelativeTransform);
+		}
+		PreviewComponentPtr->DestroyComponent();
 	}
 
 	/**
@@ -2523,6 +4756,50 @@ namespace VertexMaskForgePanel
 	}
 
 	/**
+	 * AUDITED (Nanite source-topology support): sibling of ActivatePreviewForComponent for Source-
+	 * Topology entries -- same Actor-hide acquisition contract and same "known limitation" (Actor-level
+	 * hide, not per-component; see ActivatePreviewForComponent's own doc comment -- this plugin has no
+	 * transient-safe component-level visibility flag available in UE 5.8, so this is not a regression
+	 * specific to Nanite, it is the same pre-existing, documented trade-off the render-vertex preview
+	 * already has). WorkingColors here is SourceTopologyWorkingColors (corner domain), never
+	 * DeriveDisplayColors-reduced -- Preview Mode display reduction (Red/Green/Blue/Alpha Channel) is
+	 * intentionally NOT implemented for the Source-Topology preview in this checkpoint (RGB Vertex
+	 * Color only); the underlying WorkingColors data Accept reads is unaffected either way, matching the
+	 * render-vertex path's own "Preview Mode never affects Accept" guarantee.
+	 */
+	static void ActivateSourceTopologyPreviewForComponent(
+		FVertexMaskForgePreviewComponentState& State,
+		const UE::Geometry::FDynamicMesh3& SourceMesh,
+		const TArray<FColor>& WorkingColors,
+		UMaterialInterface* DebugMaterial,
+		TMap<TWeakObjectPtr<AActor>, FVertexMaskForgeActorHideState>& ActorHideStates)
+	{
+		UStaticMeshComponent* SourceComponent = State.SourceComponent.Get();
+		if (!IsValid(SourceComponent))
+		{
+			return;
+		}
+
+		UDynamicMeshComponent* PreviewComponent = EnsureSourceTopologyPreviewComponent(State, SourceMesh);
+		if (!PreviewComponent)
+		{
+			return;
+		}
+
+		ApplySourceTopologyColorsToPreviewComponent(PreviewComponent, WorkingColors, DebugMaterial);
+
+		if (!State.bHasAcquiredActorHide)
+		{
+			AActor* Owner = SourceComponent->GetOwner();
+			AcquireActorHidden(ActorHideStates, Owner);
+			State.HiddenOwner = Owner;
+			State.bHasAcquiredActorHide = true;
+		}
+
+		State.bOverrideActive = true;
+	}
+
+	/**
 	 * Detaches and destroys ONE PreviewComponent, tolerant of an inconsistent attachment bookkeeping
 	 * state.
 	 *
@@ -2599,7 +4876,24 @@ namespace VertexMaskForgePanel
 	 * whether SourceComponent/its Actor/its World are still valid -- this function never dereferences
 	 * SourceComponent at all.
 	 */
-	static void RestoreComponentOriginal(
+	/**
+	 * Steps 1-5 ONLY (visual/attachment/actor-hide restore) -- see RestoreComponentOriginal's own doc
+	 * comment for the full step list. Deliberately does NOT touch BaselineColors/CommittedColors/
+	 * WorkingColors/AOCache.
+	 *
+	 * AUDITED (raw/composition separation checkpoint, AOCache lifetime fix): this is what
+	 * ApplyPreviewToEntry now calls for a MOMENTARY, mid-session fallback (a per-component layer
+	 * re-evaluation came back not-Ready, or the resolved Layers list is simply empty because no layer
+	 * is currently enabled) -- neither case is a genuine geometric invalidation or a session end, so
+	 * destroying AOCache (or the color arrays) there would be wrong: the checkpoint's own audit found
+	 * this exact bug -- disabling the only active layer (or a per-component World-Space-degenerate
+	 * BBox result while AO was perfectly fine) was destroying AO's geometry cache for no geometric
+	 * reason, forcing a full Tree/raycast rebuild the next time that component became eligible again.
+	 * A component visually reverted this way keeps its BaselineColors/CommittedColors/WorkingColors/
+	 * AOCache exactly as they were, ready to resume the instant it becomes eligible again, with zero
+	 * wasted recomputation.
+	 */
+	static void RestorePreviewVisualOnly(
 		FVertexMaskForgePreviewComponentState& State,
 		TMap<TWeakObjectPtr<AActor>, FVertexMaskForgeActorHideState>& ActorHideStates)
 	{
@@ -2608,12 +4902,18 @@ namespace VertexMaskForgePanel
 
 		// Step 2.
 		UStaticMeshComponent* PreviewComponentPtr = State.PreviewComponent.Get();
+		UDynamicMeshComponent* SourceTopologyPreviewComponentPtr = State.SourceTopologyPreviewComponent.Get();
 		AActor* HiddenOwnerPtr = State.HiddenOwner.Get();
 		const bool bHadAcquiredActorHide = State.bHasAcquiredActorHide;
 
-		// Step 3.
+		// Step 3. AUDITED (Nanite source-topology support): a State only ever has ONE of the two
+		// preview components active at a time (see ApplyPreviewToEntry's domain branch), but both
+		// teardown calls are safe/idempotent no-ops on a null pointer, so calling both unconditionally
+		// here is simpler than branching and cannot double-destroy anything.
 		DetachAndDestroyPreviewComponent(PreviewComponentPtr);
 		State.PreviewComponent.Reset();
+		DetachAndDestroySourceTopologyPreviewComponent(SourceTopologyPreviewComponentPtr);
+		State.SourceTopologyPreviewComponent.Reset();
 
 		// Step 4.
 		if (bHadAcquiredActorHide)
@@ -2624,26 +4924,70 @@ namespace VertexMaskForgePanel
 		// Step 5.
 		State.bHasAcquiredActorHide = false;
 		State.HiddenOwner.Reset();
+	}
 
-		// Step 6 (baseline-snapshot / Channel Filter toggle fix): the baseline snapshot, the last
-		// consolidated result, and the transient working result all belong to the session/operation
-		// that just ended for this component -- reset together, never independently -- see
-		// BaselineColors'/CommittedColors'/WorkingColors' own doc comments. Called both when a whole
-		// session concludes (Cancel, Accept, Accept as Instance Override, a RefreshSelection about to
-		// rebuild, World cleanup -- all via DestroyAllPreviews) and when ApplyPreviewToEntry falls
-		// back ONE component to its original appearance mid-session because its own per-instance
-		// World Space mask evaluation came back degenerate; in the latter case this conservatively
-		// re-captures a fresh baseline (and re-seeds CommittedColors from it) for that one component
-		// the next time its mask becomes Ready again, rather than risking a stale snapshot.
+	/**
+	 * Full session-end restore: RestorePreviewVisualOnly's steps 1-5, PLUS resetting BaselineColors/
+	 * CommittedColors/WorkingColors/AOCache together (step 6) -- see those fields' own doc comments.
+	 * Called ONLY when a whole session genuinely concludes or a genuine geometric invalidation demands
+	 * a fresh capture: Cancel, Accept (success), Accept as Instance Override (success), a
+	 * RefreshSelection about to rebuild, World cleanup (all via DestroyAllPreviews) -- never for a
+	 * momentary mid-session fallback (see RestorePreviewVisualOnly's own doc comment for that case,
+	 * used by ApplyPreviewToEntry instead since the raw/composition separation checkpoint).
+	 */
+	static void RestoreComponentOriginal(
+		FVertexMaskForgePreviewComponentState& State,
+		TMap<TWeakObjectPtr<AActor>, FVertexMaskForgeActorHideState>& ActorHideStates)
+	{
+		RestorePreviewVisualOnly(State, ActorHideStates);
+
+		// Step 6: the baseline snapshot, the last consolidated result, the transient working result,
+		// and the AO geometry cache all belong to the session that just concluded for this component --
+		// reset together, never independently. A brand new session always starts from a fresh capture
+		// (this component's geometry/transform may have changed since, e.g. Accept just wrote new
+		// colors, or the level was edited), never reusing a tree/raycast result computed for a
+		// concluded operation.
 		State.BaselineColors.Reset();
 		State.CommittedColors.Reset();
 		State.WorkingColors.Reset();
+
+		// AUDITED (Nanite source-topology support): the corner-domain arrays and the Source-Topology AO
+		// cache belong to the same concluded session -- reset together, same rule as the render-vertex
+		// arrays above.
+		State.SourceTopologyBaselineColors.Reset();
+		State.SourceTopologyCommittedColors.Reset();
+		State.SourceTopologyWorkingColors.Reset();
+
+		// DIAGNOSTICS (raw/composition separation checkpoint): low-volume -- this function is only
+		// ever called at genuine session-end points (Cancel, Accept, Accept as Instance Override,
+		// RefreshSelection, World cleanup), never per-tick/per-recomposition, so Log level is safe here.
+		if (State.AOCache.IsValid())
+		{
+			UE_LOG(LogVertexMaskForge, Log,
+				TEXT("Vertex Mask Forge: AO cache destroyed (session end/component teardown) for '%s'."),
+				State.SourceComponent.IsValid() ? *State.SourceComponent->GetName() : TEXT("<invalid component>"));
+		}
+		State.AOCache.Reset();
+
+		if (State.SourceTopologyAOCache.IsValid())
+		{
+			UE_LOG(LogVertexMaskForge, Log,
+				TEXT("Vertex Mask Forge: AO (Source Topology) cache destroyed (session end/component teardown) for '%s'."),
+				State.SourceComponent.IsValid() ? *State.SourceComponent->GetName() : TEXT("<invalid component>"));
+		}
+		State.SourceTopologyAOCache.Reset();
 	}
 }
 
 void SVertexMaskForgePanel::OnAxisParamChangedDiscrete()
 {
-	InvalidateBoundingBoxMasks();
+	// AUDITED (raw/composition separation checkpoint): now exclusively used by Bounding Box's OWN
+	// discrete geometric controls (Enable/Mirror/World Space checkboxes) -- per-axis Invert has its
+	// OWN dedicated handler (OnAxisInvertChanged, see its own doc comment for why), Ambient Occlusion
+	// and all purely compositional controls (Blend Mode, Opacity, layer Enable/Disable-when-Ready) no
+	// longer call this function at all; see InvalidateBoundingBoxRawMask/InvalidateAODerivedMask/
+	// RecomposeWorkingColors.
+	InvalidateBoundingBoxRawMask();
 	if (bAutoUpdatePreview)
 	{
 		// A stale, already-armed continuous-slider debounce must never apply after a discrete
@@ -2654,6 +4998,32 @@ void SVertexMaskForgePanel::OnAxisParamChangedDiscrete()
 		}
 		RunAutoUpdatePreview();
 	}
+}
+
+void SVertexMaskForgePanel::OnAxisInvertChanged(const int32 AxisIndex, const ECheckBoxState NewState)
+{
+	BoundingBoxAxisParams[AxisIndex].bInvert = (NewState == ECheckBoxState::Checked);
+
+	// AUDITED (BBox Invert exception, follow-up audit -- see the header's own doc comment for the
+	// full rationale): clears ONLY BoundingBoxMask (inlined, not via InvalidateBoundingBoxRawMask, to
+	// avoid that function's own conditional UpdateAllPreviews(false) firing redundantly right before
+	// the unconditional regeneration below), then ALWAYS regenerates immediately -- unlike every other
+	// discrete Bounding Box parameter, this does NOT wait for Auto Update Preview to be on. Ambient
+	// Occlusion is never touched (RunAutoUpdatePreview's bIncludeAO=false).
+	LastMaskActionStatusText = FText::GetEmpty();
+	for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
+	{
+		if (Entry.IsValid())
+		{
+			Entry->WorkingMesh.BoundingBoxMask = FVertexMaskForgeScalarMask();
+		}
+	}
+
+	if (GEditor)
+	{
+		GEditor->GetTimerManager()->ClearTimer(AutoUpdateDebounceTimerHandle);
+	}
+	RunAutoUpdatePreview(/*bIncludeAO=*/false);
 }
 
 TSharedRef<SWidget> SVertexMaskForgePanel::OnGenerateBlendModeRow(TSharedPtr<EVertexMaskForgeBlendMode> InOption) const
@@ -2671,16 +5041,142 @@ void SVertexMaskForgePanel::OnBlendModeSelectionChanged(TSharedPtr<EVertexMaskFo
 
 	BoundingBoxBlendMode = *NewSelection;
 
-	// Treated exactly like a discrete axis parameter change (see OnAxisParamChangedDiscrete's own
-	// doc comment) -- deliberately NOT an immediate UpdateAllPreviews() like Preview Mode/Channel
-	// Filter, per this checkpoint's explicit requirement that Blend Mode/Opacity wait for Generate
-	// Mask when Auto Update Preview is off.
-	OnAxisParamChangedDiscrete();
+	// AUDITED (raw/composition separation checkpoint): Blend Mode is PURE composition -- it never
+	// affects BoundingBoxMask's own raw Values, only how ComposeMaskStack reads them. Recomposes
+	// immediately, exactly like Preview Mode/Channel Filter, regardless of Auto Update Preview -- no
+	// raw invalidation, no raycasts, no risk of an original-color fallback for an otherwise-Ready mask.
+	RecomposeWorkingColors();
 }
 
 FText SVertexMaskForgePanel::GetBlendModeButtonText() const
 {
 	return VertexMaskForgePanel::GetBlendModeLabel(BoundingBoxBlendMode);
+}
+
+// --- Ambient Occlusion Mask ---------------------------------------------------------------------
+
+void SVertexMaskForgePanel::OnAOEnableChanged(const ECheckBoxState NewState)
+{
+	const bool bWasEnabled = bAOEnabled;
+	bAOEnabled = (NewState == ECheckBoxState::Checked);
+
+	// AUDITED (raw/composition separation checkpoint, re-examined per explicit follow-up audit):
+	//   - Turning OFF: PURE composition, unconditionally. AmbientOcclusionMask/AOCache/RawValues are
+	//     left completely untouched -- ApplyPreviewToEntry's bAOEnabled-gated readiness check simply
+	//     stops including this layer in the stack. RecomposeWorkingColors() only.
+	//   - Turning ON: MUST NOT invalidate an already-valid derived mask -- doing so was the bug this
+	//     follow-up audit found (enabling, by itself, was being used as a reason to invalidate).
+	//     Instead: if EVERY entry already has a Ready AmbientOcclusionMask, this is pure composition
+	//     too -- just recompose (RecomposeWorkingColors()), reusing AOCache with zero raycasts, working
+	//     identically regardless of Auto Update Preview. Only entries WITHOUT a valid derived mask
+	//     (never generated, or invalidated by an actual AO raw parameter change while AO was off) need
+	//     real (re)generation -- gated by Auto Update Preview exactly like any other raw parameter
+	//     (InvalidateAODerivedMask() is deliberately NOT called here -- it would needlessly clear
+	//     already-Ready entries too; RunAutoUpdatePreview()'s own per-entry AO logic already leaves a
+	//     Ready entry's snapshot untouched by construction when Auto Update runs, and if Auto Update is
+	//     off, those already-Ready entries are simply recomposed immediately below instead of waiting).
+	if (!bAOEnabled || bWasEnabled)
+	{
+		RecomposeWorkingColors();
+		return;
+	}
+
+	bool bAnyEntryNeedsGeneration = false;
+	for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
+	{
+		if (Entry.IsValid() && Entry->WorkingMesh.AmbientOcclusionMask.State != EVertexMaskForgeScalarMaskState::Ready)
+		{
+			bAnyEntryNeedsGeneration = true;
+			break;
+		}
+	}
+
+	if (!bAnyEntryNeedsGeneration)
+	{
+		// Every entry already has a valid, Ready AO slot -- reuse it verbatim, zero raycasts.
+		RecomposeWorkingColors();
+		return;
+	}
+
+	if (bAutoUpdatePreview)
+	{
+		if (GEditor)
+		{
+			GEditor->GetTimerManager()->ClearTimer(AutoUpdateDebounceTimerHandle);
+		}
+		RunAutoUpdatePreview();
+	}
+	else
+	{
+		// At least one entry needs Generate Mask, but entries that ARE already Ready must still be
+		// shown immediately -- never held pending just because a DIFFERENT entry needs generation.
+		RecomposeWorkingColors();
+	}
+}
+
+void SVertexMaskForgePanel::OnAOInvertChanged(const ECheckBoxState NewState)
+{
+	bAOInvert = (NewState == ECheckBoxState::Checked);
+
+	// AUDITED (raw/composition separation checkpoint, Invert fix): PURE composition -- RawValues in
+	// AOCache are NEVER inverted; Invert is applied fresh, live, every recomposition (see
+	// ApplyPreviewToEntry's own doc comment on the Invert live-override) directly from
+	// FVertexMaskForgeAOCache::RawValues. Zero raycasts, zero Tree rebuild, works identically
+	// regardless of Auto Update Preview.
+	RecomposeWorkingColors();
+}
+
+TSharedRef<SWidget> SVertexMaskForgePanel::OnGenerateAOBlendModeRow(TSharedPtr<EVertexMaskForgeBlendMode> InOption) const
+{
+	return SNew(STextBlock)
+		.Text(InOption.IsValid() ? VertexMaskForgePanel::GetBlendModeLabel(*InOption) : FText::GetEmpty());
+}
+
+void SVertexMaskForgePanel::OnAOBlendModeSelectionChanged(TSharedPtr<EVertexMaskForgeBlendMode> NewSelection, ESelectInfo::Type SelectInfo)
+{
+	if (!NewSelection.IsValid())
+	{
+		return;
+	}
+
+	AOBlendMode = *NewSelection;
+
+	// AUDITED (raw/composition separation checkpoint): PURE composition, same as Bounding Box's own
+	// OnBlendModeSelectionChanged -- recomposes immediately, zero raycasts, regardless of Auto Update
+	// Preview.
+	RecomposeWorkingColors();
+}
+
+FText SVertexMaskForgePanel::GetAOBlendModeButtonText() const
+{
+	return VertexMaskForgePanel::GetBlendModeLabel(AOBlendMode);
+}
+
+FText SVertexMaskForgePanel::GetActiveMaskSourceText() const
+{
+	bool bAnyAxisEnabled = false;
+	for (const FVertexMaskForgeAxisMaskParams& Params : BoundingBoxAxisParams)
+	{
+		if (Params.bEnabled)
+		{
+			bAnyAxisEnabled = true;
+			break;
+		}
+	}
+
+	if (bAnyAxisEnabled && bAOEnabled)
+	{
+		return LOCTEXT("ActiveMaskSourceBoth", "Active layers: Bounding Box + Ambient Occlusion");
+	}
+	if (bAnyAxisEnabled)
+	{
+		return LOCTEXT("ActiveMaskSourceBBoxOnly", "Active layers: Bounding Box only");
+	}
+	if (bAOEnabled)
+	{
+		return LOCTEXT("ActiveMaskSourceAOOnly", "Active layers: Ambient Occlusion only");
+	}
+	return LOCTEXT("ActiveMaskSourceNone", "Active layers: None -- enable a Bounding Box axis or Ambient Occlusion");
 }
 
 TSharedRef<SWidget> SVertexMaskForgePanel::BuildBoundingBoxAxisRow(const EVertexMaskForgeBoundsAxis Axis, const FText& Title)
@@ -2737,7 +5233,7 @@ TSharedRef<SWidget> SVertexMaskForgePanel::BuildBoundingBoxAxisRow(const EVertex
 			.OnValueChanged_Lambda([this, AxisIndex](const float NewValue)
 			{
 				BoundingBoxAxisParams[AxisIndex].Position = NewValue;
-				InvalidateBoundingBoxMasks();
+				InvalidateBoundingBoxRawMask();
 				ScheduleAutoUpdatePreview();
 			})
 		]
@@ -2766,7 +5262,7 @@ TSharedRef<SWidget> SVertexMaskForgePanel::BuildBoundingBoxAxisRow(const EVertex
 			.OnValueChanged_Lambda([this, AxisIndex](const float NewValue)
 			{
 				BoundingBoxAxisParams[AxisIndex].TransitionWidth = NewValue;
-				InvalidateBoundingBoxMasks();
+				InvalidateBoundingBoxRawMask();
 				ScheduleAutoUpdatePreview();
 			})
 		]
@@ -2783,8 +5279,9 @@ TSharedRef<SWidget> SVertexMaskForgePanel::BuildBoundingBoxAxisRow(const EVertex
 			})
 			.OnCheckStateChanged_Lambda([this, AxisIndex](const ECheckBoxState NewState)
 			{
-				BoundingBoxAxisParams[AxisIndex].bInvert = (NewState == ECheckBoxState::Checked);
-				OnAxisParamChangedDiscrete();
+				// AUDITED (BBox Invert exception, follow-up audit): dedicated handler, NOT
+				// OnAxisParamChangedDiscrete -- see OnAxisInvertChanged's own doc comment.
+				OnAxisInvertChanged(AxisIndex, NewState);
 			})
 			.Content()
 			[
@@ -2985,8 +5482,7 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 							.OnValueChanged_Lambda([this](const float NewValue)
 							{
 								BoundingBoxOpacity = FMath::Clamp(NewValue, 0.0f, 1.0f);
-								InvalidateBoundingBoxMasks();
-								ScheduleAutoUpdatePreview();
+								RecomposeWorkingColors();
 							})
 						]
 
@@ -3005,8 +5501,7 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 							.OnValueChanged_Lambda([this](const float NewValue)
 							{
 								BoundingBoxOpacity = FMath::Clamp(NewValue, 0.0f, 1.0f);
-								InvalidateBoundingBoxMasks();
-								ScheduleAutoUpdatePreview();
+								RecomposeWorkingColors();
 							})
 						]
 					]
@@ -3036,33 +5531,13 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 					[
 						SNew(SHorizontalBox)
 
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						[
-							SNew(SButton)
-							.Text(LOCTEXT("GenerateMask", "Generate Mask"))
-							.OnClicked(this, &SVertexMaskForgePanel::OnGenerateBoundingBoxMaskClicked)
-						]
-
+						// AUDITED (Preview reorganization checkpoint): Generate Mask / Auto Update
+						// Preview moved into the Preview Mode box below (see that section) -- Unified
+						// Bounds stays here, unchanged, since it is a Bounding-Box-specific parameter,
+						// not a preview/update control.
 						+ SHorizontalBox::Slot()
 						.AutoWidth()
 						.VAlign(VAlign_Center)
-						.Padding(FMargin(12.f, 0.f, 0.f, 0.f))
-						[
-							SNew(SCheckBox)
-							.IsChecked(this, &SVertexMaskForgePanel::GetAutoUpdatePreviewState)
-							.OnCheckStateChanged(this, &SVertexMaskForgePanel::OnAutoUpdatePreviewChanged)
-							.Content()
-							[
-								SNew(STextBlock)
-								.Text(LOCTEXT("AutoUpdatePreviewLabel", "Auto Update Preview"))
-							]
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(8.f, 0.f, 0.f, 0.f))
 						[
 							SNew(SCheckBox)
 							.IsChecked(this, &SVertexMaskForgePanel::GetUnifiedBoundsState)
@@ -3073,6 +5548,268 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 								SNew(STextBlock)
 								.Text(LOCTEXT("UnifiedBoundsLabel", "Unified Bounds"))
 							]
+						]
+					]
+				]
+			]
+
+			// Ambient Occlusion Mask: the tool's second spatial mask source, composed together with
+			// Bounding Box rather than replacing it (see bAOEnabled's own doc comment). Placed
+			// immediately BELOW the Bounding Box Mask panel above.
+			//
+			// AUDITED (UI decision, explicitly documented per the pre-test correction): uses the SAME
+			// fixed SBorder + bold-title layout as Bounding Box, not a collapsible/expandable panel --
+			// this tool has NO collapsible/expandable widget anywhere yet (Bounding Box is fixed too),
+			// so introducing one only for AO would be a new UI paradigm applied inconsistently, not
+			// "the same visual language" the checkpoint asked for. Turning BOTH Bounding Box and
+			// Ambient Occlusion into collapsible panels is left as a separate, future UI improvement --
+			// deliberately not done here, to avoid scope creep into a second checkpoint's worth of work.
+			+ SVerticalBox::Slot()
+			.AutoHeight()
+			.Padding(FMargin(0.f, 12.f, 0.f, 0.f))
+			[
+				SNew(SBorder)
+				.Padding(FMargin(8.f))
+				[
+					SNew(SVerticalBox)
+
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(FMargin(0.f, 0.f, 0.f, 4.f))
+					[
+						SNew(SHorizontalBox)
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 8.f, 0.f))
+						[
+							SNew(STextBlock)
+							.Text(LOCTEXT("AOSectionTitle", "Ambient Occlusion Mask"))
+							.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						[
+							SNew(SCheckBox)
+							.IsChecked(this, &SVertexMaskForgePanel::GetAOEnableState)
+							.OnCheckStateChanged(this, &SVertexMaskForgePanel::OnAOEnableChanged)
+							.Content()
+							[
+								SNew(STextBlock)
+								.Text(LOCTEXT("AOEnableLabel", "Enable"))
+							]
+						]
+					]
+
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(FMargin(0.f, 0.f, 0.f, 6.f))
+					[
+						SNew(STextBlock)
+						.Text(this, &SVertexMaskForgePanel::GetActiveMaskSourceText)
+						.ColorAndOpacity(FSlateColor::UseSubduedForeground())
+					]
+
+					// AUDITED (composition-stack checkpoint): Blend Mode + Opacity, same Slate
+					// controls/dimensions/alignment/labels/tooltips/limits as Bounding Box's own (see
+					// the Bounding Box Mask section above) -- independent AOBlendMode/AOOpacity state,
+					// same BlendModeOptions list (shared enum, shared GetBlendModeLabel), same
+					// ApplyMaskBlendMode/BlendMaskValue formulas via ComposeMaskStack -- never a
+					// duplicate/parallel blend implementation.
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(FMargin(0.f, 0.f, 0.f, 2.f))
+					[
+						SNew(SHorizontalBox)
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
+						[
+							SNew(STextBlock).Text(LOCTEXT("AOBlendModeLabel", "Blend Mode:"))
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						[
+							SAssignNew(AOBlendModeComboBox, SComboBox<TSharedPtr<EVertexMaskForgeBlendMode>>)
+							.OptionsSource(&BlendModeOptions)
+							.InitiallySelectedItem(BlendModeOptions[0])
+							.OnGenerateWidget(this, &SVertexMaskForgePanel::OnGenerateAOBlendModeRow)
+							.OnSelectionChanged(this, &SVertexMaskForgePanel::OnAOBlendModeSelectionChanged)
+							[
+								SNew(STextBlock)
+								.Text(this, &SVertexMaskForgePanel::GetAOBlendModeButtonText)
+							]
+						]
+					]
+
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(FMargin(0.f, 0.f, 0.f, 6.f))
+					[
+						SNew(SHorizontalBox)
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
+						[
+							SNew(STextBlock).Text(LOCTEXT("AOOpacityLabel", "Opacity:"))
+						]
+
+						+ SHorizontalBox::Slot()
+						.FillWidth(1.f)
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 8.f, 0.f))
+						[
+							SNew(SSlider)
+							.MinValue(0.0f)
+							.MaxValue(1.0f)
+							.Value_Lambda([this]() { return AOOpacity; })
+							.OnValueChanged_Lambda([this](const float NewValue)
+							{
+								AOOpacity = FMath::Clamp(NewValue, 0.0f, 1.0f);
+								RecomposeWorkingColors();
+							})
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						[
+							SNew(SSpinBox<float>)
+							.MinDesiredWidth(52.f)
+							.MinValue(0.0f)
+							.MaxValue(1.0f)
+							.Delta(0.01f)
+							.MinFractionalDigits(2)
+							.MaxFractionalDigits(2)
+							.Value_Lambda([this]() { return AOOpacity; })
+							.OnValueChanged_Lambda([this](const float NewValue)
+							{
+								AOOpacity = FMath::Clamp(NewValue, 0.0f, 1.0f);
+								RecomposeWorkingColors();
+							})
+						]
+					]
+
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(FMargin(0.f, 0.f, 0.f, 4.f))
+					[
+						SNew(SHorizontalBox)
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
+						[
+							SNew(SCheckBox)
+							.IsChecked(this, &SVertexMaskForgePanel::GetAOInvertState)
+							.OnCheckStateChanged(this, &SVertexMaskForgePanel::OnAOInvertChanged)
+							.Content()
+							[
+								SNew(STextBlock)
+								.Text(LOCTEXT("AOInvertLabel", "Invert"))
+							]
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(12.f, 0.f, 4.f, 0.f))
+						[
+							SNew(STextBlock)
+							.Text(LOCTEXT("AOSamplesLabel", "Samples"))
+							.ToolTipText(LOCTEXT("AOSamplesTooltip",
+								"Auto Update Preview uses at most 16 samples for a responsive interactive "
+								"preview; Generate Mask always uses the full Samples value set here."))
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						[
+							SNew(SSpinBox<int32>)
+							.MinDesiredWidth(52.f)
+							.MinValue(8)
+							.MaxValue(256)
+							.Delta(1)
+							.ToolTipText(LOCTEXT("AOSamplesTooltip",
+								"Auto Update Preview uses at most 16 samples for a responsive interactive "
+								"preview; Generate Mask always uses the full Samples value set here."))
+							.Value_Lambda([this]() { return AOSamples; })
+							.OnValueChanged_Lambda([this](const int32 NewValue)
+							{
+								AOSamples = FMath::Clamp(NewValue, 8, 256);
+								InvalidateAODerivedMask();
+								ScheduleAutoUpdatePreview();
+							})
+						]
+					]
+
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					[
+						SNew(SHorizontalBox)
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
+						[
+							SNew(STextBlock).Text(LOCTEXT("AOMaxDistanceLabel", "Max Distance"))
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 12.f, 0.f))
+						[
+							SNew(SSpinBox<float>)
+							.MinDesiredWidth(64.f)
+							.MinValue(0.01f)
+							.MaxValue(10000.0f)
+							.Delta(1.0f)
+							.Value_Lambda([this]() { return AOMaxDistance; })
+							.OnValueChanged_Lambda([this](const float NewValue)
+							{
+								AOMaxDistance = FMath::Clamp(NewValue, 0.01f, 10000.0f);
+								InvalidateAODerivedMask();
+								ScheduleAutoUpdatePreview();
+							})
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
+						[
+							SNew(STextBlock).Text(LOCTEXT("AOBiasLabel", "Bias"))
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						[
+							SNew(SSpinBox<float>)
+							.MinDesiredWidth(52.f)
+							.MinValue(0.001f)
+							.MaxValue(10.0f)
+							.Delta(0.01f)
+							.Value_Lambda([this]() { return AOBias; })
+							.OnValueChanged_Lambda([this](const float NewValue)
+							{
+								AOBias = FMath::Clamp(NewValue, 0.001f, 10.0f);
+								InvalidateAODerivedMask();
+								ScheduleAutoUpdatePreview();
+							})
 						]
 					]
 				]
@@ -3211,10 +5948,44 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 
 					+ SVerticalBox::Slot()
 					.AutoHeight()
+					.Padding(FMargin(0.f, 0.f, 0.f, 6.f))
 					[
 						SNew(STextBlock)
 						.Text(this, &SVertexMaskForgePanel::GetPreviewStatusText)
 						.ColorAndOpacity(FSlateColor::UseSubduedForeground())
+					]
+
+					// AUDITED (Preview reorganization checkpoint): Auto Update Preview and Generate
+					// Mask moved here from the Bounding Box Mask section above -- this box now owns
+					// everything that controls preview visualization AND update/regeneration, per the
+					// checkpoint's explicit requirement. Same widgets, same handlers, same
+					// lifecycle/behavior as before the move -- only their position changed. No copies
+					// remain at the old location.
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(FMargin(0.f, 0.f, 0.f, 4.f))
+					[
+						SNew(SCheckBox)
+						.IsChecked(this, &SVertexMaskForgePanel::GetAutoUpdatePreviewState)
+						.OnCheckStateChanged(this, &SVertexMaskForgePanel::OnAutoUpdatePreviewChanged)
+						.ToolTipText(LOCTEXT("AutoUpdatePreviewTooltip",
+							"Automatically regenerate and recompose the preview as parameters change, using a short debounce. Ambient Occlusion uses a reduced sample count while this is on, for responsiveness -- see the Samples tooltip in the Ambient Occlusion Mask section."))
+						.Content()
+						[
+							SNew(STextBlock)
+							.Text(LOCTEXT("AutoUpdatePreviewLabel", "Auto Update Preview"))
+						]
+					]
+
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.HAlign(HAlign_Left)
+					[
+						SNew(SButton)
+						.Text(LOCTEXT("GenerateMask", "Generate Mask"))
+						.ToolTipText(LOCTEXT("GenerateMaskTooltip",
+							"Generate (or regenerate) the enabled mask layer(s) -- Bounding Box and/or Ambient Occlusion -- at full quality, and compose/apply the result to the preview."))
+						.OnClicked(this, &SVertexMaskForgePanel::OnGenerateBoundingBoxMaskClicked)
 					]
 				]
 			]
@@ -3273,7 +6044,7 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 							SNew(SButton)
 							.HAlign(HAlign_Center)
 							.Text(LOCTEXT("AcceptAsInstanceOverride", "Accept as Instance Override"))
-							.ToolTipText(LOCTEXT("AcceptAsInstanceOverrideTooltip", "Stores the generated Vertex Colors as overrides on the selected component instances without modifying the Source Static Mesh. The result persists when the level is saved."))
+							.ToolTipText(this, &SVertexMaskForgePanel::GetAcceptAsInstanceOverrideTooltip)
 							.OnClicked(this, &SVertexMaskForgePanel::OnAcceptAsInstanceOverrideClicked)
 							.IsEnabled(this, &SVertexMaskForgePanel::CanAcceptAsInstanceOverride)
 						]
@@ -3289,6 +6060,18 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 							.OnClicked(this, &SVertexMaskForgePanel::OnRemoveInstanceOverrideClicked)
 							.IsEnabled(this, &SVertexMaskForgePanel::CanRemoveInstanceOverride)
 						]
+					]
+
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(FMargin(0.f, 0.f, 0.f, 4.f))
+					[
+						SNew(STextBlock)
+						.Text(LOCTEXT("NaniteRequiresSourceMeshNotice",
+							"Nanite requires vertex colors to be saved to the Static Mesh Asset. This affects every instance using the asset."))
+						.ColorAndOpacity(FSlateColor::UseSubduedForeground())
+						.AutoWrapText(true)
+						.Visibility(this, &SVertexMaskForgePanel::GetNaniteNoticeVisibility)
 					]
 
 					+ SVerticalBox::Slot()
@@ -3589,6 +6372,7 @@ void SVertexMaskForgePanel::BuildWorkingMeshes(TArray<TSharedPtr<FVertexMaskForg
 		// Resolved only for the duration of this call; no raw pointer is stored on Entry.
 		const UStaticMesh* Mesh = VertexMaskForgePanel::ResolveWorkingStaticMesh(Entry->Mesh);
 		Entry->WorkingMesh = VertexMaskForgePanel::BuildWorkingMeshForStaticMesh(Mesh, Entry->Diagnostics);
+		Entry->bUseSourceTopology = VertexMaskForgePanel::ShouldUseSourceTopology(Mesh);
 
 		if (Entry->WorkingMesh.State == EVertexMaskForgeWorkingMeshState::Ready)
 		{
@@ -3608,6 +6392,10 @@ FReply SVertexMaskForgePanel::OnGenerateBoundingBoxMaskClicked()
 	LastMaskActionStatusText = FText::GetEmpty();
 	LastOperationErrorText = FText::GetEmpty();
 
+	// AUDITED (composition-stack checkpoint): Bounding Box and Ambient Occlusion are now INDEPENDENT,
+	// optional stack layers (see FVertexMaskForgeWorkingMesh::BoundingBoxMask's own doc comment) --
+	// generation below populates BOTH slots independently; only the "nothing enabled at all" case is
+	// blocked.
 	bool bAnyAxisEnabled = false;
 	for (const FVertexMaskForgeAxisMaskParams& Params : BoundingBoxAxisParams)
 	{
@@ -3617,21 +6405,21 @@ FReply SVertexMaskForgePanel::OnGenerateBoundingBoxMaskClicked()
 			break;
 		}
 	}
-	if (!bAnyAxisEnabled)
+	if (!bAnyAxisEnabled && !bAOEnabled)
 	{
 		// Per the explicit requirement: never generate an empty mask silently, never replace the
 		// previous Preview, never enter Pending Changes with invalid data.
-		LastOperationErrorText = LOCTEXT("NoAxisEnabled", "Enable at least one Bounding Box axis.");
+		LastOperationErrorText = LOCTEXT("NoMaskSourceEnabled", "Enable at least one Bounding Box axis or Ambient Occlusion.");
 		RecomputeOperationState();
 		return FReply::Handled();
 	}
 
 	// Computed ONCE for this whole click (batch), before touching any entry's mask -- Unified Bounds
-	// must never regenerate just one mesh. Participation uses bForGeneration=true (every entry with
-	// a Ready working mesh, since generation is what's about to populate their BoundingBoxMask).
+	// must never regenerate just one mesh. Bounding-Box-only: unused (left null) when no axis is
+	// enabled.
 	TStaticArray<FVertexMaskForgeAxisBoundsResult, 3> CollectiveBounds;
 	const TStaticArray<FVertexMaskForgeAxisBoundsResult, 3>* CollectiveBoundsPtr = nullptr;
-	if (bUseUnifiedBounds)
+	if (bAnyAxisEnabled && bUseUnifiedBounds)
 	{
 		FText CollectiveError;
 		if (!VertexMaskForgePanel::ComputeCollectiveAxisBounds(SelectedMeshes, BoundingBoxAxisParams, /*bForGeneration=*/true, CollectiveBounds, CollectiveError))
@@ -3643,10 +6431,8 @@ FReply SVertexMaskForgePanel::OnGenerateBoundingBoxMaskClicked()
 		CollectiveBoundsPtr = &CollectiveBounds;
 	}
 
-	int32 NumReady = 0;
-	int32 NumUnavailable = 0;
-	int32 NumDegenerate = 0;
-	int32 NumInvalid = 0;
+	int32 NumBBoxReady = 0, NumBBoxUnavailable = 0, NumBBoxDegenerate = 0, NumBBoxInvalid = 0;
+	int32 NumAOReady = 0, NumAOUnavailable = 0;
 
 	for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
 	{
@@ -3655,77 +6441,138 @@ FReply SVertexMaskForgePanel::OnGenerateBoundingBoxMaskClicked()
 			continue;
 		}
 
-		// The working mesh (FDynamicMesh3) itself is no longer the source for this generator (see
+		// The working mesh (FDynamicMesh3) itself is no longer the source for either generator (see
 		// GenerateBoundingBoxMask's audit note), but Ready is kept as the entry-level precondition
 		// for consistency with the rest of the panel's pipeline/UX (an entry whose working mesh
-		// failed to build is flagged Unavailable across the board).
-		if (Entry->WorkingMesh.State != EVertexMaskForgeWorkingMeshState::Ready)
-		{
-			Entry->WorkingMesh.BoundingBoxMask = FVertexMaskForgeScalarMask();
-			Entry->WorkingMesh.BoundingBoxMask.State = EVertexMaskForgeScalarMaskState::Unavailable;
-			++NumUnavailable;
-			continue;
-		}
+		// failed to build is flagged Unavailable across the board, for BOTH slots).
+		bool bWorkingMeshOK = Entry->WorkingMesh.State == EVertexMaskForgeWorkingMeshState::Ready;
 
 		// Resolved only for the duration of this call, consistent with the rest of the panel.
-		const UStaticMesh* Mesh = Entry->Mesh.LoadSynchronous();
-		if (!IsValid(Mesh) || !Mesh->HasValidRenderData(/*bCheckLODForVerts=*/true, /*LODIndex=*/0))
+		const UStaticMesh* Mesh = bWorkingMeshOK ? Entry->Mesh.LoadSynchronous() : nullptr;
+		if (bWorkingMeshOK && (!IsValid(Mesh) || !Mesh->HasValidRenderData(/*bCheckLODForVerts=*/true, /*LODIndex=*/0)))
+		{
+			bWorkingMeshOK = false;
+		}
+		const FStaticMeshRenderData* RenderData = bWorkingMeshOK ? Mesh->GetRenderData() : nullptr;
+		if (bWorkingMeshOK && (!RenderData || !RenderData->LODResources.IsValidIndex(0)))
+		{
+			bWorkingMeshOK = false;
+		}
+
+		if (!bWorkingMeshOK)
 		{
 			Entry->WorkingMesh.BoundingBoxMask = FVertexMaskForgeScalarMask();
 			Entry->WorkingMesh.BoundingBoxMask.State = EVertexMaskForgeScalarMaskState::Unavailable;
-			++NumUnavailable;
+			Entry->WorkingMesh.AmbientOcclusionMask = FVertexMaskForgeScalarMask();
+			Entry->WorkingMesh.AmbientOcclusionMask.State = EVertexMaskForgeScalarMaskState::Unavailable;
+			++NumBBoxUnavailable;
+			++NumAOUnavailable;
 			continue;
 		}
 
-		const FStaticMeshRenderData* RenderData = Mesh->GetRenderData();
-		if (!RenderData || !RenderData->LODResources.IsValidIndex(0))
-		{
-			Entry->WorkingMesh.BoundingBoxMask = FVertexMaskForgeScalarMask();
-			Entry->WorkingMesh.BoundingBoxMask.State = EVertexMaskForgeScalarMaskState::Unavailable;
-			++NumUnavailable;
-			continue;
-		}
-
-		// Entry-level reference evaluation: the first live PreviewComponent's transform (for World
-		// Space axes), or Identity if this entry has none (Content-Browser-only, or no components
-		// currently valid) -- see the audit note on FVertexMaskForgeWorkingMesh::BoundingBoxMask.
-		// Actual per-instance Preview/Accept composition re-evaluates per component when needed.
+		// Entry-level reference evaluation: the first live PreviewComponent's transform, or Identity
+		// if this entry has none (Content-Browser-only, or no components currently valid) -- see the
+		// audit note on FVertexMaskForgeWorkingMesh::BoundingBoxMask. Actual per-instance Preview/
+		// Accept composition re-evaluates per component when needed (both for World Space Bounding
+		// Box axes and, unconditionally, for Ambient Occlusion -- see ApplyPreviewToEntry).
 		FTransform ReferenceTransform = FTransform::Identity;
+		bool bHasLiveComponent = false;
 		for (const FVertexMaskForgePreviewComponentState& State : Entry->PreviewComponents)
 		{
 			if (const UStaticMeshComponent* SourceComponent = State.SourceComponent.Get())
 			{
 				ReferenceTransform = SourceComponent->GetComponentTransform();
+				bHasLiveComponent = true;
 				break;
 			}
 		}
 
-		Entry->WorkingMesh.BoundingBoxMask = VertexMaskForgePanel::GenerateBoundingBoxMask(
-			RenderData->LODResources[0], BoundingBoxAxisParams, ReferenceTransform, CollectiveBoundsPtr);
-		Entry->WorkingMesh.BoundingBoxMask.SelectionMeshCount = SelectedMeshes.Num();
-
+		// Bounding Box slot.
+		//
+		// AUDITED (Nanite source-topology support): an entry with bUseSourceTopology true is generated
+		// against WorkingMesh.Mesh (SOURCE-topology FDynamicMesh3), individual bounds only -- never
+		// Unified Bounds, and never RenderData->LODResources[0] (that would be the reduced Nanite
+		// fallback -- see GenerateBoundingBoxMaskFromDynamicMesh's own doc comment for why).
+		if (bAnyAxisEnabled)
+		{
+			if (Entry->bUseSourceTopology)
+			{
+				Entry->WorkingMesh.BoundingBoxMask = VertexMaskForgePanel::GenerateBoundingBoxMaskFromDynamicMesh(
+					*Entry->WorkingMesh.Mesh, BoundingBoxAxisParams, ReferenceTransform);
+			}
+			else
+			{
+				Entry->WorkingMesh.BoundingBoxMask = VertexMaskForgePanel::GenerateBoundingBoxMask(
+					RenderData->LODResources[0], BoundingBoxAxisParams, ReferenceTransform, CollectiveBoundsPtr);
+			}
+			Entry->WorkingMesh.BoundingBoxMask.SelectionMeshCount = SelectedMeshes.Num();
+		}
+		else
+		{
+			Entry->WorkingMesh.BoundingBoxMask = FVertexMaskForgeScalarMask();
+		}
 		switch (Entry->WorkingMesh.BoundingBoxMask.State)
 		{
-		case EVertexMaskForgeScalarMaskState::Ready:
-			++NumReady;
-			break;
-		case EVertexMaskForgeScalarMaskState::DegenerateBounds:
-			++NumDegenerate;
-			break;
-		case EVertexMaskForgeScalarMaskState::Invalid:
-			++NumInvalid;
-			break;
-		case EVertexMaskForgeScalarMaskState::Unavailable:
-		case EVertexMaskForgeScalarMaskState::NotGenerated:
-		default:
-			++NumUnavailable;
-			break;
+		case EVertexMaskForgeScalarMaskState::Ready: ++NumBBoxReady; break;
+		case EVertexMaskForgeScalarMaskState::DegenerateBounds: ++NumBBoxDegenerate; break;
+		case EVertexMaskForgeScalarMaskState::Invalid: ++NumBBoxInvalid; break;
+		default: ++NumBBoxUnavailable; break;
+		}
+
+		// AUDITED (double-AO-execution fix): Ambient Occlusion slot -- ENTRY-LEVEL VALIDATION ONLY,
+		// never a real computation. See FVertexMaskForgeWorkingMesh::AmbientOcclusionMask's own doc
+		// comment: the actual per-vertex AO result is computed exactly once, per component, inside
+		// ApplyPreviewToEntry -- this entry-level pass only decides Ready/Unavailable (cheaply, via
+		// IsAmbientOcclusionInputValid) and snapshots the CLAMPED, RESOLVED parameters (full Samples --
+		// this IS the explicit Generate Mask action) that ApplyPreviewToEntry will use.
+		//
+		// AUDITED (Nanite source-topology support): the validity check and RenderVertexCount snapshot
+		// below both branch on bUseSourceTopology -- for a Source-Topology entry, "render vertex count"
+		// in this snapshot means WorkingMesh.Mesh->VertexCount() (Dynamic Mesh vertex count), never
+		// LOD0's, since ApplyPreviewToEntry will call GenerateAmbientOcclusionMaskFromDynamicMesh for
+		// this entry, not GenerateAmbientOcclusionMask.
+		if (bAOEnabled)
+		{
+			Entry->WorkingMesh.AmbientOcclusionMask = FVertexMaskForgeScalarMask();
+			Entry->WorkingMesh.AmbientOcclusionMask.Source = EVertexMaskForgeScalarMaskSource::AmbientOcclusion;
+			const bool bAOInputValid = Entry->bUseSourceTopology
+				? VertexMaskForgePanel::IsAmbientOcclusionInputValidForDynamicMesh(Entry->WorkingMesh.Mesh.Get())
+				: VertexMaskForgePanel::IsAmbientOcclusionInputValid(RenderData->LODResources[0]);
+			if (bHasLiveComponent && bAOInputValid)
+			{
+				FVertexMaskForgeAOParams Params;
+				Params.Samples = FMath::Clamp(AOSamples, 8, 256);
+				Params.MaxDistance = FMath::Clamp(AOMaxDistance, 0.01f, 10000.0f);
+				Params.Bias = FMath::Clamp(AOBias, 0.001f, 10.0f);
+				Params.bInvert = bAOInvert;
+				Entry->WorkingMesh.AmbientOcclusionMask.UsedAOParams = Params;
+				Entry->WorkingMesh.AmbientOcclusionMask.RenderVertexCount = Entry->bUseSourceTopology
+					? Entry->WorkingMesh.Mesh->VertexCount()
+					: static_cast<int32>(RenderData->LODResources[0].VertexBuffers.PositionVertexBuffer.GetNumVertices());
+				Entry->WorkingMesh.AmbientOcclusionMask.State = EVertexMaskForgeScalarMaskState::Ready;
+				++NumAOReady;
+			}
+			else
+			{
+				// Content-Browser-only entry (no live component), or the input fails its cheap
+				// structural check -- AO cannot be evaluated either way.
+				Entry->WorkingMesh.AmbientOcclusionMask.State = EVertexMaskForgeScalarMaskState::Unavailable;
+				++NumAOUnavailable;
+			}
+		}
+		else
+		{
+			Entry->WorkingMesh.AmbientOcclusionMask = FVertexMaskForgeScalarMask();
+			++NumAOUnavailable;
 		}
 	}
 
+	// Log (explicit operation summary): this function is only reached by an explicit Generate Mask
+	// click -- RunAutoUpdatePreview has its own separate loop and never calls this one, so this line
+	// cannot fire on every slider tick.
 	UE_LOG(LogVertexMaskForge, Log,
-		TEXT("Built Bounding Box masks: %d ready; %d unavailable; %d degenerate; %d invalid"),
-		NumReady, NumUnavailable, NumDegenerate, NumInvalid);
+		TEXT("Vertex Mask Forge: Generate Mask: Bounding Box %d ready/%d unavailable/%d degenerate/%d invalid; Ambient Occlusion %d ready/%d unavailable."),
+		NumBBoxReady, NumBBoxUnavailable, NumBBoxDegenerate, NumBBoxInvalid, NumAOReady, NumAOUnavailable);
 
 	// If a Vertex Color preview mode is active, recompose and reapply immediately using the
 	// mask(s) just persisted -- the user should not have to reselect the dropdown. bCommit=true:
@@ -3736,7 +6583,39 @@ FReply SVertexMaskForgePanel::OnGenerateBoundingBoxMaskClicked()
 	return FReply::Handled();
 }
 
-void SVertexMaskForgePanel::InvalidateBoundingBoxMasks()
+/**
+ * AUDITED (raw/composition separation checkpoint): supersedes the old, single, blanket
+ * InvalidateBoundingBoxMasks() -- that function invalidated BOTH slots for EVERY parameter change,
+ * including purely compositional ones (Blend Mode, Opacity, Invert, Enable/Disable), which meant even
+ * with Auto Update Preview OFF, changing e.g. AO Opacity would clear a perfectly valid, Ready
+ * AmbientOcclusionMask and flash the preview to original colors until the user clicked Generate Mask
+ * again -- exactly the contradiction this checkpoint's audit flagged. The fix is three functions with
+ * clear, disjoint responsibilities instead of one generic one:
+ *   - InvalidateBoundingBoxRawMask() (this function): Bounding Box's OWN raw geometric parameters
+ *     changed (axis Position/Falloff/Invert/Mirror/World Space/Enable, Unified Bounds) -- clears ONLY
+ *     BoundingBoxMask; AmbientOcclusionMask (and its AOCache) are completely untouched.
+ *   - InvalidateAODerivedMask(): Ambient Occlusion's OWN raw geometric parameters changed (Samples,
+ *     Max Distance, Bias) -- clears ONLY AmbientOcclusionMask; BoundingBoxMask is completely
+ *     untouched. Never touches AOCache directly either -- GenerateAmbientOcclusionMask's own cache key
+ *     (see its CACHE doc comment) transparently rebuilds only the RawValues layer when these actually
+ *     changed, the next time it is called with the new values.
+ *   - RecomposeWorkingColors(): a PURE composition change (Blend Mode, Opacity, Invert, Channel
+ *     Filter, Preview Mode, or Enable/Disable of an already-Ready layer) -- touches NEITHER slot,
+ *     calls UpdateAllPreviews(false) directly. Since ApplyPreviewToEntry always re-reads current
+ *     Blend Mode/Opacity/Channel Filter/Preview Mode/bAOEnabled live (never from a stale snapshot --
+ *     see its own doc comment on the Invert live-override fix) and AmbientOcclusionMask/AOCache stay
+ *     exactly as they were, this recomposes immediately and correctly with ZERO raycasts and ZERO
+ *     Tree rebuilds, works identically whether Auto Update Preview is on or off, and can never produce
+ *     an original-color fallback for a layer that is still genuinely Ready.
+ *
+ * Both InvalidateBoundingBoxRawMask() and InvalidateAODerivedMask() only call UpdateAllPreviews(false)
+ * synchronously when Auto Update Preview is OFF (see the reasoning that used to live on the old
+ * combined function: when Auto Update is ON, a regeneration is guaranteed to follow this call very
+ * shortly -- either immediately, via the SAME discrete-parameter handler, or via the debounce timer --
+ * so an interim synchronous UpdateAllPreviews here would only flash the OTHER, unaffected slot's
+ * preview and, for Ambient Occlusion, risk an unnecessary AOCache-destroying fallback in between).
+ */
+void SVertexMaskForgePanel::InvalidateBoundingBoxRawMask()
 {
 	LastMaskActionStatusText = FText::GetEmpty();
 
@@ -3744,16 +6623,46 @@ void SVertexMaskForgePanel::InvalidateBoundingBoxMasks()
 	{
 		if (Entry.IsValid())
 		{
-			// Reset only the mask; the working mesh (FDynamicMesh3) itself is left untouched.
 			Entry->WorkingMesh.BoundingBoxMask = FVertexMaskForgeScalarMask();
 		}
 	}
 
-	// Any preview color derived from the now-stale mask must stop being shown immediately -- true
-	// regardless of Auto Update Preview: the OLD mask is stale the instant a parameter changes, even
-	// if a new one hasn't been (re)generated yet. bCommit=false: invalidation itself never
-	// consolidates (the mask isn't even Ready at this point, so ApplyPreviewToEntry falls back to
-	// RestorePreviewForEntry and UpdateWorkingColors is not reached anyway).
+	if (!bAutoUpdatePreview)
+	{
+		UpdateAllPreviews(/*bCommit=*/false);
+	}
+}
+
+void SVertexMaskForgePanel::InvalidateAODerivedMask()
+{
+	LastMaskActionStatusText = FText::GetEmpty();
+
+	// Fires once per Samples/Max Distance/Bias change, or when AO Enable turns on for an entry with
+	// no valid derived slot yet -- Verbose (not Log): this can fire once per slider tick during a
+	// drag, same noise class as the AO cache-miss lines above. AOCache.RawValues are NEVER touched
+	// by this function -- only the entry-level derived (AmbientOcclusionMask) slot is cleared.
+	UE_LOG(LogVertexMaskForge, Verbose, TEXT("Vertex Mask Forge: AO derived mask invalidated (entry-level snapshot only, AOCache.RawValues preserved)."));
+
+	for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
+	{
+		if (Entry.IsValid())
+		{
+			Entry->WorkingMesh.AmbientOcclusionMask = FVertexMaskForgeScalarMask();
+		}
+	}
+
+	if (!bAutoUpdatePreview)
+	{
+		UpdateAllPreviews(/*bCommit=*/false);
+	}
+}
+
+void SVertexMaskForgePanel::RecomposeWorkingColors()
+{
+	// Deliberately does NOT touch BoundingBoxMask or AmbientOcclusionMask -- see this function's own
+	// doc note above (on InvalidateBoundingBoxRawMask). ApplyPreviewToEntry re-reads all compositional
+	// state (Blend Mode/Opacity/Channel Filter/Preview Mode/bAOEnabled/bAOInvert) live, every call, so
+	// this alone is a complete, correct, zero-raycast recomposition.
 	UpdateAllPreviews(/*bCommit=*/false);
 }
 
@@ -3832,7 +6741,12 @@ void SVertexMaskForgePanel::RunConstantFill(
 			continue;
 		}
 
-		FVertexMaskForgeScalarMask NewMask = VertexMaskForgePanel::GenerateConstantMask(RenderData->LODResources[0], ConstantValue, Source);
+		// AUDITED (Nanite source-topology support): a Source-Topology entry's Fill mask is built in the
+		// corner domain (3 * TriangleCount), matching UpdateWorkingColorsSourceTopology's own domain --
+		// never RenderData->LODResources[0] (the reduced Nanite fallback).
+		FVertexMaskForgeScalarMask NewMask = Entry->bUseSourceTopology
+			? VertexMaskForgePanel::GenerateConstantMaskForCornerDomain(Entry->WorkingMesh.Mesh->TriangleCount() * 3, ConstantValue, Source)
+			: VertexMaskForgePanel::GenerateConstantMask(RenderData->LODResources[0], ConstantValue, Source);
 		if (NewMask.State != EVertexMaskForgeScalarMaskState::Ready)
 		{
 			++NumFailed;
@@ -3907,8 +6821,9 @@ void SVertexMaskForgePanel::OnUnifiedBoundsChanged(const ECheckBoxState NewState
 	}
 
 	// Invalidate every entry's current Bounding-Box-sourced mask -- the domain just changed, so any
-	// existing result is stale regardless of Auto Update Preview.
-	InvalidateBoundingBoxMasks();
+	// existing result is stale regardless of Auto Update Preview. Ambient Occlusion is untouched
+	// (Unified Bounds has no effect on it).
+	InvalidateBoundingBoxRawMask();
 
 	if (bAutoUpdatePreview)
 	{
@@ -3933,12 +6848,12 @@ void SVertexMaskForgePanel::ScheduleAutoUpdatePreview()
 	constexpr float DebounceSeconds = 0.15f;
 	GEditor->GetTimerManager()->SetTimer(
 		AutoUpdateDebounceTimerHandle,
-		FTimerDelegate::CreateSP(this, &SVertexMaskForgePanel::RunAutoUpdatePreview),
+		FTimerDelegate::CreateSP(this, &SVertexMaskForgePanel::RunAutoUpdatePreview, /*bIncludeAO=*/true),
 		DebounceSeconds,
 		/*bLoop=*/false);
 }
 
-void SVertexMaskForgePanel::RunAutoUpdatePreview()
+void SVertexMaskForgePanel::RunAutoUpdatePreview(const bool bIncludeAO)
 {
 	// Not reachable in practice (Accept is fully synchronous, so no Slate tick -- and therefore no
 	// timer -- can fire while Applying), but guarded explicitly per the requirement that auto-update
@@ -3954,6 +6869,8 @@ void SVertexMaskForgePanel::RunAutoUpdatePreview()
 	// An auto-regenerated Bounding Box mask supersedes any prior Fill status message.
 	LastMaskActionStatusText = FText::GetEmpty();
 
+	// AUDITED (composition-stack checkpoint): same independent-slots model as
+	// OnGenerateBoundingBoxMaskClicked -- only "nothing enabled at all" is blocked.
 	bool bAnyAxisEnabled = false;
 	for (const FVertexMaskForgeAxisMaskParams& Params : BoundingBoxAxisParams)
 	{
@@ -3963,31 +6880,38 @@ void SVertexMaskForgePanel::RunAutoUpdatePreview()
 			break;
 		}
 	}
-	if (!bAnyAxisEnabled)
+	// AUDITED (BBox Invert exception): when bIncludeAO is false (OnAxisInvertChanged's scoped call),
+	// Ambient Occlusion is treated as irrelevant to this call regardless of bAOEnabled's actual value
+	// -- see the AO block below, which is skipped entirely in that case.
+	if (!bAnyAxisEnabled && !(bIncludeAO && bAOEnabled))
 	{
-		// Preserve every entry's existing mask untouched and surface the specific message -- do not
+		// Preserve every entry's existing masks untouched and surface the specific message -- do not
 		// fall through to the generic "could not be regenerated" wording below.
-		LastOperationErrorText = LOCTEXT("NoAxisEnabledAutoUpdate", "Enable at least one Bounding Box axis.");
+		LastOperationErrorText = LOCTEXT("NoMaskSourceEnabledAutoUpdate", "Enable at least one Bounding Box axis or Ambient Occlusion.");
 		UpdateAllPreviews(/*bCommit=*/false);
 		return;
 	}
 
 	// Computed ONCE for this whole regeneration (batch), before touching any entry's mask -- Unified
 	// Bounds must never recompute just one mesh. A failure here is global (not per-entry), so it is
-	// treated like "no axis enabled": preserve every entry's existing mask, surface the specific
-	// message, and do not attempt any per-entry regeneration this pass.
+	// treated like "no axis enabled": preserve every entry's existing Bounding Box mask, surface the
+	// specific message, and do not attempt any per-entry Bounding Box regeneration this pass (Ambient
+	// Occlusion, if enabled, still proceeds independently below).
 	TStaticArray<FVertexMaskForgeAxisBoundsResult, 3> CollectiveBounds;
 	const TStaticArray<FVertexMaskForgeAxisBoundsResult, 3>* CollectiveBoundsPtr = nullptr;
-	if (bUseUnifiedBounds)
+	bool bSkipBoundingBoxThisPass = !bAnyAxisEnabled;
+	if (bAnyAxisEnabled && bUseUnifiedBounds)
 	{
 		FText CollectiveError;
 		if (!VertexMaskForgePanel::ComputeCollectiveAxisBounds(SelectedMeshes, BoundingBoxAxisParams, /*bForGeneration=*/true, CollectiveBounds, CollectiveError))
 		{
 			LastOperationErrorText = CollectiveError;
-			UpdateAllPreviews(/*bCommit=*/false);
-			return;
+			bSkipBoundingBoxThisPass = true;
 		}
-		CollectiveBoundsPtr = &CollectiveBounds;
+		else
+		{
+			CollectiveBoundsPtr = &CollectiveBounds;
+		}
 	}
 
 	int32 NumFailed = 0;
@@ -4012,31 +6936,91 @@ void SVertexMaskForgePanel::RunAutoUpdatePreview()
 		}
 
 		FTransform ReferenceTransform = FTransform::Identity;
+		bool bHasLiveComponent = false;
 		for (const FVertexMaskForgePreviewComponentState& State : Entry->PreviewComponents)
 		{
 			if (const UStaticMeshComponent* SourceComponent = State.SourceComponent.Get())
 			{
 				ReferenceTransform = SourceComponent->GetComponentTransform();
+				bHasLiveComponent = true;
 				break;
 			}
 		}
 
-		FVertexMaskForgeScalarMask NewMask = VertexMaskForgePanel::GenerateBoundingBoxMask(
-			RenderData->LODResources[0], BoundingBoxAxisParams, ReferenceTransform, CollectiveBoundsPtr);
-		NewMask.SelectionMeshCount = SelectedMeshes.Num();
+		// Bounding Box slot: unchanged "auto-update never replaces a valid Preview with
+		// incomplete/degenerate data" contract.
+		//
+		// AUDITED (Nanite source-topology support): same domain branch as
+		// OnGenerateBoundingBoxMaskClicked -- Source-Topology entries always use individual bounds
+		// (bSkipBoundingBoxThisPass/CollectiveBoundsPtr are Unified-Bounds-only concerns and do not
+		// apply to this branch at all).
+		if (bAnyAxisEnabled && !bSkipBoundingBoxThisPass)
+		{
+			FVertexMaskForgeScalarMask NewBBoxMask = Entry->bUseSourceTopology
+				? VertexMaskForgePanel::GenerateBoundingBoxMaskFromDynamicMesh(
+					*Entry->WorkingMesh.Mesh, BoundingBoxAxisParams, ReferenceTransform)
+				: VertexMaskForgePanel::GenerateBoundingBoxMask(
+					RenderData->LODResources[0], BoundingBoxAxisParams, ReferenceTransform, CollectiveBoundsPtr);
+			NewBBoxMask.SelectionMeshCount = SelectedMeshes.Num();
 
-		if (NewMask.State == EVertexMaskForgeScalarMaskState::Ready)
-		{
-			Entry->WorkingMesh.BoundingBoxMask = MoveTemp(NewMask);
-		}
-		else
-		{
-			// Keep whatever mask this entry already had (Ready or NotGenerated) -- an auto-triggered
-			// regeneration must never replace a valid Preview with incomplete/degenerate data.
-			++NumFailed;
-			if (FirstFailedAssetName.IsEmpty())
+			if (NewBBoxMask.State == EVertexMaskForgeScalarMaskState::Ready)
 			{
-				FirstFailedAssetName = Entry->AssetName;
+				Entry->WorkingMesh.BoundingBoxMask = MoveTemp(NewBBoxMask);
+			}
+			else
+			{
+				++NumFailed;
+				if (FirstFailedAssetName.IsEmpty())
+				{
+					FirstFailedAssetName = Entry->AssetName;
+				}
+			}
+		}
+		else if (!bAnyAxisEnabled)
+		{
+			Entry->WorkingMesh.BoundingBoxMask = FVertexMaskForgeScalarMask();
+		}
+
+		// AUDITED (double-AO-execution fix): Ambient Occlusion slot -- ENTRY-LEVEL VALIDATION ONLY,
+		// same as OnGenerateBoundingBoxMaskClicked, never a real computation here -- see
+		// FVertexMaskForgeWorkingMesh::AmbientOcclusionMask's own doc comment. Samples capped to
+		// AOAutoUpdateMaxSamples for interactive responsiveness (AUDITED, interactive-performance
+		// fix); the UI's AOSamples value itself is never mutated, only what gets snapshotted for this
+		// pass. An explicit Generate Mask click always snapshots the full, user-chosen AOSamples.
+		//
+		// AUDITED (BBox Invert exception): bIncludeAO false (OnAxisInvertChanged's scoped call) skips
+		// this ENTIRE block -- AmbientOcclusionMask is not read, not cleared, not re-validated, not
+		// touched in any way, so a BBox Invert change can never have any observable effect on AO.
+		if (bIncludeAO)
+		{
+			if (bAOEnabled)
+			{
+				Entry->WorkingMesh.AmbientOcclusionMask = FVertexMaskForgeScalarMask();
+				Entry->WorkingMesh.AmbientOcclusionMask.Source = EVertexMaskForgeScalarMaskSource::AmbientOcclusion;
+				const bool bAOInputValid = Entry->bUseSourceTopology
+					? VertexMaskForgePanel::IsAmbientOcclusionInputValidForDynamicMesh(Entry->WorkingMesh.Mesh.Get())
+					: VertexMaskForgePanel::IsAmbientOcclusionInputValid(RenderData->LODResources[0]);
+				if (bHasLiveComponent && bAOInputValid)
+				{
+					FVertexMaskForgeAOParams Params;
+					Params.Samples = FMath::Clamp(FMath::Min(AOSamples, VertexMaskForgePanel::AOAutoUpdateMaxSamples), 8, 256);
+					Params.MaxDistance = FMath::Clamp(AOMaxDistance, 0.01f, 10000.0f);
+					Params.Bias = FMath::Clamp(AOBias, 0.001f, 10.0f);
+					Params.bInvert = bAOInvert;
+					Entry->WorkingMesh.AmbientOcclusionMask.UsedAOParams = Params;
+					Entry->WorkingMesh.AmbientOcclusionMask.RenderVertexCount = Entry->bUseSourceTopology
+						? Entry->WorkingMesh.Mesh->VertexCount()
+						: static_cast<int32>(RenderData->LODResources[0].VertexBuffers.PositionVertexBuffer.GetNumVertices());
+					Entry->WorkingMesh.AmbientOcclusionMask.State = EVertexMaskForgeScalarMaskState::Ready;
+				}
+				else
+				{
+					Entry->WorkingMesh.AmbientOcclusionMask.State = EVertexMaskForgeScalarMaskState::Unavailable;
+				}
+			}
+			else
+			{
+				Entry->WorkingMesh.AmbientOcclusionMask = FVertexMaskForgeScalarMask();
 			}
 		}
 	}
@@ -4123,7 +7107,8 @@ FText SVertexMaskForgePanel::GetPreviewStatusText() const
 		}
 
 		bAnyViewportComponent = true;
-		if (Entry->WorkingMesh.BoundingBoxMask.State == EVertexMaskForgeScalarMaskState::Ready)
+		if (Entry->WorkingMesh.BoundingBoxMask.State == EVertexMaskForgeScalarMaskState::Ready
+			|| Entry->WorkingMesh.AmbientOcclusionMask.State == EVertexMaskForgeScalarMaskState::Ready)
 		{
 			bAnyReady = true;
 		}
@@ -4179,7 +7164,8 @@ void SVertexMaskForgePanel::RecomputeOperationState()
 		for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
 		{
 			if (Entry.IsValid() && !Entry->PreviewComponents.IsEmpty()
-				&& Entry->WorkingMesh.BoundingBoxMask.State == EVertexMaskForgeScalarMaskState::Ready)
+				&& (Entry->WorkingMesh.BoundingBoxMask.State == EVertexMaskForgeScalarMaskState::Ready
+					|| Entry->WorkingMesh.AmbientOcclusionMask.State == EVertexMaskForgeScalarMaskState::Ready))
 			{
 				bHasPending = true;
 				break;
@@ -4289,27 +7275,56 @@ bool SVertexMaskForgePanel::AcceptPendingChanges()
 	LastInstanceOverrideStatusText = FText::GetEmpty();
 	LastRemoveOverrideStatusText = FText::GetEmpty();
 
+	UE_LOG(LogVertexMaskForge, Log, TEXT("Vertex Mask Forge: Accept started (%d selected entries)."), SelectedMeshes.Num());
+
+	// AUDITED (Nanite source-topology support): preflight BOTH domains BEFORE writing either one --
+	// if EITHER fails, nothing is modified (the whole point of validating fully before the first
+	// Modify() call). BuildAcceptTargets/BuildSourceTopologyAcceptTargets never produce overlapping
+	// targets for the same asset (an entry is exclusively one domain or the other -- see
+	// FVertexMaskForgeSelectedMesh::bUseSourceTopology), so there is no cross-domain collision to
+	// reconcile, only a combined "nothing eligible at all" / "confirm N assets total" presentation.
 	TArray<VertexMaskForgePanel::FVertexMaskForgeAcceptTarget> Targets;
+	TArray<VertexMaskForgePanel::FVertexMaskForgeSourceTopologyAcceptTarget> SourceTopologyTargets;
 	FText ErrorText;
-	if (!VertexMaskForgePanel::BuildAcceptTargets(
-		SelectedMeshes,
-		Targets, ErrorText))
+	if (!VertexMaskForgePanel::BuildAcceptTargets(SelectedMeshes, Targets, ErrorText))
 	{
 		OperationState = EVertexMaskForgeOperationState::Failed;
 		LastOperationErrorText = ErrorText;
 		UE_LOG(LogVertexMaskForge, Warning, TEXT("Vertex Mask Forge: Accept blocked: %s"), *ErrorText.ToString());
 		return false;
 	}
+	if (!VertexMaskForgePanel::BuildSourceTopologyAcceptTargets(SelectedMeshes, SourceTopologyTargets, ErrorText))
+	{
+		OperationState = EVertexMaskForgeOperationState::Failed;
+		LastOperationErrorText = ErrorText;
+		UE_LOG(LogVertexMaskForge, Warning, TEXT("Vertex Mask Forge: Accept blocked: %s"), *ErrorText.ToString());
+		return false;
+	}
+	if (Targets.IsEmpty() && SourceTopologyTargets.IsEmpty())
+	{
+		OperationState = EVertexMaskForgeOperationState::Failed;
+		LastOperationErrorText = LOCTEXT("AcceptNothingEligible", "No eligible pending changes to accept.");
+		UE_LOG(LogVertexMaskForge, Warning, TEXT("Vertex Mask Forge: Accept blocked: %s"), *LastOperationErrorText.ToString());
+		return false;
+	}
+	UE_LOG(LogVertexMaskForge, Log,
+		TEXT("Vertex Mask Forge: Accept preflight succeeded -- %d render-vertex target(s), %d Source Topology / Nanite target(s)."),
+		Targets.Num(), SourceTopologyTargets.Num());
 
 	// Confirm the (permanent, all-instances-affected) destination before the first write. Not shown
 	// for every minor adjustment -- only here, at the point of an actually destructive/permanent
 	// operation.
 	TArray<FString> AssetNames;
-	AssetNames.Reserve(Targets.Num());
+	AssetNames.Reserve(Targets.Num() + SourceTopologyTargets.Num());
 	for (const VertexMaskForgePanel::FVertexMaskForgeAcceptTarget& Target : Targets)
 	{
 		AssetNames.Add(Target.AssetName);
 	}
+	for (const VertexMaskForgePanel::FVertexMaskForgeSourceTopologyAcceptTarget& Target : SourceTopologyTargets)
+	{
+		AssetNames.Add(FText::Format(LOCTEXT("AcceptConfirmNaniteSuffixFormat", "{0} (Nanite)"), FText::FromString(Target.AssetName)).ToString());
+	}
+	const int32 TotalTargetCount = Targets.Num() + SourceTopologyTargets.Num();
 	const EAppReturnType::Type Choice = FMessageDialog::Open(
 		EAppMsgType::OkCancel,
 		FText::Format(
@@ -4317,7 +7332,7 @@ bool SVertexMaskForgePanel::AcceptPendingChanges()
 				"This will permanently write Vertex Colors into {0} Static Mesh Asset(s):\n\n{1}\n\n"
 				"This affects EVERY instance/placement of these assets in every level, not just the "
 				"currently selected one(s). This can be undone with Editor Undo.\n\nProceed?"),
-			FText::AsNumber(Targets.Num()),
+			FText::AsNumber(TotalTargetCount),
 			FText::FromString(FString::Join(AssetNames, TEXT("\n")))));
 	if (Choice != EAppReturnType::Ok)
 	{
@@ -4327,20 +7342,44 @@ bool SVertexMaskForgePanel::AcceptPendingChanges()
 
 	OperationState = EVertexMaskForgeOperationState::Applying;
 
-	if (!VertexMaskForgePanel::WriteAcceptTargets(Targets, ErrorText))
+	// AUDITED: two nested FScopedTransaction calls (one per domain, only for the domain(s) actually
+	// present) merge into ONE Undo step via UE's transaction nesting -- see
+	// WriteSourceTopologyAcceptTargets' own doc comment.
+	if (!Targets.IsEmpty() && !VertexMaskForgePanel::WriteAcceptTargets(Targets, ErrorText))
 	{
 		OperationState = EVertexMaskForgeOperationState::Failed;
 		LastOperationErrorText = ErrorText;
 		UE_LOG(LogVertexMaskForge, Error, TEXT("Vertex Mask Forge: Accept failed while writing: %s"), *ErrorText.ToString());
 		return false;
 	}
+	if (!SourceTopologyTargets.IsEmpty() && !VertexMaskForgePanel::WriteSourceTopologyAcceptTargets(SourceTopologyTargets, ErrorText))
+	{
+		OperationState = EVertexMaskForgeOperationState::Failed;
+		LastOperationErrorText = ErrorText;
+		UE_LOG(LogVertexMaskForge, Error, TEXT("Vertex Mask Forge: Accept (Source Topology) failed while writing: %s"), *ErrorText.ToString());
+		return false;
+	}
 
 	UE_LOG(LogVertexMaskForge, Log,
-		TEXT("Vertex Mask Forge: Accepted Vertex Color changes for %d Static Mesh asset(s)."), Targets.Num());
+		TEXT("Vertex Mask Forge: Accepted Vertex Color changes for %d Static Mesh asset(s) (%d render-vertex, %d Source Topology / Nanite) -- all writes committed, all Builds completed."),
+		TotalTargetCount, Targets.Num(), SourceTopologyTargets.Num());
 
 	// Success: destroy the transient Preview (its job is done -- the colors now live permanently on
-	// the asset) and return to Idle.
+	// the asset, and every real SourceComponent already reflects them via the Build() calls above) and
+	// return to Idle. AUDITED (BUG FIX round -- teardown semantics confirmed, not changed): this is the
+	// SAME DestroyAllPreviews()/RestoreComponentOriginal() Cancel also uses, and that is correct for
+	// BOTH cases, not a reused-by-mistake shortcut -- neither path ever mutates SourceComponent's own
+	// OverrideVertexColors/materials (only the transient PreviewComponent/SourceTopologyPreviewComponent
+	// ever carry those), so "restore" here only ever means "destroy the transient preview and un-hide
+	// the real component" -- never "write old colors back". For Cancel, the asset was never touched, so
+	// the real component still shows its original appearance (correct discard). For Accept (reached
+	// only here, AFTER every write+verify+Build above already succeeded), the real component's own
+	// RenderData/Nanite data was already rebuilt from the newly-committed colors BEFORE this call, so it
+	// shows the ACCEPTED result, not anything stale -- there is no separate "old baseline" data path for
+	// this function to accidentally restore.
 	DestroyAllPreviews();
+	UE_LOG(LogVertexMaskForge, Log, TEXT("Vertex Mask Forge: Accept -- preview torn down (Accept semantics: real components already show committed colors)."));
+
 	OperationState = EVertexMaskForgeOperationState::Idle;
 	LastOperationErrorText = FText::GetEmpty();
 
@@ -4348,6 +7387,8 @@ bool SVertexMaskForgePanel::AcceptPendingChanges()
 	// captured before this call; only now, with OperationState settled back to Idle, is it safe to
 	// catch up with a scene selection that may have changed while this operation was pending.
 	SyncSelectionIfChangedDuringOperation();
+
+	UE_LOG(LogVertexMaskForge, Log, TEXT("Vertex Mask Forge: Accept lifecycle finished (pending state cleared, OperationState=Idle)."));
 
 	return true;
 }
@@ -4428,6 +7469,33 @@ bool SVertexMaskForgePanel::AcceptPendingChangesAsInstanceOverride()
 	SyncSelectionIfChangedDuringOperation();
 
 	return true;
+}
+
+bool SVertexMaskForgePanel::HasNaniteMeshInSelection() const
+{
+	for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
+	{
+		if (!Entry.IsValid())
+		{
+			continue;
+		}
+		const UStaticMesh* Mesh = Entry->Mesh.Get();
+		if (IsValid(Mesh) && Mesh->IsNaniteEnabled())
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+FText SVertexMaskForgePanel::GetAcceptAsInstanceOverrideTooltip() const
+{
+	if (HasNaniteMeshInSelection())
+	{
+		return LOCTEXT("AcceptAsInstanceOverrideNaniteBlockedTooltip",
+			"Disabled: this selection includes a Nanite-enabled Static Mesh. Nanite requires vertex colors to be saved to the Static Mesh Asset -- per-instance overrides are never read by Nanite's renderer. Use Accept instead.");
+	}
+	return LOCTEXT("AcceptAsInstanceOverrideTooltip", "Stores the generated Vertex Colors as overrides on the selected component instances without modifying the Source Static Mesh. The result persists when the level is saved.");
 }
 
 bool SVertexMaskForgePanel::CanRemoveInstanceOverride() const
@@ -4531,6 +7599,14 @@ void SVertexMaskForgePanel::RestorePreviewForEntry(FVertexMaskForgeSelectedMesh&
 	}
 }
 
+void SVertexMaskForgePanel::RestorePreviewForEntryVisualOnly(FVertexMaskForgeSelectedMesh& Entry)
+{
+	for (FVertexMaskForgePreviewComponentState& State : Entry.PreviewComponents)
+	{
+		VertexMaskForgePanel::RestorePreviewVisualOnly(State, ActorHideStates);
+	}
+}
+
 void SVertexMaskForgePanel::ApplyPreviewToEntry(
 	const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry,
 	const TStaticArray<FVertexMaskForgeAxisBoundsResult, 3>* CollectiveBoundsPtr,
@@ -4543,7 +7619,9 @@ void SVertexMaskForgePanel::ApplyPreviewToEntry(
 
 	if (CurrentPreviewMode == EVertexMaskForgePreviewMode::OriginalMaterial)
 	{
-		RestorePreviewForEntry(*Entry);
+		// AUDITED (raw/composition separation checkpoint): Preview Mode is PURE composition -- visual-
+		// only restore, AOCache/color arrays survive untouched (see RestorePreviewForEntryVisualOnly).
+		RestorePreviewForEntryVisualOnly(*Entry);
 		return;
 	}
 
@@ -4555,13 +7633,25 @@ void SVertexMaskForgePanel::ApplyPreviewToEntry(
 	}
 
 	const FVertexMaskForgeWorkingMesh& WorkingMesh = Entry->WorkingMesh;
+	// AUDITED (composition-stack checkpoint): proceed if EITHER slot is Ready -- Bounding Box and
+	// Ambient Occlusion are independent, optional layers now (see BoundingBoxMask's own doc comment).
+	const bool bBBoxEntryReady = WorkingMesh.BoundingBoxMask.State == EVertexMaskForgeScalarMaskState::Ready;
+	// AUDITED (raw/composition separation checkpoint): gated LIVE on bAOEnabled, not just State --
+	// disabling AO (OnAOEnableChanged, pure composition) never touches AmbientOcclusionMask/AOCache at
+	// all (see that handler's own doc comment), so State can legitimately still read Ready while the
+	// layer is meant to be excluded from the stack; bAOEnabled is the live, authoritative "is this
+	// layer currently supposed to participate" signal.
+	const bool bAOEntryReady = bAOEnabled && WorkingMesh.AmbientOcclusionMask.State == EVertexMaskForgeScalarMaskState::Ready;
 	if (WorkingMesh.State != EVertexMaskForgeWorkingMeshState::Ready
 		|| !WorkingMesh.Mesh.IsValid()
-		|| WorkingMesh.BoundingBoxMask.State != EVertexMaskForgeScalarMaskState::Ready)
+		|| (!bBBoxEntryReady && !bAOEntryReady))
 	{
-		// Nothing safe to preview yet (mask NotGenerated/Unavailable/DegenerateBounds/Invalid):
-		// show the original colors/materials rather than a stale or fabricated result.
-		RestorePreviewForEntry(*Entry);
+		// Nothing safe to preview yet (both slots NotGenerated/Unavailable/DegenerateBounds/Invalid):
+		// show the original colors/materials rather than a stale or fabricated result. AUDITED
+		// (raw/composition separation checkpoint): visual-only -- this is not necessarily a geometric
+		// invalidation (e.g. AO alone was just disabled and BBox was never enabled), so AOCache must
+		// not be destroyed speculatively.
+		RestorePreviewForEntryVisualOnly(*Entry);
 		return;
 	}
 
@@ -4570,21 +7660,23 @@ void SVertexMaskForgePanel::ApplyPreviewToEntry(
 	const UStaticMesh* Mesh = Entry->Mesh.LoadSynchronous();
 	if (!IsValid(Mesh) || !Mesh->HasValidRenderData(/*bCheckLODForVerts=*/true, /*LODIndex=*/0))
 	{
-		RestorePreviewForEntry(*Entry);
+		// AUDITED (raw/composition separation checkpoint): visual-only, not a confirmed geometric
+		// change -- a transient resolve failure should not speculatively destroy AOCache either.
+		RestorePreviewForEntryVisualOnly(*Entry);
 		return;
 	}
 
 	const FStaticMeshRenderData* RenderData = Mesh->GetRenderData();
 	if (!RenderData || !RenderData->LODResources.IsValidIndex(0))
 	{
-		RestorePreviewForEntry(*Entry);
+		RestorePreviewForEntryVisualOnly(*Entry);
 		return;
 	}
 
 	UMaterialInterface* DebugMaterial = GetPreviewDebugMaterial();
 	if (!DebugMaterial)
 	{
-		RestorePreviewForEntry(*Entry);
+		RestorePreviewForEntryVisualOnly(*Entry);
 		return;
 	}
 
@@ -4602,28 +7694,209 @@ void SVertexMaskForgePanel::ApplyPreviewToEntry(
 			continue;
 		}
 
-		// AUDITED (World Space checkpoint): the entry-level WorkingMesh.BoundingBoxMask is only a
-		// REFERENCE, evaluated with one representative transform. When Source == BoundingBox, the
-		// mask actually used for THIS component's Preview is re-evaluated fresh with THIS
-		// component's own ComponentTransform, so World Space axes correctly vary per instance (see
-		// the audit note on FVertexMaskForgeWorkingMesh::BoundingBoxMask). Constant Fill sources are
-		// transform-independent, so the shared reference is reused directly without recomputation.
-		FVertexMaskForgeScalarMask PerComponentMask;
-		const FVertexMaskForgeScalarMask* EffectiveMask = &WorkingMesh.BoundingBoxMask;
-		if (WorkingMesh.BoundingBoxMask.Source == EVertexMaskForgeScalarMaskSource::BoundingBox)
+		// AUDITED (peer-mask composition checkpoint): builds an UNORDERED set of mask generators for
+		// THIS component, then hands it to UpdateWorkingColors/ComposeMaskStack, which sorts it by
+		// Mask->Source and applies the fixed, mode-based canonical order internally -- see those
+		// functions' own doc comments for the composition contract itself. The order Layers.Add() is
+		// called in below is NOT semantically meaningful (Bounding Box happens to be checked first in
+		// this code only for readability; it carries no priority) -- see ComposeMaskStack for why.
+		// Two shapes:
+		//   - Fill/Constant override (WorkingMesh.BoundingBoxMask.Source == ConstantWhite/Black): a
+		//     SINGLE hard layer, exactly the pre-existing Fill contract -- Bounding Box axes/Ambient
+		//     Occlusion are NOT combined with a Fill result (Fill is transform-independent, so the
+		//     shared entry-level reference is reused directly, same as before this checkpoint).
+		//   - Normal composition: up to TWO peer layers -- Bounding Box (if its slot is Ready) and
+		//     Ambient Occlusion (if its slot is Ready) -- neither has priority over the other; both
+		//     are re-evaluated PER COMPONENT, unconditionally: World Space Bounding Box axes vary per
+		//     instance (audited, World Space checkpoint); Ambient Occlusion is ALWAYS transform-
+		//     dependent (see GenerateAmbientOcclusionMask's own doc comment), using THIS component's
+		//     own AOCache so the (potentially expensive) tree/raycast results are memoized per
+		//     component -- see that function's CACHE doc comment for exactly what invalidates it. If
+		//     EITHER enabled layer's per-component re-evaluation comes back not-Ready (degenerate World
+		//     Space bounds, or an AO input that failed structural validation), OR the resulting set is
+		//     empty, this component falls back to its original appearance -- never a stale or
+		//     fabricated result.
+		TArray<VertexMaskForgePanel::FVertexMaskForgeMaskLayerParams> Layers;
+		FVertexMaskForgeScalarMask PerComponentBBoxMask;
+		FVertexMaskForgeScalarMask PerComponentAOMask;
+		bool bAnyLayerFailed = false;
+
+		// AUDITED (Nanite source-topology support): the two domains diverge starting here -- Source-
+		// Topology entries never read RenderData/LODResources[0] at all (that would be the reduced
+		// Nanite fallback), and use the FDynamicMesh3-based generators/caches/preview instead. See
+		// FVertexMaskForgeSelectedMesh::bUseSourceTopology's own doc comment for the domain-selection
+		// rule.
+		if (Entry->bUseSourceTopology)
 		{
-			PerComponentMask = VertexMaskForgePanel::GenerateBoundingBoxMask(
-				RenderData->LODResources[0], WorkingMesh.BoundingBoxMask.UsedAxisParams, SourceComponent->GetComponentTransform(),
-				CollectiveBoundsPtr);
-			if (PerComponentMask.State != EVertexMaskForgeScalarMaskState::Ready)
+			if (WorkingMesh.BoundingBoxMask.Source == EVertexMaskForgeScalarMaskSource::ConstantWhite
+				|| WorkingMesh.BoundingBoxMask.Source == EVertexMaskForgeScalarMaskSource::ConstantBlack)
 			{
-				// This specific instance's World Space evaluation came back degenerate/invalid even
-				// though the entry-level reference was Ready -- fall back to this component's
-				// original appearance rather than showing stale or fabricated data.
-				VertexMaskForgePanel::RestoreComponentOriginal(State, ActorHideStates);
+				// GenerateConstantMaskForCornerDomain (see RunConstantFill) already built this mask in
+				// the corner domain for a Source-Topology entry -- IndexOverride's default (-1) resolves
+				// to the shared CornerIndex UpdateWorkingColorsSourceTopology passes as VertexIndex,
+				// exactly like the render-vertex Fill path does with render vertex index.
+				Layers.Add({ &WorkingMesh.BoundingBoxMask, EVertexMaskForgeBlendMode::Copy, 1.0f });
+			}
+			else
+			{
+				if (bBBoxEntryReady)
+				{
+					PerComponentBBoxMask = VertexMaskForgePanel::GenerateBoundingBoxMaskFromDynamicMesh(
+						*WorkingMesh.Mesh, WorkingMesh.BoundingBoxMask.UsedAxisParams, SourceComponent->GetComponentTransform());
+					if (PerComponentBBoxMask.State != EVertexMaskForgeScalarMaskState::Ready)
+					{
+						bAnyLayerFailed = true;
+					}
+					else
+					{
+						Layers.Add({ &PerComponentBBoxMask, BoundingBoxBlendMode, BoundingBoxOpacity });
+					}
+				}
+				if (!bAnyLayerFailed && bAOEntryReady)
+				{
+					// Same "exactly one real computation site per component per update" contract as the
+					// render-vertex path below -- see its own AUDITED note for the full history. bInvert
+					// is the same live override, for the same reason.
+					FVertexMaskForgeAOParams EffectiveAOParams = WorkingMesh.AmbientOcclusionMask.UsedAOParams;
+					EffectiveAOParams.bInvert = bAOInvert;
+					PerComponentAOMask = VertexMaskForgePanel::GenerateAmbientOcclusionMaskFromDynamicMesh(
+						State.SourceTopologyAOCache, *WorkingMesh.Mesh, WorkingMesh.GeometryFingerprint,
+						SourceComponent->GetComponentTransform(), EffectiveAOParams);
+					if (PerComponentAOMask.State != EVertexMaskForgeScalarMaskState::Ready)
+					{
+						bAnyLayerFailed = true;
+					}
+					else
+					{
+						Layers.Add({ &PerComponentAOMask, AOBlendMode, AOOpacity });
+					}
+				}
+			}
+
+			if (bAnyLayerFailed || Layers.IsEmpty())
+			{
+				VertexMaskForgePanel::RestorePreviewVisualOnly(State, ActorHideStates);
 				continue;
 			}
-			EffectiveMask = &PerComponentMask;
+
+			// AUDITED: mutates State.SourceTopologyBaselineColors/CommittedColors/WorkingColors in
+			// place -- the SAME arrays Accept (source-topology commit) reads, never writes. bCommit
+			// forwarded exactly like the render-vertex call below.
+			int32 NumComposed = 0;
+			VertexMaskForgePanel::UpdateWorkingColorsSourceTopology(
+				State.SourceTopologyBaselineColors, State.SourceTopologyCommittedColors, State.SourceTopologyWorkingColors,
+				Layers, *WorkingMesh.Mesh,
+				bChannelFilterR, bChannelFilterG, bChannelFilterB,
+				bCommit,
+				NumComposed);
+
+			UE_LOG(LogVertexMaskForge, Verbose,
+				TEXT("Vertex Mask Forge: composed %d/%d corner(s) for '%s' on component '%s' (Source Topology)."),
+				NumComposed, WorkingMesh.Mesh->TriangleCount() * 3, *Entry->AssetName, *SourceComponent->GetName());
+
+			VertexMaskForgePanel::ActivateSourceTopologyPreviewForComponent(
+				State, *WorkingMesh.Mesh, State.SourceTopologyWorkingColors, DebugMaterial, ActorHideStates);
+			continue;
+		}
+
+		// AUDITED (peer-mask composition checkpoint): builds an UNORDERED set of mask generators for
+		// THIS component, then hands it to UpdateWorkingColors/ComposeMaskStack, which sorts it by
+		// Mask->Source and applies the fixed, mode-based canonical order internally -- see those
+		// functions' own doc comments for the composition contract itself. The order Layers.Add() is
+		// called in below is NOT semantically meaningful (Bounding Box happens to be checked first in
+		// this code only for readability; it carries no priority) -- see ComposeMaskStack for why.
+		// Two shapes:
+		//   - Fill/Constant override (WorkingMesh.BoundingBoxMask.Source == ConstantWhite/Black): a
+		//     SINGLE hard layer, exactly the pre-existing Fill contract -- Bounding Box axes/Ambient
+		//     Occlusion are NOT combined with a Fill result (Fill is transform-independent, so the
+		//     shared entry-level reference is reused directly, same as before this checkpoint).
+		//   - Normal composition: up to TWO peer layers -- Bounding Box (if its slot is Ready) and
+		//     Ambient Occlusion (if its slot is Ready) -- neither has priority over the other; both
+		//     are re-evaluated PER COMPONENT, unconditionally: World Space Bounding Box axes vary per
+		//     instance (audited, World Space checkpoint); Ambient Occlusion is ALWAYS transform-
+		//     dependent (see GenerateAmbientOcclusionMask's own doc comment), using THIS component's
+		//     own AOCache so the (potentially expensive) tree/raycast results are memoized per
+		//     component -- see that function's CACHE doc comment for exactly what invalidates it. If
+		//     EITHER enabled layer's per-component re-evaluation comes back not-Ready (degenerate World
+		//     Space bounds, or an AO input that failed structural validation), OR the resulting set is
+		//     empty, this component falls back to its original appearance -- never a stale or
+		//     fabricated result.
+		if (WorkingMesh.BoundingBoxMask.Source == EVertexMaskForgeScalarMaskSource::ConstantWhite
+			|| WorkingMesh.BoundingBoxMask.Source == EVertexMaskForgeScalarMaskSource::ConstantBlack)
+		{
+			Layers.Add({ &WorkingMesh.BoundingBoxMask, EVertexMaskForgeBlendMode::Copy, 1.0f });
+		}
+		else
+		{
+			if (bBBoxEntryReady)
+			{
+				PerComponentBBoxMask = VertexMaskForgePanel::GenerateBoundingBoxMask(
+					RenderData->LODResources[0], WorkingMesh.BoundingBoxMask.UsedAxisParams, SourceComponent->GetComponentTransform(),
+					CollectiveBoundsPtr);
+				if (PerComponentBBoxMask.State != EVertexMaskForgeScalarMaskState::Ready)
+				{
+					// This specific instance's World Space evaluation came back degenerate/invalid
+					// even though the entry-level reference was Ready.
+					bAnyLayerFailed = true;
+				}
+				else
+				{
+					Layers.Add({ &PerComponentBBoxMask, BoundingBoxBlendMode, BoundingBoxOpacity });
+				}
+			}
+			if (!bAnyLayerFailed && bAOEntryReady)
+			{
+				// AUDITED (double-AO-execution fix): this is the ONE AND ONLY call site in the whole
+				// panel that ever performs a REAL Ambient Occlusion computation -- see
+				// FVertexMaskForgeWorkingMesh::AmbientOcclusionMask's own doc comment. Previously, a
+				// SEPARATE entry-level call (inside OnGenerateBoundingBoxMaskClicked/RunAutoUpdatePreview)
+				// ALSO called GenerateAmbientOcclusionMask for the reference component, producing a
+				// full second Tree-build+raycast pass every update in the Output Log even though the
+				// two calls' cache keys should have matched -- rather than continue relying on that
+				// cache comparison never diverging (its exact failure mode could not be conclusively
+				// isolated via static analysis alone, without a live debugger), the redundant call
+				// site was removed entirely: the entry-level pass now only validates cheaply (see
+				// IsAmbientOcclusionInputValid) and snapshots UsedAOParams, never touching AOCache.
+				// Combined with InvalidateAODerivedMask/InvalidateBoundingBoxRawMask (see their own doc
+				// comments) that stopped a per-tick interim RestorePreviewForEntry from destroying
+				// AOCache before the debounced regeneration even ran, Ambient Occlusion is now
+				// structurally computed in exactly ONE place, exactly once per component per update.
+				// AUDITED (raw/composition separation checkpoint, Invert live-override fix): Samples/
+				// MaxDistance/Bias come from the entry-level snapshot (UsedAOParams) -- those ARE
+				// geometric/cache-relevant, correctly resolved at the last real (re)generation (full
+				// Samples for an explicit Generate Mask, capped for Auto Update -- see
+				// OnGenerateBoundingBoxMaskClicked/RunAutoUpdatePreview). bInvert is deliberately
+				// OVERRIDDEN with the LIVE bAOInvert panel value here, every call -- Invert is pure
+				// composition (OnAOInvertChanged never re-snapshots UsedAOParams, see its own doc
+				// comment), so using the stale snapshot's bInvert would silently ignore an Invert
+				// toggle until the next real regeneration. GenerateAmbientOcclusionMask applies Invert
+				// fresh from AOCache.RawValues every call regardless (see its own doc comment) -- this
+				// override only makes sure it uses the CURRENT checkbox state, never a stale one.
+				FVertexMaskForgeAOParams EffectiveAOParams = WorkingMesh.AmbientOcclusionMask.UsedAOParams;
+				EffectiveAOParams.bInvert = bAOInvert;
+				PerComponentAOMask = VertexMaskForgePanel::GenerateAmbientOcclusionMask(
+					State.AOCache, Mesh, RenderData->LODResources[0], SourceComponent->GetComponentTransform(),
+					EffectiveAOParams);
+				if (PerComponentAOMask.State != EVertexMaskForgeScalarMaskState::Ready)
+				{
+					bAnyLayerFailed = true;
+				}
+				else
+				{
+					Layers.Add({ &PerComponentAOMask, AOBlendMode, AOOpacity });
+				}
+			}
+		}
+
+		if (bAnyLayerFailed || Layers.IsEmpty())
+		{
+			// AUDITED (raw/composition separation checkpoint, AOCache lifetime fix): visual-only --
+			// see RestorePreviewVisualOnly's own doc comment. Neither "a per-component layer
+			// re-evaluation genuinely failed" nor "no layer is currently enabled" is a session end or
+			// a real geometric invalidation, so BaselineColors/CommittedColors/WorkingColors/AOCache
+			// must survive this fallback untouched.
+			VertexMaskForgePanel::RestorePreviewVisualOnly(State, ActorHideStates);
+			continue;
 		}
 
 		// Read-only: this buffer belongs to SourceComponent and is never modified by the plugin.
@@ -4641,8 +7914,7 @@ void SVertexMaskForgePanel::ApplyPreviewToEntry(
 		// UpdateWorkingColors' own doc comment for the full baseline/committed/working contract.
 		int32 NumComposed = 0;
 		VertexMaskForgePanel::UpdateWorkingColors(
-			State.BaselineColors, State.CommittedColors, State.WorkingColors, *EffectiveMask, RenderData->LODResources[0], InstanceOverrideColors,
-			BoundingBoxBlendMode, BoundingBoxOpacity,
+			State.BaselineColors, State.CommittedColors, State.WorkingColors, Layers, RenderData->LODResources[0], InstanceOverrideColors,
 			bChannelFilterR, bChannelFilterG, bChannelFilterB,
 			bCommit,
 			NumComposed);
@@ -4659,11 +7931,6 @@ void SVertexMaskForgePanel::ApplyPreviewToEntry(
 
 void SVertexMaskForgePanel::UpdateAllPreviews(const bool bCommit)
 {
-	int32 NumReady = 0;
-	int32 NumFallback = 0;
-	int32 NumUnavailable = 0;
-	int32 NumInvalid = 0;
-
 	// Computed ONCE per refresh (never cached across calls, consistent with the rest of the panel),
 	// then reused for every entry below -- Unified Bounds must never recompute just one mesh in
 	// isolation. On failure, only entries actually showing a BoundingBox-sourced preview are
@@ -4688,7 +7955,10 @@ void SVertexMaskForgePanel::UpdateAllPreviews(const bool bCommit)
 			{
 				if (Entry.IsValid() && Entry->WorkingMesh.BoundingBoxMask.Source == EVertexMaskForgeScalarMaskSource::BoundingBox)
 				{
-					RestorePreviewForEntry(*Entry);
+					// AUDITED (raw/composition separation checkpoint): visual-only -- this failure is
+					// Unified Bounds (Bounding-Box-specific); Ambient Occlusion's own AOCache is
+					// unrelated and must not be destroyed as collateral damage.
+					RestorePreviewForEntryVisualOnly(*Entry);
 				}
 			}
 			LastOperationErrorText = CollectiveError;
@@ -4705,36 +7975,6 @@ void SVertexMaskForgePanel::UpdateAllPreviews(const bool bCommit)
 		}
 
 		ApplyPreviewToEntry(Entry, CollectiveBoundsPtr, bCommit);
-
-		if (Entry->PreviewComponents.IsEmpty())
-		{
-			continue; // Content-Browser-only; not counted in the viewport preview tally.
-		}
-
-		switch (Entry->WorkingMesh.BoundingBoxMask.State)
-		{
-		case EVertexMaskForgeScalarMaskState::Ready:
-			++NumReady;
-			break;
-		case EVertexMaskForgeScalarMaskState::Invalid:
-			++NumInvalid;
-			break;
-		case EVertexMaskForgeScalarMaskState::Unavailable:
-		case EVertexMaskForgeScalarMaskState::DegenerateBounds:
-			++NumUnavailable;
-			break;
-		case EVertexMaskForgeScalarMaskState::NotGenerated:
-		default:
-			++NumFallback;
-			break;
-		}
-	}
-
-	if (CurrentPreviewMode != EVertexMaskForgePreviewMode::OriginalMaterial)
-	{
-		UE_LOG(LogVertexMaskForge, Log,
-			TEXT("Updated Vertex Mask Forge preview: %d ready; %d original-color fallback; %d unavailable; %d invalid"),
-			NumReady, NumFallback, NumUnavailable, NumInvalid);
 	}
 
 	RecomputeOperationState();
