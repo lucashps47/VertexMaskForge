@@ -272,6 +272,23 @@ enum class EVertexMaskForgeNoiseType : uint8
 	 *  decreasing amplitude (see Octaves/Roughness/Lacunarity), normalized by the total amplitude
 	 *  weight BEFORE the signed-to-[0,1] remap. Default. */
 	FractalPerlin,
+
+	/** Billow (V2-A): like FractalPerlin, but each octave's Perlin sample is folded to
+	 *  2*abs(Perlin)-1 (still signed) before accumulation -- see
+	 *  VertexMaskForgePanel::EvaluateBillow for the exact formula. Multi-octave (Octaves/Roughness/
+	 *  Lacunarity apply). */
+	Billow,
+
+	/** Ridged (V2-A): each octave contributes pow(1-abs(Perlin), 2), summed directly in [0,1] space
+	 *  (no signed remap at the end) -- see VertexMaskForgePanel::EvaluateRidged for the exact formula.
+	 *  Multi-octave (Octaves/Roughness/Lacunarity apply). */
+	Ridged,
+
+	/** Turbulence (V2-A): domain-warped FractalPerlin -- three FBM-derived warp signals (at fixed,
+	 *  mutually-separated constant offsets) displace the sample position by TurbulenceStrength before a
+	 *  final FBM evaluation -- see VertexMaskForgePanel::EvaluateTurbulence for the exact formula.
+	 *  Multi-octave (Octaves/Roughness/Lacunarity apply); also uses NoiseTurbulenceStrength. */
+	Turbulence,
 };
 
 /**
@@ -309,8 +326,15 @@ struct FVertexMaskForgeNoiseGenerativeParams
 	/** FractalPerlin only: per-octave amplitude multiplier. UI range [0, 1]; default 0.5. */
 	float Roughness = 0.5f;
 
-	/** FractalPerlin only: per-octave frequency multiplier. UI minimum 1.0; default 2.0. */
+	/** FractalPerlin/Billow/Ridged/Turbulence only: per-octave frequency multiplier. UI minimum 1.0;
+	 *  default 2.0. */
 	float Lacunarity = 2.0f;
+
+	/** Turbulence only: domain-warp displacement strength, in noise space. UI range [0, 5]; default 0.5.
+	 *  Harmless/unused for every other Noise Type (mirrors Octaves/Roughness/Lacunarity's own
+	 *  "harmless when Perlin" contract) but still part of the cache key below, so switching a mesh in or
+	 *  out of Turbulence, or tweaking Strength while already on Turbulence, is never missed. */
+	float TurbulenceStrength = 0.5f;
 
 	bool operator==(const FVertexMaskForgeNoiseGenerativeParams& Other) const
 	{
@@ -318,7 +342,8 @@ struct FVertexMaskForgeNoiseGenerativeParams
 			&& ScaleX == Other.ScaleX && ScaleY == Other.ScaleY && ScaleZ == Other.ScaleZ
 			&& OffsetX == Other.OffsetX && OffsetY == Other.OffsetY && OffsetZ == Other.OffsetZ
 			&& Seed == Other.Seed
-			&& Octaves == Other.Octaves && Roughness == Other.Roughness && Lacunarity == Other.Lacunarity;
+			&& Octaves == Other.Octaves && Roughness == Other.Roughness && Lacunarity == Other.Lacunarity
+			&& TurbulenceStrength == Other.TurbulenceStrength;
 	}
 	bool operator!=(const FVertexMaskForgeNoiseGenerativeParams& Other) const { return !(*this == Other); }
 };
@@ -1489,6 +1514,26 @@ private:
 	float NoiseScaleY = 1.0f;
 	float NoiseScaleZ = 1.0f;
 
+	/** UI/workflow-only toggle (V2-A adjustment) -- when true, Scale Y/Z are driven from Scale X and
+	 *  disabled for direct editing (see OnNoiseScaleXChanged/OnNoiseScaleAxesLockChanged). NOT part of
+	 *  FVertexMaskForgeNoiseGenerativeParams: the generative result is already fully determined by the
+	 *  final Scale X/Y/Z values themselves, so this flag has nothing left to contribute to the cache key.
+	 *  Default false -- preserves the exact pre-existing independent-axes behavior. */
+	bool bNoiseScaleAxesLocked = false;
+
+	ECheckBoxState GetNoiseScaleAxesLockState() const { return bNoiseScaleAxesLocked ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; }
+
+	/** Turning ON immediately snaps Y/Z to the current X (at most one InvalidateNoiseRawMask + one Auto
+	 *  Update, only if a value actually changed). Turning OFF only flips the flag -- no value changes, so
+	 *  no invalidation and no Auto Update (see OnNoiseScaleAxesLockChanged's own doc comment). */
+	void OnNoiseScaleAxesLockChanged(ECheckBoxState NewState);
+
+	/** Dedicated, atomic handler for the Scale X spin box -- when bNoiseScaleAxesLocked is true, also
+	 *  applies the same final value to Scale Y and Scale Z in the SAME call, so a single edit invalidates
+	 *  Raw Noise and requests Auto Update exactly ONCE (never three times via three separate handler
+	 *  calls). When unlocked, behaves exactly like the pre-existing Scale X handler. */
+	void OnNoiseScaleXChanged(float NewValue);
+
 	/** Domain offset in noise space. Default 0 each. GENERATIVE. */
 	float NoiseOffsetX = 0.0f;
 	float NoiseOffsetY = 0.0f;
@@ -1503,12 +1548,20 @@ private:
 	/** FractalPerlin only. UI range [0, 1]; default 0.5. GENERATIVE. */
 	float NoiseRoughness = 0.5f;
 
-	/** FractalPerlin only. UI minimum 1.0; default 2.0. GENERATIVE. */
+	/** FractalPerlin/Billow/Ridged/Turbulence only. UI minimum 1.0; default 2.0. GENERATIVE. */
 	float NoiseLacunarity = 2.0f;
+
+	/** Turbulence only. UI range [0, 5]; default 0.5. GENERATIVE. */
+	float NoiseTurbulenceStrength = 0.5f;
+
+	/** V2-A: true for every Noise Type whose raw pattern is a weighted sum of octaves (FractalPerlin,
+	 *  Billow, Ridged, Turbulence) -- false only for the single-sample Perlin. Small, localized helper so
+	 *  the Octaves/Roughness/Lacunarity IsEnabled bindings don't each repeat their own type comparison. */
+	bool UsesFractalParameters() const { return NoiseType != EVertexMaskForgeNoiseType::Perlin; }
 
 	/**
 	 * Shared handler for ALL generative Noise parameters (Type/Scale XYZ/Offset XYZ/Seed/Octaves/
-	 * Roughness/Lacunarity): these change WHAT the raw pattern looks like, so -- exactly like Bounding
+	 * Roughness/Lacunarity/Turbulence Strength): these change WHAT the raw pattern looks like, so -- exactly like Bounding
 	 * Box axis parameters (OnAxisParamChangedDiscrete) and AO's Samples/Max Distance/Bias
 	 * (InvalidateAODerivedMask) -- this invalidates every selected entry's NoiseMask (NOT NoiseRawCache
 	 * itself; EnsureNoiseRawCache's own GeometryFingerprint+params comparison decides reuse lazily, the

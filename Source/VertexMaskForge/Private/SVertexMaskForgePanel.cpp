@@ -2372,6 +2372,12 @@ namespace VertexMaskForgePanel
 			return LOCTEXT("NoiseTypePerlin", "Perlin");
 		case EVertexMaskForgeNoiseType::FractalPerlin:
 			return LOCTEXT("NoiseTypeFractalPerlin", "Fractal Perlin (FBM)");
+		case EVertexMaskForgeNoiseType::Billow:
+			return LOCTEXT("NoiseTypeBillow", "Billow");
+		case EVertexMaskForgeNoiseType::Ridged:
+			return LOCTEXT("NoiseTypeRidged", "Ridged");
+		case EVertexMaskForgeNoiseType::Turbulence:
+			return LOCTEXT("NoiseTypeTurbulence", "Turbulence");
 		default:
 			return FText::GetEmpty();
 		}
@@ -2397,6 +2403,122 @@ namespace VertexMaskForgePanel
 			return (static_cast<double>(Hash) / static_cast<double>(MAX_uint32)) * 1000.0;
 		};
 		return FVector(AxisOffset(0x9E3779B1u), AxisOffset(0x85EBCA77u), AxisOffset(0xC2B2AE3Du));
+	}
+
+	/**
+	 * AUDITED (Noise V2-A): SIGNED Fractal Brownian Motion -- a weighted sum of Perlin octaves at
+	 * increasing frequency (Frequency *= Lacunarity each step, starting at 1) and decreasing amplitude
+	 * (Amplitude *= Roughness each step, starting at 1), normalized by the TOTAL amplitude weight, kept
+	 * SIGNED (no [0,1] remap here -- callers decide how to use it: FractalPerlin remaps it directly,
+	 * Turbulence uses it BOTH for its warp signals AND its final evaluation). Extracted verbatim from
+	 * Noise V1's original FractalPerlin branch so FractalPerlin's own output is bit-for-bit unchanged.
+	 * Pure function of its explicit parameters only (no global/member state, no RNG) -- safe for
+	 * ParallelFor, deterministic, order-independent. Octaves/Roughness/Lacunarity are assumed
+	 * already-clamped by the caller (see ComputeRawNoiseValue's own safe-range clamps).
+	 */
+	static float EvaluateSignedFBM(const FVector& P, const int32 Octaves, const float Roughness, const float Lacunarity)
+	{
+		double Frequency = 1.0;
+		float Amplitude = 1.0f;
+		double Sum = 0.0;
+		float WeightSum = 0.0f;
+		for (int32 Octave = 0; Octave < Octaves; ++Octave)
+		{
+			const FVector OctavePosition = P * Frequency;
+			Sum += static_cast<double>(FMath::PerlinNoise3D(OctavePosition) * Amplitude);
+			WeightSum += Amplitude;
+			Frequency *= Lacunarity;
+			Amplitude *= Roughness;
+		}
+		constexpr float WeightEpsilon = 1e-4f;
+		return static_cast<float>(Sum / FMath::Max(WeightSum, WeightEpsilon));
+	}
+
+	/**
+	 * AUDITED (Noise V2-A): Billow -- like EvaluateSignedFBM, but each octave's raw Perlin sample is
+	 * folded to 2*abs(Perlin)-1 (still SIGNED, in [-1,1]) before being weighted and accumulated, per the
+	 * explicit V2-A formula. Kept signed on return -- ComputeRawNoiseValue applies the shared
+	 * signed-to-[0,1] remap, exactly like FractalPerlin. With a single octave this reduces to
+	 * 2*abs(Perlin(P))-1, which the shared remap turns into abs(Perlin(P)).
+	 */
+	static float EvaluateBillow(const FVector& P, const int32 Octaves, const float Roughness, const float Lacunarity)
+	{
+		double Frequency = 1.0;
+		float Amplitude = 1.0f;
+		double SignedSum = 0.0;
+		float AmplitudeSum = 0.0f;
+		for (int32 Octave = 0; Octave < Octaves; ++Octave)
+		{
+			const FVector OctavePosition = P * Frequency;
+			const float PerlinValue = FMath::PerlinNoise3D(OctavePosition);
+			const float BillowSigned = 2.0f * FMath::Abs(PerlinValue) - 1.0f;
+			SignedSum += static_cast<double>(BillowSigned * Amplitude);
+			AmplitudeSum += Amplitude;
+			Frequency *= Lacunarity;
+			Amplitude *= Roughness;
+		}
+		constexpr float WeightEpsilon = 1e-4f;
+		return static_cast<float>(SignedSum / FMath::Max(AmplitudeSum, WeightEpsilon));
+	}
+
+	/**
+	 * AUDITED (Noise V2-A): Ridged -- each octave contributes pow(1-abs(Perlin), 2), ALREADY in [0,1]
+	 * space (never signed), weighted and accumulated, per the explicit V2-A formula. UNLIKE
+	 * EvaluateSignedFBM/EvaluateBillow, the result is returned saturated and ready to use directly as
+	 * RawMask -- ComputeRawNoiseValue skips its shared signed-to-[0,1] remap for this type, per the
+	 * explicit "Não converter Ridge para signed antes da soma" requirement. With a single octave this
+	 * reduces to pow(1-abs(Perlin(P)), 2) exactly.
+	 */
+	static float EvaluateRidged(const FVector& P, const int32 Octaves, const float Roughness, const float Lacunarity)
+	{
+		double Frequency = 1.0;
+		float Amplitude = 1.0f;
+		double Sum = 0.0;
+		float AmplitudeSum = 0.0f;
+		for (int32 Octave = 0; Octave < Octaves; ++Octave)
+		{
+			const FVector OctavePosition = P * Frequency;
+			const float PerlinValue = FMath::PerlinNoise3D(OctavePosition);
+			float Ridge = 1.0f - FMath::Abs(PerlinValue);
+			Ridge = Ridge * Ridge;
+			Sum += static_cast<double>(Ridge * Amplitude);
+			AmplitudeSum += Amplitude;
+			Frequency *= Lacunarity;
+			Amplitude *= Roughness;
+		}
+		constexpr float WeightEpsilon = 1e-4f;
+		return FMath::Clamp(static_cast<float>(Sum / FMath::Max(AmplitudeSum, WeightEpsilon)), 0.0f, 1.0f);
+	}
+
+	/**
+	 * AUDITED (Noise V2-A): Turbulence -- domain-warped Fractal Perlin, deliberately distinct from
+	 * Billow (never a plain sum of abs(Perlin)). Three SIGNED FBM samples (EvaluateSignedFBM, same
+	 * Octaves/Roughness/Lacunarity) are taken at P offset by three FIXED, mutually-separated constant
+	 * vectors (never derived from Seed/SeedOffset -- deliberately distinct from it, per the explicit
+	 * "Não reutilizar exatamente o mesmo SeedOffset" requirement, so the warp axes are decorrelated both
+	 * from each other and from the base seed domain), forming a 3D warp vector; P is displaced by that
+	 * warp vector scaled by TurbulenceStrength (noise-space units); a final SIGNED FBM sample at the
+	 * warped position is returned (still signed -- ComputeRawNoiseValue applies the shared remap).
+	 * TurbulenceStrength == 0 collapses WarpedPosition back to P exactly, so Turbulence reduces to plain
+	 * FractalPerlin (EvaluateSignedFBM(P, ...)) bit-for-bit when Strength is 0. All three warp offsets
+	 * and the recursive EvaluateSignedFBM calls are pure functions of their explicit inputs -- no global
+	 * state, no RNG, safe for ParallelFor, deterministic regardless of execution order.
+	 */
+	static float EvaluateTurbulence(const FVector& P, const int32 Octaves, const float Roughness, const float Lacunarity, const float Strength)
+	{
+		// Fixed, deliberately-separated constants (never SeedOffset) -- decorrelate the three warp axes
+		// from each other and from the base Seed domain. Magnitude chosen well outside Perlin's 256-cell
+		// period so each axis samples a visibly different neighborhood of the noise field.
+		static const FVector WarpOffsetX(37.234, 91.847, 15.372);
+		static const FVector WarpOffsetY(64.129, 12.583, 77.914);
+		static const FVector WarpOffsetZ(88.472, 45.607, 23.951);
+
+		const float WarpX = EvaluateSignedFBM(P + WarpOffsetX, Octaves, Roughness, Lacunarity);
+		const float WarpY = EvaluateSignedFBM(P + WarpOffsetY, Octaves, Roughness, Lacunarity);
+		const float WarpZ = EvaluateSignedFBM(P + WarpOffsetZ, Octaves, Roughness, Lacunarity);
+
+		const FVector WarpedPosition = P + FVector(WarpX, WarpY, WarpZ) * static_cast<double>(Strength);
+		return EvaluateSignedFBM(WarpedPosition, Octaves, Roughness, Lacunarity);
 	}
 
 	/**
@@ -2445,31 +2567,46 @@ namespace VertexMaskForgePanel
 			LocalPosition.Y * (SafeScaleY / 100.0) + static_cast<double>(Params.OffsetY) + SeedOffset.Y,
 			LocalPosition.Z * (SafeScaleZ / 100.0) + static_cast<double>(Params.OffsetZ) + SeedOffset.Z);
 
-		float SignedResult;
 		if (Params.NoiseType == EVertexMaskForgeNoiseType::Perlin)
 		{
-			SignedResult = FMath::PerlinNoise3D(BaseNoisePosition);
-		}
-		else
-		{
-			const int32 SafeOctaves = FMath::Clamp(Params.Octaves, 1, 8);
-			const float SafeRoughness = FMath::Clamp(Params.Roughness, 0.0f, 1.0f);
-			const float SafeLacunarity = FMath::Max(Params.Lacunarity, 1.0f);
-
-			double Frequency = 1.0;
-			float Amplitude = 1.0f;
-			double Sum = 0.0;
-			float WeightSum = 0.0f;
-			for (int32 Octave = 0; Octave < SafeOctaves; ++Octave)
+			float SignedResult = FMath::PerlinNoise3D(BaseNoisePosition);
+			if (!FMath::IsFinite(SignedResult))
 			{
-				const FVector OctavePosition = BaseNoisePosition * Frequency;
-				Sum += static_cast<double>(FMath::PerlinNoise3D(OctavePosition) * Amplitude);
-				WeightSum += Amplitude;
-				Frequency *= SafeLacunarity;
-				Amplitude *= SafeRoughness;
+				SignedResult = 0.0f;
 			}
-			constexpr float WeightEpsilon = 1e-4f;
-			SignedResult = static_cast<float>(Sum / FMath::Max(WeightSum, WeightEpsilon));
+			return FMath::Clamp(SignedResult * 0.5f + 0.5f, 0.0f, 1.0f);
+		}
+
+		const int32 SafeOctaves = FMath::Clamp(Params.Octaves, 1, 8);
+		const float SafeRoughness = FMath::Clamp(Params.Roughness, 0.0f, 1.0f);
+		const float SafeLacunarity = FMath::Max(Params.Lacunarity, 1.0f);
+		const float SafeTurbulenceStrength = FMath::Clamp(Params.TurbulenceStrength, 0.0f, 5.0f);
+
+		// Ridged is the one type whose per-octave accumulation is already in [0,1] space -- see
+		// EvaluateRidged's own doc comment for why it must skip the shared signed-to-[0,1] remap below.
+		if (Params.NoiseType == EVertexMaskForgeNoiseType::Ridged)
+		{
+			float RawMask = EvaluateRidged(BaseNoisePosition, SafeOctaves, SafeRoughness, SafeLacunarity);
+			if (!FMath::IsFinite(RawMask))
+			{
+				RawMask = 0.0f;
+			}
+			return FMath::Clamp(RawMask, 0.0f, 1.0f);
+		}
+
+		float SignedResult;
+		switch (Params.NoiseType)
+		{
+		case EVertexMaskForgeNoiseType::Billow:
+			SignedResult = EvaluateBillow(BaseNoisePosition, SafeOctaves, SafeRoughness, SafeLacunarity);
+			break;
+		case EVertexMaskForgeNoiseType::Turbulence:
+			SignedResult = EvaluateTurbulence(BaseNoisePosition, SafeOctaves, SafeRoughness, SafeLacunarity, SafeTurbulenceStrength);
+			break;
+		case EVertexMaskForgeNoiseType::FractalPerlin:
+		default:
+			SignedResult = EvaluateSignedFBM(BaseNoisePosition, SafeOctaves, SafeRoughness, SafeLacunarity);
+			break;
 		}
 
 		if (!FMath::IsFinite(SignedResult))
@@ -6281,6 +6418,46 @@ void SVertexMaskForgePanel::OnNoiseGenerativeParamChanged()
 	}
 }
 
+void SVertexMaskForgePanel::OnNoiseScaleAxesLockChanged(const ECheckBoxState NewState)
+{
+	// UI/workflow-only flag -- flipping it never touches NoiseScaleX/Y/Z by itself, so OFF never
+	// invalidates or Auto Updates (the numeric values genuinely have not changed).
+	bNoiseScaleAxesLocked = (NewState == ECheckBoxState::Checked);
+
+	if (bNoiseScaleAxesLocked)
+	{
+		// Snap Y/Z to the current X immediately, per the explicit "usar imediatamente o valor atual de
+		// Scale X como mestre" requirement -- but only invalidate/Auto Update ONCE, and only if a value
+		// actually changed (e.g. locking while already X==Y==Z must be a no-op beyond the flag itself).
+		bool bAnyValueChanged = false;
+		if (NoiseScaleY != NoiseScaleX) { NoiseScaleY = NoiseScaleX; bAnyValueChanged = true; }
+		if (NoiseScaleZ != NoiseScaleX) { NoiseScaleZ = NoiseScaleX; bAnyValueChanged = true; }
+		if (bAnyValueChanged)
+		{
+			OnNoiseGenerativeParamChanged();
+		}
+	}
+}
+
+void SVertexMaskForgePanel::OnNoiseScaleXChanged(const float NewValue)
+{
+	// Single atomic entry point for Scale X -- when locked, folds the Y/Z synchronization into the SAME
+	// call so OnNoiseGenerativeParamChanged (one InvalidateNoiseRawMask + at most one Auto Update) fires
+	// exactly once per edit, never once per axis.
+	const float ClampedValue = FMath::Max(NewValue, 0.001f);
+	bool bAnyValueChanged = false;
+	if (NoiseScaleX != ClampedValue) { NoiseScaleX = ClampedValue; bAnyValueChanged = true; }
+	if (bNoiseScaleAxesLocked)
+	{
+		if (NoiseScaleY != NoiseScaleX) { NoiseScaleY = NoiseScaleX; bAnyValueChanged = true; }
+		if (NoiseScaleZ != NoiseScaleX) { NoiseScaleZ = NoiseScaleX; bAnyValueChanged = true; }
+	}
+	if (bAnyValueChanged)
+	{
+		OnNoiseGenerativeParamChanged();
+	}
+}
+
 void SVertexMaskForgePanel::OnNoiseInvertChanged(const ECheckBoxState NewState)
 {
 	bNoiseInvert = (NewState == ECheckBoxState::Checked);
@@ -6605,6 +6782,9 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 
 	NoiseTypeOptions.Add(MakeShared<EVertexMaskForgeNoiseType>(EVertexMaskForgeNoiseType::Perlin));
 	NoiseTypeOptions.Add(MakeShared<EVertexMaskForgeNoiseType>(EVertexMaskForgeNoiseType::FractalPerlin));
+	NoiseTypeOptions.Add(MakeShared<EVertexMaskForgeNoiseType>(EVertexMaskForgeNoiseType::Billow));
+	NoiseTypeOptions.Add(MakeShared<EVertexMaskForgeNoiseType>(EVertexMaskForgeNoiseType::Ridged));
+	NoiseTypeOptions.Add(MakeShared<EVertexMaskForgeNoiseType>(EVertexMaskForgeNoiseType::Turbulence));
 
 	// Z starts enabled to reproduce the exact previously-validated Local-Z-only default; X and Y
 	// start disabled (see BoundingBoxAxisParams' doc comment in the header).
@@ -7660,11 +7840,7 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 							.Delta(0.01f)
 							.ToolTipText(LOCTEXT("NoiseScaleXTooltip", "Frequency multiplier along local X. 1.0 is approximately one noise unit per meter."))
 							.Value_Lambda([this]() { return NoiseScaleX; })
-							.OnValueChanged_Lambda([this](const float NewValue)
-							{
-								NoiseScaleX = FMath::Max(NewValue, 0.001f);
-								OnNoiseGenerativeParamChanged();
-							})
+							.OnValueChanged(this, &SVertexMaskForgePanel::OnNoiseScaleXChanged)
 						]
 
 						+ SHorizontalBox::Slot()
@@ -7678,6 +7854,7 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 							.MaxValue(1000.0f)
 							.Delta(0.01f)
 							.ToolTipText(LOCTEXT("NoiseScaleYTooltip", "Frequency multiplier along local Y."))
+							.IsEnabled_Lambda([this]() { return !bNoiseScaleAxesLocked; })
 							.Value_Lambda([this]() { return NoiseScaleY; })
 							.OnValueChanged_Lambda([this](const float NewValue)
 							{
@@ -7689,6 +7866,7 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 						+ SHorizontalBox::Slot()
 						.AutoWidth()
 						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 8.f, 0.f))
 						[
 							SNew(SSpinBox<float>)
 							.MinDesiredWidth(52.f)
@@ -7696,12 +7874,27 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 							.MaxValue(1000.0f)
 							.Delta(0.01f)
 							.ToolTipText(LOCTEXT("NoiseScaleZTooltip", "Frequency multiplier along local Z."))
+							.IsEnabled_Lambda([this]() { return !bNoiseScaleAxesLocked; })
 							.Value_Lambda([this]() { return NoiseScaleZ; })
 							.OnValueChanged_Lambda([this](const float NewValue)
 							{
 								NoiseScaleZ = FMath::Max(NewValue, 0.001f);
 								OnNoiseGenerativeParamChanged();
 							})
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						[
+							SNew(SCheckBox)
+							.ToolTipText(LOCTEXT("NoiseScaleAxesLockedTooltip", "Use Scale X for all three axes."))
+							.IsChecked(this, &SVertexMaskForgePanel::GetNoiseScaleAxesLockState)
+							.OnCheckStateChanged(this, &SVertexMaskForgePanel::OnNoiseScaleAxesLockChanged)
+							[
+								SNew(STextBlock)
+								.Text(LOCTEXT("NoiseScaleAxesLockedLabel", "Lock Axes"))
+							]
 						]
 					]
 
@@ -7851,7 +8044,7 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 						[
 							SNew(STextBlock)
 							.Text(LOCTEXT("NoiseOctavesLabel", "Octaves"))
-							.ToolTipText(LOCTEXT("NoiseOctavesTooltip", "Fractal Perlin (FBM) only."))
+							.ToolTipText(LOCTEXT("NoiseOctavesTooltip", "Multi-octave types only (Fractal Perlin, Billow, Ridged, Turbulence)."))
 						]
 
 						+ SHorizontalBox::Slot()
@@ -7864,7 +8057,7 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 							.MinValue(1)
 							.MaxValue(8)
 							.Delta(1)
-							.IsEnabled_Lambda([this]() { return NoiseType == EVertexMaskForgeNoiseType::FractalPerlin; })
+							.IsEnabled_Lambda([this]() { return UsesFractalParameters(); })
 							.Value_Lambda([this]() { return NoiseOctaves; })
 							.OnValueChanged_Lambda([this](const int32 NewValue)
 							{
@@ -7880,7 +8073,7 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 						[
 							SNew(STextBlock)
 							.Text(LOCTEXT("NoiseRoughnessLabel", "Roughness"))
-							.ToolTipText(LOCTEXT("NoiseRoughnessTooltip", "Per-octave amplitude multiplier. Fractal Perlin (FBM) only."))
+							.ToolTipText(LOCTEXT("NoiseRoughnessTooltip", "Per-octave amplitude multiplier. Multi-octave types only."))
 						]
 
 						+ SHorizontalBox::Slot()
@@ -7893,7 +8086,7 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 							.MinValue(0.0f)
 							.MaxValue(1.0f)
 							.Delta(0.01f)
-							.IsEnabled_Lambda([this]() { return NoiseType == EVertexMaskForgeNoiseType::FractalPerlin; })
+							.IsEnabled_Lambda([this]() { return UsesFractalParameters(); })
 							.Value_Lambda([this]() { return NoiseRoughness; })
 							.OnValueChanged_Lambda([this](const float NewValue)
 							{
@@ -7909,7 +8102,7 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 						[
 							SNew(STextBlock)
 							.Text(LOCTEXT("NoiseLacunarityLabel", "Lacunarity"))
-							.ToolTipText(LOCTEXT("NoiseLacunarityTooltip", "Per-octave frequency multiplier. Fractal Perlin (FBM) only."))
+							.ToolTipText(LOCTEXT("NoiseLacunarityTooltip", "Per-octave frequency multiplier. Multi-octave types only."))
 						]
 
 						+ SHorizontalBox::Slot()
@@ -7921,11 +8114,49 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 							.MinValue(1.0f)
 							.MaxValue(10.0f)
 							.Delta(0.01f)
-							.IsEnabled_Lambda([this]() { return NoiseType == EVertexMaskForgeNoiseType::FractalPerlin; })
+							.IsEnabled_Lambda([this]() { return UsesFractalParameters(); })
 							.Value_Lambda([this]() { return NoiseLacunarity; })
 							.OnValueChanged_Lambda([this](const float NewValue)
 							{
 								NoiseLacunarity = FMath::Max(NewValue, 1.0f);
+								OnNoiseGenerativeParamChanged();
+							})
+						]
+					]
+
+					// Turbulence-only control -- always visible (no dynamic show/hide by Noise Type),
+					// but disabled (IsEnabled) unless Noise Type is Turbulence, same contract as the
+					// Octaves/Roughness/Lacunarity row above.
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(FMargin(0.f, 0.f, 0.f, 4.f))
+					[
+						SNew(SHorizontalBox)
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
+						[
+							SNew(STextBlock)
+							.Text(LOCTEXT("NoiseTurbulenceStrengthLabel", "Turbulence Strength"))
+							.ToolTipText(LOCTEXT("NoiseTurbulenceStrengthTooltip", "Domain-warp displacement strength, in noise space. Turbulence only."))
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						[
+							SNew(SSpinBox<float>)
+							.MinDesiredWidth(52.f)
+							.MinValue(0.0f)
+							.MaxValue(5.0f)
+							.Delta(0.01f)
+							.IsEnabled_Lambda([this]() { return NoiseType == EVertexMaskForgeNoiseType::Turbulence; })
+							.Value_Lambda([this]() { return NoiseTurbulenceStrength; })
+							.OnValueChanged_Lambda([this](const float NewValue)
+							{
+								NoiseTurbulenceStrength = FMath::Clamp(NewValue, 0.0f, 5.0f);
 								OnNoiseGenerativeParamChanged();
 							})
 						]
@@ -8601,6 +8832,7 @@ FReply SVertexMaskForgePanel::OnGenerateBoundingBoxMaskClicked()
 	NoiseGenerativeParams.Octaves = NoiseOctaves;
 	NoiseGenerativeParams.Roughness = NoiseRoughness;
 	NoiseGenerativeParams.Lacunarity = NoiseLacunarity;
+	NoiseGenerativeParams.TurbulenceStrength = NoiseTurbulenceStrength;
 
 	for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
 	{
@@ -9171,6 +9403,7 @@ void SVertexMaskForgePanel::RunAutoUpdatePreview(const bool bIncludeAO)
 	NoiseGenerativeParams.Octaves = NoiseOctaves;
 	NoiseGenerativeParams.Roughness = NoiseRoughness;
 	NoiseGenerativeParams.Lacunarity = NoiseLacunarity;
+	NoiseGenerativeParams.TurbulenceStrength = NoiseTurbulenceStrength;
 
 	for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
 	{
