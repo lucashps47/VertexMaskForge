@@ -289,6 +289,23 @@ enum class EVertexMaskForgeNoiseType : uint8
 	 *  final FBM evaluation -- see VertexMaskForgePanel::EvaluateTurbulence for the exact formula.
 	 *  Multi-octave (Octaves/Roughness/Lacunarity apply); also uses NoiseTurbulenceStrength. */
 	Turbulence,
+
+	/** Worley F1 (V2-B): the Euclidean distance, in noise-space cellular units, to the nearest feature
+	 *  point of a 3D cellular pattern -- see VertexMaskForgePanel::EvaluateCellularNoise for the shared
+	 *  feature-point layout and VertexMaskForgePanel::ComputeRawNoiseValue for the exact RawMask
+	 *  formula. Not multi-octave (Octaves/Roughness/Lacunarity/Turbulence Strength are unused). */
+	WorleyF1,
+
+	/** Worley F2-F1 (V2-B): the difference between the SECOND- and first-nearest feature-point
+	 *  distances of the SAME cellular pattern as WorleyF1 -- produces cell-edge structures, near zero at
+	 *  cell boundaries. Not multi-octave. */
+	WorleyF2MinusF1,
+
+	/** Voronoi (V2-B): a solid, per-region deterministic value -- every point sharing the same nearest
+	 *  feature point (the SAME cellular pattern as WorleyF1/WorleyF2MinusF1) receives EXACTLY the same
+	 *  hashed value; changes only when crossing into a different region, never as a function of
+	 *  distance. Not multi-octave. */
+	Voronoi,
 };
 
 /**
@@ -1554,10 +1571,24 @@ private:
 	/** Turbulence only. UI range [0, 5]; default 0.5. GENERATIVE. */
 	float NoiseTurbulenceStrength = 0.5f;
 
-	/** V2-A: true for every Noise Type whose raw pattern is a weighted sum of octaves (FractalPerlin,
-	 *  Billow, Ridged, Turbulence) -- false only for the single-sample Perlin. Small, localized helper so
-	 *  the Octaves/Roughness/Lacunarity IsEnabled bindings don't each repeat their own type comparison. */
-	bool UsesFractalParameters() const { return NoiseType != EVertexMaskForgeNoiseType::Perlin; }
+	/** True for every Noise Type whose raw pattern is a weighted sum of octaves (FractalPerlin, Billow,
+	 *  Ridged, Turbulence) -- false for the single-sample Perlin AND for the three V2-B cellular types
+	 *  (WorleyF1/WorleyF2MinusF1/Voronoi are not multi-octave; Octaves/Roughness/Lacunarity are unused by
+	 *  ComputeRawNoiseValue's cellular branch). Small, localized helper so the Octaves/Roughness/
+	 *  Lacunarity IsEnabled bindings don't each repeat their own type comparison. */
+	bool UsesFractalParameters() const
+	{
+		switch (NoiseType)
+		{
+		case EVertexMaskForgeNoiseType::FractalPerlin:
+		case EVertexMaskForgeNoiseType::Billow:
+		case EVertexMaskForgeNoiseType::Ridged:
+		case EVertexMaskForgeNoiseType::Turbulence:
+			return true;
+		default:
+			return false;
+		}
+	}
 
 	/**
 	 * Shared handler for ALL generative Noise parameters (Type/Scale XYZ/Offset XYZ/Seed/Octaves/

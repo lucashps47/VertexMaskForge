@@ -2378,6 +2378,12 @@ namespace VertexMaskForgePanel
 			return LOCTEXT("NoiseTypeRidged", "Ridged");
 		case EVertexMaskForgeNoiseType::Turbulence:
 			return LOCTEXT("NoiseTypeTurbulence", "Turbulence");
+		case EVertexMaskForgeNoiseType::WorleyF1:
+			return LOCTEXT("NoiseTypeWorleyF1", "Worley F1");
+		case EVertexMaskForgeNoiseType::WorleyF2MinusF1:
+			return LOCTEXT("NoiseTypeWorleyF2MinusF1", "Worley F2 - F1");
+		case EVertexMaskForgeNoiseType::Voronoi:
+			return LOCTEXT("NoiseTypeVoronoi", "Voronoi");
 		default:
 			return FText::GetEmpty();
 		}
@@ -2521,6 +2527,132 @@ namespace VertexMaskForgePanel
 		return EvaluateSignedFBM(WarpedPosition, Octaves, Roughness, Lacunarity);
 	}
 
+	// --- Cellular (V2-B): Worley F1, Worley F2-F1, Voronoi ------------------------------------------
+
+	/**
+	 * AUDITED (Noise V2-B): converts a 32-bit hash into a float in [0, 1) -- takes the low 24 bits (a
+	 * full 32-bit uint's worth of entropy is more than the mantissa of a float can represent anyway) and
+	 * divides by 2^24, per the explicit required conversion. Never returns exactly 1.0.
+	 */
+	static float Hash01(const uint32 Hash)
+	{
+		return static_cast<float>(Hash & 0x00FFFFFFu) / 16777216.0f;
+	}
+
+	/**
+	 * AUDITED (Noise V2-B): the ONE deterministic integer hash every cellular helper below builds on --
+	 * mixes a 3D cell coordinate, the Noise Seed, and a caller-chosen Salt (to decorrelate different
+	 * uses: feature-point X/Y/Z, Voronoi's solid value) via the SAME GetTypeHash/HashCombine idiom
+	 * already used elsewhere in this file (see ComputeDeterministicScrambleAngle,
+	 * ComputeDynamicMeshGeometryFingerprint) -- well-defined uint32 overflow, no FMath::Rand, no shared/
+	 * global RNG state, no pointers, no geometry IDs, deterministic on a given platform regardless of
+	 * ParallelFor execution order. GetTypeHash(int32) already handles negative CellX/Y/Z correctly (a
+	 * pure bit-pattern reinterpretation, not a magnitude-dependent formula), so cells on either side of
+	 * the origin hash exactly as well-distributed as positive ones.
+	 */
+	static uint32 HashCellCoordinate(const int32 CellX, const int32 CellY, const int32 CellZ, const int32 Seed, const uint32 Salt)
+	{
+		uint32 Hash = GetTypeHash(CellX);
+		Hash = HashCombine(Hash, GetTypeHash(CellY));
+		Hash = HashCombine(Hash, GetTypeHash(CellZ));
+		Hash = HashCombine(Hash, GetTypeHash(Seed));
+		Hash = HashCombine(Hash, Salt);
+		return Hash;
+	}
+
+	/**
+	 * AUDITED (Noise V2-B): Random3(CandidateCell, Seed) -- three independent, deterministic [0,1)
+	 * values (one per axis), each from HashCellCoordinate salted differently so the X/Y/Z components of
+	 * the resulting feature-point jitter are decorrelated from each other (never the same value reused
+	 * on all three axes, which would visibly align feature points along the diagonal).
+	 */
+	static FVector ComputeCellFeatureOffset(const FIntVector& Cell, const int32 Seed)
+	{
+		constexpr uint32 SaltX = 0xA24BAED4u;
+		constexpr uint32 SaltY = 0x9F6F6DACu;
+		constexpr uint32 SaltZ = 0xC2A2A7DDu;
+		return FVector(
+			Hash01(HashCellCoordinate(Cell.X, Cell.Y, Cell.Z, Seed, SaltX)),
+			Hash01(HashCellCoordinate(Cell.X, Cell.Y, Cell.Z, Seed, SaltY)),
+			Hash01(HashCellCoordinate(Cell.X, Cell.Y, Cell.Z, Seed, SaltZ)));
+	}
+
+	/** AUDITED (Noise V2-B): the solid per-region Voronoi value -- salted independently from the feature
+	 *  X/Y/Z offsets above, so it is never derivable from (and never correlates with) F1/F2 distance --
+	 *  hashed from ClosestCell alone, so every point sharing a ClosestCell gets EXACTLY the same value,
+	 *  with no gradient inside the region and no smoothing. */
+	static float ComputeVoronoiValue(const FIntVector& ClosestCell, const int32 Seed)
+	{
+		constexpr uint32 VoronoiValueSalt = 0x6F4C6BA1u;
+		return Hash01(HashCellCoordinate(ClosestCell.X, ClosestCell.Y, ClosestCell.Z, Seed, VoronoiValueSalt));
+	}
+
+	/** The two smallest feature-point distances found while scanning the 3x3x3 neighborhood, plus the
+	 *  cell that produced the smallest one -- shared by all three cellular Noise Types so they always
+	 *  agree on the same feature-point layout for the same Scale/Offset/Seed. */
+	struct FCellularNoiseSample
+	{
+		float F1 = 0.0f;
+		float F2 = 0.0f;
+		FIntVector ClosestCell = FIntVector::ZeroValue;
+	};
+
+	/**
+	 * AUDITED (Noise V2-B): the ONE shared cellular evaluation Worley F1/Worley F2-F1/Voronoi all call --
+	 * floors P to its containing Cell, scans the fixed 3x3x3 neighborhood (27 candidates, Offset X/Y/Z
+	 * each -1..+1, in a FIXED nested-loop order) ONCE, and tracks F1/F2/ClosestCell together in that same
+	 * pass (no second pass, no dynamic array of the 27 distances). FeaturePoint = CandidateCell +
+	 * Random3(CandidateCell, Seed), per the explicit formula -- exactly the SAME feature points regardless
+	 * of which of the three cellular types is asking, since only P and Seed are consulted (never the
+	 * enum). Tie-breaking is deterministic: strict `<` comparisons only, evaluated in the SAME fixed
+	 * iteration order every call, so a Distance exactly equal to the current best never overwrites it --
+	 * the result depends only on the 27 (CandidateCell, Distance) pairs, never on execution order (safe
+	 * under ParallelFor). No heap allocation, no TArray/TMap, no locks -- three doubles and one FIntVector
+	 * of local state for the whole scan.
+	 */
+	static FCellularNoiseSample EvaluateCellularNoise(const FVector& P, const int32 Seed)
+	{
+		const FIntVector Cell(FMath::FloorToInt(P.X), FMath::FloorToInt(P.Y), FMath::FloorToInt(P.Z));
+
+		float BestF1 = TNumericLimits<float>::Max();
+		float BestF2 = TNumericLimits<float>::Max();
+		FIntVector BestCell = Cell;
+
+		for (int32 OffsetZ = -1; OffsetZ <= 1; ++OffsetZ)
+		{
+			for (int32 OffsetY = -1; OffsetY <= 1; ++OffsetY)
+			{
+				for (int32 OffsetX = -1; OffsetX <= 1; ++OffsetX)
+				{
+					const FIntVector CandidateCell(Cell.X + OffsetX, Cell.Y + OffsetY, Cell.Z + OffsetZ);
+					const FVector RandomOffset = ComputeCellFeatureOffset(CandidateCell, Seed);
+					const FVector FeaturePoint(
+						static_cast<double>(CandidateCell.X) + RandomOffset.X,
+						static_cast<double>(CandidateCell.Y) + RandomOffset.Y,
+						static_cast<double>(CandidateCell.Z) + RandomOffset.Z);
+					const float Distance = static_cast<float>((FeaturePoint - P).Size());
+
+					if (Distance < BestF1)
+					{
+						BestF2 = BestF1;
+						BestF1 = Distance;
+						BestCell = CandidateCell;
+					}
+					else if (Distance < BestF2)
+					{
+						BestF2 = Distance;
+					}
+				}
+			}
+		}
+
+		FCellularNoiseSample Sample;
+		Sample.F1 = BestF1;
+		Sample.F2 = BestF2;
+		Sample.ClosestCell = BestCell;
+		return Sample;
+	}
+
 	/**
 	 * AUDITED (Noise V1): the expensive, GENERATIVE half of Noise -- samples ONE Perlin or FBM value at
 	 * LocalPosition (the vertex's own LOCAL/OBJECT-SPACE position -- LOD0's PositionVertexBuffer for a
@@ -2575,6 +2707,41 @@ namespace VertexMaskForgePanel
 				SignedResult = 0.0f;
 			}
 			return FMath::Clamp(SignedResult * 0.5f + 0.5f, 0.0f, 1.0f);
+		}
+
+		// V2-B cellular types -- not multi-octave (Octaves/Roughness/Lacunarity/TurbulenceStrength are
+		// never read here), share the SAME feature-point layout (EvaluateCellularNoise depends only on
+		// BaseNoisePosition and Params.Seed, never on which of the three types is asking).
+		if (Params.NoiseType == EVertexMaskForgeNoiseType::WorleyF1
+			|| Params.NoiseType == EVertexMaskForgeNoiseType::WorleyF2MinusF1
+			|| Params.NoiseType == EVertexMaskForgeNoiseType::Voronoi)
+		{
+			const FCellularNoiseSample Sample = EvaluateCellularNoise(BaseNoisePosition, Params.Seed);
+
+			float RawMask;
+			switch (Params.NoiseType)
+			{
+			case EVertexMaskForgeNoiseType::WorleyF1:
+				// RawMask = saturate(F1) -- Euclidean distance to the nearest feature point.
+				RawMask = Sample.F1;
+				break;
+			case EVertexMaskForgeNoiseType::WorleyF2MinusF1:
+				// RawMask = saturate(max(F2-F1, 0)) -- near zero at cell edges, never a plain inversion
+				// or remap of F1 (a DIFFERENT quantity: the gap between the two nearest distances).
+				RawMask = FMath::Max(Sample.F2 - Sample.F1, 0.0f);
+				break;
+			case EVertexMaskForgeNoiseType::Voronoi:
+			default:
+				// Solid per-region value -- hashed from ClosestCell alone, never from F1/F2 distance.
+				RawMask = ComputeVoronoiValue(Sample.ClosestCell, Params.Seed);
+				break;
+			}
+
+			if (!FMath::IsFinite(RawMask))
+			{
+				RawMask = 0.0f;
+			}
+			return FMath::Clamp(RawMask, 0.0f, 1.0f);
 		}
 
 		const int32 SafeOctaves = FMath::Clamp(Params.Octaves, 1, 8);
@@ -6785,6 +6952,9 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 	NoiseTypeOptions.Add(MakeShared<EVertexMaskForgeNoiseType>(EVertexMaskForgeNoiseType::Billow));
 	NoiseTypeOptions.Add(MakeShared<EVertexMaskForgeNoiseType>(EVertexMaskForgeNoiseType::Ridged));
 	NoiseTypeOptions.Add(MakeShared<EVertexMaskForgeNoiseType>(EVertexMaskForgeNoiseType::Turbulence));
+	NoiseTypeOptions.Add(MakeShared<EVertexMaskForgeNoiseType>(EVertexMaskForgeNoiseType::WorleyF1));
+	NoiseTypeOptions.Add(MakeShared<EVertexMaskForgeNoiseType>(EVertexMaskForgeNoiseType::WorleyF2MinusF1));
+	NoiseTypeOptions.Add(MakeShared<EVertexMaskForgeNoiseType>(EVertexMaskForgeNoiseType::Voronoi));
 
 	// Z starts enabled to reproduce the exact previously-validated Local-Z-only default; X and Y
 	// start disabled (see BoundingBoxAxisParams' doc comment in the header).
