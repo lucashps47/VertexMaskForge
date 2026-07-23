@@ -306,6 +306,13 @@ enum class EVertexMaskForgeNoiseType : uint8
 	 *  hashed value; changes only when crossing into a different region, never as a function of
 	 *  distance. Not multi-octave. */
 	Voronoi,
+
+	/** Alligator (V2-C): a distinct celullar type built from the DIFFERENCE between the two largest
+	 *  radial-basis-function contributions of the same feature-point layout (never a Worley distance,
+	 *  never Voronoi's solid hash) -- see VertexMaskForgePanel::EvaluateBaseAlligator/EvaluateAlligator
+	 *  for the exact formulas. Multi-octave (Octaves/Roughness/Lacunarity apply, same contract as
+	 *  FractalPerlin/Billow/Ridged/Turbulence). */
+	Alligator,
 };
 
 /**
@@ -353,6 +360,15 @@ struct FVertexMaskForgeNoiseGenerativeParams
 	 *  out of Turbulence, or tweaking Strength while already on Turbulence, is never missed. */
 	float TurbulenceStrength = 0.5f;
 
+	/** V2-C: universal pre-Multiplier blur radius factor (Radius = Blur*0.5, noise-space units) --
+	 *  applies to ALL nine Noise Types (see VertexMaskForgePanel::ComputeRawNoiseValue's seven-tap
+	 *  kernel). GENERATIVE, not artistic: it requires re-evaluating the procedural field at six extra
+	 *  offset positions, so it belongs in the raw cache key exactly like Scale/Offset/Seed, never treated
+	 *  as a cheap downstream reprocessing step like Multiplier/Levels/Invert. UI range [0, 1]; default
+	 *  0.0 -- Blur <= 0 takes an exact short-circuit path (see ComputeRawNoiseValue) that reproduces
+	 *  every existing Noise Type's pre-V2-C output bit-for-bit. */
+	float Blur = 0.0f;
+
 	bool operator==(const FVertexMaskForgeNoiseGenerativeParams& Other) const
 	{
 		return NoiseType == Other.NoiseType
@@ -360,7 +376,8 @@ struct FVertexMaskForgeNoiseGenerativeParams
 			&& OffsetX == Other.OffsetX && OffsetY == Other.OffsetY && OffsetZ == Other.OffsetZ
 			&& Seed == Other.Seed
 			&& Octaves == Other.Octaves && Roughness == Other.Roughness && Lacunarity == Other.Lacunarity
-			&& TurbulenceStrength == Other.TurbulenceStrength;
+			&& TurbulenceStrength == Other.TurbulenceStrength
+			&& Blur == Other.Blur;
 	}
 	bool operator!=(const FVertexMaskForgeNoiseGenerativeParams& Other) const { return !(*this == Other); }
 };
@@ -1572,10 +1589,10 @@ private:
 	float NoiseTurbulenceStrength = 0.5f;
 
 	/** True for every Noise Type whose raw pattern is a weighted sum of octaves (FractalPerlin, Billow,
-	 *  Ridged, Turbulence) -- false for the single-sample Perlin AND for the three V2-B cellular types
-	 *  (WorleyF1/WorleyF2MinusF1/Voronoi are not multi-octave; Octaves/Roughness/Lacunarity are unused by
-	 *  ComputeRawNoiseValue's cellular branch). Small, localized helper so the Octaves/Roughness/
-	 *  Lacunarity IsEnabled bindings don't each repeat their own type comparison. */
+	 *  Ridged, Turbulence, Alligator) -- false for the single-sample Perlin AND for the three V2-B
+	 *  cellular types (WorleyF1/WorleyF2MinusF1/Voronoi are not multi-octave; Octaves/Roughness/
+	 *  Lacunarity are unused by ComputeRawNoiseValue's cellular branch). Small, localized helper so the
+	 *  Octaves/Roughness/Lacunarity IsEnabled bindings don't each repeat their own type comparison. */
 	bool UsesFractalParameters() const
 	{
 		switch (NoiseType)
@@ -1584,6 +1601,7 @@ private:
 		case EVertexMaskForgeNoiseType::Billow:
 		case EVertexMaskForgeNoiseType::Ridged:
 		case EVertexMaskForgeNoiseType::Turbulence:
+		case EVertexMaskForgeNoiseType::Alligator:
 			return true;
 		default:
 			return false;
@@ -1604,6 +1622,13 @@ private:
 	/** Same contract/range as BoundingBoxOpacity/AOOpacity/CurvatureMultiplier's own scale role -- UI
 	 *  range [0, 10], default 1.0. ARTISTIC -- see OnNoiseArtisticParamChanged. */
 	float NoiseMultiplier = 1.0f;
+
+	/** V2-C: universal blur, applied to the raw procedural field BEFORE Multiplier/Levels/Invert (see
+	 *  ComputeRawNoiseValue's seven-tap kernel). UI range [0, 1]; default 0.0. GENERATIVE (unlike
+	 *  Multiplier right next to it in the UI) -- see OnNoiseGenerativeParamChanged. Positioned in the UI
+	 *  immediately after Multiplier (Seed -> Multiplier -> Blur) per the explicit layout requirement,
+	 *  even though it is evaluated FIRST in the actual pipeline. */
+	float NoiseBlur = 0.0f;
 
 	/** Same semantics as AOLevelsMin/CurvatureLevelsMin. UI range [0, 1]; default 0.0. ARTISTIC. */
 	float NoiseLevelsMin = 0.0f;

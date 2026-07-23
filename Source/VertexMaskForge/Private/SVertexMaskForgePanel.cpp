@@ -2384,6 +2384,8 @@ namespace VertexMaskForgePanel
 			return LOCTEXT("NoiseTypeWorleyF2MinusF1", "Worley F2 - F1");
 		case EVertexMaskForgeNoiseType::Voronoi:
 			return LOCTEXT("NoiseTypeVoronoi", "Voronoi");
+		case EVertexMaskForgeNoiseType::Alligator:
+			return LOCTEXT("NoiseTypeAlligator", "Alligator");
 		default:
 			return FText::GetEmpty();
 		}
@@ -2653,20 +2655,106 @@ namespace VertexMaskForgePanel
 		return Sample;
 	}
 
+	// --- Alligator (V2-C): a distinct cellular type from a two-largest RBF-contribution difference ----
+
 	/**
-	 * AUDITED (Noise V1): the expensive, GENERATIVE half of Noise -- samples ONE Perlin or FBM value at
-	 * LocalPosition (the vertex's own LOCAL/OBJECT-SPACE position -- LOD0's PositionVertexBuffer for a
-	 * non-Source-Topology entry, Mesh.GetVertex() for a Source-Topology one -- never a component
-	 * transform, never World Position, per the explicit "Local Space" requirement), returns a value
-	 * already reduced to [0, 1] (no Multiplier/Levels/Invert applied -- see ApplyNoiseArtisticParams for
-	 * that separate, cheap stage).
-	 *
-	 * NoisePosition = LocalPosition * (Scale/100) + Offset + SeedOffset -- per the explicit formula:
-	 * dividing by 100 converts Unreal's centimeter-scale local position into an approximately
-	 * meters-scale noise domain, so Scale 1 reads as "about one noise unit per meter" and remains
-	 * artistically comprehensible across modular meshes of different sizes. Offset and SeedOffset are
-	 * BOTH already in this same noise-space domain (added after the Scale multiply), per the explicit
-	 * "Offset deve operar em noise space" requirement.
+	 * AUDITED (Noise V2-C): the SINGLE-octave Alligator base value -- uses the EXACT SAME feature-point
+	 * layout as WorleyF1/WorleyF2MinusF1/Voronoi (CandidateCell + Random3(CandidateCell, Seed),
+	 * ComputeCellFeatureOffset, same 3x3x3 neighborhood, same fixed iteration order), but a DIFFERENT
+	 * combination rule: each candidate contributes CellValue*RBF(Distance) (0 once Distance >= 1, a
+	 * smoothstep-shaped falloff for Distance in [0,1)), and the result is the DIFFERENCE between the two
+	 * LARGEST contributions found -- never a Worley distance, never Voronoi's solid per-cell hash. This
+	 * "difference of two competing round volumes" is what produces the scale-like/rounded-volume look,
+	 * distinct from both Worley families and Voronoi. Same single-pass, no-container, strict-comparison,
+	 * fixed-order contract as EvaluateCellularNoise -- safe for ParallelFor, deterministic regardless of
+	 * execution order.
+	 */
+	static float EvaluateBaseAlligator(const FVector& P, const int32 Seed)
+	{
+		// Distinct from the Feature X/Y/Z salts (ComputeCellFeatureOffset) and from the Voronoi value
+		// salt (ComputeVoronoiValue) -- documented per the explicit requirement.
+		constexpr uint32 AlligatorValueSalt = 0x3D4C2F17u;
+
+		const FIntVector Cell(FMath::FloorToInt(P.X), FMath::FloorToInt(P.Y), FMath::FloorToInt(P.Z));
+
+		float Largest = 0.0f;
+		float SecondLargest = 0.0f;
+
+		for (int32 OffsetZ = -1; OffsetZ <= 1; ++OffsetZ)
+		{
+			for (int32 OffsetY = -1; OffsetY <= 1; ++OffsetY)
+			{
+				for (int32 OffsetX = -1; OffsetX <= 1; ++OffsetX)
+				{
+					const FIntVector CandidateCell(Cell.X + OffsetX, Cell.Y + OffsetY, Cell.Z + OffsetZ);
+					const FVector RandomOffset = ComputeCellFeatureOffset(CandidateCell, Seed);
+					const FVector FeaturePoint(
+						static_cast<double>(CandidateCell.X) + RandomOffset.X,
+						static_cast<double>(CandidateCell.Y) + RandomOffset.Y,
+						static_cast<double>(CandidateCell.Z) + RandomOffset.Z);
+					const float Distance = static_cast<float>((FeaturePoint - P).Size());
+
+					float Contribution = 0.0f;
+					if (Distance < 1.0f)
+					{
+						const float T = 1.0f - Distance;
+						const float RBF = T * T * (3.0f - 2.0f * T); // smoothstep, 0 at Distance=1, 1 at Distance=0
+						const float CellValue = Hash01(HashCellCoordinate(CandidateCell.X, CandidateCell.Y, CandidateCell.Z, Seed, AlligatorValueSalt));
+						Contribution = CellValue * RBF;
+					}
+
+					if (Contribution > Largest)
+					{
+						SecondLargest = Largest;
+						Largest = Contribution;
+					}
+					else if (Contribution > SecondLargest)
+					{
+						SecondLargest = Contribution;
+					}
+				}
+			}
+		}
+
+		return FMath::Max(Largest - SecondLargest, 0.0f);
+	}
+
+	/**
+	 * AUDITED (Noise V2-C): Alligator's multi-octave accumulation -- SAME contract as EvaluateSignedFBM/
+	 * EvaluateBillow/EvaluateRidged (Frequency *= Lacunarity, Amplitude *= Roughness, starting at 1),
+	 * except EvaluateBaseAlligator is ALREADY in [0,1] (never signed), so -- like Ridged -- this
+	 * accumulates directly in [0,1] space and skips any signed-to-[0,1] remap. Octaves == 1 reduces to
+	 * EvaluateBaseAlligator(P, Seed) exactly (Sum = Sample*1, AmplitudeSum = 1). Does not apply the
+	 * frequency-scale-1.64 convention some third-party Alligator implementations use -- the Vertex Mask
+	 * Forge Scale control remains the only visible base-frequency knob, per the explicit requirement.
+	 */
+	static float EvaluateAlligator(const FVector& P, const int32 Seed, const int32 Octaves, const float Roughness, const float Lacunarity)
+	{
+		double Frequency = 1.0;
+		float Amplitude = 1.0f;
+		double Sum = 0.0;
+		float AmplitudeSum = 0.0f;
+		for (int32 Octave = 0; Octave < Octaves; ++Octave)
+		{
+			const FVector OctavePosition = P * Frequency;
+			const float Sample = EvaluateBaseAlligator(OctavePosition, Seed);
+			Sum += static_cast<double>(Sample * Amplitude);
+			AmplitudeSum += Amplitude;
+			Frequency *= Lacunarity;
+			Amplitude *= Roughness;
+		}
+		constexpr float WeightEpsilon = 1e-4f;
+		return (AmplitudeSum > WeightEpsilon) ? FMath::Clamp(static_cast<float>(Sum / AmplitudeSum), 0.0f, 1.0f) : 0.0f;
+	}
+
+	/**
+	 * AUDITED (Noise V1, extended V2-C): the expensive, GENERATIVE type-dispatch half of Noise -- samples
+	 * ONE value of whichever Noise Type Params selects at NoisePosition (an ALREADY-PREPARED noise-space
+	 * position -- see ComputeRawNoiseValue for how LocalPosition/Scale/Offset/SeedOffset combine into it;
+	 * this function never re-derives that itself, so it can be called at Blur's six extra offset
+	 * positions without duplicating the position-preparation logic), returns a value already reduced to
+	 * [0, 1] (no Blur/Multiplier/Levels/Invert applied here -- see ComputeRawNoiseValue for Blur,
+	 * ApplyNoiseArtisticParams for the artistic stage).
 	 *
 	 * PERLIN: SignedNoise = FMath::PerlinNoise3D(NoisePosition); Mask = saturate(SignedNoise*0.5+0.5).
 	 *
@@ -2683,25 +2771,15 @@ namespace VertexMaskForgePanel
 	 * thread-safe static initialization and never mutated afterward, no FMath::Rand/global RNG state,
 	 * no heap access -- so concurrent reads from multiple ParallelFor workers are safe with no locking,
 	 * and the result depends ONLY on the input Location (fully deterministic, order-independent). All
-	 * inputs are defensively clamped (Scale away from zero, Octaves/Roughness/Lacunarity to their
-	 * documented safe ranges) and the final result is FMath::IsFinite-checked before being trusted, so
-	 * this can never return NaN/Inf even from a pathological parameter combination.
+	 * inputs are defensively clamped (Octaves/Roughness/Lacunarity/TurbulenceStrength to their documented
+	 * safe ranges) and the final result is FMath::IsFinite-checked before being trusted, so this can
+	 * never return NaN/Inf even from a pathological parameter combination.
 	 */
-	static float ComputeRawNoiseValue(const FVector& LocalPosition, const FVertexMaskForgeNoiseGenerativeParams& Params, const FVector& SeedOffset)
+	static float EvaluateUnblurredNoiseAtPosition(const FVector& NoisePosition, const FVertexMaskForgeNoiseGenerativeParams& Params)
 	{
-		constexpr double ScaleEpsilon = 1e-4;
-		const double SafeScaleX = FMath::Max(FMath::Abs(static_cast<double>(Params.ScaleX)), ScaleEpsilon);
-		const double SafeScaleY = FMath::Max(FMath::Abs(static_cast<double>(Params.ScaleY)), ScaleEpsilon);
-		const double SafeScaleZ = FMath::Max(FMath::Abs(static_cast<double>(Params.ScaleZ)), ScaleEpsilon);
-
-		const FVector BaseNoisePosition(
-			LocalPosition.X * (SafeScaleX / 100.0) + static_cast<double>(Params.OffsetX) + SeedOffset.X,
-			LocalPosition.Y * (SafeScaleY / 100.0) + static_cast<double>(Params.OffsetY) + SeedOffset.Y,
-			LocalPosition.Z * (SafeScaleZ / 100.0) + static_cast<double>(Params.OffsetZ) + SeedOffset.Z);
-
 		if (Params.NoiseType == EVertexMaskForgeNoiseType::Perlin)
 		{
-			float SignedResult = FMath::PerlinNoise3D(BaseNoisePosition);
+			float SignedResult = FMath::PerlinNoise3D(NoisePosition);
 			if (!FMath::IsFinite(SignedResult))
 			{
 				SignedResult = 0.0f;
@@ -2711,12 +2789,12 @@ namespace VertexMaskForgePanel
 
 		// V2-B cellular types -- not multi-octave (Octaves/Roughness/Lacunarity/TurbulenceStrength are
 		// never read here), share the SAME feature-point layout (EvaluateCellularNoise depends only on
-		// BaseNoisePosition and Params.Seed, never on which of the three types is asking).
+		// NoisePosition and Params.Seed, never on which of the three types is asking).
 		if (Params.NoiseType == EVertexMaskForgeNoiseType::WorleyF1
 			|| Params.NoiseType == EVertexMaskForgeNoiseType::WorleyF2MinusF1
 			|| Params.NoiseType == EVertexMaskForgeNoiseType::Voronoi)
 		{
-			const FCellularNoiseSample Sample = EvaluateCellularNoise(BaseNoisePosition, Params.Seed);
+			const FCellularNoiseSample Sample = EvaluateCellularNoise(NoisePosition, Params.Seed);
 
 			float RawMask;
 			switch (Params.NoiseType)
@@ -2749,11 +2827,21 @@ namespace VertexMaskForgePanel
 		const float SafeLacunarity = FMath::Max(Params.Lacunarity, 1.0f);
 		const float SafeTurbulenceStrength = FMath::Clamp(Params.TurbulenceStrength, 0.0f, 5.0f);
 
-		// Ridged is the one type whose per-octave accumulation is already in [0,1] space -- see
-		// EvaluateRidged's own doc comment for why it must skip the shared signed-to-[0,1] remap below.
+		// Ridged and Alligator are the two types whose per-octave accumulation is already in [0,1] space
+		// -- see EvaluateRidged/EvaluateAlligator's own doc comments for why they must skip the shared
+		// signed-to-[0,1] remap below.
 		if (Params.NoiseType == EVertexMaskForgeNoiseType::Ridged)
 		{
-			float RawMask = EvaluateRidged(BaseNoisePosition, SafeOctaves, SafeRoughness, SafeLacunarity);
+			float RawMask = EvaluateRidged(NoisePosition, SafeOctaves, SafeRoughness, SafeLacunarity);
+			if (!FMath::IsFinite(RawMask))
+			{
+				RawMask = 0.0f;
+			}
+			return FMath::Clamp(RawMask, 0.0f, 1.0f);
+		}
+		if (Params.NoiseType == EVertexMaskForgeNoiseType::Alligator)
+		{
+			float RawMask = EvaluateAlligator(NoisePosition, Params.Seed, SafeOctaves, SafeRoughness, SafeLacunarity);
 			if (!FMath::IsFinite(RawMask))
 			{
 				RawMask = 0.0f;
@@ -2765,14 +2853,14 @@ namespace VertexMaskForgePanel
 		switch (Params.NoiseType)
 		{
 		case EVertexMaskForgeNoiseType::Billow:
-			SignedResult = EvaluateBillow(BaseNoisePosition, SafeOctaves, SafeRoughness, SafeLacunarity);
+			SignedResult = EvaluateBillow(NoisePosition, SafeOctaves, SafeRoughness, SafeLacunarity);
 			break;
 		case EVertexMaskForgeNoiseType::Turbulence:
-			SignedResult = EvaluateTurbulence(BaseNoisePosition, SafeOctaves, SafeRoughness, SafeLacunarity, SafeTurbulenceStrength);
+			SignedResult = EvaluateTurbulence(NoisePosition, SafeOctaves, SafeRoughness, SafeLacunarity, SafeTurbulenceStrength);
 			break;
 		case EVertexMaskForgeNoiseType::FractalPerlin:
 		default:
-			SignedResult = EvaluateSignedFBM(BaseNoisePosition, SafeOctaves, SafeRoughness, SafeLacunarity);
+			SignedResult = EvaluateSignedFBM(NoisePosition, SafeOctaves, SafeRoughness, SafeLacunarity);
 			break;
 		}
 
@@ -2781,6 +2869,66 @@ namespace VertexMaskForgePanel
 			SignedResult = 0.0f;
 		}
 		return FMath::Clamp(SignedResult * 0.5f + 0.5f, 0.0f, 1.0f);
+	}
+
+	/**
+	 * AUDITED (V2-C): prepares BaseNoisePosition (LocalPosition * (Scale/100) + Offset + SeedOffset --
+	 * UNCHANGED formula, per the explicit "preserve the current Seed/SeedOffset prep" requirement) and
+	 * then applies the universal Blur kernel BEFORE handing off to EvaluateUnblurredNoiseAtPosition for
+	 * the actual per-type evaluation.
+	 *
+	 * Blur <= 0 (the default): an EXACT short-circuit straight to
+	 * EvaluateUnblurredNoiseAtPosition(BaseNoisePosition, Params) -- zero extra evaluations, reproducing
+	 * every one of the eight pre-V2-C Noise Types bit-for-bit (this function does not itself branch on
+	 * NoiseType at all, so nothing about Blur=0 can diverge per type).
+	 *
+	 * Blur > 0: Radius = Blur*0.5 (noise-space units); a SYMMETRIC seven-tap kernel -- center weight 0.4,
+	 * each of the six axis-aligned taps (+-X, +-Y, +-Z, each offset by Radius) weight 0.1, summing to
+	 * exactly 1.0 -- averages EvaluateUnblurredNoiseAtPosition at those seven noise-space positions. Pure
+	 * position-space sampling of the SAME procedural field (never mesh adjacency, vertex neighbors, or
+	 * Actor Transform), so it stays Local-Space/topology-independent and Nanite/non-Nanite-consistent
+	 * exactly like every other Noise Type. NEVER calls ComputeRawNoiseValue itself (no recursion) --
+	 * every tap goes directly to EvaluateUnblurredNoiseAtPosition, which never reads Params.Blur.
+	 */
+	static float ComputeRawNoiseValue(const FVector& LocalPosition, const FVertexMaskForgeNoiseGenerativeParams& Params, const FVector& SeedOffset)
+	{
+		constexpr double ScaleEpsilon = 1e-4;
+		const double SafeScaleX = FMath::Max(FMath::Abs(static_cast<double>(Params.ScaleX)), ScaleEpsilon);
+		const double SafeScaleY = FMath::Max(FMath::Abs(static_cast<double>(Params.ScaleY)), ScaleEpsilon);
+		const double SafeScaleZ = FMath::Max(FMath::Abs(static_cast<double>(Params.ScaleZ)), ScaleEpsilon);
+
+		const FVector BaseNoisePosition(
+			LocalPosition.X * (SafeScaleX / 100.0) + static_cast<double>(Params.OffsetX) + SeedOffset.X,
+			LocalPosition.Y * (SafeScaleY / 100.0) + static_cast<double>(Params.OffsetY) + SeedOffset.Y,
+			LocalPosition.Z * (SafeScaleZ / 100.0) + static_cast<double>(Params.OffsetZ) + SeedOffset.Z);
+
+		const float SafeBlur = FMath::Clamp(Params.Blur, 0.0f, 1.0f);
+		if (SafeBlur <= 0.0f)
+		{
+			return EvaluateUnblurredNoiseAtPosition(BaseNoisePosition, Params);
+		}
+
+		const double Radius = static_cast<double>(SafeBlur) * 0.5;
+		const float CenterValue = EvaluateUnblurredNoiseAtPosition(BaseNoisePosition, Params);
+		const float XPositive = EvaluateUnblurredNoiseAtPosition(BaseNoisePosition + FVector(Radius, 0.0, 0.0), Params);
+		const float XNegative = EvaluateUnblurredNoiseAtPosition(BaseNoisePosition - FVector(Radius, 0.0, 0.0), Params);
+		const float YPositive = EvaluateUnblurredNoiseAtPosition(BaseNoisePosition + FVector(0.0, Radius, 0.0), Params);
+		const float YNegative = EvaluateUnblurredNoiseAtPosition(BaseNoisePosition - FVector(0.0, Radius, 0.0), Params);
+		const float ZPositive = EvaluateUnblurredNoiseAtPosition(BaseNoisePosition + FVector(0.0, 0.0, Radius), Params);
+		const float ZNegative = EvaluateUnblurredNoiseAtPosition(BaseNoisePosition - FVector(0.0, 0.0, Radius), Params);
+
+		const float Blurred =
+			CenterValue * 0.4f
+			+ XPositive * 0.1f + XNegative * 0.1f
+			+ YPositive * 0.1f + YNegative * 0.1f
+			+ ZPositive * 0.1f + ZNegative * 0.1f;
+
+		float RawNoise = Blurred;
+		if (!FMath::IsFinite(RawNoise))
+		{
+			RawNoise = 0.0f;
+		}
+		return FMath::Clamp(RawNoise, 0.0f, 1.0f);
 	}
 
 	/**
@@ -6955,6 +7103,7 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 	NoiseTypeOptions.Add(MakeShared<EVertexMaskForgeNoiseType>(EVertexMaskForgeNoiseType::WorleyF1));
 	NoiseTypeOptions.Add(MakeShared<EVertexMaskForgeNoiseType>(EVertexMaskForgeNoiseType::WorleyF2MinusF1));
 	NoiseTypeOptions.Add(MakeShared<EVertexMaskForgeNoiseType>(EVertexMaskForgeNoiseType::Voronoi));
+	NoiseTypeOptions.Add(MakeShared<EVertexMaskForgeNoiseType>(EVertexMaskForgeNoiseType::Alligator));
 
 	// Z starts enabled to reproduce the exact previously-validated Local-Z-only default; X and Y
 	// start disabled (see BoundingBoxAxisParams' doc comment in the header).
@@ -8183,6 +8332,7 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 						+ SHorizontalBox::Slot()
 						.AutoWidth()
 						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 12.f, 0.f))
 						[
 							SNew(SSpinBox<float>)
 							.MinDesiredWidth(52.f)
@@ -8194,6 +8344,34 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 							{
 								NoiseMultiplier = FMath::Max(NewValue, 0.0f);
 								OnNoiseArtisticParamChanged();
+							})
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
+						[
+							SNew(STextBlock)
+							.Text(LOCTEXT("NoiseBlurLabel", "Blur"))
+							.ToolTipText(LOCTEXT("NoiseBlurTooltip", "Smooths the procedural noise field before Multiplier and Levels are applied."))
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						[
+							SNew(SSpinBox<float>)
+							.MinDesiredWidth(52.f)
+							.MinValue(0.0f)
+							.MaxValue(1.0f)
+							.Delta(0.01f)
+							.ToolTipText(LOCTEXT("NoiseBlurTooltip", "Smooths the procedural noise field before Multiplier and Levels are applied."))
+							.Value_Lambda([this]() { return NoiseBlur; })
+							.OnValueChanged_Lambda([this](const float NewValue)
+							{
+								NoiseBlur = FMath::Clamp(NewValue, 0.0f, 1.0f);
+								OnNoiseGenerativeParamChanged();
 							})
 						]
 					]
@@ -9003,6 +9181,7 @@ FReply SVertexMaskForgePanel::OnGenerateBoundingBoxMaskClicked()
 	NoiseGenerativeParams.Roughness = NoiseRoughness;
 	NoiseGenerativeParams.Lacunarity = NoiseLacunarity;
 	NoiseGenerativeParams.TurbulenceStrength = NoiseTurbulenceStrength;
+	NoiseGenerativeParams.Blur = NoiseBlur;
 
 	for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
 	{
@@ -9574,6 +9753,7 @@ void SVertexMaskForgePanel::RunAutoUpdatePreview(const bool bIncludeAO)
 	NoiseGenerativeParams.Roughness = NoiseRoughness;
 	NoiseGenerativeParams.Lacunarity = NoiseLacunarity;
 	NoiseGenerativeParams.TurbulenceStrength = NoiseTurbulenceStrength;
+	NoiseGenerativeParams.Blur = NoiseBlur;
 
 	for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
 	{
