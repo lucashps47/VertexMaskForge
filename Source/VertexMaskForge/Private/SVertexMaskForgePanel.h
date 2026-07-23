@@ -271,6 +271,43 @@ enum class EVertexMaskForgeScalarMaskSource : uint8
 	 * different values. Computed ONCE PER ENTRY (transform-independent, like Curvature/Noise).
 	 */
 	MaterialSlot,
+
+	/**
+	 * GenerateDirectionalNormalMask / GenerateDirectionalNormalMaskFromDynamicMesh (V2-E): a smooth
+	 * angular mask -- 1.0 where the surface normal is aligned with the chosen axis direction (within
+	 * Angle degrees, optionally with a smoothstep Falloff transition), 0.0 outside that cone, optionally
+	 * complemented by Invert -- see VertexMaskForgePanel::ComputeDirectionalNormalRawValue for the exact
+	 * formula. A true generator/layer like Curvature/Noise/MaterialSlot. LOCAL Space is transform-
+	 * independent (computed ONCE PER ENTRY, like Curvature/Noise); WORLD Space depends on each
+	 * component's own transform (re-evaluated PER COMPONENT, like Bounding Box's own World Space axes
+	 * and Ambient Occlusion -- see ApplyPreviewToEntry). Appended here (after MaterialSlot, not in
+	 * visual panel order) to preserve every existing enum value's numeric stability -- see this enum's
+	 * own append-only contract.
+	 */
+	DirectionalNormal,
+};
+
+/** Local vs. World Space for VertexMaskForgePanel::ComputeDirectionalNormalRawValue's surface normal --
+ *  Local is asset-relative (transform-independent); World transforms the normal by the selected
+ *  component's own ComponentToWorld (see GenerateDirectionalNormalMask's own doc comment for the exact,
+ *  non-uniform-scale-safe transform used). */
+enum class EVertexMaskForgeNormalSpace : uint8
+{
+	Local,
+	World,
+};
+
+/** One of the six principal axis directions a surface normal can be compared against -- Unreal's own
+ *  convention (X+ Forward, Y+ Right, Z+ Up). See VertexMaskForgePanel::GetNormalDirectionVector for the
+ *  exact unit vectors. */
+enum class EVertexMaskForgeNormalDirection : uint8
+{
+	PositiveX,
+	NegativeX,
+	PositiveY,
+	NegativeY,
+	PositiveZ,
+	NegativeZ,
 };
 
 /** Which of FVertexMaskForgeWorkingMesh::CurvatureRawConvexCache/CurvatureRawConcaveCache (or their
@@ -912,6 +949,33 @@ struct FVertexMaskForgeWorkingMesh
 	 *  entry (State stays Unavailable, with a specific diagnostic) rather than risk bleeding between
 	 *  slots; every other generator, and the Source-Topology domain, are completely unaffected. */
 	bool bRenderVertexMaterialSlotAmbiguous = false;
+
+	// --- Directional Normal Mask (V2-E) --------------------------------------------------------
+
+	/**
+	 * The Directional Normal Mask slot's ENTRY-LEVEL reference -- dual contract depending on the
+	 * panel's current Space setting (mirrors CurvatureMask/AmbientOcclusionMask's own split, chosen
+	 * dynamically):
+	 *  - LOCAL Space: holds the REAL, final per-element values, exactly like CurvatureMask/NoiseMask/
+	 *    MaterialSlotMask (transform-independent -- every component of this entry shares it directly).
+	 *  - WORLD Space: VALIDATION ONLY (Values/bHasValue left empty, same "State decides Ready, never
+	 *    read for real values" contract as AmbientOcclusionMask) -- ApplyPreviewToEntry re-evaluates the
+	 *    REAL result per component, using each component's own transform, exactly like Bounding Box's
+	 *    own World Space axes and Ambient Occlusion.
+	 * Render-vertex domain sized like BoundingBoxMask/CurvatureMask; Source-Topology domain is CORNER-
+	 * EXACT (Mesh.TriangleCount()*3, like MaterialSlotMask -- NEVER collapsed to Dynamic Mesh Vertex ID,
+	 * since two corners at the same position can legitimately have different split normals).
+	 */
+	FVertexMaskForgeScalarMask DirectionalNormalMask;
+
+	/**
+	 * True if BuildWorkingMeshForStaticMesh (or a later per-component check) found this entry's live
+	 * PreviewComponents producing DIFFERENT effective World-Space normal-transform results for the SAME
+	 * underlying asset (see VertexMaskForgePanel::HasConflictingWorldSpaceNormalTransforms) -- only
+	 * meaningful when Directional Normal Mask is enabled AND Space == World; checked live at generation
+	 * and Accept time (never cached stale), never affects Local Space or any other generator.
+	 */
+	bool bDirectionalNormalWorldSpaceConflict = false;
 };
 
 /**
@@ -1842,6 +1906,89 @@ private:
 	 */
 	void ReconcileMaterialSlotSelection();
 
+	// --- Directional Normal Mask (V2-E) --------------------------------------------------------
+	// A sixth, independent, optional composition-stack layer -- structural peer of Bounding Box/AO/
+	// Curvature/Noise/Material Slot. VISUAL panel position is Curvature -> Directional Normal -> Noise
+	// (see Construct()); enum value is appended AFTER MaterialSlot to preserve numeric stability of
+	// every existing EVertexMaskForgeScalarMaskSource value (the two orderings are independent, per the
+	// explicit "position and enum are decoupled" allowance).
+
+	ECheckBoxState GetDirectionalNormalMaskEnableState() const { return bDirectionalNormalMaskEnabled ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; }
+	void OnDirectionalNormalMaskEnableChanged(ECheckBoxState NewState);
+	bool bDirectionalNormalMaskEnabled = false;
+
+	TSharedRef<SWidget> OnGenerateNormalSpaceRow(TSharedPtr<EVertexMaskForgeNormalSpace> InOption) const;
+	void OnNormalSpaceSelectionChanged(TSharedPtr<EVertexMaskForgeNormalSpace> NewSelection, ESelectInfo::Type SelectInfo);
+	FText GetNormalSpaceButtonText() const;
+	TArray<TSharedPtr<EVertexMaskForgeNormalSpace>> NormalSpaceOptions;
+	TSharedPtr<SComboBox<TSharedPtr<EVertexMaskForgeNormalSpace>>> NormalSpaceComboBox;
+
+	/** UI default World (per the explicit suggested default) -- GENERATIVE, see
+	 *  OnDirectionalNormalMaskGenerativeParamChanged. */
+	EVertexMaskForgeNormalSpace DirectionalNormalSpace = EVertexMaskForgeNormalSpace::World;
+
+	TSharedRef<SWidget> OnGenerateNormalDirectionRow(TSharedPtr<EVertexMaskForgeNormalDirection> InOption) const;
+	void OnNormalDirectionSelectionChanged(TSharedPtr<EVertexMaskForgeNormalDirection> NewSelection, ESelectInfo::Type SelectInfo);
+	FText GetNormalDirectionButtonText() const;
+	TArray<TSharedPtr<EVertexMaskForgeNormalDirection>> NormalDirectionOptions;
+	TSharedPtr<SComboBox<TSharedPtr<EVertexMaskForgeNormalDirection>>> NormalDirectionComboBox;
+
+	/** Default Z+ (Up), per the explicit suggested default. GENERATIVE. */
+	EVertexMaskForgeNormalDirection DirectionalNormalDirection = EVertexMaskForgeNormalDirection::PositiveZ;
+
+	/** Degrees, UI range [0, 180]; default 90. GENERATIVE. */
+	float DirectionalNormalAngle = 90.0f;
+
+	/** Degrees, UI range [0, 180]; default 45 -- internally clamped to [0, Angle] at generation time
+	 *  (see ComputeDirectionalNormalRawValue), never causing a division by zero or NaN. GENERATIVE. */
+	float DirectionalNormalFalloff = 45.0f;
+
+	/**
+	 * Topological smoothing of the raw Directional Normal Mask, applied BEFORE Invert -- same algorithm
+	 * shape, range, default, and "whole number = full iterations, fractional part blends toward one
+	 * more" semantics as CurvatureBlur (see ApplyTopologicalCurvatureBlur's own doc comment), adapted to
+	 * a domain-appropriate adjacency (render-vertex index-buffer adjacency for non-Nanite, corner/
+	 * triangle-neighbor adjacency for Source-Topology -- see VertexMaskForgePanel::
+	 * ApplyAdjacencyTopologicalBlur for why CurvatureBlur's own Dynamic-Mesh-Vertex-ID adjacency
+	 * cannot be reused directly without collapsing split normals at hard edges/UV seams). UI range
+	 * [0, 10]; default 0.0 -- Blur <= 0 is an exact no-op (bit-for-bit identical to no Blur at all).
+	 * GENERATIVE.
+	 */
+	float DirectionalNormalBlur = 0.0f;
+
+	/**
+	 * Shared handler for Directional Normal Mask's generative parameters (Space/Direction/Angle/
+	 * Falloff -- all change WHAT the raw angular pattern looks like): invalidates the entry's
+	 * DirectionalNormalMask and either regenerates immediately (Auto Update Preview on) or waits for an
+	 * explicit Generate Mask (off) -- same contract as OnNoiseGenerativeParamChanged/
+	 * OnMaterialSlotMaskGenerativeParamChanged. Never touches AO/Curvature/Noise/Material Slot state or
+	 * caches.
+	 */
+	void OnDirectionalNormalMaskGenerativeParamChanged();
+	void InvalidateDirectionalNormalMaskRawMask();
+
+	ECheckBoxState GetDirectionalNormalMaskInvertState() const { return bDirectionalNormalMaskInvert ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; }
+	void OnDirectionalNormalMaskInvertChanged(ECheckBoxState NewState);
+	bool bDirectionalNormalMaskInvert = false;
+
+	TSharedRef<SWidget> OnGenerateDirectionalNormalMaskBlendModeRow(TSharedPtr<EVertexMaskForgeBlendMode> InOption) const;
+	void OnDirectionalNormalMaskBlendModeSelectionChanged(TSharedPtr<EVertexMaskForgeBlendMode> NewSelection, ESelectInfo::Type SelectInfo);
+	FText GetDirectionalNormalMaskBlendModeButtonText() const;
+	TSharedPtr<SComboBox<TSharedPtr<EVertexMaskForgeBlendMode>>> DirectionalNormalMaskBlendModeComboBox;
+
+	/** Same "every new layer defaults to Copy" convention as every other generator. ARTISTIC (pure
+	 *  composition, see RecomposeWorkingColors) -- never regenerates the raw mask. */
+	EVertexMaskForgeBlendMode DirectionalNormalMaskBlendMode = EVertexMaskForgeBlendMode::Copy;
+
+	/** Same contract/range/default as every other generator's own Opacity. Applied ONLY during final
+	 *  composition, never to DirectionalNormalMask.Values itself. ARTISTIC. */
+	float DirectionalNormalMaskOpacity = 1.0f;
+
+	/** Short, user-facing reason Directional Normal Mask is currently invalid/blocked (empty if valid) --
+	 *  e.g. degenerate normal, unresolved corner mapping, degenerate World transform, or a World-Space
+	 *  multi-instance conflict (see FVertexMaskForgeWorkingMesh::bDirectionalNormalWorldSpaceConflict). */
+	FText GetDirectionalNormalMaskDiagnosticText() const;
+
 	// --- Fill White / Fill Black utility masks ----------------------------------------------
 
 	FReply OnFillWhiteClicked();
@@ -2074,6 +2221,21 @@ private:
 	/** See OnEditorSelectionChanged's doc comment. Registered/removed the same way as, and for the
 	 *  same reason as, WorldCleanupDelegateHandle above. */
 	FDelegateHandle SelectionChangedDelegateHandle;
+
+	/**
+	 * AUDITED (V2-E corrective pass, transform freshness): GEngine->OnActorMoved() -- the engine's own
+	 * official notification that an Actor's viewport gizmo move/rotate/scale has FINISHED (confirmed by
+	 * reading AActor::PostEditMove(bFinished=true) in ActorEditor.cpp, which unconditionally calls
+	 * GEngine->BroadcastOnActorMoved(this) -- the same call chain LevelEditorViewport.cpp's own
+	 * TrackingStopped path uses when a gizmo drag completes). Fires ONCE per completed drag (never
+	 * continuously mid-drag, so no extra debounce is needed beyond the existing Auto Update Preview
+	 * mechanism), for ANY actor moved anywhere in the level -- OnActorMovedForDirectionalNormal filters
+	 * to only the actors actually relevant to this panel's own tracked components. Registered/removed
+	 * the same way as WorldCleanupDelegateHandle/SelectionChangedDelegateHandle above.
+	 */
+	void OnActorMovedForDirectionalNormal(AActor* Actor);
+
+	FDelegateHandle ActorMovedDelegateHandle;
 
 	/**
 	 * Centralized per-Actor hide ref-counting for the whole panel (not per-entry), since components

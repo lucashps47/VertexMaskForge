@@ -3504,6 +3504,764 @@ namespace VertexMaskForgePanel
 		return Mask;
 	}
 
+	// --- Directional Normal Mask (V2-E) --------------------------------------------------------------
+
+	/** Unreal's own axis convention (X+ Forward, Y+ Right, Z+ Up). Never inferred from bounding box. */
+	static FVector GetNormalDirectionVector(const EVertexMaskForgeNormalDirection Direction)
+	{
+		switch (Direction)
+		{
+		case EVertexMaskForgeNormalDirection::PositiveX: return FVector(1.0, 0.0, 0.0);
+		case EVertexMaskForgeNormalDirection::NegativeX: return FVector(-1.0, 0.0, 0.0);
+		case EVertexMaskForgeNormalDirection::PositiveY: return FVector(0.0, 1.0, 0.0);
+		case EVertexMaskForgeNormalDirection::NegativeY: return FVector(0.0, -1.0, 0.0);
+		case EVertexMaskForgeNormalDirection::PositiveZ: return FVector(0.0, 0.0, 1.0);
+		case EVertexMaskForgeNormalDirection::NegativeZ:
+		default:
+			return FVector(0.0, 0.0, -1.0);
+		}
+	}
+
+	static FText GetNormalDirectionLabel(const EVertexMaskForgeNormalDirection Direction)
+	{
+		switch (Direction)
+		{
+		case EVertexMaskForgeNormalDirection::PositiveX: return LOCTEXT("NormalDirectionPositiveX", "X+ (Forward)");
+		case EVertexMaskForgeNormalDirection::NegativeX: return LOCTEXT("NormalDirectionNegativeX", "X- (Backward)");
+		case EVertexMaskForgeNormalDirection::PositiveY: return LOCTEXT("NormalDirectionPositiveY", "Y+ (Right)");
+		case EVertexMaskForgeNormalDirection::NegativeY: return LOCTEXT("NormalDirectionNegativeY", "Y- (Left)");
+		case EVertexMaskForgeNormalDirection::PositiveZ: return LOCTEXT("NormalDirectionPositiveZ", "Z+ (Up)");
+		case EVertexMaskForgeNormalDirection::NegativeZ: return LOCTEXT("NormalDirectionNegativeZ", "Z- (Down)");
+		default: return FText::GetEmpty();
+		}
+	}
+
+	static FText GetNormalSpaceLabel(const EVertexMaskForgeNormalSpace Space)
+	{
+		switch (Space)
+		{
+		case EVertexMaskForgeNormalSpace::Local: return LOCTEXT("NormalSpaceLocal", "Local Space");
+		case EVertexMaskForgeNormalSpace::World: return LOCTEXT("NormalSpaceWorld", "World Space");
+		default: return FText::GetEmpty();
+		}
+	}
+
+	/**
+	 * AUDITED (V2-E): the exact per-element formula -- Alignment = clamp(dot(Normal,Direction),-1,1);
+	 * AngleDegrees = degrees(acos(Alignment)); OuterAngle = clamp(UserAngle,0,180); EffectiveFalloff =
+	 * clamp(UserFalloff,0,OuterAngle); InnerAngle = OuterAngle-EffectiveFalloff. EffectiveFalloff <=
+	 * epsilon: hard cutoff (AngleDegrees<=OuterAngle ? 1:0). Otherwise: RawMask =
+	 * 1-smoothstep(InnerAngle,OuterAngle,AngleDegrees), smoothstep's own denominator
+	 * (OuterAngle-InnerAngle) equals EffectiveFalloff by construction, always > epsilon in this branch --
+	 * never a division by zero. Both Normal and Direction are assumed ALREADY unit-length (callers
+	 * validate/normalize before calling, per the "never normalize blindly" requirement) -- this function
+	 * itself never normalizes, so a non-unit input is a caller bug, not a runtime guess here.
+	 */
+	static float ComputeDirectionalNormalRawValue(const FVector& UnitNormal, const FVector& UnitDirection, const float UserAngle, const float UserFalloff)
+	{
+		const double Alignment = FMath::Clamp(FVector::DotProduct(UnitNormal, UnitDirection), -1.0, 1.0);
+		const double AngleDegrees = FMath::RadiansToDegrees(FMath::Acos(Alignment));
+
+		const float OuterAngle = FMath::Clamp(UserAngle, 0.0f, 180.0f);
+		const float EffectiveFalloff = FMath::Clamp(UserFalloff, 0.0f, OuterAngle);
+
+		float RawMask;
+		if (EffectiveFalloff <= UE_KINDA_SMALL_NUMBER)
+		{
+			RawMask = (AngleDegrees <= static_cast<double>(OuterAngle)) ? 1.0f : 0.0f;
+		}
+		else
+		{
+			const float InnerAngle = OuterAngle - EffectiveFalloff;
+			const float T = FMath::Clamp(static_cast<float>((AngleDegrees - InnerAngle) / EffectiveFalloff), 0.0f, 1.0f);
+			const float Smoothstep = T * T * (3.0f - 2.0f * T);
+			RawMask = 1.0f - Smoothstep;
+		}
+
+		if (!FMath::IsFinite(RawMask))
+		{
+			RawMask = 0.0f;
+		}
+		return FMath::Clamp(RawMask, 0.0f, 1.0f);
+	}
+
+	/**
+	 * AUDITED (V2-E, World Space normal transform): reuses the EXACT SAME inverse-transpose technique
+	 * already audited and proven correct for Ambient Occlusion's own World Space normal transform (see
+	 * GenerateAmbientOcclusionMask's own NORMALS doc note) -- `ComponentTransform.ToMatrixWithScale().
+	 * Inverse().GetTransposed()`, the mathematically correct transform for surface normals under
+	 * non-uniform scale (a plain TransformVector would skew the normal off-perpendicular). Correctly
+	 * handles negative/mirrored scale too: matrix inversion inherently accounts for a negative
+	 * determinant, so a mirrored component still produces a correctly-reflected normal, not a guess.
+	 * Guards against a DEGENERATE transform explicitly (any scale axis magnitude below a small epsilon)
+	 * BEFORE calling Inverse() -- a near-zero-scale axis would make ToMatrixWithScale() singular,
+	 * FMatrix::Inverse() on a singular matrix produces NaN/Inf, which must never reach TransformVector.
+	 */
+	static bool ComputeWorldSpaceNormalMatrix(const FTransform& ComponentTransform, FMatrix& OutNormalMatrix)
+	{
+		constexpr float ScaleEpsilon = 1e-6f;
+		const FVector Scale = ComponentTransform.GetScale3D();
+		if (FMath::Abs(Scale.X) < ScaleEpsilon || FMath::Abs(Scale.Y) < ScaleEpsilon || FMath::Abs(Scale.Z) < ScaleEpsilon)
+		{
+			return false;
+		}
+		const FMatrix Candidate = ComponentTransform.ToMatrixWithScale().Inverse().GetTransposed();
+		// AUDITED (V2-E corrective pass): FMatrix::Inverse() on a near-singular-in-practice matrix
+		// (e.g. a pathological rotation quaternion) can still produce NaN/Inf even after the scale-
+		// magnitude guard above -- checked explicitly, never trusted implicitly.
+		for (int32 Row = 0; Row < 3; ++Row)
+		{
+			for (int32 Col = 0; Col < 3; ++Col)
+			{
+				if (!FMath::IsFinite(Candidate.M[Row][Col]))
+				{
+					return false;
+				}
+			}
+		}
+		OutNormalMatrix = Candidate;
+		return true;
+	}
+
+	/** Applies OutNormalMatrix (see ComputeWorldSpaceNormalMatrix) to LocalNormal and normalizes the
+	 *  result -- returns false (never a guessed/fallback vector) if the input fails to normalize
+	 *  (degenerate/zero local normal, or a pathological matrix). */
+	static bool TransformNormalToWorldSpace(const FMatrix& NormalMatrix, const FVector& LocalNormal, FVector& OutWorldNormal)
+	{
+		FVector WorldNormal = NormalMatrix.TransformVector(LocalNormal);
+		// IsFinite checked BEFORE Normalize() -- a pathological (near-singular-in-practice) matrix could
+		// produce a non-finite component that Normalize()'s own zero-length check would not catch.
+		if (!FMath::IsFinite(WorldNormal.X) || !FMath::IsFinite(WorldNormal.Y) || !FMath::IsFinite(WorldNormal.Z))
+		{
+			return false;
+		}
+		if (!WorldNormal.Normalize())
+		{
+			return false;
+		}
+		OutWorldNormal = WorldNormal;
+		return true;
+	}
+
+	/**
+	 * AUDITED (V2-E CORRECTIVE PASS -- root cause of the original bug): TransformNormal's own contract
+	 * is `Rotate(Normalize(InverseScale * Normal))` (see UE::Geometry::TTransformSRT3::TransformNormal's
+	 * own doc comment, confirmed against the GeometryCore source during the original V2-E audit) -- the
+	 * per-normal Normalize() step means TWO normal matrices A and B produce IDENTICAL results for EVERY
+	 * possible input normal if and only if B = k*A for some SINGLE POSITIVE SCALAR k (normalize(k*A*N) ==
+	 * normalize(A*N) for any k>0, since scaling a vector never changes its direction; conversely, if B is
+	 * NOT a positive scalar multiple of A, there EXISTS at least one input N for which normalize(A*N) !=
+	 * normalize(B*N) -- the original bug's own counter-example, a diagonal normal under Identity vs.
+	 * Scale(2,1,1), is exactly one such N). Comparing only 3 independently-normalized canonical axis
+	 * vectors (the ORIGINAL, insufficient implementation) missed this: non-uniform scale can leave EVERY
+	 * individual axis vector's OWN direction unchanged after its own normalization, while still producing
+	 * a matrix that is NOT a scalar multiple of the reference -- so a diagonal (or any non-axis-aligned)
+	 * normal still disagrees. Testing full matrix proportionality is therefore not just "more thorough"
+	 * than testing 3 axes -- it is the exact necessary-and-sufficient condition, mathematically equivalent
+	 * to (and far cheaper than) comparing the transformed-and-normalized result for EVERY possible corner/
+	 * render normal one by one (Option B in the corrective brief), since the matrix multiply is linear and
+	 * the normalize step's scale-invariance is exact, not approximate.
+	 */
+	static bool AreNormalMatricesEquivalent(const FMatrix& A, const FMatrix& B, float& OutMaxRelativeDeviation)
+	{
+		OutMaxRelativeDeviation = 0.0f;
+
+		// Find A's largest-magnitude element to derive the candidate scalar k robustly (dividing by a
+		// near-zero element would amplify floating-point noise into a meaningless k).
+		double MaxAbsA = 0.0;
+		double K = 0.0;
+		for (int32 Row = 0; Row < 3; ++Row)
+		{
+			for (int32 Col = 0; Col < 3; ++Col)
+			{
+				const double AElem = A.M[Row][Col];
+				if (FMath::Abs(AElem) > MaxAbsA)
+				{
+					MaxAbsA = FMath::Abs(AElem);
+					K = B.M[Row][Col] / AElem;
+				}
+			}
+		}
+
+		// A degenerate (all-zero) normal matrix should never reach here (ComputeWorldSpaceNormalMatrix
+		// already rejects degenerate transforms before this is ever called) -- treated defensively as a
+		// non-match rather than asserting.
+		if (MaxAbsA < 1e-9)
+		{
+			return false;
+		}
+		// K <= 0 means B is either a non-scalar-multiple of A or a NEGATIVE multiple -- a negative k would
+		// flip every transformed normal to point the opposite way (a genuinely different, not equivalent,
+		// result) -- never treated as a match. This is NOT a "negative/mirrored scale isn't supported"
+		// limitation: a mirrored component's OWN normal matrix already encodes its mirroring internally
+		// (via ComputeWorldSpaceNormalMatrix's inverse-transpose, whose sign naturally flips for a
+		// negative-determinant transform) -- two SIMILARLY-mirrored components still compare as
+		// equivalent here (B = +k*A), and only a genuine orientation DISAGREEMENT (K<=0, or K>0 but the
+		// full-matrix check below fails) is ever flagged as a conflict.
+		if (K <= 0.0)
+		{
+			OutMaxRelativeDeviation = 1.0f; // Maximal disagreement -- orientation itself disagrees.
+			return false;
+		}
+
+		// Verify B == K*A across all 9 elements, relative to A's own largest magnitude (scaled by K) so
+		// the tolerance is meaningful regardless of the transform's absolute magnitude.
+		double MaxAbsDeviation = 0.0;
+		for (int32 Row = 0; Row < 3; ++Row)
+		{
+			for (int32 Col = 0; Col < 3; ++Col)
+			{
+				const double Expected = K * A.M[Row][Col];
+				const double Actual = B.M[Row][Col];
+				MaxAbsDeviation = FMath::Max(MaxAbsDeviation, FMath::Abs(Actual - Expected));
+			}
+		}
+		const double ReferenceScale = FMath::Max(MaxAbsA * K, 1e-9);
+		OutMaxRelativeDeviation = static_cast<float>(MaxAbsDeviation / ReferenceScale);
+
+		constexpr float RelativeToleranceForEquivalence = 1e-3f;
+		return OutMaxRelativeDeviation <= RelativeToleranceForEquivalence;
+	}
+
+	/**
+	 * AUDITED (V2-E CORRECTIVE PASS): compares EVERY live component's own World-Space normal MATRIX (see
+	 * ComputeWorldSpaceNormalMatrix) against a single reference matrix (the first valid one found) using
+	 * full-matrix proportionality (see AreNormalMatricesEquivalent's own doc comment for why this is the
+	 * mathematically necessary-and-sufficient test -- NOT the previous, insufficient 3-axis-vector
+	 * comparison). Translation is irrelevant by construction (ComputeWorldSpaceNormalMatrix only ever
+	 * reads the transform's 3x3 linear part). Uniform-scale differences (e.g. Scale 1 vs. Scale 2,
+	 * otherwise identical rotation) ARE equivalent (their normal matrices are exact positive scalar
+	 * multiples of each other). Non-uniform scale differences are NOT silently accepted (their matrices
+	 * are provably non-proportional whenever they would actually change a transformed normal's
+	 * direction). Different rotations are NOT equivalent (a pure rotation is orthogonal, never a scalar
+	 * multiple of a different rotation, except the identity case). A component with a degenerate
+	 * transform is skipped here (never treated as a conflict on its own -- see this entry's separate
+	 * DirectionalNormalMask.State==Invalid diagnostic) but every OTHER pair is still compared. Never
+	 * picks a "winning" instance -- returns true (conflict) the moment ANY live component disagrees with
+	 * the reference beyond tolerance.
+	 */
+	static bool HasConflictingWorldSpaceNormalTransforms(const TArray<FVertexMaskForgePreviewComponentState>& PreviewComponents, float& OutMaxRelativeDeviation)
+	{
+		OutMaxRelativeDeviation = 0.0f;
+
+		FMatrix ReferenceMatrix = FMatrix::Identity;
+		bool bHaveReference = false;
+		bool bAnyConflict = false;
+
+		for (const FVertexMaskForgePreviewComponentState& State : PreviewComponents)
+		{
+			const UStaticMeshComponent* Component = State.SourceComponent.Get();
+			if (!IsValid(Component))
+			{
+				continue;
+			}
+			FMatrix NormalMatrix;
+			if (!ComputeWorldSpaceNormalMatrix(Component->GetComponentTransform(), NormalMatrix))
+			{
+				continue; // A degenerate individual transform is its own separate diagnostic, not a conflict here.
+			}
+
+			if (!bHaveReference)
+			{
+				ReferenceMatrix = NormalMatrix;
+				bHaveReference = true;
+				continue;
+			}
+
+			float ThisDeviation = 0.0f;
+			if (!AreNormalMatricesEquivalent(ReferenceMatrix, NormalMatrix, ThisDeviation))
+			{
+				bAnyConflict = true;
+			}
+			OutMaxRelativeDeviation = FMath::Max(OutMaxRelativeDeviation, ThisDeviation);
+		}
+
+		return bAnyConflict;
+	}
+
+	/**
+	 * AUDITED (V2-F, Directional Normal Blur): the SAME iterative algorithm shape as
+	 * ApplyTopologicalCurvatureBlur (self-plus-neighbors average, repeated FullIterations times, plus a
+	 * fractional-iteration lerp toward one more pass -- see that function's own doc comment for the
+	 * "whole number = full iterations, fractional part blends toward one more" contract, preserved
+	 * verbatim here) -- but DELIBERATELY NOT ApplyTopologicalCurvatureBlur ITSELF: that function's
+	 * adjacency (Mesh.VtxVerticesItr(VertexID)) is Dynamic-Mesh-VERTEX-ID domain, one value per vertex --
+	 * correct for Curvature (a genuinely per-vertex geometric property) but WRONG for Directional Normal
+	 * Mask, whose raw values are deliberately CORNER-EXACT/per-render-vertex (never collapsed, so a hard
+	 * edge/UV seam's several corners at the same position can legitimately differ -- see
+	 * GenerateDirectionalNormalMaskFromDynamicMesh's own doc note). Blurring through
+	 * ApplyTopologicalCurvatureBlur would require collapsing to one value per Vertex ID first, silently
+	 * destroying exactly the split-normal independence V2-E was built to preserve. This generic function
+	 * instead takes an EXPLICIT, domain-appropriate adjacency list (built once per generation call by
+	 * BuildRenderVertexAdjacency or BuildCornerAdjacency below) -- everything else about the algorithm is
+	 * identical. Never allocates per element inside the hot loop (Adjacency is built once, up front).
+	 */
+	static TArray<float> ApplyAdjacencyTopologicalBlur(const TArray<TArray<int32>>& Adjacency, const TArray<float>& Input, const TArray<bool>& bHasValue, const float BlurAmount)
+	{
+		if (BlurAmount <= 0.0f || Input.IsEmpty())
+		{
+			return Input;
+		}
+
+		const int32 FullIterations = FMath::FloorToInt32(BlurAmount);
+		const float FractionalIteration = BlurAmount - static_cast<float>(FullIterations);
+
+		// Never lets an unwritten (degenerate-normal) element bleed into or receive a blurred value --
+		// an element with no raw value stays exactly as unwritten as it started (never guessed), and it
+		// never contributes to a neighbor's average either (there is nothing valid to contribute).
+		auto RunOneIteration = [&Adjacency, &bHasValue](const TArray<float>& Src) -> TArray<float>
+		{
+			TArray<float> Dst = Src;
+			for (int32 i = 0; i < Src.Num(); ++i)
+			{
+				if (!bHasValue.IsValidIndex(i) || !bHasValue[i])
+				{
+					continue;
+				}
+				float Sum = Src[i];
+				int32 Count = 1;
+				if (Adjacency.IsValidIndex(i))
+				{
+					for (const int32 NeighborIndex : Adjacency[i])
+					{
+						if (Src.IsValidIndex(NeighborIndex) && bHasValue.IsValidIndex(NeighborIndex) && bHasValue[NeighborIndex])
+						{
+							Sum += Src[NeighborIndex];
+							++Count;
+						}
+					}
+				}
+				Dst[i] = Sum / static_cast<float>(Count);
+			}
+			return Dst;
+		};
+
+		TArray<float> Current = Input;
+		for (int32 Iter = 0; Iter < FullIterations; ++Iter)
+		{
+			Current = RunOneIteration(Current);
+		}
+
+		if (FractionalIteration > UE_KINDA_SMALL_NUMBER)
+		{
+			TArray<float> OneMore = RunOneIteration(Current);
+			for (int32 i = 0; i < Current.Num(); ++i)
+			{
+				if (bHasValue.IsValidIndex(i) && bHasValue[i])
+				{
+					Current[i] = FMath::Lerp(Current[i], OneMore[i], FractionalIteration);
+				}
+			}
+		}
+
+		return Current;
+	}
+
+	/**
+	 * AUDITED (V2-F): render-vertex adjacency, built directly from LOD0's own IndexBuffer (the SAME
+	 * render-vertex domain GenerateDirectionalNormalMask itself reads normals from) -- render vertex i's
+	 * neighbors are the OTHER two render vertices of every triangle i participates in. A hard edge/UV
+	 * seam is ALREADY represented as physically SEPARATE render vertex entries in this domain (that is
+	 * what makes VertexTangentZ per-render-vertex correct for split normals in the first place -- see
+	 * GenerateDirectionalNormalMask's own doc note), so this adjacency never needs any special-casing to
+	 * avoid crossing a seam: a split vertex's two "halves" simply belong to disjoint triangle fans with
+	 * their own, separate neighbor sets by construction. Built once per generation call (not cached --
+	 * Directional Normal Mask has no raw cache of its own, matching Material Slot Mask's own "cheap
+	 * enough to just recompute" precedent).
+	 */
+	static TArray<TArray<int32>> BuildRenderVertexAdjacency(const FStaticMeshLODResources& LOD0, const int32 NumRenderVerts)
+	{
+		TArray<TArray<int32>> Adjacency;
+		Adjacency.SetNum(NumRenderVerts);
+
+		const FRawStaticIndexBuffer& IndexBuffer = LOD0.IndexBuffer;
+		const int32 NumIndices = IndexBuffer.GetNumIndices();
+		for (int32 TriStart = 0; TriStart + 2 < NumIndices; TriStart += 3)
+		{
+			const int32 I0 = static_cast<int32>(IndexBuffer.GetIndex(TriStart + 0));
+			const int32 I1 = static_cast<int32>(IndexBuffer.GetIndex(TriStart + 1));
+			const int32 I2 = static_cast<int32>(IndexBuffer.GetIndex(TriStart + 2));
+			if (!Adjacency.IsValidIndex(I0) || !Adjacency.IsValidIndex(I1) || !Adjacency.IsValidIndex(I2))
+			{
+				continue;
+			}
+			Adjacency[I0].AddUnique(I1); Adjacency[I0].AddUnique(I2);
+			Adjacency[I1].AddUnique(I0); Adjacency[I1].AddUnique(I2);
+			Adjacency[I2].AddUnique(I0); Adjacency[I2].AddUnique(I1);
+		}
+		return Adjacency;
+	}
+
+	/**
+	 * AUDITED (V2-F corrective pass): CORNER-exact adjacency for the Source-Topology domain, built from
+	 * real triangle topology (Mesh.GetTriNeighbourTris(TriangleID)/Mesh.GetTriEdge(), the SAME official
+	 * GeometryCore edge-adjacency query -- never a second/parallel topology representation). Corner c of
+	 * triangle T is connected to the OTHER TWO corners of T itself (unconditional -- a single face is
+	 * always internally continuous), plus, for each of T's up-to-3 edge-adjacent triangles, ONLY the ONE
+	 * corner of that neighbor that shares c's actual Mesh VertexID at that edge (matched by VertexID, not
+	 * by local Corner slot -- winding order is not guaranteed to agree across an edge) -- and ONLY when
+	 * NormalOverlay->IsSeamEdge() reports the PrimaryNormals overlay is CONTINUOUS there (no split/hard
+	 * edge). A boundary edge, an edge whose neighbor could not be resolved, or a genuine normal-overlay
+	 * seam all simply contribute no cross-triangle neighbor there. Deliberately keyed to the NORMAL
+	 * overlay specifically (not any UV overlay): a UV seam does not imply a normal split and must not by
+	 * itself interrupt this Blur. NEVER collapses distinct corners: every corner keeps its OWN entry in
+	 * the output CornerIndex-domain array, even when several corners share a position/Dynamic Mesh
+	 * VertexID with genuinely different normals (that is the entire reason this exists instead of reusing
+	 * ApplyTopologicalCurvatureBlur's own Vertex-ID-domain adjacency).
+	 */
+	static TArray<TArray<int32>> BuildCornerAdjacency(const UE::Geometry::FDynamicMesh3& Mesh, const UE::Geometry::FDynamicMeshNormalOverlay* NormalOverlay, const int32 NumCorners)
+	{
+		using namespace UE::Geometry;
+
+		TArray<TArray<int32>> Adjacency;
+		Adjacency.SetNum(NumCorners);
+
+		TMap<int32, int32> TriangleIDToCornerBase;
+		TriangleIDToCornerBase.Reserve(Mesh.TriangleCount());
+		{
+			int32 Base = 0;
+			for (const int32 TriangleID : Mesh.TriangleIndicesItr())
+			{
+				TriangleIDToCornerBase.Add(TriangleID, Base);
+				Base += 3;
+			}
+		}
+
+		int32 CornerBase = 0;
+		for (const int32 TriangleID : Mesh.TriangleIndicesItr())
+		{
+			// Within a single triangle, all 3 corners are always the same continuous surface --
+			// unconditional, no overlay check needed (a face can never be split from itself).
+			for (int32 C = 0; C < 3; ++C)
+			{
+				for (int32 C2 = 0; C2 < 3; ++C2)
+				{
+					if (C != C2)
+					{
+						Adjacency[CornerBase + C].Add(CornerBase + C2);
+					}
+				}
+			}
+
+			// AUDITED (V2-F corrective pass): cross-triangle connections must (a) link ONLY the two
+			// corners that are the actual shared-edge endpoints -- matched by underlying Mesh VertexID,
+			// never by local Corner slot 0/1/2, since winding order is not guaranteed to agree between
+			// two triangles on either side of an edge -- and (b) be skipped entirely when
+			// NormalOverlay->IsSeamEdge() reports the PrimaryNormals overlay has a split (different
+			// Element IDs on either side) at that edge, i.e. an authored hard edge. This is the SAME
+			// seam query FDynamicMeshNormalOverlay already exposes and other engine code relies on for
+			// this exact purpose -- not a second, hand-rolled continuity check. Deliberately keyed to the
+			// NORMAL overlay specifically, not any UV overlay: a UV seam does not imply a normal split
+			// (e.g. a cylinder cap seam can still be normal-smooth) and must not interrupt this Blur.
+			const FIndex3i TriVertices = Mesh.GetTriangle(TriangleID);
+			const FIndex3i NeighborTriangles = Mesh.GetTriNeighbourTris(TriangleID);
+			for (int32 Edge = 0; Edge < 3; ++Edge)
+			{
+				const int32 NeighborTriangleID = NeighborTriangles[Edge];
+				if (NeighborTriangleID == INDEX_NONE)
+				{
+					continue;
+				}
+				const int32* NeighborBasePtr = TriangleIDToCornerBase.Find(NeighborTriangleID);
+				if (!NeighborBasePtr)
+				{
+					continue;
+				}
+
+				const int32 EdgeID = Mesh.GetTriEdge(TriangleID, Edge);
+				if (NormalOverlay && NormalOverlay->IsSeamEdge(EdgeID))
+				{
+					continue; // Hard edge / split normal on the NORMAL overlay -- Blur must not cross it.
+				}
+
+				// Edge `Edge` connects local corners `Edge` and `(Edge+1)%3` of this triangle (the same
+				// convention GetTriNeighbourTris/GetTriEdge share -- see FDynamicMesh3::FindTriangleEdge).
+				const int32 LocalA = Edge;
+				const int32 LocalB = (Edge + 1) % 3;
+				const int32 VertexA = TriVertices[LocalA];
+				const int32 VertexB = TriVertices[LocalB];
+
+				const FIndex3i NeighborVertices = Mesh.GetTriangle(NeighborTriangleID);
+				int32 NeighborLocalA = INDEX_NONE, NeighborLocalB = INDEX_NONE;
+				for (int32 NC = 0; NC < 3; ++NC)
+				{
+					if (NeighborVertices[NC] == VertexA) { NeighborLocalA = NC; }
+					else if (NeighborVertices[NC] == VertexB) { NeighborLocalB = NC; }
+				}
+				if (NeighborLocalA == INDEX_NONE || NeighborLocalB == INDEX_NONE)
+				{
+					continue; // Should not happen for a genuine edge-neighbor, but never guess.
+				}
+
+				Adjacency[CornerBase + LocalA].Add(*NeighborBasePtr + NeighborLocalA);
+				Adjacency[CornerBase + LocalB].Add(*NeighborBasePtr + NeighborLocalB);
+			}
+
+			CornerBase += 3;
+		}
+		return Adjacency;
+	}
+
+	/**
+	 * AUDITED (V2-E): render-vertex domain -- one Directional Normal value per RenderIndex, read from
+	 * LOD0.VertexBuffers.StaticMeshVertexBuffer.VertexTangentZ, the SAME real render normal / SAME
+	 * render-vertex domain AO already uses for its own World Space transform (see
+	 * GenerateAmbientOcclusionMask's own NORMALS doc note) -- preserves split normals/hard edges exactly
+	 * (never collapsed by position or source Vertex ID). Space==World transforms via ComponentTransform
+	 * (see ComputeWorldSpaceNormalMatrix/TransformNormalToWorldSpace); Space==Local uses the render
+	 * normal as-is (ComponentTransform ignored entirely). A degenerate/non-finite render normal, or (in
+	 * World Space) a degenerate ComponentTransform, marks that ONE element unwritten (bHasValue false) --
+	 * never guessed -- and the whole mask still reports Ready as long as at least one element resolved.
+	 */
+	static FVertexMaskForgeScalarMask GenerateDirectionalNormalMask(
+		const FStaticMeshLODResources& LOD0,
+		const EVertexMaskForgeNormalSpace Space,
+		const EVertexMaskForgeNormalDirection Direction,
+		const float Angle,
+		const float Falloff,
+		const float Blur,
+		const bool bInvert,
+		const FTransform& ComponentTransform)
+	{
+		FVertexMaskForgeScalarMask Mask;
+		Mask.Source = EVertexMaskForgeScalarMaskSource::DirectionalNormal;
+
+		const int32 NumRenderVerts = static_cast<int32>(LOD0.VertexBuffers.PositionVertexBuffer.GetNumVertices());
+		Mask.RenderVertexCount = NumRenderVerts;
+		if (NumRenderVerts <= 0)
+		{
+			Mask.State = EVertexMaskForgeScalarMaskState::Unavailable;
+			return Mask;
+		}
+
+		FMatrix WorldNormalMatrix = FMatrix::Identity;
+		bool bWorldTransformValid = true;
+		if (Space == EVertexMaskForgeNormalSpace::World)
+		{
+			bWorldTransformValid = ComputeWorldSpaceNormalMatrix(ComponentTransform, WorldNormalMatrix);
+		}
+		if (!bWorldTransformValid)
+		{
+			Mask.State = EVertexMaskForgeScalarMaskState::Invalid;
+			return Mask;
+		}
+
+		const FVector DirectionVector = GetNormalDirectionVector(Direction);
+		const FStaticMeshVertexBuffer& RenderTangents = LOD0.VertexBuffers.StaticMeshVertexBuffer;
+
+		// Pass 1: compute the raw, pre-Blur, pre-Invert value for every render vertex. Blur is a
+		// NEIGHBORHOOD operation, so the full raw array must exist before it can run -- see
+		// ApplyAdjacencyTopologicalBlur's own doc comment for why this can't be folded into a single loop.
+		TArray<float> RawValues;
+		TArray<bool> bHasRawValue;
+		RawValues.SetNumZeroed(NumRenderVerts);
+		bHasRawValue.Init(false, NumRenderVerts);
+		for (int32 i = 0; i < NumRenderVerts; ++i)
+		{
+			const FVector4f LocalNormal4 = RenderTangents.VertexTangentZ(i);
+			FVector Normal(LocalNormal4.X, LocalNormal4.Y, LocalNormal4.Z);
+			if (!FMath::IsFinite(Normal.X) || !FMath::IsFinite(Normal.Y) || !FMath::IsFinite(Normal.Z) || !Normal.Normalize())
+			{
+				continue; // Degenerate render normal -- element left unwritten, never guessed.
+			}
+
+			if (Space == EVertexMaskForgeNormalSpace::World)
+			{
+				FVector WorldNormal;
+				if (!TransformNormalToWorldSpace(WorldNormalMatrix, Normal, WorldNormal))
+				{
+					continue;
+				}
+				Normal = WorldNormal;
+			}
+
+			RawValues[i] = ComputeDirectionalNormalRawValue(Normal, DirectionVector, Angle, Falloff);
+			bHasRawValue[i] = true;
+		}
+
+		// Blur <= 0 is an exact no-op: ApplyAdjacencyTopologicalBlur returns Input unchanged, so the
+		// result below is bit-for-bit identical to the pre-Blur V2-E behavior.
+		TArray<float> BlurredValues = RawValues;
+		if (Blur > 0.0f)
+		{
+			const TArray<TArray<int32>> Adjacency = BuildRenderVertexAdjacency(LOD0, NumRenderVerts);
+			BlurredValues = ApplyAdjacencyTopologicalBlur(Adjacency, RawValues, bHasRawValue, Blur);
+		}
+
+		// Pass 2: apply Invert (same order as CurvatureBlur/NoiseBlur -- Blur before Invert) and
+		// accumulate stats.
+		Mask.Values.SetNumZeroed(NumRenderVerts);
+		Mask.bHasValue.Init(false, NumRenderVerts);
+
+		double Sum = 0.0;
+		for (int32 i = 0; i < NumRenderVerts; ++i)
+		{
+			if (!bHasRawValue[i])
+			{
+				continue;
+			}
+			const float Final = bInvert ? (1.0f - BlurredValues[i]) : BlurredValues[i];
+
+			Mask.Values[i] = Final;
+			Mask.bHasValue[i] = true;
+			++Mask.NumValidValues;
+			Sum += Final;
+			Mask.MinValue = (Mask.NumValidValues == 1) ? Final : FMath::Min(Mask.MinValue, Final);
+			Mask.MaxValue = (Mask.NumValidValues == 1) ? Final : FMath::Max(Mask.MaxValue, Final);
+			if (Final <= FVertexMaskForgeScalarMask::Tolerance) { ++Mask.NumNearZero; }
+			if (Final >= 1.0f - FVertexMaskForgeScalarMask::Tolerance) { ++Mask.NumNearOne; }
+		}
+		Mask.MeanValue = (Mask.NumValidValues > 0) ? static_cast<float>(Sum / Mask.NumValidValues) : 0.0f;
+		Mask.State = (Mask.NumValidValues > 0) ? EVertexMaskForgeScalarMaskState::Ready : EVertexMaskForgeScalarMaskState::Unavailable;
+
+		return Mask;
+	}
+
+	/**
+	 * AUDITED (V2-E): sibling of GenerateDirectionalNormalMask for Source-Topology (Nanite) entries --
+	 * CORNER-EXACT (Mesh.TriangleCount()*3, indexed by CornerIndex directly, like MaterialSlotMask),
+	 * reading each corner's normal from the Dynamic Mesh's own Normal Overlay
+	 * (Mesh.Attributes()->PrimaryNormals(), populated from the source MeshDescription's own
+	 * VertexInstanceNormals by FMeshDescriptionToDynamicMesh::Convert at working-mesh build time -- see
+	 * EnsureNormalOverlay) via NormalOverlay->GetTriangle(TriangleID)[Corner] -- the EXACT SAME Normal
+	 * Element domain GenerateAmbientOcclusionMaskFromDynamicMesh already uses for AO's own hard-edge-
+	 * preserving normal lookup, so hard edges/split normals/UV-seam-distinct corners are preserved
+	 * identically, with no separate correspondence table needed (the Normal Overlay's own per-corner
+	 * structure already IS that correspondence, already audited for this exact purpose). A corner
+	 * without a set Normal Overlay entry, or a degenerate normal, is left unwritten -- never guessed.
+	 */
+	static FVertexMaskForgeScalarMask GenerateDirectionalNormalMaskFromDynamicMesh(
+		const FVertexMaskForgeWorkingMesh& WorkingMesh,
+		const EVertexMaskForgeNormalSpace Space,
+		const EVertexMaskForgeNormalDirection Direction,
+		const float Angle,
+		const float Falloff,
+		const float Blur,
+		const bool bInvert,
+		const FTransform& ComponentTransform)
+	{
+		using namespace UE::Geometry;
+
+		FVertexMaskForgeScalarMask Mask;
+		Mask.Source = EVertexMaskForgeScalarMaskSource::DirectionalNormal;
+
+		if (!WorkingMesh.Mesh.IsValid())
+		{
+			Mask.State = EVertexMaskForgeScalarMaskState::Unavailable;
+			return Mask;
+		}
+		const FDynamicMesh3& Mesh = *WorkingMesh.Mesh;
+		const int32 NumCorners = Mesh.TriangleCount() * 3;
+		Mask.RenderVertexCount = NumCorners;
+		if (NumCorners <= 0)
+		{
+			Mask.State = EVertexMaskForgeScalarMaskState::Unavailable;
+			return Mask;
+		}
+
+		const FDynamicMeshNormalOverlay* NormalOverlay =
+			(Mesh.HasAttributes() && Mesh.Attributes()->PrimaryNormals() != nullptr)
+			? Mesh.Attributes()->PrimaryNormals() : nullptr;
+		if (!NormalOverlay || NormalOverlay->ElementCount() <= 0)
+		{
+			Mask.State = EVertexMaskForgeScalarMaskState::Unavailable;
+			return Mask;
+		}
+
+		FMatrix WorldNormalMatrix = FMatrix::Identity;
+		bool bWorldTransformValid = true;
+		if (Space == EVertexMaskForgeNormalSpace::World)
+		{
+			bWorldTransformValid = ComputeWorldSpaceNormalMatrix(ComponentTransform, WorldNormalMatrix);
+		}
+		if (!bWorldTransformValid)
+		{
+			Mask.State = EVertexMaskForgeScalarMaskState::Invalid;
+			return Mask;
+		}
+
+		const FVector DirectionVector = GetNormalDirectionVector(Direction);
+
+		// Pass 1: compute the raw, pre-Blur, pre-Invert value for every corner (see
+		// GenerateDirectionalNormalMask's identical two-pass rationale).
+		TArray<float> RawValues;
+		TArray<bool> bHasRawValue;
+		RawValues.SetNumZeroed(NumCorners);
+		bHasRawValue.Init(false, NumCorners);
+		{
+			int32 CornerIndex = 0;
+			for (const int32 TriangleID : Mesh.TriangleIndicesItr())
+			{
+				const FIndex3i NormalTri = NormalOverlay->IsSetTriangle(TriangleID)
+					? NormalOverlay->GetTriangle(TriangleID)
+					: FIndex3i(INDEX_NONE, INDEX_NONE, INDEX_NONE);
+
+				for (int32 Corner = 0; Corner < 3; ++Corner, ++CornerIndex)
+				{
+					const int32 ElementID = NormalTri[Corner];
+					if (ElementID == INDEX_NONE || !NormalOverlay->IsElement(ElementID))
+					{
+						continue;
+					}
+					const FVector3f LocalNormal3f = NormalOverlay->GetElement(ElementID);
+					FVector Normal(LocalNormal3f.X, LocalNormal3f.Y, LocalNormal3f.Z);
+					if (!FMath::IsFinite(Normal.X) || !FMath::IsFinite(Normal.Y) || !FMath::IsFinite(Normal.Z) || !Normal.Normalize())
+					{
+						continue;
+					}
+
+					if (Space == EVertexMaskForgeNormalSpace::World)
+					{
+						FVector WorldNormal;
+						if (!TransformNormalToWorldSpace(WorldNormalMatrix, Normal, WorldNormal))
+						{
+							continue;
+						}
+						Normal = WorldNormal;
+					}
+
+					RawValues[CornerIndex] = ComputeDirectionalNormalRawValue(Normal, DirectionVector, Angle, Falloff);
+					bHasRawValue[CornerIndex] = true;
+				}
+			}
+		}
+
+		// Blur <= 0 is an exact no-op (see ApplyAdjacencyTopologicalBlur).
+		TArray<float> BlurredValues = RawValues;
+		if (Blur > 0.0f)
+		{
+			const TArray<TArray<int32>> Adjacency = BuildCornerAdjacency(Mesh, NormalOverlay, NumCorners);
+			BlurredValues = ApplyAdjacencyTopologicalBlur(Adjacency, RawValues, bHasRawValue, Blur);
+		}
+
+		// Pass 2: apply Invert (Blur before Invert, matching CurvatureBlur/NoiseBlur) and accumulate stats.
+		Mask.Values.SetNumZeroed(NumCorners);
+		Mask.bHasValue.Init(false, NumCorners);
+
+		double Sum = 0.0;
+		for (int32 CornerIndex = 0; CornerIndex < NumCorners; ++CornerIndex)
+		{
+			if (!bHasRawValue[CornerIndex])
+			{
+				continue;
+			}
+			const float Final = bInvert ? (1.0f - BlurredValues[CornerIndex]) : BlurredValues[CornerIndex];
+
+			Mask.Values[CornerIndex] = Final;
+			Mask.bHasValue[CornerIndex] = true;
+			++Mask.NumValidValues;
+			Sum += Final;
+			Mask.MinValue = (Mask.NumValidValues == 1) ? Final : FMath::Min(Mask.MinValue, Final);
+			Mask.MaxValue = (Mask.NumValidValues == 1) ? Final : FMath::Max(Mask.MaxValue, Final);
+			if (Final <= FVertexMaskForgeScalarMask::Tolerance) { ++Mask.NumNearZero; }
+			if (Final >= 1.0f - FVertexMaskForgeScalarMask::Tolerance) { ++Mask.NumNearOne; }
+		}
+		Mask.MeanValue = (Mask.NumValidValues > 0) ? static_cast<float>(Sum / Mask.NumValidValues) : 0.0f;
+		Mask.State = (Mask.NumValidValues > 0) ? EVertexMaskForgeScalarMaskState::Ready : EVertexMaskForgeScalarMaskState::Unavailable;
+
+		return Mask;
+	}
+
 	/**
 	 * Generates the Ambient Occlusion Mask directly in RENDER VERTEX order for one component, using
 	 * CPU hemisphere raycasts against the component's OWN geometry via a GeometryCore
@@ -5182,6 +5940,15 @@ namespace VertexMaskForgePanel
 						// VertexID on opposite sides of a material boundary correctly read different values.
 						Layer.IndexOverride = CornerIndex;
 						break;
+					case EVertexMaskForgeScalarMaskSource::DirectionalNormal:
+						// AUDITED (V2-E): same CORNER-EXACT domain as MaterialSlot above, deliberately NOT
+						// VertTri[Corner] or NormalTri[Corner] -- GenerateDirectionalNormalMaskFromDynamicMesh
+						// already writes Values in CornerIndex order directly (it reads the Normal Overlay
+						// element per-corner internally, but stores the RESULT per CornerIndex), so two
+						// corners sharing a position/VertexID with different split normals correctly read
+						// different values.
+						Layer.IndexOverride = CornerIndex;
+						break;
 					default: // ConstantWhite / ConstantBlack (Fill) -- corner-domain mask, see
 						// GenerateConstantMaskForCornerDomain.
 						Layer.IndexOverride = CornerIndex;
@@ -5307,6 +6074,8 @@ namespace VertexMaskForgePanel
 	 */
 	static bool BuildAcceptTargets(
 		const TArray<TSharedPtr<FVertexMaskForgeSelectedMesh>>& SelectedMeshes,
+		const bool bDirectionalNormalMaskEnabled,
+		const EVertexMaskForgeNormalSpace DirectionalNormalSpace,
 		TArray<FVertexMaskForgeAcceptTarget>& OutTargets,
 		FText& OutErrorText)
 	{
@@ -5330,9 +6099,30 @@ namespace VertexMaskForgePanel
 					&& Entry->WorkingMesh.AmbientOcclusionMask.State != EVertexMaskForgeScalarMaskState::Ready
 					&& Entry->WorkingMesh.CurvatureMask.State != EVertexMaskForgeScalarMaskState::Ready
 					&& Entry->WorkingMesh.NoiseMask.State != EVertexMaskForgeScalarMaskState::Ready
-					&& Entry->WorkingMesh.MaterialSlotMask.State != EVertexMaskForgeScalarMaskState::Ready))
+					&& Entry->WorkingMesh.MaterialSlotMask.State != EVertexMaskForgeScalarMaskState::Ready
+					&& Entry->WorkingMesh.DirectionalNormalMask.State != EVertexMaskForgeScalarMaskState::Ready))
 			{
 				continue;
+			}
+
+			// AUDITED (V2-E CORRECTIVE PASS, transform freshness): re-checked LIVE, right here,
+			// immediately before any Modify() -- NEVER trusts the cached WorkingMesh.
+			// bDirectionalNormalWorldSpaceConflict flag alone (that flag can only ever be as fresh as the
+			// last Generate Mask/Auto Update pass; a component could have been moved since, with Auto
+			// Update off or faster than the debounce). Only evaluated when Directional Normal Mask is
+			// enabled AND in World Space -- false/skipped in every other case, so this never blocks
+			// Accept for any other generator or for Local Space.
+			if (bDirectionalNormalMaskEnabled && DirectionalNormalSpace == EVertexMaskForgeNormalSpace::World)
+			{
+				float LiveDeviation = 0.0f;
+				if (VertexMaskForgePanel::HasConflictingWorldSpaceNormalTransforms(Entry->PreviewComponents, LiveDeviation))
+				{
+					OutErrorText = FText::Format(
+						LOCTEXT("AcceptDirectionalNormalWorldSpaceConflictFormat",
+							"'{0}': World Space Directional Normal Mask cannot write conflicting results from differently transformed instances of the same Static Mesh asset."),
+						FText::FromString(Entry->AssetName));
+					return false;
+				}
 			}
 
 			UStaticMesh* Mesh = Entry->Mesh.LoadSynchronous();
@@ -5670,6 +6460,8 @@ namespace VertexMaskForgePanel
 	 */
 	static bool BuildSourceTopologyAcceptTargets(
 		const TArray<TSharedPtr<FVertexMaskForgeSelectedMesh>>& SelectedMeshes,
+		const bool bDirectionalNormalMaskEnabled,
+		const EVertexMaskForgeNormalSpace DirectionalNormalSpace,
 		TArray<FVertexMaskForgeSourceTopologyAcceptTarget>& OutTargets,
 		FText& OutErrorText)
 	{
@@ -5682,9 +6474,26 @@ namespace VertexMaskForgePanel
 					&& Entry->WorkingMesh.AmbientOcclusionMask.State != EVertexMaskForgeScalarMaskState::Ready
 					&& Entry->WorkingMesh.CurvatureMask.State != EVertexMaskForgeScalarMaskState::Ready
 					&& Entry->WorkingMesh.NoiseMask.State != EVertexMaskForgeScalarMaskState::Ready
-					&& Entry->WorkingMesh.MaterialSlotMask.State != EVertexMaskForgeScalarMaskState::Ready))
+					&& Entry->WorkingMesh.MaterialSlotMask.State != EVertexMaskForgeScalarMaskState::Ready
+					&& Entry->WorkingMesh.DirectionalNormalMask.State != EVertexMaskForgeScalarMaskState::Ready))
 			{
 				continue;
+			}
+
+			// AUDITED (V2-E CORRECTIVE PASS, transform freshness): same LIVE re-check as
+			// BuildAcceptTargets' own -- see its doc comment. Never trusts the cached
+			// bDirectionalNormalWorldSpaceConflict flag alone.
+			if (bDirectionalNormalMaskEnabled && DirectionalNormalSpace == EVertexMaskForgeNormalSpace::World)
+			{
+				float LiveDeviation = 0.0f;
+				if (VertexMaskForgePanel::HasConflictingWorldSpaceNormalTransforms(Entry->PreviewComponents, LiveDeviation))
+				{
+					OutErrorText = FText::Format(
+						LOCTEXT("AcceptSourceTopologyDirectionalNormalWorldSpaceConflictFormat",
+							"'{0}': World Space Directional Normal Mask cannot write conflicting results from differently transformed instances of the same Static Mesh asset."),
+						FText::FromString(Entry->AssetName));
+					return false;
+				}
 			}
 
 			UStaticMesh* Mesh = Entry->Mesh.LoadSynchronous();
@@ -7195,6 +8004,198 @@ FText SVertexMaskForgePanel::GetMaterialSlotMaskBlendModeButtonText() const
 	return VertexMaskForgePanel::GetBlendModeLabel(MaterialSlotMaskBlendMode);
 }
 
+// --- Directional Normal Mask (V2-E) --------------------------------------------------------------
+
+void SVertexMaskForgePanel::InvalidateDirectionalNormalMaskRawMask()
+{
+	LastMaskActionStatusText = FText::GetEmpty();
+
+	for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
+	{
+		if (Entry.IsValid())
+		{
+			Entry->WorkingMesh.DirectionalNormalMask = FVertexMaskForgeScalarMask();
+			Entry->WorkingMesh.bDirectionalNormalWorldSpaceConflict = false;
+		}
+	}
+
+	if (!bAutoUpdatePreview)
+	{
+		UpdateAllPreviews(/*bCommit=*/false);
+	}
+}
+
+void SVertexMaskForgePanel::OnDirectionalNormalMaskGenerativeParamChanged()
+{
+	// AUDITED (V2-E): mirrors OnNoiseGenerativeParamChanged/OnMaterialSlotMaskGenerativeParamChanged's
+	// exact pattern -- Space/Direction/Angle/Falloff/Invert change WHAT the raw angular pattern looks
+	// like, so they invalidate every selected entry's DirectionalNormalMask and either regenerate
+	// immediately (Auto Update Preview on, cancelling any stale debounce first) or wait for an explicit
+	// Generate Mask (off). Never touches AO/Curvature/Noise/Material Slot state or caches.
+	InvalidateDirectionalNormalMaskRawMask();
+	if (bAutoUpdatePreview)
+	{
+		if (GEditor)
+		{
+			GEditor->GetTimerManager()->ClearTimer(AutoUpdateDebounceTimerHandle);
+		}
+		RunAutoUpdatePreview();
+	}
+}
+
+void SVertexMaskForgePanel::OnDirectionalNormalMaskEnableChanged(const ECheckBoxState NewState)
+{
+	const bool bWasEnabled = bDirectionalNormalMaskEnabled;
+	bDirectionalNormalMaskEnabled = (NewState == ECheckBoxState::Checked);
+
+	// Same enable/disable contract as OnCurvatureEnableChanged/OnNoiseEnableChanged/
+	// OnMaterialSlotMaskEnableChanged: turning OFF is always pure composition; turning ON reuses an
+	// already-Ready entry immediately and only regenerates if genuinely needed, gated by Auto Update
+	// Preview.
+	if (!bDirectionalNormalMaskEnabled || bWasEnabled)
+	{
+		RecomposeWorkingColors();
+		return;
+	}
+
+	bool bAnyEntryNeedsGeneration = false;
+	for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
+	{
+		if (Entry.IsValid() && Entry->WorkingMesh.DirectionalNormalMask.State != EVertexMaskForgeScalarMaskState::Ready)
+		{
+			bAnyEntryNeedsGeneration = true;
+			break;
+		}
+	}
+
+	if (!bAnyEntryNeedsGeneration)
+	{
+		RecomposeWorkingColors();
+		return;
+	}
+
+	if (bAutoUpdatePreview)
+	{
+		if (GEditor)
+		{
+			GEditor->GetTimerManager()->ClearTimer(AutoUpdateDebounceTimerHandle);
+		}
+		RunAutoUpdatePreview();
+	}
+	else
+	{
+		RecomposeWorkingColors();
+	}
+}
+
+TSharedRef<SWidget> SVertexMaskForgePanel::OnGenerateNormalSpaceRow(TSharedPtr<EVertexMaskForgeNormalSpace> InOption) const
+{
+	return SNew(STextBlock)
+		.Text(InOption.IsValid() ? VertexMaskForgePanel::GetNormalSpaceLabel(*InOption) : FText::GetEmpty());
+}
+
+void SVertexMaskForgePanel::OnNormalSpaceSelectionChanged(TSharedPtr<EVertexMaskForgeNormalSpace> NewSelection, ESelectInfo::Type SelectInfo)
+{
+	if (!NewSelection.IsValid())
+	{
+		return;
+	}
+
+	DirectionalNormalSpace = *NewSelection;
+	OnDirectionalNormalMaskGenerativeParamChanged();
+}
+
+FText SVertexMaskForgePanel::GetNormalSpaceButtonText() const
+{
+	return VertexMaskForgePanel::GetNormalSpaceLabel(DirectionalNormalSpace);
+}
+
+TSharedRef<SWidget> SVertexMaskForgePanel::OnGenerateNormalDirectionRow(TSharedPtr<EVertexMaskForgeNormalDirection> InOption) const
+{
+	return SNew(STextBlock)
+		.Text(InOption.IsValid() ? VertexMaskForgePanel::GetNormalDirectionLabel(*InOption) : FText::GetEmpty());
+}
+
+void SVertexMaskForgePanel::OnNormalDirectionSelectionChanged(TSharedPtr<EVertexMaskForgeNormalDirection> NewSelection, ESelectInfo::Type SelectInfo)
+{
+	if (!NewSelection.IsValid())
+	{
+		return;
+	}
+
+	DirectionalNormalDirection = *NewSelection;
+	OnDirectionalNormalMaskGenerativeParamChanged();
+}
+
+FText SVertexMaskForgePanel::GetNormalDirectionButtonText() const
+{
+	return VertexMaskForgePanel::GetNormalDirectionLabel(DirectionalNormalDirection);
+}
+
+void SVertexMaskForgePanel::OnDirectionalNormalMaskInvertChanged(const ECheckBoxState NewState)
+{
+	bDirectionalNormalMaskInvert = (NewState == ECheckBoxState::Checked);
+	OnDirectionalNormalMaskGenerativeParamChanged();
+}
+
+TSharedRef<SWidget> SVertexMaskForgePanel::OnGenerateDirectionalNormalMaskBlendModeRow(TSharedPtr<EVertexMaskForgeBlendMode> InOption) const
+{
+	return SNew(STextBlock)
+		.Text(InOption.IsValid() ? VertexMaskForgePanel::GetBlendModeLabel(*InOption) : FText::GetEmpty());
+}
+
+void SVertexMaskForgePanel::OnDirectionalNormalMaskBlendModeSelectionChanged(TSharedPtr<EVertexMaskForgeBlendMode> NewSelection, ESelectInfo::Type SelectInfo)
+{
+	if (!NewSelection.IsValid())
+	{
+		return;
+	}
+
+	DirectionalNormalMaskBlendMode = *NewSelection;
+	RecomposeWorkingColors();
+}
+
+FText SVertexMaskForgePanel::GetDirectionalNormalMaskBlendModeButtonText() const
+{
+	return VertexMaskForgePanel::GetBlendModeLabel(DirectionalNormalMaskBlendMode);
+}
+
+FText SVertexMaskForgePanel::GetDirectionalNormalMaskDiagnosticText() const
+{
+	if (SelectedMeshes.IsEmpty())
+	{
+		return FText::GetEmpty();
+	}
+	bool bAnyConflict = false;
+	bool bAnyInvalid = false;
+	for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
+	{
+		if (!Entry.IsValid())
+		{
+			continue;
+		}
+		if (Entry->WorkingMesh.bDirectionalNormalWorldSpaceConflict)
+		{
+			bAnyConflict = true;
+		}
+		if (Entry->WorkingMesh.DirectionalNormalMask.State == EVertexMaskForgeScalarMaskState::Invalid)
+		{
+			bAnyInvalid = true;
+		}
+	}
+	if (bAnyConflict)
+	{
+		return LOCTEXT("DirectionalNormalMaskWorldSpaceConflict",
+			"World Space Directional Normal Mask cannot write conflicting results from differently transformed instances of the same Static Mesh asset. Preview still shows each instance correctly; Accept is blocked for the affected asset(s).");
+	}
+	if (bAnyInvalid)
+	{
+		return LOCTEXT("DirectionalNormalMaskDegenerateTransform",
+			"Directional Normal Mask unavailable for one or more selected meshes: degenerate World Space transform (zero or near-zero scale on at least one axis).");
+	}
+	return FText::GetEmpty();
+}
+
 void SVertexMaskForgePanel::OnNoiseEnableChanged(const ECheckBoxState NewState)
 {
 	const bool bWasEnabled = bNoiseEnabled;
@@ -7407,7 +8408,7 @@ FText SVertexMaskForgePanel::GetActiveMaskSourceText() const
 		}
 	}
 
-	TArray<FText, TInlineAllocator<5>> ActiveLayerNames;
+	TArray<FText, TInlineAllocator<6>> ActiveLayerNames;
 	if (bAnyAxisEnabled)
 	{
 		ActiveLayerNames.Add(LOCTEXT("ActiveLayerBBox", "Bounding Box"));
@@ -7420,6 +8421,10 @@ FText SVertexMaskForgePanel::GetActiveMaskSourceText() const
 	{
 		ActiveLayerNames.Add(LOCTEXT("ActiveLayerCurvature", "Curvature"));
 	}
+	if (bDirectionalNormalMaskEnabled)
+	{
+		ActiveLayerNames.Add(LOCTEXT("ActiveLayerDirectionalNormal", "Directional Normal"));
+	}
 	if (bNoiseEnabled)
 	{
 		ActiveLayerNames.Add(LOCTEXT("ActiveLayerNoise", "Noise"));
@@ -7431,7 +8436,7 @@ FText SVertexMaskForgePanel::GetActiveMaskSourceText() const
 
 	if (ActiveLayerNames.IsEmpty())
 	{
-		return LOCTEXT("ActiveMaskSourceNone", "Active layers: None -- enable a Bounding Box axis, Ambient Occlusion, Curvature, Noise, or Material Slot Mask");
+		return LOCTEXT("ActiveMaskSourceNone", "Active layers: None -- enable a Bounding Box axis, Ambient Occlusion, Curvature, Directional Normal, Noise, or Material Slot Mask");
 	}
 
 	TArray<FString> LayerStrings;
@@ -7614,6 +8619,13 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 	// "Refresh Selection" button is gone (see OnEditorSelectionChanged's own audit note).
 	SelectionChangedDelegateHandle = USelection::SelectionChangedEvent.AddRaw(this, &SVertexMaskForgePanel::OnEditorSelectionChanged);
 
+	// AUDITED (V2-E corrective pass): see ActorMovedDelegateHandle's own doc comment for the engine-
+	// source evidence that this fires once per completed viewport gizmo move/rotate/scale.
+	if (GEngine)
+	{
+		ActorMovedDelegateHandle = GEngine->OnActorMoved().AddRaw(this, &SVertexMaskForgePanel::OnActorMovedForDirectionalNormal);
+	}
+
 	// AUDITED (Undo/Redo fix): FEditorUndoClient::PostUndo/PostRedo are the engine's own official
 	// notification for "an Undo or Redo transaction just finished" (used the same way by, e.g., Actor
 	// detail panels and other Editor tool widgets) -- registered/unregistered explicitly via
@@ -7646,6 +8658,16 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 	CurvatureTypeOptions.Add(MakeShared<EVertexMaskForgeCurvatureType>(EVertexMaskForgeCurvatureType::Convex));
 	CurvatureTypeOptions.Add(MakeShared<EVertexMaskForgeCurvatureType>(EVertexMaskForgeCurvatureType::Concave));
 	CurvatureTypeOptions.Add(MakeShared<EVertexMaskForgeCurvatureType>(EVertexMaskForgeCurvatureType::Both));
+
+	NormalSpaceOptions.Add(MakeShared<EVertexMaskForgeNormalSpace>(EVertexMaskForgeNormalSpace::Local));
+	NormalSpaceOptions.Add(MakeShared<EVertexMaskForgeNormalSpace>(EVertexMaskForgeNormalSpace::World));
+
+	NormalDirectionOptions.Add(MakeShared<EVertexMaskForgeNormalDirection>(EVertexMaskForgeNormalDirection::PositiveX));
+	NormalDirectionOptions.Add(MakeShared<EVertexMaskForgeNormalDirection>(EVertexMaskForgeNormalDirection::NegativeX));
+	NormalDirectionOptions.Add(MakeShared<EVertexMaskForgeNormalDirection>(EVertexMaskForgeNormalDirection::PositiveY));
+	NormalDirectionOptions.Add(MakeShared<EVertexMaskForgeNormalDirection>(EVertexMaskForgeNormalDirection::NegativeY));
+	NormalDirectionOptions.Add(MakeShared<EVertexMaskForgeNormalDirection>(EVertexMaskForgeNormalDirection::PositiveZ));
+	NormalDirectionOptions.Add(MakeShared<EVertexMaskForgeNormalDirection>(EVertexMaskForgeNormalDirection::NegativeZ));
 
 	NoiseTypeOptions.Add(MakeShared<EVertexMaskForgeNoiseType>(EVertexMaskForgeNoiseType::Perlin));
 	NoiseTypeOptions.Add(MakeShared<EVertexMaskForgeNoiseType>(EVertexMaskForgeNoiseType::FractalPerlin));
@@ -8519,6 +9541,376 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 								OnCurvatureParamChanged();
 							})
 						]
+					]
+				]
+			]
+
+			// Directional Normal Mask (V2-E): the tool's independent, optional composition-stack layer
+			// positioned visually between Curvature and Noise -- same collapsible panel pattern as
+			// Bounding Box/Ambient Occlusion/Curvature above. (Its EVertexMaskForgeScalarMaskSource enum
+			// value is appended AFTER Material Slot for numeric stability -- visual position and enum
+			// declaration order are deliberately independent, see that enum's own doc comment.)
+			+ SVerticalBox::Slot()
+			.AutoHeight()
+			.Padding(FMargin(0.f, 12.f, 0.f, 0.f))
+			[
+				SNew(SExpandableArea)
+				.InitiallyCollapsed(false)
+				.Padding(FMargin(8.f))
+				.HeaderContent()
+				[
+					SNew(STextBlock)
+					.Text(LOCTEXT("DirectionalNormalMaskSectionTitle", "Directional Normal Mask"))
+					.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
+				]
+				.BodyContent()
+				[
+					SNew(SVerticalBox)
+
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(FMargin(0.f, 0.f, 0.f, 6.f))
+					[
+						SNew(SCheckBox)
+						.IsChecked(this, &SVertexMaskForgePanel::GetDirectionalNormalMaskEnableState)
+						.OnCheckStateChanged(this, &SVertexMaskForgePanel::OnDirectionalNormalMaskEnableChanged)
+						.Content()
+						[
+							SNew(STextBlock)
+							.Text(LOCTEXT("DirectionalNormalMaskEnableLabel", "Enable"))
+						]
+					]
+
+					// Blend Mode + Blend: same Slate controls/dimensions/alignment/labels/tooltips/limits
+					// as the other layers' own (see those sections above). Purely compositional -- changing
+					// either only calls RecomposeWorkingColors(), never regenerates the raw mask.
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(FMargin(0.f, 0.f, 0.f, 2.f))
+					[
+						SNew(SHorizontalBox)
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
+						[
+							SNew(STextBlock).Text(LOCTEXT("DirectionalNormalMaskBlendModeLabel", "Blend Mode:"))
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						[
+							SAssignNew(DirectionalNormalMaskBlendModeComboBox, SComboBox<TSharedPtr<EVertexMaskForgeBlendMode>>)
+							.OptionsSource(&BlendModeOptions)
+							.InitiallySelectedItem(BlendModeOptions[0])
+							.OnGenerateWidget(this, &SVertexMaskForgePanel::OnGenerateDirectionalNormalMaskBlendModeRow)
+							.OnSelectionChanged(this, &SVertexMaskForgePanel::OnDirectionalNormalMaskBlendModeSelectionChanged)
+							[
+								SNew(STextBlock)
+								.Text(this, &SVertexMaskForgePanel::GetDirectionalNormalMaskBlendModeButtonText)
+							]
+						]
+					]
+
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(FMargin(0.f, 0.f, 0.f, 6.f))
+					[
+						SNew(SHorizontalBox)
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
+						[
+							SNew(STextBlock).Text(LOCTEXT("DirectionalNormalMaskOpacityLabel", "Blend:"))
+						]
+
+						+ SHorizontalBox::Slot()
+						.FillWidth(1.f)
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 8.f, 0.f))
+						[
+							SNew(SSlider)
+							.MinValue(0.0f)
+							.MaxValue(1.0f)
+							.Value_Lambda([this]() { return DirectionalNormalMaskOpacity; })
+							.OnValueChanged_Lambda([this](const float NewValue)
+							{
+								DirectionalNormalMaskOpacity = FMath::Clamp(NewValue, 0.0f, 1.0f);
+								RecomposeWorkingColors();
+							})
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						[
+							SNew(SSpinBox<float>)
+							.MinDesiredWidth(52.f)
+							.MinValue(0.0f)
+							.MaxValue(1.0f)
+							.Delta(0.01f)
+							.MinFractionalDigits(2)
+							.MaxFractionalDigits(2)
+							.Value_Lambda([this]() { return DirectionalNormalMaskOpacity; })
+							.OnValueChanged_Lambda([this](const float NewValue)
+							{
+								DirectionalNormalMaskOpacity = FMath::Clamp(NewValue, 0.0f, 1.0f);
+								RecomposeWorkingColors();
+							})
+						]
+					]
+
+					// Space: Local vs. World.
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(FMargin(0.f, 0.f, 0.f, 6.f))
+					[
+						SNew(SHorizontalBox)
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
+						[
+							SNew(STextBlock)
+							.Text(LOCTEXT("NormalSpaceLabel", "Space:"))
+							.ToolTipText(LOCTEXT("NormalSpaceTooltip",
+								"Local Space evaluates normals in the Static Mesh asset's own space -- the same result for every instance, unaffected by Actor/Component rotation. "
+								"World Space evaluates normals using the selected component's transform. The generated colors are saved to the Static Mesh asset and therefore affect every instance of that asset."))
+						]
+
+						+ SHorizontalBox::Slot()
+						.FillWidth(1.f)
+						.VAlign(VAlign_Center)
+						[
+							SAssignNew(NormalSpaceComboBox, SComboBox<TSharedPtr<EVertexMaskForgeNormalSpace>>)
+							.OptionsSource(&NormalSpaceOptions)
+							.OnGenerateWidget(this, &SVertexMaskForgePanel::OnGenerateNormalSpaceRow)
+							.OnSelectionChanged(this, &SVertexMaskForgePanel::OnNormalSpaceSelectionChanged)
+							.ToolTipText(LOCTEXT("NormalSpaceTooltip",
+								"Local Space evaluates normals in the Static Mesh asset's own space -- the same result for every instance, unaffected by Actor/Component rotation. "
+								"World Space evaluates normals using the selected component's transform. The generated colors are saved to the Static Mesh asset and therefore affect every instance of that asset."))
+							[
+								SNew(STextBlock)
+								.Text(this, &SVertexMaskForgePanel::GetNormalSpaceButtonText)
+							]
+						]
+					]
+
+					// Direction: the six principal axes.
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(FMargin(0.f, 0.f, 0.f, 6.f))
+					[
+						SNew(SHorizontalBox)
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
+						[
+							SNew(STextBlock).Text(LOCTEXT("NormalDirectionLabel", "Direction:"))
+						]
+
+						+ SHorizontalBox::Slot()
+						.FillWidth(1.f)
+						.VAlign(VAlign_Center)
+						[
+							SAssignNew(NormalDirectionComboBox, SComboBox<TSharedPtr<EVertexMaskForgeNormalDirection>>)
+							.OptionsSource(&NormalDirectionOptions)
+							.OnGenerateWidget(this, &SVertexMaskForgePanel::OnGenerateNormalDirectionRow)
+							.OnSelectionChanged(this, &SVertexMaskForgePanel::OnNormalDirectionSelectionChanged)
+							[
+								SNew(STextBlock)
+								.Text(this, &SVertexMaskForgePanel::GetNormalDirectionButtonText)
+							]
+						]
+					]
+
+					// Angle (degrees, 0-180).
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(FMargin(0.f, 0.f, 0.f, 2.f))
+					[
+						SNew(SHorizontalBox)
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
+						[
+							SNew(STextBlock)
+							.Text(LOCTEXT("DirectionalNormalAngleLabel", "Angle"))
+							.ToolTipText(LOCTEXT("DirectionalNormalAngleTooltip", "Cone half-angle, in degrees, from the selected Direction. 0 = only exact alignment; 180 = full coverage."))
+						]
+
+						+ SHorizontalBox::Slot()
+						.FillWidth(1.f)
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 8.f, 0.f))
+						[
+							SNew(SSlider)
+							.MinValue(0.0f)
+							.MaxValue(180.0f)
+							.Value_Lambda([this]() { return DirectionalNormalAngle; })
+							.OnValueChanged_Lambda([this](const float NewValue)
+							{
+								DirectionalNormalAngle = FMath::Clamp(NewValue, 0.0f, 180.0f);
+								OnDirectionalNormalMaskGenerativeParamChanged();
+							})
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						[
+							SNew(SSpinBox<float>)
+							.MinDesiredWidth(52.f)
+							.MinValue(0.0f)
+							.MaxValue(180.0f)
+							.Delta(0.1f)
+							.Value_Lambda([this]() { return DirectionalNormalAngle; })
+							.OnValueChanged_Lambda([this](const float NewValue)
+							{
+								DirectionalNormalAngle = FMath::Clamp(NewValue, 0.0f, 180.0f);
+								OnDirectionalNormalMaskGenerativeParamChanged();
+							})
+						]
+					]
+
+					// Falloff (degrees, 0-180, internally clamped to [0, Angle] at generation time).
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(FMargin(0.f, 0.f, 0.f, 6.f))
+					[
+						SNew(SHorizontalBox)
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
+						[
+							SNew(STextBlock)
+							.Text(LOCTEXT("DirectionalNormalFalloffLabel", "Falloff"))
+							.ToolTipText(LOCTEXT("DirectionalNormalFalloffTooltip", "Smooth transition width, in degrees, ending exactly at Angle. Internally clamped to [0, Angle] -- never causes a division by zero."))
+						]
+
+						+ SHorizontalBox::Slot()
+						.FillWidth(1.f)
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 8.f, 0.f))
+						[
+							SNew(SSlider)
+							.MinValue(0.0f)
+							.MaxValue(180.0f)
+							.Value_Lambda([this]() { return DirectionalNormalFalloff; })
+							.OnValueChanged_Lambda([this](const float NewValue)
+							{
+								DirectionalNormalFalloff = FMath::Clamp(NewValue, 0.0f, 180.0f);
+								OnDirectionalNormalMaskGenerativeParamChanged();
+							})
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						[
+							SNew(SSpinBox<float>)
+							.MinDesiredWidth(52.f)
+							.MinValue(0.0f)
+							.MaxValue(180.0f)
+							.Delta(0.1f)
+							.Value_Lambda([this]() { return DirectionalNormalFalloff; })
+							.OnValueChanged_Lambda([this](const float NewValue)
+							{
+								DirectionalNormalFalloff = FMath::Clamp(NewValue, 0.0f, 180.0f);
+								OnDirectionalNormalMaskGenerativeParamChanged();
+							})
+						]
+					]
+
+					// Blur: topological smoothing of the raw Directional Normal Mask, applied BEFORE Invert --
+					// same widget/range/default/tooltip pattern as Curvature's own Blur (see that section
+					// above and ApplyAdjacencyTopologicalBlur's doc comment for why the underlying adjacency
+					// must differ by domain even though the algorithm and UI are identical).
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(FMargin(0.f, 0.f, 0.f, 4.f))
+					[
+						SNew(SHorizontalBox)
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
+						[
+							SNew(STextBlock)
+							.Text(LOCTEXT("DirectionalNormalBlurLabel", "Blur"))
+							.ToolTipText(LOCTEXT("DirectionalNormalBlurTooltip",
+								"Topological smoothing of the Directional Normal Mask, applied before Invert. Whole number = full iterations; fractional part blends toward one more."))
+						]
+
+						+ SHorizontalBox::Slot()
+						.FillWidth(1.f)
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(0.f, 0.f, 8.f, 0.f))
+						[
+							SNew(SSlider)
+							.MinValue(0.0f)
+							.MaxValue(10.0f)
+							.Value_Lambda([this]() { return DirectionalNormalBlur; })
+							.OnValueChanged_Lambda([this](const float NewValue)
+							{
+								DirectionalNormalBlur = FMath::Clamp(NewValue, 0.0f, 10.0f);
+								OnDirectionalNormalMaskGenerativeParamChanged();
+							})
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						[
+							SNew(SSpinBox<float>)
+							.MinDesiredWidth(52.f)
+							.MinValue(0.0f)
+							.MaxValue(10.0f)
+							.Delta(0.01f)
+							.Value_Lambda([this]() { return DirectionalNormalBlur; })
+							.OnValueChanged_Lambda([this](const float NewValue)
+							{
+								DirectionalNormalBlur = FMath::Clamp(NewValue, 0.0f, 10.0f);
+								OnDirectionalNormalMaskGenerativeParamChanged();
+							})
+						]
+					]
+
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(FMargin(0.f, 0.f, 0.f, 6.f))
+					[
+						SNew(SCheckBox)
+						.IsChecked(this, &SVertexMaskForgePanel::GetDirectionalNormalMaskInvertState)
+						.OnCheckStateChanged(this, &SVertexMaskForgePanel::OnDirectionalNormalMaskInvertChanged)
+						.Content()
+						[
+							SNew(STextBlock)
+							.Text(LOCTEXT("DirectionalNormalMaskInvertLabel", "Invert"))
+						]
+					]
+
+					// Diagnostic: World-Space multi-instance conflict / degenerate transform reasons --
+					// empty (renders nothing) when available and valid.
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					[
+						SNew(STextBlock)
+						.Text(this, &SVertexMaskForgePanel::GetDirectionalNormalMaskDiagnosticText)
+						.ColorAndOpacity(FSlateColor::UseSubduedForeground())
+						.AutoWrapText(true)
 					]
 				]
 			]
@@ -9554,6 +10946,12 @@ SVertexMaskForgePanel::~SVertexMaskForgePanel()
 	// Same rationale, for the same reason: no callback into a partially-destructed panel.
 	USelection::SelectionChangedEvent.Remove(SelectionChangedDelegateHandle);
 
+	// Same rationale, for the same reason: no callback into a partially-destructed panel.
+	if (GEngine)
+	{
+		GEngine->OnActorMoved().Remove(ActorMovedDelegateHandle);
+	}
+
 	// Same rationale as the two unregistrations above: no PostUndo/PostRedo callback into a
 	// partially-destructed panel. Paired with GEditor->RegisterForUndo(this) in Construct().
 	if (GEditor)
@@ -9621,6 +11019,73 @@ void SVertexMaskForgePanel::OnEditorSelectionChanged(UObject* NewSelection)
 	bSceneSelectionChangedDuringActiveOperation = false;
 
 	RefreshSelection();
+}
+
+/**
+ * AUDITED (V2-E corrective pass, transform freshness): fires once per completed viewport gizmo move/
+ * rotate/scale, for ANY actor anywhere in the level (see ActorMovedDelegateHandle's own doc comment for
+ * the engine-source evidence) -- filtered here to do nothing at all unless Directional Normal Mask is
+ * actually enabled AND in World Space (Local Space is transform-independent by construction and must
+ * never be regenerated by an instance transform change), and unless the moved Actor actually owns one of
+ * THIS panel's own currently-tracked PreviewComponents. Invalidates ONLY DirectionalNormalMask (and its
+ * own bDirectionalNormalWorldSpaceConflict flag) for the affected entry/entries -- never touches AO/
+ * Curvature/Noise/Material Slot state or caches. Mirrors OnDirectionalNormalMaskGenerativeParamChanged's
+ * own "invalidate, then regenerate immediately if Auto Update Preview is on, else wait for an explicit
+ * Generate Mask" contract -- reuses the SAME debounce-clearing/RunAutoUpdatePreview call, no new timer.
+ */
+void SVertexMaskForgePanel::OnActorMovedForDirectionalNormal(AActor* Actor)
+{
+	if (!Actor || !bDirectionalNormalMaskEnabled || DirectionalNormalSpace != EVertexMaskForgeNormalSpace::World)
+	{
+		return;
+	}
+
+	bool bAnyEntryAffected = false;
+	for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
+	{
+		if (!Entry.IsValid())
+		{
+			continue;
+		}
+		bool bThisEntryAffected = false;
+		for (const FVertexMaskForgePreviewComponentState& State : Entry->PreviewComponents)
+		{
+			const UStaticMeshComponent* Component = State.SourceComponent.Get();
+			if (IsValid(Component) && Component->GetOwner() == Actor)
+			{
+				bThisEntryAffected = true;
+				break;
+			}
+		}
+		if (bThisEntryAffected)
+		{
+			Entry->WorkingMesh.DirectionalNormalMask = FVertexMaskForgeScalarMask();
+			Entry->WorkingMesh.bDirectionalNormalWorldSpaceConflict = false;
+			bAnyEntryAffected = true;
+		}
+	}
+
+	if (!bAnyEntryAffected)
+	{
+		return; // The moved Actor owns none of this panel's tracked components -- nothing to do.
+	}
+
+	LastMaskActionStatusText = FText::GetEmpty();
+	if (bAutoUpdatePreview)
+	{
+		if (GEditor)
+		{
+			GEditor->GetTimerManager()->ClearTimer(AutoUpdateDebounceTimerHandle);
+		}
+		RunAutoUpdatePreview();
+	}
+	else
+	{
+		// Auto Update Preview off: same "wait for an explicit Generate Mask" contract as every other
+		// generative parameter change -- still recompose so the now-invalidated entry shows its
+		// baseline/last-valid state rather than a stale World Space result from before the move.
+		UpdateAllPreviews(/*bCommit=*/false);
+	}
 }
 
 void SVertexMaskForgePanel::SyncSelectionIfChangedDuringOperation()
@@ -9871,11 +11336,11 @@ FReply SVertexMaskForgePanel::OnGenerateBoundingBoxMaskClicked()
 			break;
 		}
 	}
-	if (!bAnyAxisEnabled && !bAOEnabled && !bCurvatureEnabled && !bNoiseEnabled && !bMaterialSlotMaskEnabled)
+	if (!bAnyAxisEnabled && !bAOEnabled && !bCurvatureEnabled && !bNoiseEnabled && !bMaterialSlotMaskEnabled && !bDirectionalNormalMaskEnabled)
 	{
 		// Per the explicit requirement: never generate an empty mask silently, never replace the
 		// previous Preview, never enter Pending Changes with invalid data.
-		LastOperationErrorText = LOCTEXT("NoMaskSourceEnabled", "Enable at least one Bounding Box axis, Ambient Occlusion, Curvature, Noise, or Material Slot Mask.");
+		LastOperationErrorText = LOCTEXT("NoMaskSourceEnabled", "Enable at least one Bounding Box axis, Ambient Occlusion, Curvature, Directional Normal, Noise, or Material Slot Mask.");
 		RecomputeOperationState();
 		return FReply::Handled();
 	}
@@ -9902,6 +11367,7 @@ FReply SVertexMaskForgePanel::OnGenerateBoundingBoxMaskClicked()
 	int32 NumCurvatureReady = 0, NumCurvatureUnavailable = 0;
 	int32 NumNoiseReady = 0, NumNoiseUnavailable = 0;
 	int32 NumMaterialSlotReady = 0, NumMaterialSlotUnavailable = 0;
+	int32 NumDirectionalNormalReady = 0, NumDirectionalNormalUnavailable = 0;
 
 	// AUDITED (Noise V1): computed ONCE for this whole click, before touching any entry -- Noise's raw
 	// pattern generation only needs the CURRENT UI values, never per-entry state.
@@ -9960,11 +11426,14 @@ FReply SVertexMaskForgePanel::OnGenerateBoundingBoxMaskClicked()
 			Entry->WorkingMesh.NoiseMask.State = EVertexMaskForgeScalarMaskState::Unavailable;
 			Entry->WorkingMesh.MaterialSlotMask = FVertexMaskForgeScalarMask();
 			Entry->WorkingMesh.MaterialSlotMask.State = EVertexMaskForgeScalarMaskState::Unavailable;
+			Entry->WorkingMesh.DirectionalNormalMask = FVertexMaskForgeScalarMask();
+			Entry->WorkingMesh.DirectionalNormalMask.State = EVertexMaskForgeScalarMaskState::Unavailable;
 			++NumBBoxUnavailable;
 			++NumAOUnavailable;
 			++NumCurvatureUnavailable;
 			++NumNoiseUnavailable;
 			++NumMaterialSlotUnavailable;
+			++NumDirectionalNormalUnavailable;
 			continue;
 		}
 
@@ -10153,14 +11622,56 @@ FReply SVertexMaskForgePanel::OnGenerateBoundingBoxMaskClicked()
 			Entry->WorkingMesh.MaterialSlotMask = FVertexMaskForgeScalarMask();
 			++NumMaterialSlotUnavailable;
 		}
+
+		// AUDITED (V2-E): Directional Normal Mask -- entry-level reference, using the SAME
+		// ReferenceTransform (first live component, or Identity) as Bounding Box above; the REAL values
+		// for Local Space (transform-independent), or a Ready/Unavailable GATING signal only for World
+		// Space (ApplyPreviewToEntry re-evaluates the real per-component result there -- same split as
+		// AmbientOcclusionMask's own entry-level slot). World-Space multi-instance conflict (see
+		// HasConflictingWorldSpaceNormalTransforms) is tracked separately and never blocks PREVIEW
+		// (each instance still previews correctly, using its own transform) -- only Accept (see
+		// BuildAcceptTargets/BuildSourceTopologyAcceptTargets) is blocked by it.
+		if (bDirectionalNormalMaskEnabled)
+		{
+			Entry->WorkingMesh.DirectionalNormalMask = Entry->bUseSourceTopology
+				? VertexMaskForgePanel::GenerateDirectionalNormalMaskFromDynamicMesh(
+					Entry->WorkingMesh, DirectionalNormalSpace, DirectionalNormalDirection,
+					DirectionalNormalAngle, DirectionalNormalFalloff, DirectionalNormalBlur, bDirectionalNormalMaskInvert, ReferenceTransform)
+				: VertexMaskForgePanel::GenerateDirectionalNormalMask(
+					RenderData->LODResources[0], DirectionalNormalSpace, DirectionalNormalDirection,
+					DirectionalNormalAngle, DirectionalNormalFalloff, DirectionalNormalBlur, bDirectionalNormalMaskInvert, ReferenceTransform);
+
+			Entry->WorkingMesh.bDirectionalNormalWorldSpaceConflict = false;
+			if (DirectionalNormalSpace == EVertexMaskForgeNormalSpace::World)
+			{
+				float MaxDeviationDegrees = 0.0f;
+				Entry->WorkingMesh.bDirectionalNormalWorldSpaceConflict =
+					VertexMaskForgePanel::HasConflictingWorldSpaceNormalTransforms(Entry->PreviewComponents, MaxDeviationDegrees);
+			}
+
+			if (Entry->WorkingMesh.DirectionalNormalMask.State == EVertexMaskForgeScalarMaskState::Ready)
+			{
+				++NumDirectionalNormalReady;
+			}
+			else
+			{
+				++NumDirectionalNormalUnavailable;
+			}
+		}
+		else
+		{
+			Entry->WorkingMesh.DirectionalNormalMask = FVertexMaskForgeScalarMask();
+			Entry->WorkingMesh.bDirectionalNormalWorldSpaceConflict = false;
+			++NumDirectionalNormalUnavailable;
+		}
 	}
 
 	// Log (explicit operation summary): this function is only reached by an explicit Generate Mask
 	// click -- RunAutoUpdatePreview has its own separate loop and never calls this one, so this line
 	// cannot fire on every slider tick.
 	UE_LOG(LogVertexMaskForge, Log,
-		TEXT("Vertex Mask Forge: Generate Mask: Bounding Box %d ready/%d unavailable/%d degenerate/%d invalid; Ambient Occlusion %d ready/%d unavailable; Curvature %d ready/%d unavailable; Noise %d ready/%d unavailable; Material Slot Mask %d ready/%d unavailable."),
-		NumBBoxReady, NumBBoxUnavailable, NumBBoxDegenerate, NumBBoxInvalid, NumAOReady, NumAOUnavailable, NumCurvatureReady, NumCurvatureUnavailable, NumNoiseReady, NumNoiseUnavailable, NumMaterialSlotReady, NumMaterialSlotUnavailable);
+		TEXT("Vertex Mask Forge: Generate Mask: Bounding Box %d ready/%d unavailable/%d degenerate/%d invalid; Ambient Occlusion %d ready/%d unavailable; Curvature %d ready/%d unavailable; Noise %d ready/%d unavailable; Material Slot Mask %d ready/%d unavailable; Directional Normal Mask %d ready/%d unavailable."),
+		NumBBoxReady, NumBBoxUnavailable, NumBBoxDegenerate, NumBBoxInvalid, NumAOReady, NumAOUnavailable, NumCurvatureReady, NumCurvatureUnavailable, NumNoiseReady, NumNoiseUnavailable, NumMaterialSlotReady, NumMaterialSlotUnavailable, NumDirectionalNormalReady, NumDirectionalNormalUnavailable);
 
 	// If a Vertex Color preview mode is active, recompose and reapply immediately using the
 	// mask(s) just persisted -- the user should not have to reselect the dropdown. bCommit=true:
@@ -10471,11 +11982,11 @@ void SVertexMaskForgePanel::RunAutoUpdatePreview(const bool bIncludeAO)
 	// AUDITED (BBox Invert exception): when bIncludeAO is false (OnAxisInvertChanged's scoped call),
 	// Ambient Occlusion is treated as irrelevant to this call regardless of bAOEnabled's actual value
 	// -- see the AO block below, which is skipped entirely in that case.
-	if (!bAnyAxisEnabled && !(bIncludeAO && bAOEnabled) && !bCurvatureEnabled && !bNoiseEnabled && !bMaterialSlotMaskEnabled)
+	if (!bAnyAxisEnabled && !(bIncludeAO && bAOEnabled) && !bCurvatureEnabled && !bNoiseEnabled && !bMaterialSlotMaskEnabled && !bDirectionalNormalMaskEnabled)
 	{
 		// Preserve every entry's existing masks untouched and surface the specific message -- do not
 		// fall through to the generic "could not be regenerated" wording below.
-		LastOperationErrorText = LOCTEXT("NoMaskSourceEnabledAutoUpdate", "Enable at least one Bounding Box axis, Ambient Occlusion, Curvature, Noise, or Material Slot Mask.");
+		LastOperationErrorText = LOCTEXT("NoMaskSourceEnabledAutoUpdate", "Enable at least one Bounding Box axis, Ambient Occlusion, Curvature, Directional Normal, Noise, or Material Slot Mask.");
 		UpdateAllPreviews(/*bCommit=*/false);
 		return;
 	}
@@ -10703,6 +12214,40 @@ void SVertexMaskForgePanel::RunAutoUpdatePreview(const bool bIncludeAO)
 		{
 			Entry->WorkingMesh.MaterialSlotMask = FVertexMaskForgeScalarMask();
 		}
+
+		// AUDITED (V2-E): same "entry-level reference, cheap enough to just recompute" contract as
+		// OnGenerateBoundingBoxMaskClicked's own Directional Normal Mask block -- see that call site's
+		// doc comment. Never gated by bIncludeAO (same rationale as Curvature/Noise/Material Slot).
+		if (bDirectionalNormalMaskEnabled)
+		{
+			FVertexMaskForgeScalarMask NewDirectionalNormalMask = Entry->bUseSourceTopology
+				? VertexMaskForgePanel::GenerateDirectionalNormalMaskFromDynamicMesh(
+					Entry->WorkingMesh, DirectionalNormalSpace, DirectionalNormalDirection,
+					DirectionalNormalAngle, DirectionalNormalFalloff, DirectionalNormalBlur, bDirectionalNormalMaskInvert, ReferenceTransform)
+				: VertexMaskForgePanel::GenerateDirectionalNormalMask(
+					RenderData->LODResources[0], DirectionalNormalSpace, DirectionalNormalDirection,
+					DirectionalNormalAngle, DirectionalNormalFalloff, DirectionalNormalBlur, bDirectionalNormalMaskInvert, ReferenceTransform);
+
+			Entry->WorkingMesh.bDirectionalNormalWorldSpaceConflict = false;
+			if (DirectionalNormalSpace == EVertexMaskForgeNormalSpace::World)
+			{
+				float MaxDeviationDegrees = 0.0f;
+				Entry->WorkingMesh.bDirectionalNormalWorldSpaceConflict =
+					VertexMaskForgePanel::HasConflictingWorldSpaceNormalTransforms(Entry->PreviewComponents, MaxDeviationDegrees);
+			}
+
+			if (NewDirectionalNormalMask.State == EVertexMaskForgeScalarMaskState::Ready)
+			{
+				Entry->WorkingMesh.DirectionalNormalMask = MoveTemp(NewDirectionalNormalMask);
+			}
+			// else: preserve whatever DirectionalNormalMask this entry already had -- same "auto-update
+			// never replaces a valid Preview with incomplete/degenerate data" contract as the others.
+		}
+		else
+		{
+			Entry->WorkingMesh.DirectionalNormalMask = FVertexMaskForgeScalarMask();
+			Entry->WorkingMesh.bDirectionalNormalWorldSpaceConflict = false;
+		}
 	}
 
 	if (NumFailed > 0)
@@ -10791,7 +12336,8 @@ FText SVertexMaskForgePanel::GetPreviewStatusText() const
 			|| Entry->WorkingMesh.AmbientOcclusionMask.State == EVertexMaskForgeScalarMaskState::Ready
 			|| Entry->WorkingMesh.CurvatureMask.State == EVertexMaskForgeScalarMaskState::Ready
 			|| Entry->WorkingMesh.NoiseMask.State == EVertexMaskForgeScalarMaskState::Ready
-			|| Entry->WorkingMesh.MaterialSlotMask.State == EVertexMaskForgeScalarMaskState::Ready)
+			|| Entry->WorkingMesh.MaterialSlotMask.State == EVertexMaskForgeScalarMaskState::Ready
+			|| Entry->WorkingMesh.DirectionalNormalMask.State == EVertexMaskForgeScalarMaskState::Ready)
 		{
 			bAnyReady = true;
 		}
@@ -10916,7 +12462,8 @@ void SVertexMaskForgePanel::RecomputeOperationState()
 				|| Entry->WorkingMesh.AmbientOcclusionMask.State == EVertexMaskForgeScalarMaskState::Ready
 				|| Entry->WorkingMesh.CurvatureMask.State == EVertexMaskForgeScalarMaskState::Ready
 				|| Entry->WorkingMesh.NoiseMask.State == EVertexMaskForgeScalarMaskState::Ready
-				|| Entry->WorkingMesh.MaterialSlotMask.State == EVertexMaskForgeScalarMaskState::Ready))
+				|| Entry->WorkingMesh.MaterialSlotMask.State == EVertexMaskForgeScalarMaskState::Ready
+				|| Entry->WorkingMesh.DirectionalNormalMask.State == EVertexMaskForgeScalarMaskState::Ready))
 		{
 			bHasPending = true;
 			break;
@@ -11015,6 +12562,21 @@ bool SVertexMaskForgePanel::AcceptPendingChanges()
 
 	UE_LOG(LogVertexMaskForge, Log, TEXT("Vertex Mask Forge: Accept started (%d selected entries)."), SelectedMeshes.Num());
 
+	// AUDITED (V2-E corrective pass, transform freshness): Directional Normal Mask's World Space per-
+	// component result is only ever recomputed live inside ApplyPreviewToEntry -- if the user moved a
+	// component's Actor and Auto Update Preview is OFF (or the move happened faster than the debounced
+	// regeneration), WorkingColors could still reflect a STALE transform at the moment Accept is
+	// clicked. A synchronous, non-committing recomposition pass HERE (the exact same call every other
+	// live-recompose path already uses) guarantees WorkingColors reflects the CURRENT live component
+	// transform(s) before a single byte is read for persistence -- reusing 100% existing, already-
+	// audited machinery (ApplyPreviewToEntry recomputes Directional Normal Mask fresh per component in
+	// World Space every single call; Local Space and every other generator are entirely unaffected,
+	// since this never invalidates any raw cache, only recomposes from what is already cached).
+	if (bDirectionalNormalMaskEnabled && DirectionalNormalSpace == EVertexMaskForgeNormalSpace::World)
+	{
+		UpdateAllPreviews(/*bCommit=*/false);
+	}
+
 	// AUDITED (Nanite source-topology support): preflight BOTH domains BEFORE writing either one --
 	// if EITHER fails, nothing is modified (the whole point of validating fully before the first
 	// Modify() call). BuildAcceptTargets/BuildSourceTopologyAcceptTargets never produce overlapping
@@ -11024,14 +12586,14 @@ bool SVertexMaskForgePanel::AcceptPendingChanges()
 	TArray<VertexMaskForgePanel::FVertexMaskForgeAcceptTarget> Targets;
 	TArray<VertexMaskForgePanel::FVertexMaskForgeSourceTopologyAcceptTarget> SourceTopologyTargets;
 	FText ErrorText;
-	if (!VertexMaskForgePanel::BuildAcceptTargets(SelectedMeshes, Targets, ErrorText))
+	if (!VertexMaskForgePanel::BuildAcceptTargets(SelectedMeshes, bDirectionalNormalMaskEnabled, DirectionalNormalSpace, Targets, ErrorText))
 	{
 		OperationState = EVertexMaskForgeOperationState::Failed;
 		LastOperationErrorText = ErrorText;
 		UE_LOG(LogVertexMaskForge, Warning, TEXT("Vertex Mask Forge: Accept blocked: %s"), *ErrorText.ToString());
 		return false;
 	}
-	if (!VertexMaskForgePanel::BuildSourceTopologyAcceptTargets(SelectedMeshes, SourceTopologyTargets, ErrorText))
+	if (!VertexMaskForgePanel::BuildSourceTopologyAcceptTargets(SelectedMeshes, bDirectionalNormalMaskEnabled, DirectionalNormalSpace, SourceTopologyTargets, ErrorText))
 	{
 		OperationState = EVertexMaskForgeOperationState::Failed;
 		LastOperationErrorText = ErrorText;
@@ -11241,9 +12803,14 @@ void SVertexMaskForgePanel::ApplyPreviewToEntry(
 	// AUDITED (V2-D): same live-gating rationale as bCurvatureEntryReady/bNoiseEntryReady above --
 	// Material Slot Mask is also entry-level, real values, no per-component re-evaluation needed.
 	const bool bMaterialSlotMaskEntryReady = bMaterialSlotMaskEnabled && WorkingMesh.MaterialSlotMask.State == EVertexMaskForgeScalarMaskState::Ready;
+	// AUDITED (V2-E): same live-gating rationale as bAOEntryReady above -- in World Space,
+	// WorkingMesh.DirectionalNormalMask.State is VALIDATION ONLY (same contract as AmbientOcclusionMask),
+	// the real per-component result is computed fresh below; in Local Space it holds the real, final
+	// entry-level values directly, like Curvature/Noise/Material Slot.
+	const bool bDirectionalNormalMaskEntryReady = bDirectionalNormalMaskEnabled && WorkingMesh.DirectionalNormalMask.State == EVertexMaskForgeScalarMaskState::Ready;
 	if (WorkingMesh.State != EVertexMaskForgeWorkingMeshState::Ready
 		|| !WorkingMesh.Mesh.IsValid()
-		|| (!bBBoxEntryReady && !bAOEntryReady && !bCurvatureEntryReady && !bNoiseEntryReady && !bMaterialSlotMaskEntryReady))
+		|| (!bBBoxEntryReady && !bAOEntryReady && !bCurvatureEntryReady && !bNoiseEntryReady && !bMaterialSlotMaskEntryReady && !bDirectionalNormalMaskEntryReady))
 	{
 		// Nothing safe to preview yet (both slots NotGenerated/Unavailable/DegenerateBounds/Invalid):
 		// show the original colors/materials rather than a stale or fabricated result. AUDITED
@@ -11322,6 +12889,7 @@ void SVertexMaskForgePanel::ApplyPreviewToEntry(
 		TArray<VertexMaskForgePanel::FVertexMaskForgeMaskLayerParams> Layers;
 		FVertexMaskForgeScalarMask PerComponentBBoxMask;
 		FVertexMaskForgeScalarMask PerComponentAOMask;
+		FVertexMaskForgeScalarMask PerComponentDirectionalNormalMask;
 		bool bAnyLayerFailed = false;
 
 		// AUDITED (Nanite source-topology support): the two domains diverge starting here -- Source-
@@ -11407,6 +12975,34 @@ void SVertexMaskForgePanel::ApplyPreviewToEntry(
 				if (!bAnyLayerFailed && bMaterialSlotMaskEntryReady)
 				{
 					Layers.Add({ &WorkingMesh.MaterialSlotMask, MaterialSlotMaskBlendMode, MaterialSlotMaskOpacity });
+				}
+				// AUDITED (V2-E): Local Space is transform-independent -- WorkingMesh.DirectionalNormalMask
+				// already holds the REAL, final, CORNER-EXACT values (see its own doc comment), reused
+				// directly like Curvature/Noise/Material Slot above. World Space is ALWAYS transform-
+				// dependent (like Ambient Occlusion) -- re-evaluated fresh per component, using THIS
+				// component's own transform, into a per-component-scoped local variable (never cached,
+				// since it is cheap -- no raycasting, just a dot product per corner).
+				if (!bAnyLayerFailed && bDirectionalNormalMaskEntryReady)
+				{
+					if (DirectionalNormalSpace == EVertexMaskForgeNormalSpace::Local)
+					{
+						Layers.Add({ &WorkingMesh.DirectionalNormalMask, DirectionalNormalMaskBlendMode, DirectionalNormalMaskOpacity });
+					}
+					else
+					{
+						PerComponentDirectionalNormalMask = VertexMaskForgePanel::GenerateDirectionalNormalMaskFromDynamicMesh(
+							WorkingMesh, DirectionalNormalSpace, DirectionalNormalDirection,
+							DirectionalNormalAngle, DirectionalNormalFalloff, DirectionalNormalBlur, bDirectionalNormalMaskInvert,
+							SourceComponent->GetComponentTransform());
+						if (PerComponentDirectionalNormalMask.State != EVertexMaskForgeScalarMaskState::Ready)
+						{
+							bAnyLayerFailed = true;
+						}
+						else
+						{
+							Layers.Add({ &PerComponentDirectionalNormalMask, DirectionalNormalMaskBlendMode, DirectionalNormalMaskOpacity });
+						}
+					}
 				}
 			}
 
@@ -11552,6 +13148,32 @@ void SVertexMaskForgePanel::ApplyPreviewToEntry(
 			if (!bAnyLayerFailed && bMaterialSlotMaskEntryReady)
 			{
 				Layers.Add({ &WorkingMesh.MaterialSlotMask, MaterialSlotMaskBlendMode, MaterialSlotMaskOpacity });
+			}
+			// AUDITED (V2-E): Local Space reuses the REAL, final per-render-vertex entry-level values
+			// directly (IndexOverride default -1), like Curvature/Noise/Material Slot above. World Space
+			// is ALWAYS transform-dependent (like Ambient Occlusion) -- re-evaluated fresh per component
+			// into a per-component-scoped local variable, never cached.
+			if (!bAnyLayerFailed && bDirectionalNormalMaskEntryReady)
+			{
+				if (DirectionalNormalSpace == EVertexMaskForgeNormalSpace::Local)
+				{
+					Layers.Add({ &WorkingMesh.DirectionalNormalMask, DirectionalNormalMaskBlendMode, DirectionalNormalMaskOpacity });
+				}
+				else
+				{
+					PerComponentDirectionalNormalMask = VertexMaskForgePanel::GenerateDirectionalNormalMask(
+						RenderData->LODResources[0], DirectionalNormalSpace, DirectionalNormalDirection,
+						DirectionalNormalAngle, DirectionalNormalFalloff, DirectionalNormalBlur, bDirectionalNormalMaskInvert,
+						SourceComponent->GetComponentTransform());
+					if (PerComponentDirectionalNormalMask.State != EVertexMaskForgeScalarMaskState::Ready)
+					{
+						bAnyLayerFailed = true;
+					}
+					else
+					{
+						Layers.Add({ &PerComponentDirectionalNormalMask, DirectionalNormalMaskBlendMode, DirectionalNormalMaskOpacity });
+					}
+				}
 			}
 		}
 
