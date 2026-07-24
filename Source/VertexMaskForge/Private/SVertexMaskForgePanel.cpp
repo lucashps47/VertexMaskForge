@@ -33,6 +33,7 @@
 #include "UObject/Package.h"
 #include "UObject/UObjectGlobals.h"
 #include "VectorUtil.h"
+#include "VertexMaskForgeMaskStackComposer.h"
 #include "SPrimaryButton.h"
 #include "Styling/CoreStyle.h"
 #include "Widgets/Input/SButton.h"
@@ -6090,128 +6091,19 @@ namespace VertexMaskForgePanel
 	}
 
 	// --- Blend Mode math (see EVertexMaskForgeBlendMode) -------------------------------------
-
-	/**
-	 * The raw, un-opacitized blend-mode formula for one channel, operating on already-normalized
-	 * [0,1] Base ("B")/Mask ("M") values. Pure function -- mutates nothing, never clamps. Linear is
-	 * deliberately NOT an alias of Copy, even though lerp(B, M, M) at M=1 equals M exactly like
-	 * Copy does -- for M < 1 the two diverge (Linear also factors in B), which is the whole point of
-	 * offering it as a distinct mode.
-	 */
-	static float ApplyMaskBlendMode(const float Base, const float Mask, const EVertexMaskForgeBlendMode Mode)
-	{
-		switch (Mode)
-		{
-		case EVertexMaskForgeBlendMode::Copy:
-			return Mask;
-		case EVertexMaskForgeBlendMode::Add:
-			return Base + Mask;
-		case EVertexMaskForgeBlendMode::Subtract:
-			return Base - Mask;
-		case EVertexMaskForgeBlendMode::Multiply:
-			return Base * Mask;
-		case EVertexMaskForgeBlendMode::Overlay:
-			return (Base < 0.5f)
-				? (2.0f * Base * Mask)
-				: (1.0f - 2.0f * (1.0f - Base) * (1.0f - Mask));
-		case EVertexMaskForgeBlendMode::Screen:
-			return 1.0f - (1.0f - Base) * (1.0f - Mask);
-		case EVertexMaskForgeBlendMode::Linear:
-			return FMath::Lerp(Base, Mask, Mask);
-		default:
-			return Mask;
-		}
-	}
-
-	/**
-	 * AUDITED (peer-mask composition checkpoint): the Opacity lerp, WITHOUT any clamp. Renamed from
-	 * BlendMaskValue (which used to clamp every call) -- clamping every single-layer step is exactly
-	 * what breaks the associativity/commutativity proofs the multi-mask composition below relies on
-	 * (demonstrated numerically in the checkpoint report: Add-then-Subtract vs Subtract-then-Add only
-	 * agree if intermediate saturation is never clamped away mid-fold). Clamping now happens ONLY at
-	 * the two audited boundaries inside ComposeMaskStack -- see that function's own doc comment.
-	 */
-	static float BlendMaskValueUnclamped(const float Base, const float Mask, const EVertexMaskForgeBlendMode Mode, const float Opacity)
-	{
-		const float BlendResult = ApplyMaskBlendMode(Base, Mask, Mode);
-		return FMath::Lerp(Base, BlendResult, Opacity);
-	}
-
-	// FVertexMaskForgeMaskLayerParams is now defined in VertexMaskForgeMaskTypes.h (M1 extraction,
-	// still inside this same namespace) -- see that header for the struct's own doc comment.
-
-	/**
-	 * AUDITED (peer-mask composition checkpoint -- supersedes the previous, UI-position-ordered fold
-	 * this same function used to implement). Combines an UNORDERED set of mask generators (Bounding
-	 * Box, Ambient Occlusion, future Curvature/Thickness/...) into ONE result per channel, starting
-	 * from BaselineColor's own channel value ("Base") -- never a neutral 1.0/0.0 seed, and Base is
-	 * NEVER itself a peer entry in Layers (no generator, no Enable, no Invert, no Blend Mode, no
-	 * Opacity of its own) -- it is simply the accumulator the canonical-order operations below act on.
-	 * Proof this must be Base (not a neutral seed): a single Multiply-mode mask at Opacity 0 must
-	 * leave the channel completely unchanged ("Opacity 0 = no influence", the pre-existing, still-
-	 * approved contract) -- lerp(Base, Base*Mask, 0) = Base only holds when the fold's own base
-	 * already equals Base; lerp(1, 1*Mask, 0) = 1 would incorrectly turn the channel white instead.
-	 *
-	 * CANONICAL ORDER (approved convention -- internal, mathematical, never a UI/artistic stack; see
-	 * the checkpoint report for the full derivation and proofs): every enabled mask is processed in
-	 * FIXED STAGES, by Blend Mode, in this exact sequence -- Copy, {Add+Subtract combined}, Multiply,
-	 * Overlay, Screen, Linear (the EVertexMaskForgeBlendMode enum's own declaration order, with
-	 * Add/Subtract merged into one stage). This ordering is NEVER configurable, NEVER derived from
-	 * section position in the UI, and NEVER derived from the order masks were enabled in -- two masks
-	 * sharing the exact same Blend Mode are tie-broken by Mask->Source (a fixed, stable generator
-	 * identifier, itself never configurable). No generator (Bounding Box, Ambient Occlusion, or any
-	 * future one) has any special role -- ALL of them go through the exact same per-stage logic below,
-	 * selected purely by which Blend Mode each one's own panel setting currently uses.
-	 *
-	 * Per stage:
-	 *   - Copy: sequential fold (BlendMaskValueUnclamped), Mask->Source order -- proven NON-
-	 *     commutative even among only Copy-mode masks (two different Opacity<1 Copy layers do not
-	 *     commute), so this is the one stage with no closed-form reduction.
-	 *   - Add+Subtract: closed form, order-irrelevant -- Result = R + Sum(AddValue*AddOpacity) -
-	 *     Sum(SubValue*SubOpacity). Proven: BlendMaskValueUnclamped(R,M,Add,Op) = R + M*Op and
-	 *     (R,M,Subtract,Op) = R - M*Op are both purely additive per-term, so summing every Add/Subtract
-	 *     mask's own term, in ANY order, reproduces the exact same total. No clamp within this stage
-	 *     (per the checkpoint's explicit instruction) -- the running total may legitimately leave
-	 *     [0,1] here.
-	 *   - Multiply: closed form, order-irrelevant -- Result = R * Product(lerp(1,MaskValue,Opacity)).
-	 *     Proven algebraically associative/commutative among Multiply-mode masks regardless of R's own
-	 *     magnitude (the proof needs no assumption that R is normalized), so it safely consumes
-	 *     whatever the Add/Subtract stage produced, in or out of [0,1], with no clamp beforehand.
-	 *   - CLAMP BOUNDARY: R is clamped to [0,1] here, and ONLY here (plus the final defensive clamp) --
-	 *     this is the one clamp the checkpoint's audit proved is actually required: Overlay's branch
-	 *     (R < 0.5), and Screen/Linear's (1-R)-based formulas, are only proven to map [0,1] back into
-	 *     [0,1] when their OWN input is already in [0,1] (see the checkpoint report's worked
-	 *     Add/Subtract-then-Overlay example, which shows what happens without this clamp: Overlay
-	 *     receiving R=1.4 produces 1.56, compounding out-of-domain error instead of correcting it).
-	 *   - Overlay: sequential fold (BlendMaskValueUnclamped), Mask->Source order -- proven NON-
-	 *     commutative (worked counter-example in the checkpoint report: swapping two Overlay masks
-	 *     changes the result from 0.84 to 0.36 for the same inputs).
-	 *   - Screen: closed form, order-irrelevant -- (1-Result) = (1-R) * Product(1-MaskValue*Opacity).
-	 *     Proven algebraically (De Morgan dual of Multiply). Input is already in [0,1] from the clamp
-	 *     boundary above (and Overlay's own output stays in [0,1] given [0,1] input -- proven), so no
-	 *     further clamp is needed before this stage.
-	 *   - Linear: sequential fold (BlendMaskValueUnclamped), Mask->Source order -- proven NON-
-	 *     commutative (f(B,M) != f(M,B) whenever B != M and B+M != 1). Proven to stay in [0,1] given
-	 *     [0,1] input (B(1-M)+M^2 in [0,1] for B,M in [0,1]), so still no clamp needed entering this
-	 *     stage; a final defensive clamp still closes out the whole channel computation.
-	 *
-	 * AUDITED (non-accumulation preserved): Base is re-read from BaselineColor fresh on EVERY single
-	 * UpdateWorkingColors call (never from a previous WorkingColors/Accumulator value -- see that
-	 * function's own doc comment), so regenerating the SAME set of masks with the SAME parameters
-	 * always reproduces the EXACT same final result, never drifting across repeated recompositions.
-	 *
-	 * A "Fill/Constant" layer (Mask->Source == ConstantWhite/ConstantBlack) is handled entirely by the
-	 * CALLER (ApplyPreviewToEntry) as a single Copy@1.0 layer, never combined with any other generator
-	 * in the same pass -- this function has no special knowledge of Fill/Constant sources at all; it
-	 * just sees one Copy-mode layer in that case, same as any other generator would look if configured
-	 * that way.
-	 *
-	 * Channels NOT enabled in the Channel Filter (bFilterR/G/B false) are read verbatim from
-	 * CommittedColor -- untouched by any layer or stage. Alpha is always BaselineColor.W,
-	 * unconditionally. bOutAnyLayerContributed is true iff at least one layer had a value for this
-	 * vertex -- the caller uses it to decide whether to write this vertex's R/G/B into WorkingColors at
-	 * all, or leave it exactly as the CommittedColors copy left it.
-	 */
+	// AUDITED (M2 extraction): the actual fold/formula math (ApplyMaskBlendMode,
+	// BlendMaskValueUnclamped, and the fixed-stage composition previously implemented directly here)
+	// moved verbatim to VertexMaskForgeMaskStackComposer::ComposeStack (VertexMaskForgeMaskStackComposer.cpp)
+	// -- a generic, stateless composer that knows nothing about FVertexMaskForgeScalarMask, Mask->Source,
+	// IndexOverride, render vertices, triangle corners, or Nanite/Source-Topology domains. This function
+	// is now a thin WRAPPER, kept at its ORIGINAL name/signature so both existing call sites (inside
+	// UpdateWorkingColors/UpdateWorkingColorsSourceTopology below) need zero changes: it still resolves
+	// each layer's LookupIndex (IndexOverride >= 0 ? IndexOverride : VertexIndex), still calls
+	// Layer.Mask->TryGetValue() exactly as before, still skips a layer under the exact same conditions
+	// (null Mask or a failed TryGetValue) -- only building a VertexMaskForgeMaskStackComposer::
+	// FResolvedMaskLayer (BlendMode/Opacity/MaskValue only, no Mask pointer, no Source) per successfully
+	// resolved layer, in the SAME order SortedLayers was received in (never re-sorted here), before
+	// delegating the actual per-channel fold/clamp/Channel-Filter/Alpha math to ComposeStack.
 	static FVector4f ComposeMaskStack(
 		const FVector4f& BaselineColor,
 		const FVector4f& CommittedColor,
@@ -6220,20 +6112,13 @@ namespace VertexMaskForgePanel
 		const bool bFilterR, const bool bFilterG, const bool bFilterB,
 		bool& bOutAnyLayerContributed)
 	{
-		bOutAnyLayerContributed = false;
-
-		// Resolved ONCE per vertex -- MaskValue does not vary per channel, so every channel below
-		// reuses the exact same set of (MaskValue, Mode, Opacity) contributions. SortedLayers is
-		// already ordered by Mask->Source (the caller sorts once, outside the per-vertex loop) --
-		// preserved here, which is what gives the Copy/Overlay/Linear stages their deterministic,
-		// generator-ID tie-break order.
-		struct FResolvedContribution
-		{
-			float MaskValue;
-			EVertexMaskForgeBlendMode Mode;
-			float Opacity;
-		};
-		TArray<FResolvedContribution, TInlineAllocator<8>> Contributions;
+		// Resolved ONCE per vertex -- MaskValue does not vary per channel, so every channel the
+		// composer computes below reuses the exact same set of (MaskValue, BlendMode, Opacity)
+		// samples. SortedLayers is already ordered by Mask->Source (the caller sorts once, outside the
+		// per-vertex loop, in UpdateWorkingColors/UpdateWorkingColorsSourceTopology) -- that order is
+		// preserved verbatim into ResolvedLayers, which is what gives the Copy/Overlay/Linear stages
+		// their deterministic, generator-ID tie-break order inside the composer.
+		TArray<VertexMaskForgeMaskStackComposer::FResolvedMaskLayer, TInlineAllocator<8>> ResolvedLayers;
 		for (const FVertexMaskForgeMaskLayerParams& Layer : SortedLayers)
 		{
 			float MaskValue = 0.f;
@@ -6242,95 +6127,11 @@ namespace VertexMaskForgePanel
 			{
 				continue;
 			}
-			bOutAnyLayerContributed = true;
-			Contributions.Add({ MaskValue, Layer.BlendMode, Layer.Opacity });
+			ResolvedLayers.Add({ Layer.BlendMode, Layer.Opacity, MaskValue });
 		}
 
-		if (!bOutAnyLayerContributed)
-		{
-			return FVector4f(CommittedColor.X, CommittedColor.Y, CommittedColor.Z, BaselineColor.W);
-		}
-
-		auto ComposeChannel = [&Contributions](const float Base) -> float
-		{
-			float R = Base;
-
-			// Stage 1: Copy -- sequential fold, Mask->Source order (non-commutative, no closed form).
-			for (const FResolvedContribution& C : Contributions)
-			{
-				if (C.Mode == EVertexMaskForgeBlendMode::Copy)
-				{
-					R = BlendMaskValueUnclamped(R, C.MaskValue, EVertexMaskForgeBlendMode::Copy, C.Opacity);
-				}
-			}
-
-			// Stage 2: Add + Subtract -- closed form, order-irrelevant. No clamp within this stage.
-			for (const FResolvedContribution& C : Contributions)
-			{
-				if (C.Mode == EVertexMaskForgeBlendMode::Add)
-				{
-					R += C.MaskValue * C.Opacity;
-				}
-				else if (C.Mode == EVertexMaskForgeBlendMode::Subtract)
-				{
-					R -= C.MaskValue * C.Opacity;
-				}
-			}
-
-			// Stage 3: Multiply -- closed form, order-irrelevant. Safely consumes an out-of-[0,1] R
-			// from Stage 2 (the algebraic proof needs no [0,1] assumption on R).
-			for (const FResolvedContribution& C : Contributions)
-			{
-				if (C.Mode == EVertexMaskForgeBlendMode::Multiply)
-				{
-					R *= FMath::Lerp(1.0f, C.MaskValue, C.Opacity);
-				}
-			}
-
-			// CLAMP BOUNDARY (audited, required): Overlay/Screen/Linear's own formulas are only
-			// proven to stay in [0,1] when their input already is -- see this function's own doc
-			// comment for the worked counter-example without this clamp.
-			R = FMath::Clamp(R, 0.0f, 1.0f);
-
-			// Stage 4: Overlay -- sequential fold, Mask->Source order (non-commutative, no closed form).
-			for (const FResolvedContribution& C : Contributions)
-			{
-				if (C.Mode == EVertexMaskForgeBlendMode::Overlay)
-				{
-					R = BlendMaskValueUnclamped(R, C.MaskValue, EVertexMaskForgeBlendMode::Overlay, C.Opacity);
-				}
-			}
-
-			// Stage 5: Screen -- closed form (De Morgan dual of Multiply), order-irrelevant. No
-			// additional clamp needed: R is already in [0,1] from the boundary above, and Overlay's
-			// own output stays in [0,1] given [0,1] input (proven).
-			for (const FResolvedContribution& C : Contributions)
-			{
-				if (C.Mode == EVertexMaskForgeBlendMode::Screen)
-				{
-					R = 1.0f - (1.0f - R) * (1.0f - C.MaskValue * C.Opacity);
-				}
-			}
-
-			// Stage 6: Linear -- sequential fold, Mask->Source order (non-commutative, no closed form).
-			for (const FResolvedContribution& C : Contributions)
-			{
-				if (C.Mode == EVertexMaskForgeBlendMode::Linear)
-				{
-					R = BlendMaskValueUnclamped(R, C.MaskValue, EVertexMaskForgeBlendMode::Linear, C.Opacity);
-				}
-			}
-
-			// Final defensive clamp (float precision only -- every stage above is already proven to
-			// leave R in [0,1] by this point under normal inputs).
-			return FMath::Clamp(R, 0.0f, 1.0f);
-		};
-
-		return FVector4f(
-			bFilterR ? ComposeChannel(BaselineColor.X) : CommittedColor.X,
-			bFilterG ? ComposeChannel(BaselineColor.Y) : CommittedColor.Y,
-			bFilterB ? ComposeChannel(BaselineColor.Z) : CommittedColor.Z,
-			BaselineColor.W);
+		return VertexMaskForgeMaskStackComposer::ComposeStack(
+			BaselineColor, CommittedColor, ResolvedLayers, bFilterR, bFilterG, bFilterB, bOutAnyLayerContributed);
 	}
 
 	/**
