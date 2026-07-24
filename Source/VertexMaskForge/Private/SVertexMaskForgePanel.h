@@ -1182,52 +1182,114 @@ private:
 
 	/**
 	 * Bound to USelection::SelectionChangedEvent (registered once in Construct(), removed in the
-	 * destructor via SelectionChangedDelegateHandle) -- the sole automatic trigger for
-	 * RefreshSelection() now that the manual "Refresh Selection" button no longer exists. Fires for
-	 * Actor/Component/BSP scene selection changes only; Content Browser asset selection is a
-	 * completely separate system and was never routed through this delegate, matching this panel no
-	 * longer consulting the Content Browser at all (see CollectViewportSelection, the only collector
-	 * left). NewSelection (which USelection instance changed) is unused.
+	 * destructor via SelectionChangedDelegateHandle). Fires for Actor/Component/BSP scene selection
+	 * changes only; Content Browser asset selection is a completely separate system and was never
+	 * routed through this delegate, matching this panel no longer consulting the Content Browser at
+	 * all (see CollectViewportSelection, the only collector left). NewSelection (which USelection
+	 * instance changed) is unused.
 	 *
-	 * Deferred-sync contract (replaces the old manual Refresh Selection button's YesNoCancel prompt):
-	 * while OperationState != Idle, an operation is pending against ORIGINAL targets that must never
-	 * be silently retargeted or discarded just because the scene selection changed underneath it --
-	 * so this does NOT call RefreshSelection() in that case. It also does NOT destroy previews, does
-	 * NOT touch SelectedMeshes, and does NOT create any transaction or mark anything dirty; it only
-	 * records that a sync is owed, via bSceneSelectionChangedDuringActiveOperation, so that the panel
-	 * can catch up automatically -- without requiring another viewport/World Outliner click -- the
-	 * moment the pending operation is actually resolved (see SyncSelectionIfChangedDuringOperation).
+	 * AUDITED (UX1, explicit Edit Vertex Mask session entry): a scene selection change NEVER starts or
+	 * retargets an editing session by itself -- RefreshSelection() (the function that actually builds
+	 * WorkingMeshes/PreviewComponents and enters Editing) is called ONLY from OnEditVertexMaskClicked()
+	 * now. While bIsEditingVertexMask is true, an active session's targets (SelectedMeshes) must never
+	 * be silently retargeted or discarded just because the scene selection changed underneath it -- so
+	 * this does NOT call anything that touches SelectedMeshes in that case; it only records that a
+	 * candidate resync is owed, via bSceneSelectionChangedDuringActiveOperation, so the panel can catch
+	 * up automatically -- without requiring another viewport/World Outliner click -- the moment the
+	 * session actually concludes (see SyncSelectionIfChangedDuringOperation). While NOT editing, this
+	 * only refreshes the lightweight candidate list used to enable/disable the "Edit Vertex Mask"
+	 * button (RefreshCandidateSelection()) -- never WorkingMeshes, never previews, never hides anything.
 	 */
 	void OnEditorSelectionChanged(UObject* NewSelection);
 
-	/** Re-queries the scene (viewport/World Outliner) selection and rebuilds the working set. */
+	/**
+	 * Re-queries the scene (viewport/World Outliner) selection and rebuilds the working set --
+	 * i.e. STARTS an editing session (WorkingMeshes, baseline colors, and -- once a generator produces
+	 * a Ready mask -- PreviewComponents/hidden originals, all via the existing UpdateAllPreviews/
+	 * ApplyPreviewToEntry lifecycle, entirely unchanged by UX1). Called ONLY from
+	 * OnEditVertexMaskClicked() now -- see that function's own doc comment. Left otherwise unmodified
+	 * by UX1: still the single, existing lifecycle entry point the button reuses verbatim.
+	 */
 	void RefreshSelection();
 
 	/**
-	 * Set true by OnEditorSelectionChanged() when the scene selection changes while OperationState !=
-	 * Idle (i.e. while an operation is pending against targets captured before that change).
-	 * Consumed -- and cleared -- by SyncSelectionIfChangedDuringOperation(), called at the tail of
-	 * exactly the two actions that can legitimately conclude a session and return OperationState to
-	 * Idle: OnCancelChangesClicked() and AcceptPendingChanges() (on success). Deliberately NOT
-	 * consumed by any other RecomputeOperationState() call site (e.g. ordinary mask regeneration
-	 * flipping PendingChanges<->Idle), so an incidental state flip unrelated to actually concluding a
-	 * session never triggers an unwanted resync/rebuild.
+	 * Lightweight Idle-state counterpart to RefreshSelection(): re-derives CandidateMeshes from the
+	 * CURRENT scene selection via CollectViewportSelection()/UpdateMeshDiagnostics() only -- never
+	 * BuildWorkingMeshes(), never DestroyAllPreviews()/UpdateAllPreviews(), never touches SelectedMeshes.
+	 * Used purely to keep the "Edit Vertex Mask" button's enabled state and the Idle status text
+	 * current; has no effect on any session, preview, generator, or asset.
+	 */
+	void RefreshCandidateSelection();
+
+	/**
+	 * Set true by OnEditorSelectionChanged() when the scene selection changes while
+	 * bIsEditingVertexMask is true (i.e. while a session is active against targets captured at the
+	 * moment "Edit Vertex Mask" was clicked). Consumed -- and cleared -- by
+	 * SyncSelectionIfChangedDuringOperation(), called at the tail of exactly the two actions that can
+	 * legitimately conclude a session: OnCancelChangesClicked() and AcceptPendingChanges() (on
+	 * success). Deliberately NOT consumed by any other RecomputeOperationState() call site (e.g.
+	 * ordinary mask regeneration flipping PendingChanges<->Idle mid-session), so an incidental state
+	 * flip unrelated to actually concluding the session never triggers an unwanted resync.
 	 */
 	bool bSceneSelectionChangedDuringActiveOperation = false;
 
 	/**
-	 * If the scene selection changed while the operation that just concluded was pending (see
-	 * bSceneSelectionChangedDuringActiveOperation), re-syncs SelectedMeshes with the CURRENT scene
-	 * selection via RefreshSelection() and clears the flag -- no extra viewport/World Outliner click
-	 * required. No-ops (no rebuild, no flicker, no clobbered status text) if the selection never
-	 * changed during the just-concluded operation.
+	 * If the scene selection changed while the session that just concluded was active (see
+	 * bSceneSelectionChangedDuringActiveOperation), re-derives CandidateMeshes from the CURRENT scene
+	 * selection via RefreshCandidateSelection() and clears the flag -- no extra viewport/World Outliner
+	 * click required to re-enable "Edit Vertex Mask" for the new selection. No-ops if the selection
+	 * never changed during the just-concluded session. AUDITED (UX1): no longer calls RefreshSelection()
+	 * -- concluding a session must never automatically start another one (see requirement #6).
 	 *
-	 * MUST only be called AFTER the operation's own targets have been fully validated/written (Accept)
-	 * or fully discarded (Cancel) against the ORIGINAL SelectedMeshes, and after OperationState has
-	 * already settled back to Idle -- calling this any earlier would let
-	 * a resync silently retarget or interrupt an in-flight operation, which must never happen.
+	 * MUST only be called AFTER the session's own targets have been fully validated/written (Accept) or
+	 * fully discarded (Cancel) against the ORIGINAL SelectedMeshes, and after bIsEditingVertexMask has
+	 * already been cleared -- calling this any earlier would let a resync silently retarget or interrupt
+	 * an in-flight session, which must never happen.
 	 */
 	void SyncSelectionIfChangedDuringOperation();
+
+	/**
+	 * AUDITED (UX1, explicit Edit Vertex Mask session entry): the ONLY thing that starts an editing
+	 * session now. True from the moment "Edit Vertex Mask" is clicked (RefreshSelection() has captured
+	 * the then-current scene selection into SelectedMeshes) until Accept succeeds or Cancel runs.
+	 * Independent of OperationState -- a session can be Editing with OperationState still Idle (no
+	 * generator enabled/Ready yet); OperationState only tracks "is there a Ready mask to Accept",
+	 * never "does a session exist". While true: OnEditorSelectionChanged() never touches SelectedMeshes;
+	 * while false: SelectedMeshes is always empty (no WorkingMeshes, no PreviewComponents, no hidden
+	 * originals, no generator/live-preview/Accept/Cancel activity -- all of those already read from
+	 * SelectedMeshes and are therefore no-ops by construction while this is false).
+	 */
+	bool bIsEditingVertexMask = false;
+
+	/**
+	 * Idle-state-only candidate list, kept current by RefreshCandidateSelection() (called from
+	 * Construct()'s tail and from OnEditorSelectionChanged() while not editing). Used exclusively to
+	 * decide whether "Edit Vertex Mask" is enabled (CanEditVertexMask()) and for the Idle status text
+	 * (GetEditSessionStatusText()) -- never read by any generator, composition, preview, or Accept/
+	 * Cancel code, which all operate on SelectedMeshes (the session's own targets) instead. Left empty
+	 * while a session is active (not maintained during Editing -- see OnEditorSelectionChanged).
+	 */
+	TArray<TSharedPtr<FVertexMaskForgeSelectedMesh>> CandidateMeshes;
+
+	/** True only while Idle (not already editing) and at least one valid candidate target is present. */
+	bool CanEditVertexMask() const { return !bIsEditingVertexMask && !CandidateMeshes.IsEmpty(); }
+
+	/**
+	 * "Edit Vertex Mask" button handler -- the sole entry point into an editing session. Re-validates
+	 * the selection is still eligible, then reuses RefreshSelection() UNCHANGED (it already re-queries
+	 * the CURRENT scene selection and runs the existing WorkingMeshes/preview/baseline lifecycle) to
+	 * capture a snapshot of the currently selected valid target(s) -- ALL of them, via the same
+	 * CollectViewportSelection precedence/filtering every other entry point already uses, so multi-
+	 * target sessions are preserved exactly as before. Idempotent against repeated clicks:
+	 * CanEditVertexMask() (bound to the button's IsEnabled) is false the instant bIsEditingVertexMask
+	 * becomes true, so a session can never be started twice.
+	 */
+	FReply OnEditVertexMaskClicked();
+
+	/** Idle: reports the current candidate count ("no valid selection" / "N target(s) selected, click
+	 *  Edit Vertex Mask to begin"). Editing: reports the ACTIVE SESSION's own target count (SelectedMeshes),
+	 *  never the (possibly since-changed) external scene selection, to avoid ambiguity during Editing. */
+	FText GetEditSessionStatusText() const;
 
 	/**
 	 * Gathers unique Static Meshes from UStaticMeshComponents in the CURRENT SCENE selection -- the
@@ -2137,7 +2199,11 @@ private:
 	 *  instance using it. */
 	EVisibility GetNaniteNoticeVisibility() const { return HasNaniteMeshInSelection() ? EVisibility::Visible : EVisibility::Collapsed; }
 
-	bool CanCancelChanges() const { return OperationState == EVertexMaskForgeOperationState::PendingChanges || OperationState == EVertexMaskForgeOperationState::Failed; }
+	/** AUDITED (UX1): Cancel must be able to end ANY active session, not only one with a Ready mask to
+	 *  discard -- e.g. a session started via "Edit Vertex Mask" where no generator was enabled yet
+	 *  still has WorkingMeshes/baseline state that Cancel should be able to walk away from. Gated on
+	 *  bIsEditingVertexMask (the session flag) rather than OperationState. */
+	bool CanCancelChanges() const { return bIsEditingVertexMask; }
 	FReply OnCancelChangesClicked();
 
 	FText GetOperationStatusText() const;
