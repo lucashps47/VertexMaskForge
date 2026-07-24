@@ -187,3 +187,30 @@ namespace VertexMaskForgePanel
 		int32 IndexOverride = -1;
 	};
 }
+
+/**
+ * What the artist currently sees in the viewport for Vertex Color preview purposes.
+ * Purely a session/panel-level setting -- never saved on the UStaticMesh, never affects the
+ * Bounding Box Mask or its per-axis parameters.
+ */
+enum class EVertexMaskForgePreviewMode : uint8
+{
+	/** Restore the mesh's own materials; no debug visualization is shown. */
+	OriginalMaterial,
+
+	/** Show the temporarily composed RGBA color (mask blended into the Channel Filter's channels). */
+	RGBVertexColor,
+
+	/** Show the composed color's Red channel as grayscale (R, R, R, 1). */
+	RedChannel,
+
+	/** Show the composed color's Green channel as grayscale (G, G, G, 1). */
+	GreenChannel,
+
+	/** Show the composed color's Blue channel as grayscale (B, B, B, 1). */
+	BlueChannel,
+
+	/** Show the composed color's Alpha channel as grayscale (A, A, A, 1) -- visualization only, never
+	 *  alters the real RGBA values held in the composed Preview/Accept data. */
+	AlphaChannel,
+};
