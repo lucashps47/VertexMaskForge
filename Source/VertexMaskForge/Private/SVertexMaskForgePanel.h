@@ -43,6 +43,19 @@ struct FVertexMaskForgeAOCache;
 struct FVertexMaskForgeSourceTopologyAOCache;
 
 /**
+ * Opaque Thickness cache (Asset Local Space -- NEVER keyed by ComponentTransform, unlike AOCache).
+ * Owned by FVertexMaskForgeWorkingMesh (per-entry/per-asset, not per-component), since Thickness never
+ * depends on instance transform. Forward-declared here, fully defined in the .cpp -- see
+ * VertexMaskForgePanel::GenerateThicknessMask for the full contract (local spatial tree + raw hit
+ * distances + a freshness snapshot compared against the CURRENT asset at Accept pre-write time).
+ */
+struct FVertexMaskForgeThicknessCache;
+
+/** Sibling of FVertexMaskForgeThicknessCache for Source-Topology (Nanite) entries -- see
+ *  VertexMaskForgePanel::GenerateThicknessMaskFromDynamicMesh in the .cpp for the full contract. */
+struct FVertexMaskForgeSourceTopologyThicknessCache;
+
+/**
  * Explicit state of the Pending Changes workflow (Accept/Cancel). Never inferred merely from
  * whether a PreviewComponent exists -- see SVertexMaskForgePanel::RecomputeOperationState().
  */
@@ -285,6 +298,17 @@ enum class EVertexMaskForgeScalarMaskSource : uint8
 	 * own append-only contract.
 	 */
 	DirectionalNormal,
+
+	/**
+	 * GenerateThicknessMask / GenerateThicknessMaskFromDynamicMesh (V2-G): a smooth mask driven by the
+	 * measured local-space distance to the nearest qualifying opposite surface along -Normal (thin =
+	 * white, thick = black, before Invert) -- see VertexMaskForgePanel::ComputeThicknessRawValue for the
+	 * exact raycast/normalization pipeline. Asset Local Space ONLY -- never depends on any component's
+	 * transform, so unlike Directional Normal World Space this has no per-instance conflict concept.
+	 * Appended here (after DirectionalNormal, not in visual panel order) per this enum's own append-only
+	 * contract.
+	 */
+	Thickness,
 };
 
 /** Local vs. World Space for VertexMaskForgePanel::ComputeDirectionalNormalRawValue's surface normal --
@@ -387,7 +411,7 @@ enum class EVertexMaskForgeNoiseType : uint8
  * WHAT the raw procedural pattern actually looks like, as opposed to how it is post-processed
  * artistically (Multiplier/Levels/Invert/Opacity/Blend Mode, which live directly on the panel and are
  * never part of this struct). Snapshotted onto FVertexMaskForgeWorkingMesh::NoiseCacheUsedParams at raw
- * generation time and compared field-by-field on every subsequent Generate Mask / Auto Update pass (see
+ * generation time and compared field-by-field on every subsequent live regeneration pass (see
  * VertexMaskForgePanel::EnsureNoiseRawCache) -- ANY difference (including a GeometryFingerprint change)
  * forces a full recompute of NoiseRawCache; an exact match reuses it verbatim, zero re-evaluation.
  */
@@ -789,9 +813,8 @@ struct FVertexMaskForgeWorkingMesh
 	/**
 	 * The Ambient Occlusion slot's ENTRY-LEVEL mask -- populated ONLY as a cheap, geometry-cache-free
 	 * VALIDATION result (NumRenderVerts/triangles/normal-buffer sanity, and UsedAOParams snapshot with
-	 * Samples already resolved to either the full user-chosen value (explicit Generate Mask) or the
-	 * interactive cap (Auto Update Preview) -- see OnGenerateBoundingBoxMaskClicked/
-	 * RunAutoUpdatePreview). Values/bHasValue are ALWAYS left empty here -- this field is NEVER used to
+	 * Samples resolved to the full, user-chosen value -- see RunAutoUpdatePreview, the tool's single
+	 * live-regeneration entry point). Values/bHasValue are ALWAYS left empty here -- this field is NEVER used to
 	 * read actual per-vertex AO values; ApplyPreviewToEntry unconditionally re-evaluates the REAL,
 	 * per-component result (using that component's own AOCache) from UsedAOParams, exactly once per
 	 * component, every time. This is what guarantees Ambient Occlusion is ever computed in exactly ONE
@@ -976,6 +999,24 @@ struct FVertexMaskForgeWorkingMesh
 	 * and Accept time (never cached stale), never affects Local Space or any other generator.
 	 */
 	bool bDirectionalNormalWorldSpaceConflict = false;
+
+	/**
+	 * Thickness Mask (V2-G) -- Asset Local Space, transform-independent, so (unlike
+	 * DirectionalNormalMask's World Space branch) always holds REAL final values directly usable by
+	 * every component of this entry, same "computed ONCE PER ENTRY" contract as CurvatureMask/NoiseMask.
+	 * Render-vertex domain for a non-Source-Topology entry, CORNER-EXACT (Mesh.TriangleCount()*3) for a
+	 * Source-Topology entry -- never collapsed to Dynamic Mesh Vertex ID, same reason as
+	 * DirectionalNormalMask/MaterialSlotMask.
+	 */
+	FVertexMaskForgeScalarMask ThicknessMask;
+
+	/** Non-Nanite Thickness cache (local spatial tree + raw hit distances + freshness snapshot). Lives
+	 *  here (per-entry), never in FVertexMaskForgePreviewComponentState, because Thickness has zero
+	 *  Component Transform dependency -- see FVertexMaskForgeThicknessCache's own doc comment. */
+	TUniquePtr<FVertexMaskForgeThicknessCache> ThicknessCache;
+
+	/** Source-Topology sibling of ThicknessCache -- see FVertexMaskForgeSourceTopologyThicknessCache. */
+	TUniquePtr<FVertexMaskForgeSourceTopologyThicknessCache> SourceTopologyThicknessCache;
 };
 
 /**
@@ -1119,14 +1160,14 @@ struct FVertexMaskForgePreviewComponentState
 	 * The last result EXPLICITLY CONSOLIDATED for this component, in render-vertex order
 	 * (LOD0-sized). Seeded from BaselineColors at the same moment BaselineColors itself is captured
 	 * (see that field's doc comment), then only ever overwritten by
-	 * VertexMaskForgePanel::UpdateWorkingColors when called with bCommit == true -- exclusively an
-	 * explicit Generate Mask click or a Fill White/Black action (see UpdateAllPreviews' own doc
+	 * VertexMaskForgePanel::UpdateWorkingColors when called with bCommit == true --
+	 * exclusively a Fill White/Black action (see UpdateAllPreviews' own doc
 	 * comment for the exhaustive list of which triggers commit and which do not).
 	 *
 	 * AUDITED (Channel Filter toggle fix): this is what WorkingColors is rebuilt FROM on every single
 	 * recomposition (see WorkingColors' own doc comment) -- so a channel that is toggled OFF in the
 	 * Channel Filter before ever being consolidated correctly reverts to whatever this array already
-	 * holds for it (BaselineColors, if never consolidated; or an earlier Generate Mask/Fill's result,
+	 * holds for it (BaselineColors, if never consolidated; or an earlier Fill's result,
 	 * if it was), rather than freezing whatever transient value a previous, uncommitted recomposition
 	 * happened to leave behind.
 	 *
@@ -1391,9 +1432,9 @@ private:
 	/**
 	 * Shared handler for a DISCRETE per-axis control change (Enable/Mirror/World Space -- anything
 	 * that isn't a continuously-dragged slider and isn't per-axis Invert, see OnAxisInvertChanged for
-	 * that exception): invalidates the current mask, then, if Auto Update Preview is on, cancels any
-	 * pending debounce (a stale continuous-slider callback must never apply after a discrete change)
-	 * and regenerates immediately.
+	 * that exception): invalidates the current mask, cancels any pending debounce (a stale
+	 * continuous-slider callback must never apply after a discrete change), and always regenerates
+	 * immediately.
 	 */
 	void OnAxisParamChangedDiscrete();
 
@@ -1404,16 +1445,12 @@ private:
 	 * cannot be correctly represented as a single post-hoc, composition-time invert (see
 	 * ComposeMaskStack), so Option A (preserve raw un-inverted values, invert during composition) was
 	 * judged disproportionate for this axis-based design; Option B is implemented instead: Invert
-	 * ALWAYS regenerates BoundingBoxMask immediately, unconditionally bypassing the normal
-	 * Auto-Update-gated "wait for Generate Mask" contract every other Bounding Box raw parameter still
-	 * follows (regeneration itself is cheap here -- unlike Ambient Occlusion, Bounding Box has no
-	 * persistent geometry cache to needlessly rebuild). Calls RunAutoUpdatePreview with bIncludeAO
-	 * false so Ambient Occlusion's own slot/AOCache are never touched, not even a harmless re-validation.
+	 * regenerates BoundingBoxMask immediately (regeneration itself is cheap here -- unlike Ambient
+	 * Occlusion, Bounding Box has no persistent geometry cache to needlessly rebuild). Calls
+	 * RunAutoUpdatePreview with bIncludeAO false so Ambient Occlusion's own slot/AOCache are never
+	 * touched, not even a harmless re-validation.
 	 */
 	void OnAxisInvertChanged(int32 AxisIndex, ECheckBoxState NewState);
-
-	/** Processes every selected entry's working mesh, generating or clearing its Bounding Box Mask. */
-	FReply OnGenerateBoundingBoxMaskClicked();
 
 	/**
 	 * AUDITED (raw/composition separation checkpoint): resets ONLY every selected entry's
@@ -1421,10 +1458,8 @@ private:
 	 * touching the working mesh (FDynamicMesh3) itself. Called whenever a Bounding Box RAW/geometric
 	 * parameter changes (axis Position/Falloff/Invert/Mirror/World Space/Enable, Unified Bounds) --
 	 * NEVER for a purely compositional change (Blend Mode, Opacity -- see RecomposeWorkingColors
-	 * instead). Calls UpdateAllPreviews(false) synchronously ONLY when Auto Update Preview is off (see
-	 * the .cpp definition for why); the user must click Generate Mask again in that case, or
-	 * ScheduleAutoUpdatePreview()/RunAutoUpdatePreview() take over automatically otherwise. Never
-	 * touches a Constant Fill mask's meaning -- Fill results are independent of these axis parameters.
+	 * instead). Never touches a Constant Fill mask's meaning -- Fill results are independent of these
+	 * axis parameters.
 	 */
 	void InvalidateBoundingBoxRawMask();
 
@@ -1449,8 +1484,7 @@ private:
 	 * Opacity, Invert (Bounding Box or Ambient Occlusion), Enable/Disable of an already-Ready layer,
 	 * Channel Filter, Preview Mode. Touches NEITHER BoundingBoxMask NOR AmbientOcclusionMask/AOCache --
 	 * simply calls UpdateAllPreviews(false), which re-reads all compositional state live every call.
-	 * Recomposes immediately and correctly with ZERO raycasts and ZERO Tree rebuilds, identically
-	 * whether Auto Update Preview is on or off.
+	 * Recomposes immediately and correctly with ZERO raycasts and ZERO Tree rebuilds.
 	 */
 	void RecomposeWorkingColors();
 
@@ -1467,12 +1501,9 @@ private:
 	TSharedRef<SWidget> OnGenerateBlendModeRow(TSharedPtr<EVertexMaskForgeBlendMode> InOption) const;
 
 	/**
-	 * Treated exactly like a discrete axis parameter change (see OnAxisParamChangedDiscrete):
-	 * invalidates the current mask/preview, then, if Auto Update Preview is on, regenerates
-	 * immediately. Deliberately NOT treated like Channel Filter/Preview Mode (which always recompose
-	 * immediately via UpdateAllPreviews() regardless of Auto Update Preview) -- Blend Mode is a
-	 * generation-adjacent parameter whose change must wait for Generate Mask when Auto Update is off,
-	 * per this checkpoint's explicit requirement.
+	 * Blend Mode is PURE composition -- it never affects the underlying mask's raw Values, only how
+	 * ComposeMaskStack reads them -- so this recomposes immediately via RecomposeWorkingColors(),
+	 * exactly like Channel Filter/Preview Mode.
 	 */
 	void OnBlendModeSelectionChanged(TSharedPtr<EVertexMaskForgeBlendMode> NewSelection, ESelectInfo::Type SelectInfo);
 	FText GetBlendModeButtonText() const;
@@ -1502,9 +1533,8 @@ private:
 
 	/** AUDITED (re-examined per explicit follow-up audit): turning OFF is always pure composition.
 	 *  Turning ON is pure composition TOO when every entry already has a Ready AmbientOcclusionMask
-	 *  (reuses it verbatim, zero raycasts, works immediately even with Auto Update Preview off) --
-	 *  only entries WITHOUT a valid derived mask trigger real (re)generation, gated by Auto Update
-	 *  Preview like any other raw parameter. Enabling, by itself, is never treated as a reason to
+	 *  (reuses it verbatim, zero raycasts) -- only entries WITHOUT a valid derived mask trigger real
+	 *  (re)generation, always immediate. Enabling, by itself, is never treated as a reason to
 	 *  invalidate an already-valid mask. See the .cpp definition for the exact per-entry decision. */
 	void OnAOEnableChanged(ECheckBoxState NewState);
 
@@ -1522,8 +1552,8 @@ private:
 
 	TSharedRef<SWidget> OnGenerateAOBlendModeRow(TSharedPtr<EVertexMaskForgeBlendMode> InOption) const;
 
-	/** Same treatment as OnBlendModeSelectionChanged (Bounding Box's own Blend Mode combo) -- a
-	 *  discrete, generation-adjacent change; waits for Generate Mask when Auto Update Preview is off. */
+	/** Pure composition -- same treatment as OnBlendModeSelectionChanged (Bounding Box's own Blend
+	 *  Mode combo): recomposes immediately via RecomposeWorkingColors(). */
 	void OnAOBlendModeSelectionChanged(TSharedPtr<EVertexMaskForgeBlendMode> NewSelection, ESelectInfo::Type SelectInfo);
 	FText GetAOBlendModeButtonText() const;
 
@@ -1580,8 +1610,7 @@ private:
 
 	/** Same enable/disable contract as OnAOEnableChanged (see its own doc comment): turning OFF is
 	 *  always pure composition; turning ON reuses an already-Ready entry immediately (zero re-analysis)
-	 *  and only regenerates entries that genuinely need it, gated by Auto Update Preview like any other
-	 *  raw/geometric parameter. */
+	 *  and always regenerates immediately if genuinely needed. */
 	void OnCurvatureEnableChanged(ECheckBoxState NewState);
 
 	TSharedRef<SWidget> OnGenerateCurvatureTypeRow(TSharedPtr<EVertexMaskForgeCurvatureType> InOption) const;
@@ -1630,7 +1659,7 @@ private:
 	 * arrays (see FVertexMaskForgeWorkingMesh::CurvatureRawConvexCache's own doc comment) -- none of
 	 * them ever re-run the adjacency/dihedral-angle analysis or touch GeometryFingerprint, so (unlike
 	 * Bounding Box axis parameters or AO Samples/Max Distance/Bias) this is UNCONDITIONAL and immediate,
-	 * never gated by Auto Update Preview, exactly like OnAOInvertChanged/OnAOLevelsChanged. Regenerates
+	 * exactly like OnAOInvertChanged/OnAOLevelsChanged. Regenerates
 	 * every SelectedMeshes entry's CurvatureMask directly from its cached raw magnitudes (entry-level,
 	 * real values -- see FVertexMaskForgeWorkingMesh::CurvatureMask), then recomposes. Pipeline order:
 	 * raw Convex/Concave -> Curvature Type -> Multiplier -> Blur -> Levels Min/Max -> Invert -> (Opacity
@@ -1666,8 +1695,8 @@ private:
 	// Curvature, its raw pattern DOES depend on artist-chosen generative parameters (Scale/Offset/Seed/
 	// Octaves/Roughness/Lacunarity/Type) -- see FVertexMaskForgeNoiseGenerativeParams and
 	// FVertexMaskForgeWorkingMesh::NoiseRawCache's own doc comments for the resulting two-tier
-	// invalidation contract (generative params gate a real regeneration, gated by Auto Update Preview
-	// exactly like Bounding Box axis params / AO Samples-MaxDistance-Bias; Multiplier/Levels/Invert/
+	// invalidation contract (generative params gate a real, always-immediate regeneration, exactly
+	// like Bounding Box axis params / AO Samples-MaxDistance-Bias; Multiplier/Levels/Invert/
 	// Opacity/Blend Mode are cheap, immediate, unconditional reprocessing, exactly like Curvature's own
 	// Type/Multiplier/Blur/Levels/Invert).
 
@@ -1675,8 +1704,7 @@ private:
 
 	/** Same enable/disable contract as OnAOEnableChanged/OnCurvatureEnableChanged (see their own doc
 	 *  comments): turning OFF is always pure composition; turning ON reuses an already-Ready entry
-	 *  immediately (zero re-evaluation) and only regenerates entries that genuinely need it, gated by
-	 *  Auto Update Preview like any other raw/generative parameter. */
+	 *  immediately (zero re-evaluation) and always regenerates immediately if genuinely needed. */
 	void OnNoiseEnableChanged(ECheckBoxState NewState);
 
 	TSharedRef<SWidget> OnGenerateNoiseTypeRow(TSharedPtr<EVertexMaskForgeNoiseType> InOption) const;
@@ -1762,8 +1790,7 @@ private:
 	 * Box axis parameters (OnAxisParamChangedDiscrete) and AO's Samples/Max Distance/Bias
 	 * (InvalidateAODerivedMask) -- this invalidates every selected entry's NoiseMask (NOT NoiseRawCache
 	 * itself; EnsureNoiseRawCache's own GeometryFingerprint+params comparison decides reuse lazily, the
-	 * next time Noise is actually (re)generated) and then either regenerates immediately (Auto Update
-	 * Preview on) or waits for an explicit Generate Mask (off).
+	 * next time Noise is actually (re)generated) and always regenerates immediately.
 	 */
 	void OnNoiseGenerativeParamChanged();
 
@@ -1796,7 +1823,7 @@ private:
 	 * Shared handler for Multiplier / Levels Min / Levels Max / Invert: ALL cheap, PURELY DOWNSTREAM
 	 * reprocessing of the already-cached NoiseRawCache (see that field's own doc comment) -- never the
 	 * per-vertex Perlin/FBM evaluation, never GeometryFingerprint, never the generative-params
-	 * comparison. So this is UNCONDITIONAL and immediate, never gated by Auto Update Preview, exactly
+	 * comparison. So this is UNCONDITIONAL and immediate, exactly
 	 * like OnCurvatureParamChanged. Regenerates every SelectedMeshes entry's NoiseMask directly from its
 	 * cached NoiseRawCache (entry-level, real values -- see FVertexMaskForgeWorkingMesh::NoiseMask),
 	 * then recomposes.
@@ -1840,8 +1867,8 @@ private:
 	ECheckBoxState GetMaterialSlotMaskEnableState() const { return bMaterialSlotMaskEnabled ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; }
 
 	/** Same enable/disable contract as OnCurvatureEnableChanged/OnNoiseEnableChanged: turning OFF is
-	 *  always pure composition; turning ON reuses an already-Ready entry immediately and only
-	 *  regenerates if genuinely needed, gated by Auto Update Preview. */
+	 *  always pure composition; turning ON reuses an already-Ready entry immediately and always
+	 *  regenerates immediately if genuinely needed. */
 	void OnMaterialSlotMaskEnableChanged(ECheckBoxState NewState);
 	bool bMaterialSlotMaskEnabled = false;
 
@@ -1870,8 +1897,8 @@ private:
 	/**
 	 * Shared handler for Material Slot Mask's generative parameters (which slot is selected, Invert --
 	 * both change WHAT the raw binary mask looks like): invalidates the entry's MaterialSlotMask (reset
-	 * to NotGenerated) and either regenerates immediately (Auto Update Preview on) or waits for an
-	 * explicit Generate Mask (off) -- same contract as OnNoiseGenerativeParamChanged.
+	 * to NotGenerated) and always regenerates immediately -- same contract as
+	 * OnNoiseGenerativeParamChanged.
 	 */
 	void OnMaterialSlotMaskGenerativeParamChanged();
 	void InvalidateMaterialSlotMaskRawMask();
@@ -1959,10 +1986,9 @@ private:
 	/**
 	 * Shared handler for Directional Normal Mask's generative parameters (Space/Direction/Angle/
 	 * Falloff -- all change WHAT the raw angular pattern looks like): invalidates the entry's
-	 * DirectionalNormalMask and either regenerates immediately (Auto Update Preview on) or waits for an
-	 * explicit Generate Mask (off) -- same contract as OnNoiseGenerativeParamChanged/
-	 * OnMaterialSlotMaskGenerativeParamChanged. Never touches AO/Curvature/Noise/Material Slot state or
-	 * caches.
+	 * DirectionalNormalMask and always regenerates immediately -- same contract as
+	 * OnNoiseGenerativeParamChanged/OnMaterialSlotMaskGenerativeParamChanged. Never touches
+	 * AO/Curvature/Noise/Material Slot state or caches.
 	 */
 	void OnDirectionalNormalMaskGenerativeParamChanged();
 	void InvalidateDirectionalNormalMaskRawMask();
@@ -1989,23 +2015,100 @@ private:
 	 *  multi-instance conflict (see FVertexMaskForgeWorkingMesh::bDirectionalNormalWorldSpaceConflict). */
 	FText GetDirectionalNormalMaskDiagnosticText() const;
 
+	// --- Thickness Mask (V2-G) ---------------------------------------------------------------
+	// A seventh, independent, optional composition-stack layer -- structural peer of every generator
+	// above. VISUAL panel position is Directional Normal -> Thickness -> Noise (see Construct()); enum
+	// value is appended after DirectionalNormal (see EVertexMaskForgeScalarMaskSource's own doc note).
+	// Asset Local Space ONLY -- never a seletor, never depends on Component/Actor Transform.
+
+	ECheckBoxState GetThicknessMaskEnableState() const { return bThicknessMaskEnabled ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; }
+	void OnThicknessMaskEnableChanged(ECheckBoxState NewState);
+	bool bThicknessMaskEnabled = false;
+
+	TSharedRef<SWidget> OnGenerateThicknessMaskBlendModeRow(TSharedPtr<EVertexMaskForgeBlendMode> InOption) const;
+	void OnThicknessMaskBlendModeSelectionChanged(TSharedPtr<EVertexMaskForgeBlendMode> NewSelection, ESelectInfo::Type SelectInfo);
+	FText GetThicknessMaskBlendModeButtonText() const;
+	TSharedPtr<SComboBox<TSharedPtr<EVertexMaskForgeBlendMode>>> ThicknessMaskBlendModeComboBox;
+
+	/** Same "every new layer defaults to Copy" convention as every other generator. ARTISTIC. */
+	EVertexMaskForgeBlendMode ThicknessMaskBlendMode = EVertexMaskForgeBlendMode::Copy;
+
+	/** Same contract/range/default as every other generator's own Opacity. ARTISTIC. */
+	float ThicknessMaskOpacity = 1.0f;
+
+	/** Measured thickness (local-space units) at or below this value reads as white (1.0) after
+	 *  normalization, before Invert. UI range [0, 10000]; default 0.0. GENERATIVE (renormalizes only --
+	 *  never triggers a new raycast, see GenerateThicknessMask's own cache contract). */
+	float ThicknessMinThickness = 0.0f;
+
+	/** Measured thickness at or above this value reads as black (0.0) after normalization, before
+	 *  Invert. UI range [0, 10000]; default 50.0 -- strictly below the default SearchDistance (100.0) so
+	 *  the initial range is a genuinely useful, non-degenerate interval (not merely "corrected" by
+	 *  SanitizeThicknessParams at generation time) and the raycast retains headroom beyond the visible
+	 *  saturation point. Sanitized together with MinThickness/SearchDistance/Bias at generation time --
+	 *  see VertexMaskForgePanel::SanitizeThicknessParams. GENERATIVE (renormalizes only). */
+	float ThicknessMaxThickness = 50.0f;
+
+	/** Maximum physical raycast distance from the origin surface, in local-space units -- distinct from
+	 *  MaxThickness (the artistic saturation point): a hit beyond MaxThickness but within SearchDistance
+	 *  is still a valid "black" measurement, not a missing one. UI range [0, 10000]; default 100.0.
+	 *  GENERATIVE (triggers a new raycast -- see GenerateThicknessMask's own cache contract). */
+	float ThicknessSearchDistance = 100.0f;
+
+	/** Ray origin offset along -Normal (into the mesh), local-space units, used ONLY to avoid self-hit;
+	 *  reconstructed back out of the measured distance (MeasuredThickness = HitT + EffectiveBias) so it
+	 *  never artistically shifts the result -- see ComputeThicknessRawValue. UI range [0.001, 10.0];
+	 *  default 0.01. GENERATIVE (triggers a new raycast). */
+	float ThicknessBias = 0.01f;
+
+	/** Topological smoothing of the normalized Thickness mask, applied BEFORE Invert -- same algorithm/
+	 *  adjacency/seam-awareness as DirectionalNormalBlur (reuses BuildCornerAdjacency/
+	 *  BuildRenderVertexAdjacency/ApplyAdjacencyTopologicalBlur verbatim). UI range [0, 10]; default 0.0
+	 *  -- Blur <= 0 is an exact no-op. GENERATIVE (post-processing only -- never triggers a new raycast).
+	 */
+	float ThicknessBlur = 0.0f;
+
+	/**
+	 * Shared handler for Thickness's raycast-affecting generative parameters (SearchDistance/Bias):
+	 * invalidates the entry's ThicknessMask (raw hit distances + everything downstream) and always
+	 * regenerates immediately. Never touches AO/Curvature/Noise/Material Slot/Directional Normal state
+	 * or caches.
+	 */
+	void OnThicknessRaycastParamChanged();
+
+	/** Shared handler for Min/Max Thickness/Blur (post-raycast only -- renormalizes/re-blurs the
+	 *  already-cached raw hit distances, never repeats the raycast). */
+	void OnThicknessPostProcessParamChanged();
+
+	void InvalidateThicknessMaskRawMask();
+
+	ECheckBoxState GetThicknessMaskInvertState() const { return bThicknessMaskInvert ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; }
+	void OnThicknessMaskInvertChanged(ECheckBoxState NewState);
+	bool bThicknessMaskInvert = false;
+
+	/** Short, user-facing reason Thickness Mask is currently invalid/blocked/partial (empty if fully
+	 *  valid) -- e.g. no opposite surface found, degenerate geometry, Source-Topology mapping invalid. */
+	FText GetThicknessMaskDiagnosticText() const;
+
 	// --- Fill White / Fill Black utility masks ----------------------------------------------
 
 	FReply OnFillWhiteClicked();
 	FReply OnFillBlackClicked();
 
 	/**
-	 * Shared implementation for both Fill buttons: cancels any pending Auto Update Preview debounce
-	 * first (a Fill must never be overwritten moments later by a stale regeneration), then, for every
-	 * SelectedMeshes entry that passes the SAME entry-level validity gating as Generate Mask
+	 * Shared implementation for both Fill buttons: cancels any pending live-update debounce first (a
+	 * Fill must never be overwritten moments later by a stale regeneration), then, for every
+	 * SelectedMeshes entry that passes the SAME entry-level validity gating as live generation
 	 * (WorkingMesh Ready, resolvable Static Mesh, valid LOD 0 render data), generates a dense
 	 * constant-valued mask (VertexMaskForgePanel::GenerateConstantMask) and assigns it to that
-	 * entry's mask. Unlike a manual Generate Mask click, an entry that fails validation here is left
-	 * COMPLETELY UNTOUCHED (its previous mask, if any, is preserved) rather than reset to
-	 * Unavailable -- per the explicit "preserve the last valid Preview on failure" requirement.
-	 * Ends with UpdateAllPreviews(), which recomposes/reapplies the transient Preview (reusing the
-	 * exact same ApplyPreviewToEntry/UpdateWorkingColors path as every other mask) and marks Pending
-	 * Changes via RecomputeOperationState().
+	 * entry's mask. An entry that fails validation here is left COMPLETELY UNTOUCHED (its previous
+	 * mask, if any, is preserved) rather than reset to Unavailable -- per the explicit "preserve the
+	 * last valid Preview on failure" requirement. Ends with UpdateAllPreviews(), which recomposes/
+	 * reapplies the transient Preview (reusing the exact same ApplyPreviewToEntry/UpdateWorkingColors
+	 * path as every other mask) and marks Pending Changes via RecomputeOperationState(). Fill White/
+	 * Black are explicit, standalone actions on the current base -- they are never required to make a
+	 * live parameter change visible, and never repair/resize any buffer that live generation itself
+	 * should already have prepared.
 	 */
 	void RunConstantFill(float ConstantValue, EVertexMaskForgeScalarMaskSource Source, const FText& SuccessMessage);
 
@@ -2014,14 +2117,11 @@ private:
 
 	FText GetMaskActionStatusText() const { return LastMaskActionStatusText; }
 
-	/** Success/partial-failure message for the last Generate Mask / Fill action; cleared by the next
-	 *  mask-changing action (Generate Mask, Fill, parameter change, Refresh Selection, Accept, Cancel). */
+	/** Success/partial-failure message for the last Fill action; cleared by the next mask-changing
+	 *  action (Fill, parameter change, Refresh Selection, Accept, Cancel). */
 	FText LastMaskActionStatusText;
 
-	// --- Auto Update Preview (debounced automatic regeneration) ----------------------------
-
-	ECheckBoxState GetAutoUpdatePreviewState() const { return bAutoUpdatePreview ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; }
-	void OnAutoUpdatePreviewChanged(ECheckBoxState NewState);
+	// --- Live preview update (debounced automatic regeneration) ----------------------------
 
 	/**
 	 * Arms (or restarts) a short one-shot debounce timer via GEditor's FTimerManager -- not a
@@ -2029,34 +2129,38 @@ private:
 	 * continuously while dragging) collapses into a single regeneration ~150ms after the LAST
 	 * event. Calling FTimerManager::SetTimer() again with the same FTimerHandle before it fires
 	 * clears and re-adds it (confirmed in TimerManager.cpp), which is exactly "a new change resets
-	 * the wait". No-ops if Auto Update Preview is off. Uses FTimerDelegate::CreateSP (weak-safe: a
-	 * pending timer harmlessly no-ops if this widget is destroyed first), but the timer is also
-	 * explicitly cleared in OnWorldCleanup() and the destructor rather than relying on that alone.
+	 * the wait" -- the LAST value received before the timer fires is always what gets published, never
+	 * an intermediate one. Uses FTimerDelegate::CreateSP (weak-safe: a pending timer harmlessly no-ops
+	 * if this widget is destroyed first), but the timer is also explicitly cleared in
+	 * OnWorldCleanup() and the destructor rather than relying on that alone. This is the tool's ONLY
+	 * automatic-regeneration path -- there is no manual "Generate Mask" alternative; every parameter
+	 * change either regenerates immediately (cheap/discrete changes) or arms this debounce (expensive/
+	 * continuous changes), unconditionally.
 	 */
 	void ScheduleAutoUpdatePreview();
 
 	/**
-	 * Regenerates the Bounding Box Mask for every eligible entry using the CURRENT per-axis
-	 * parameters. On a per-entry basis: if the new mask comes back Ready, it replaces the entry's
-	 * mask; otherwise (DegenerateBounds/Invalid/Unavailable, including "no axis enabled") the
-	 * entry's EXISTING mask is left untouched -- an auto-triggered regeneration must never destroy a
-	 * valid Preview, unlike a manual Generate Mask click (OnGenerateBoundingBoxMaskClicked), which
-	 * still unconditionally overwrites, per the already-validated checkpoint behavior. Never runs
-	 * while Applying (guarded defensively; not reachable in practice since Accept is synchronous).
-	 * Called by the debounce timer, or immediately for discrete parameter changes
-	 * (Enable/Invert/Mirror/World Space).
+	 * Regenerates every enabled generator's mask for every eligible entry using the CURRENT
+	 * parameters -- this IS the tool's single live-regeneration entry point (there is no separate
+	 * manual "Generate Mask" action; every parameter-change callback in this panel funnels here,
+	 * either immediately or via ScheduleAutoUpdatePreview's debounce). On a per-entry, per-generator
+	 * basis: if the new mask comes back Ready, it replaces the entry's mask; otherwise
+	 * (DegenerateBounds/Invalid/Unavailable, including "generator disabled") the entry's EXISTING mask
+	 * is left untouched -- regeneration must never destroy a valid Preview on a transient failure.
+	 * Never runs while Applying (guarded defensively; not reachable in practice since Accept is
+	 * synchronous). Called by the debounce timer, immediately for discrete parameter changes
+	 * (Enable/Invert/Mirror/World Space/raycast-affecting parameters), and once from RefreshSelection()
+	 * when the newly selected entry/entries already have at least one generator enabled.
 	 *
 	 * bIncludeAO (AUDITED, BBox Invert exception -- default true, preserves all pre-existing call
 	 * sites' behavior unchanged): when false, the Ambient Occlusion slot (AmbientOcclusionMask) is
 	 * left COMPLETELY untouched for every entry -- not re-validated, not cleared, not re-snapshotted.
 	 * Used exclusively by OnAxisInvertChanged (BBox per-axis Invert's immediate-regeneration
-	 * exception), so that regenerating BoundingBoxMask immediately (bypassing the normal Auto-Update-
-	 * gated wait) can never have any observable effect -- not even a harmless entry-level
-	 * re-validation -- on Ambient Occlusion.
+	 * exception), so that regenerating BoundingBoxMask immediately can never have any observable
+	 * effect -- not even a harmless entry-level re-validation -- on Ambient Occlusion.
 	 */
 	void RunAutoUpdatePreview(bool bIncludeAO = true);
 
-	bool bAutoUpdatePreview = true;
 	FTimerHandle AutoUpdateDebounceTimerHandle;
 
 	// --- Unified Bounds (global, all 3 axes, all selected meshes) --------------------------
@@ -2066,11 +2170,9 @@ private:
 	/**
 	 * Toggling Unified Bounds never recomputes just one mesh: it cancels any pending debounce,
 	 * invalidates every entry's current Bounding-Box-sourced mask (InvalidateBoundingBoxRawMask()), and
-	 * -- only if Auto Update Preview is on -- immediately regenerates every eligible entry as one
-	 * coherent batch (RunAutoUpdatePreview(), which itself computes the collective domain once, if
-	 * applicable, and reuses it for every participant). If Auto Update Preview is off, parameters are
-	 * updated and results invalidated, but no new Preview is generated until the user clicks Generate
-	 * Mask -- same contract as every other axis parameter.
+	 * unconditionally immediately regenerates every eligible entry as one coherent batch
+	 * (RunAutoUpdatePreview(), which itself computes the collective domain once, if applicable, and
+	 * reuses it for every participant).
 	 */
 	void OnUnifiedBoundsChanged(ECheckBoxState NewState);
 
@@ -2080,8 +2182,8 @@ private:
 	 * VertexMaskForgePanel::GenerateBoundingBoxMask's internal bounds pass). True: every enabled
 	 * axis is normalized against a COLLECTIVE domain -- the union of that axis's coordinate across
 	 * every participating component's render vertices (see VertexMaskForgePanel::
-	 * ComputeCollectiveAxisBounds) -- computed fresh before each batch (Generate Mask click, Auto
-	 * Update regeneration, every Preview refresh, and Accept validation), never cached across calls,
+	 * ComputeCollectiveAxisBounds) -- computed fresh before each batch (every live regeneration,
+	 * Preview refresh, and Accept validation), never cached across calls,
 	 * consistent with the rest of the panel's "always recompute, never stale" design. Global for all
 	 * 3 axes and the whole selection -- there is no per-axis or per-mesh Unified Bounds mode.
 	 */
@@ -2108,10 +2210,10 @@ private:
 	 * side-effect-free with respect to the mask itself -- never generates or invalidates it.
 	 *
 	 * bCommit (audited, Channel Filter toggle fix): forwarded unchanged to ApplyPreviewToEntry /
-	 * UpdateWorkingColors -- true ONLY for an explicit Generate Mask click or a Fill White/Black
-	 * action (both promote the freshly-composed WorkingColors to CommittedColors); false for every
-	 * other trigger (Auto Update Preview, Channel Filter toggle, Preview Mode change, RefreshSelection,
-	 * mask invalidation) so none of those can silently consolidate a transient edit. See
+	 * UpdateWorkingColors -- true ONLY for an explicit Fill White/Black action (promotes the
+	 * freshly-composed WorkingColors to CommittedColors); false for every other trigger (live
+	 * regeneration, Channel Filter toggle, Preview Mode change, RefreshSelection, mask invalidation)
+	 * so none of those can silently consolidate a transient edit. See
 	 * FVertexMaskForgePreviewComponentState::CommittedColors' own doc comment for the full contract.
 	 */
 	void UpdateAllPreviews(bool bCommit);
@@ -2228,7 +2330,7 @@ private:
 	 * reading AActor::PostEditMove(bFinished=true) in ActorEditor.cpp, which unconditionally calls
 	 * GEngine->BroadcastOnActorMoved(this) -- the same call chain LevelEditorViewport.cpp's own
 	 * TrackingStopped path uses when a gizmo drag completes). Fires ONCE per completed drag (never
-	 * continuously mid-drag, so no extra debounce is needed beyond the existing Auto Update Preview
+	 * continuously mid-drag, so no extra debounce is needed beyond the existing live-regeneration
 	 * mechanism), for ANY actor moved anywhere in the level -- OnActorMovedForDirectionalNormal filters
 	 * to only the actors actually relevant to this panel's own tracked components. Registered/removed
 	 * the same way as WorldCleanupDelegateHandle/SelectionChangedDelegateHandle above.
