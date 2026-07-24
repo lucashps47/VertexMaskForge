@@ -6137,35 +6137,8 @@ namespace VertexMaskForgePanel
 		return FMath::Lerp(Base, BlendResult, Opacity);
 	}
 
-	/**
-	 * ONE mask generator's contribution to the composition -- Bounding Box, Ambient Occlusion, and any
-	 * future generator (Curvature, Thickness, ...) are STRUCTURALLY IDENTICAL peers here: this struct
-	 * carries no notion of "spatial" vs "content", no fixed role, and no UI-derived position. Already
-	 * resolved to the PER-COMPONENT effective mask for this call (World Space Bounding Box axes and
-	 * Ambient Occlusion are both re-evaluated per component by the caller -- see ApplyPreviewToEntry --
-	 * before being wrapped here). Mask is a non-owning pointer into a caller-owned
-	 * FVertexMaskForgeScalarMask that must outlive the UpdateWorkingColors call it is passed to.
-	 * Mask->Source doubles as the fixed, stable "generator identifier" used to break ties between two
-	 * masks sharing the same Blend Mode (see ComposeMaskStack) -- never reused for anything else, never
-	 * exposed in the UI, never configurable.
-	 */
-	struct FVertexMaskForgeMaskLayerParams
-	{
-		const FVertexMaskForgeScalarMask* Mask = nullptr;
-		EVertexMaskForgeBlendMode BlendMode = EVertexMaskForgeBlendMode::Copy;
-		float Opacity = 1.0f;
-
-		/**
-		 * AUDITED (Nanite source-topology support): when >= 0, ComposeMaskStack looks up THIS value
-		 * instead of its own shared VertexIndex parameter for this one layer -- needed because Source-
-		 * Topology masks are not all indexed by the same domain (Bounding Box by Dynamic Mesh Vertex ID;
-		 * Ambient Occlusion by Normal Overlay Element ID, to preserve hard-edge AO correctness -- see
-		 * GenerateAmbientOcclusionMaskFromDynamicMesh's own doc comment). -1 (default) preserves the
-		 * original, single-shared-index behavior every existing (render-vertex domain) caller already
-		 * relies on -- unchanged, since every layer there is indexed identically by render vertex index.
-		 */
-		int32 IndexOverride = -1;
-	};
+	// FVertexMaskForgeMaskLayerParams is now defined in VertexMaskForgeMaskTypes.h (M1 extraction,
+	// still inside this same namespace) -- see that header for the struct's own doc comment.
 
 	/**
 	 * AUDITED (peer-mask composition checkpoint -- supersedes the previous, UI-position-ordered fold
