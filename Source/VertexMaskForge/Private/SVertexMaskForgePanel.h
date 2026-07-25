@@ -26,6 +26,15 @@ enum class ECheckBoxState : uint8;
 namespace ESelectInfo { enum Type : int; }
 
 namespace UE::Geometry { class FDynamicMesh3; }
+struct FMeshDescription;
+struct FStaticMeshLODResources;
+
+// AUDITED (M5, Extract Accept Writer): shared across SVertexMaskForgePanel.cpp and
+// VertexMaskForgeAcceptWriter.cpp -- a per-TU DEFINE_LOG_CATEGORY_STATIC would collide under Unity
+// Build (both .cpp files textually merged into one translation unit), so this category is declared
+// EXTERN here and defined exactly once, in SVertexMaskForgePanel.cpp (DEFINE_LOG_CATEGORY). Same name,
+// same default/compile-time verbosity as before -- only the declaration mechanism changed.
+DECLARE_LOG_CATEGORY_EXTERN(LogVertexMaskForge, Log, All);
 
 /**
  * Opaque per-component Ambient Occlusion cache (world-space-baked occluder geometry + spatial index
@@ -1101,6 +1110,27 @@ namespace VertexMaskForgePanel
 	bool HasConflictingWorldSpaceNormalTransforms(
 		const TArray<FVertexMaskForgePreviewComponentState>& PreviewComponents,
 		float& OutMaxRelativeDeviation);
+
+	/**
+	 * AUDITED (M5, Extract Accept Writer): full deep geometry-freshness comparison for the Thickness
+	 * Mask cache (render-vertex domain) -- see the definition in SVertexMaskForgePanel.cpp for the full
+	 * algorithm doc comment. Consumed both by Thickness generation (as a re-verification, not only at
+	 * Accept) and by VertexMaskForgeAcceptWriter::WriteAcceptTargets as the write-time freshness gate.
+	 */
+	bool AreThicknessGeometrySnapshotsExactlyEquivalent(
+		const FVertexMaskForgeThicknessCache& Cache,
+		const FStaticMeshLODResources& CurrentLOD0);
+
+	/**
+	 * AUDITED (M5, Extract Accept Writer): Source-Topology sibling of
+	 * AreThicknessGeometrySnapshotsExactlyEquivalent -- see the definition in SVertexMaskForgePanel.cpp
+	 * for the full algorithm doc comment. Consumed only by
+	 * VertexMaskForgeAcceptWriter::WriteSourceTopologyAcceptTargets as the write-time freshness gate.
+	 */
+	bool IsThicknessSourceTopologyContentUnchanged(
+		const UE::Geometry::FDynamicMesh3& OldMesh,
+		const TArray<FTriangleID>& TriIDMap,
+		const FMeshDescription& CurrentMeshDescription);
 }
 
 /**

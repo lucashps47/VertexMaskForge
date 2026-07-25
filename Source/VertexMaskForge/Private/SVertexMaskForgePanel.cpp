@@ -34,6 +34,7 @@
 #include "UObject/UObjectGlobals.h"
 #include "VectorUtil.h"
 #include "VertexMaskForgeAcceptTargetBuilder.h"
+#include "VertexMaskForgeAcceptWriter.h"
 #include "VertexMaskForgeDisplayColorDerivation.h"
 #include "VertexMaskForgeMaskStackComposer.h"
 #include "SPrimaryButton.h"
@@ -50,7 +51,7 @@
 #include "Widgets/SBoxPanel.h"
 #include "Widgets/Text/STextBlock.h"
 
-DEFINE_LOG_CATEGORY_STATIC(LogVertexMaskForge, Log, All);
+DEFINE_LOG_CATEGORY(LogVertexMaskForge);
 
 /**
  * Non-Nanite Thickness cache (V2-G) -- Asset Local Space, NEVER keyed by ComponentTransform (unlike
@@ -4656,8 +4657,8 @@ namespace VertexMaskForgePanel
 	// the corrective audit's own requirement: a Mesh-pointer+DerivedDataKey+count match is a FAST
 	// REJECT only, never sufficient alone to reuse cached geometry/raw distances -- the same rule that
 	// already applies at Accept must apply during generation/preview too).
-	static bool AreThicknessGeometrySnapshotsExactlyEquivalent(const FVertexMaskForgeThicknessCache& Cache, const FStaticMeshLODResources& CurrentLOD0);
-	static bool IsThicknessSourceTopologyContentUnchanged(const UE::Geometry::FDynamicMesh3& OldMesh, const TArray<FTriangleID>& TriIDMap, const FMeshDescription& CurrentMeshDescription);
+	bool AreThicknessGeometrySnapshotsExactlyEquivalent(const FVertexMaskForgeThicknessCache& Cache, const FStaticMeshLODResources& CurrentLOD0);
+	bool IsThicknessSourceTopologyContentUnchanged(const UE::Geometry::FDynamicMesh3& OldMesh, const TArray<FTriangleID>& TriIDMap, const FMeshDescription& CurrentMeshDescription);
 
 	static FVertexMaskForgeScalarMask GenerateThicknessMask(
 		TUniquePtr<FVertexMaskForgeThicknessCache>& CachePtr,
@@ -6602,7 +6603,7 @@ namespace VertexMaskForgePanel
 	 * fast-reject) already matched CurrentFingerprint -- a fingerprint match NEVER by itself proves
 	 * freshness, this comparison is always still required; see WriteAcceptTargets' own call site.
 	 */
-	static bool AreThicknessGeometrySnapshotsExactlyEquivalent(
+	bool AreThicknessGeometrySnapshotsExactlyEquivalent(
 		const FVertexMaskForgeThicknessCache& Cache,
 		const FStaticMeshLODResources& CurrentLOD0)
 	{
@@ -6682,7 +6683,7 @@ namespace VertexMaskForgePanel
 	 * comparing WITHIN that single persistent object is always self-consistent, so no cross-run Dynamic-
 	 * Mesh-internal ID comparison is ever needed). Never reconverts MeshDescription->FDynamicMesh3.
 	 */
-	static bool IsThicknessSourceTopologyContentUnchanged(
+	bool IsThicknessSourceTopologyContentUnchanged(
 		const UE::Geometry::FDynamicMesh3& OldMesh,
 		const TArray<FTriangleID>& TriIDMap,
 		const FMeshDescription& CurrentMeshDescription)
@@ -6749,314 +6750,6 @@ namespace VertexMaskForgePanel
 				}
 			}
 		}
-		return true;
-	}
-
-	/**
-	 * Writes every target's FinalColors into its Static Mesh asset's LOD 0 MeshDescription (via the
-	 * SAME WedgeMap-based approach as UMeshPaintingSubsystem::PropagateColorsToRawMesh -- see the
-	 * audit note on BuildAcceptTargets). Re-validates every target BEFORE modifying anything -- once
-	 * the write loop starts, every step is expected to succeed by construction (validated moments
-	 * earlier, synchronously, nothing else runs in between), so there is no mid-loop rollback path:
-	 * if this function ever returns false, NOTHING has been modified.
-	 *
-	 * AUDITED (Undo/Redo fix): does NOT open its own FScopedTransaction or call Mesh->Build() -- the
-	 * caller (AcceptPendingChanges) owns ONE outer transaction spanning this function and its
-	 * Source-Topology sibling together, and calls BuildModifiedMeshes() for both domains' results only
-	 * AFTER that transaction closes (see BuildModifiedMeshes' own doc comment for why the rebuild must
-	 * stay outside it). Every successfully-written Mesh is appended to OutModifiedMeshes for that later
-	 * pass.
-	 *
-	 * AUDITED (Undo/Redo fix, root cause): Mesh->Modify() ALONE only snapshots UStaticMesh's own
-	 * UPROPERTY fields -- the TObjectPtr<UStaticMeshDescriptionBulkData> pointer VALUE inside
-	 * FStaticMeshSourceModel, which does not change (same sub-object instance before and after Accept).
-	 * The actual serialized MeshDescription bytes live inside that SEPARATE UObject
-	 * (UStaticMeshDescriptionBulkData, via UMeshDescriptionBaseBulkData::Serialize -- see
-	 * MeshDescriptionBaseBulkData.h/.cpp), which the Editor transaction system only captures if Modify()
-	 * is ALSO called on THAT object -- exactly what UStaticMesh::ModifyMeshDescription(LodIndex) does
-	 * (StaticMesh.cpp: `SourceModel.StaticMeshDescriptionBulkData->Modify(bAlwaysMarkDirty)`). Without
-	 * it, Mesh->Modify() alone records an empty/no-op change for this asset, so Undo never restores the
-	 * previous colors (this was the actual bug -- not a refresh/notification problem). Confirmed against
-	 * the native reference for this exact commit sequence, Modeling Tools'
-	 * UStaticMeshToolTarget::CommitMeshDescription (StaticMeshToolTarget.cpp): SetFlags(RF_Transactional)
-	 * -> Modify() -> ModifyMeshDescription(LodIndex) -> mutate -> CommitMeshDescription(LodIndex) ->
-	 * PostEditChange() (done here via BuildModifiedMeshes/Build(), the derived-data equivalent). On
-	 * Undo, UStaticMesh::PostEditUndo() -> Super::PostEditUndo() -> PostEditChangeProperty() -> Build()
-	 * automatically regenerates RenderData (and Nanite data) from the restored MeshDescription -- no
-	 * extra Undo/Redo handling is needed here for that part.
-	 */
-	static bool WriteAcceptTargets(const TArray<VertexMaskForgeAcceptTargetBuilder::FAcceptTarget>& Targets, TArray<UStaticMesh*>& OutModifiedMeshes, FText& OutErrorText)
-	{
-		for (const VertexMaskForgeAcceptTargetBuilder::FAcceptTarget& Target : Targets)
-		{
-			UStaticMesh* Mesh = Target.Mesh.Get();
-			const FMeshDescription* MeshDescription = IsValid(Mesh) ? Mesh->GetMeshDescription(0) : nullptr;
-			const FStaticMeshRenderData* RenderData = IsValid(Mesh) ? Mesh->GetRenderData() : nullptr;
-			const bool bLODValid = RenderData && RenderData->LODResources.IsValidIndex(0);
-
-			if (!MeshDescription || !bLODValid
-				|| RenderData->LODResources[0].WedgeMap.Num() != MeshDescription->VertexInstances().Num()
-				|| Target.FinalColors.Num() != static_cast<int32>(RenderData->LODResources[0].GetNumVertices()))
-			{
-				OutErrorText = FText::Format(
-					LOCTEXT("AcceptWriteRevalidationFailedFormat", "'{0}' failed re-validation immediately before writing; aborting Accept (nothing was modified)."),
-					FText::FromString(Target.AssetName));
-				return false;
-			}
-
-			// AUDITED (V2-G, Thickness freshness): only applies when this entry's accepted result
-			// actually depends on Thickness (Ready + a populated cache) -- never widens the deep
-			// comparison to entries/generators that never used Thickness. No fingerprint short-circuit
-			// here (see AreThicknessGeometrySnapshotsExactlyEquivalent's own doc note) -- the full
-			// semantic comparison always runs, so a match can never be assumed from a cheap proxy alone.
-			if (Target.Entry.IsValid() && Target.Entry->WorkingMesh.ThicknessMask.State == EVertexMaskForgeScalarMaskState::Ready
-				&& Target.Entry->WorkingMesh.ThicknessCache.IsValid()
-				&& !VertexMaskForgePanel::AreThicknessGeometrySnapshotsExactlyEquivalent(*Target.Entry->WorkingMesh.ThicknessCache, RenderData->LODResources[0]))
-			{
-				OutErrorText = FText::Format(
-					LOCTEXT("AcceptThicknessFreshnessMismatchFormat", "'{0}': geometry or normals changed since Thickness Mask was generated; aborting Accept (nothing was modified). Regenerate the mask and try again."),
-					FText::FromString(Target.AssetName));
-				return false;
-			}
-		}
-
-		for (const VertexMaskForgeAcceptTargetBuilder::FAcceptTarget& Target : Targets)
-		{
-			UStaticMesh* Mesh = Target.Mesh.Get();
-			FMeshDescription* MeshDescription = Mesh->GetMeshDescription(0);
-			const FStaticMeshLODResources& LOD0 = Mesh->GetRenderData()->LODResources[0];
-
-			// AUDITED (Undo/Redo fix): SetFlags is defensive (assets already loaded in the Editor are
-			// transactional in practice) and matches the native reference exactly; Modify() captures
-			// UStaticMesh's own properties, ModifyMeshDescription(0) captures the source data that
-			// actually changes -- see this function's own doc comment for why both are required.
-			Mesh->SetFlags(RF_Transactional);
-			Mesh->Modify();
-			Mesh->ModifyMeshDescription(0);
-
-			FStaticMeshAttributes Attributes(*MeshDescription);
-			TVertexInstanceAttributesRef<FVector4f> Colors = Attributes.GetVertexInstanceColors();
-
-			int32 VertexInstanceIndex = 0;
-			for (const FVertexInstanceID VertexInstanceID : MeshDescription->VertexInstances().GetElementIDs())
-			{
-				const int32 RenderIndex = LOD0.WedgeMap[VertexInstanceIndex];
-				if (RenderIndex != INDEX_NONE && Target.FinalColors.IsValidIndex(RenderIndex))
-				{
-					Colors[VertexInstanceID] = FLinearColor(Target.FinalColors[RenderIndex]);
-				}
-				++VertexInstanceIndex;
-			}
-
-			Mesh->CommitMeshDescription(0);
-			OutModifiedMeshes.Add(Mesh);
-		}
-
-		return true;
-	}
-
-	// --- Accept (Source-Topology / Nanite): permanent write to the SOURCE MeshDescription -----
-
-	/**
-	 * Sibling of WriteAcceptTargets for Source-Topology entries. Writes ONLY VertexInstanceColors on
-	 * the SOURCE MeshDescription (Mesh->GetMeshDescription(0)) -- never positions, topology, normals,
-	 * UVs, polygon groups, or any other attribute -- via the TriangleID+corner correspondence
-	 * (Entry->WorkingMesh.TriIDMap), reproducing exactly what
-	 * UE::Geometry::FDynamicMeshToMeshDescription::UpdateVertexColors does for the native Paint Vertex
-	 * Colors tool's own commit (see the native-tool audit), without re-running a full mesh conversion
-	 * (which could risk touching other attributes). Same two-pass (re-validate everything, THEN write)
-	 * discipline as WriteAcceptTargets -- if this returns false, nothing was modified.
-	 *
-	 * AUDITED (Undo/Redo fix): like its render-vertex sibling, does NOT open its own FScopedTransaction
-	 * or call Mesh->Build() -- see WriteAcceptTargets' own doc comment for why (single outer
-	 * transaction owned by AcceptPendingChanges, rebuild deferred to BuildModifiedMeshes() after that
-	 * transaction closes) and for the ModifyMeshDescription() root-cause explanation, which applies
-	 * identically here.
-	 */
-	static bool WriteSourceTopologyAcceptTargets(const TArray<VertexMaskForgeAcceptTargetBuilder::FSourceTopologyAcceptTarget>& Targets, TArray<UStaticMesh*>& OutModifiedMeshes, FText& OutErrorText)
-	{
-		using namespace UE::Geometry;
-
-		for (const VertexMaskForgeAcceptTargetBuilder::FSourceTopologyAcceptTarget& Target : Targets)
-		{
-			UStaticMesh* Mesh = Target.Mesh.Get();
-			const bool bEntryValid = Target.Entry.IsValid() && Target.Entry->WorkingMesh.Mesh.IsValid()
-				&& !Target.Entry->WorkingMesh.TriIDMap.IsEmpty();
-			const FMeshDescription* MeshDescription = IsValid(Mesh) ? Mesh->GetMeshDescription(0) : nullptr;
-			const int32 NumCorners = bEntryValid ? Target.Entry->WorkingMesh.Mesh->TriangleCount() * 3 : 0;
-
-			if (!MeshDescription || !bEntryValid || Target.FinalColors.Num() != NumCorners)
-			{
-				OutErrorText = FText::Format(
-					LOCTEXT("AcceptSourceTopologyWriteRevalidationFailedFormat", "'{0}' failed re-validation immediately before writing; aborting Accept (nothing was modified)."),
-					FText::FromString(Target.AssetName));
-				return false;
-			}
-			// AUDITED (commit preflight correction): full correspondence re-check, same as
-			// BuildSourceTopologyAcceptTargets' own preflight -- nothing else can have touched these
-			// assets between preflight and here (synchronous, same call), but re-proving it immediately
-			// before the first Modify() matches WriteAcceptTargets' own re-validation discipline exactly.
-			if (!VertexMaskForgeAcceptTargetBuilder::ValidateSourceTopologyCorrespondence(
-				*Target.Entry->WorkingMesh.Mesh, Target.Entry->WorkingMesh.TriIDMap, *MeshDescription, Target.AssetName, OutErrorText))
-			{
-				return false;
-			}
-
-			// AUDITED (V2-G, Thickness freshness): ValidateSourceTopologyCorrespondence above only
-			// proves structural/ID correspondence (TriangleID/VertexInstanceID validity) -- it never
-			// compares position or normal VALUES, so a reimport/edit preserving every count and ID would
-			// slip through it silently. Only applies when this entry's result depends on Thickness.
-			if (Target.Entry->WorkingMesh.ThicknessMask.State == EVertexMaskForgeScalarMaskState::Ready
-				&& Target.Entry->WorkingMesh.SourceTopologyThicknessCache.IsValid()
-				&& !VertexMaskForgePanel::IsThicknessSourceTopologyContentUnchanged(
-					*Target.Entry->WorkingMesh.Mesh, Target.Entry->WorkingMesh.TriIDMap, *MeshDescription))
-			{
-				OutErrorText = FText::Format(
-					LOCTEXT("AcceptSourceTopologyThicknessFreshnessMismatchFormat", "'{0}': geometry or normals changed since Thickness Mask was generated; aborting Accept (nothing was modified). Regenerate the mask and try again."),
-					FText::FromString(Target.AssetName));
-				return false;
-			}
-		}
-
-		for (const VertexMaskForgeAcceptTargetBuilder::FSourceTopologyAcceptTarget& Target : Targets)
-		{
-			UStaticMesh* Mesh = Target.Mesh.Get();
-			FMeshDescription* MeshDescription = Mesh->GetMeshDescription(0);
-			const FDynamicMesh3& WorkingDynamicMesh = *Target.Entry->WorkingMesh.Mesh;
-			const TArray<FTriangleID>& TriIDMap = Target.Entry->WorkingMesh.TriIDMap;
-
-			// AUDITED (Undo/Redo fix): see WriteAcceptTargets' own doc comment -- ModifyMeshDescription
-			// is the call that actually makes the source data participate in the Transaction Buffer.
-			Mesh->SetFlags(RF_Transactional);
-			Mesh->Modify();
-			Mesh->ModifyMeshDescription(0);
-
-			FStaticMeshAttributes Attributes(*MeshDescription);
-			TVertexInstanceAttributesRef<FVector4f> Colors = Attributes.GetVertexInstanceColors();
-
-			int32 CornerIndex = 0;
-			for (const int32 TriangleID : WorkingDynamicMesh.TriangleIndicesItr())
-			{
-				if (!TriIDMap.IsValidIndex(TriangleID))
-				{
-					// Re-validated above; never reachable in practice, but never crash or misalign the
-					// remaining corners if it somehow were.
-					CornerIndex += 3;
-					continue;
-				}
-				const FTriangleID SourceTriangleID = TriIDMap[TriangleID];
-				const TArrayView<const FVertexInstanceID> SourceInstances = MeshDescription->GetTriangleVertexInstances(SourceTriangleID);
-				if (SourceInstances.Num() != 3)
-				{
-					CornerIndex += 3;
-					continue;
-				}
-				for (int32 Corner = 0; Corner < 3; ++Corner, ++CornerIndex)
-				{
-					if (Target.FinalColors.IsValidIndex(CornerIndex))
-					{
-						Colors[SourceInstances[Corner]] = FLinearColor(Target.FinalColors[CornerIndex]);
-					}
-				}
-			}
-
-			Mesh->CommitMeshDescription(0);
-
-			// AUDITED (BUG FIX round -- persistence verification, per explicit requirement): re-read
-			// VertexInstanceColors from the LIVE MeshDescription (re-fetched, not the stale local
-			// pointer/attributes-ref from before Commit) and compare against what was just written, via
-			// the EXACT SAME TriangleID+corner walk -- never trust the preview's appearance alone as
-			// proof the asset was actually updated. Aborts BEFORE Build()/notifying anything if the
-			// write did not actually stick.
-			{
-				const FMeshDescription* VerifyMeshDescription = Mesh->GetMeshDescription(0);
-				const FStaticMeshConstAttributes VerifyAttributes(*VerifyMeshDescription);
-				const TVertexInstanceAttributesConstRef<FVector4f> VerifyColors = VerifyAttributes.GetVertexInstanceColors();
-
-				int32 VerifyCornerIndex = 0;
-				int32 NumMismatched = 0;
-				for (const int32 TriangleID : WorkingDynamicMesh.TriangleIndicesItr())
-				{
-					if (!TriIDMap.IsValidIndex(TriangleID)) { VerifyCornerIndex += 3; continue; }
-					const FTriangleID VerifySourceTriangleID = TriIDMap[TriangleID];
-					const TArrayView<const FVertexInstanceID> VerifySourceInstances = VerifyMeshDescription->GetTriangleVertexInstances(VerifySourceTriangleID);
-					if (VerifySourceInstances.Num() != 3) { VerifyCornerIndex += 3; continue; }
-					for (int32 Corner = 0; Corner < 3; ++Corner, ++VerifyCornerIndex)
-					{
-						if (!Target.FinalColors.IsValidIndex(VerifyCornerIndex)) { continue; }
-						const FVector4f Expected(FLinearColor(Target.FinalColors[VerifyCornerIndex]));
-						const FVector4f Actual = VerifyColors.Get(VerifySourceInstances[Corner]);
-						if (!Expected.Equals(Actual, 1.0f / 512.0f))
-						{
-							++NumMismatched;
-						}
-					}
-				}
-
-				if (NumMismatched > 0)
-				{
-					OutErrorText = FText::Format(
-						LOCTEXT("AcceptSourceTopologyPersistenceVerificationFailedFormat",
-							"'{0}': {1} Vertex Instance color(s) did not match what was written immediately after CommitMeshDescription; aborting Accept before Build/notify (the write did not persist as expected)."),
-						FText::FromString(Target.AssetName), FText::AsNumber(NumMismatched));
-					UE_LOG(LogVertexMaskForge, Error,
-						TEXT("Vertex Mask Forge: Accept (Source Topology) persistence verification FAILED for '%s' -- %d mismatched Vertex Instance color(s)."),
-						*Target.AssetName, NumMismatched);
-					return false;
-				}
-			}
-
-			UE_LOG(LogVertexMaskForge, Log,
-				TEXT("Vertex Mask Forge: Accept (Source Topology) -- '%s': colors written, CommitMeshDescription succeeded, persistence verified."),
-				*Target.AssetName);
-
-			OutModifiedMeshes.Add(Mesh);
-		}
-
-		return true;
-	}
-
-	/**
-	 * Rebuilds RenderData (and Nanite cluster data, for Nanite-enabled assets -- same build pass, see
-	 * the native Nanite build audit: MeshBuilderModule.BuildMesh() reads VertexInstanceColors directly
-	 * from the same source MeshDescription when constructing Nanite's cluster input) for every mesh
-	 * whose MeshDescription was just committed by WriteAcceptTargets/WriteSourceTopologyAcceptTargets.
-	 *
-	 * AUDITED (Undo/Redo fix): called by AcceptPendingChanges AFTER its outer FScopedTransaction has
-	 * already closed -- mirrors UE::ToolTarget::Internal::PostEditChangeWithConditionalUndo, the
-	 * audited native reference (Modeling Tools' own StaticMeshToolTarget::CommitMeshDescription commit
-	 * sequence): RenderData/Nanite data is DERIVED, deterministically regenerated from the (now
-	 * transacted) MeshDescription on both Accept and Undo/Redo (UStaticMesh::PostEditUndo() ->
-	 * Super::PostEditUndo() -> PostEditChangeProperty() -> Build(), the exact same derivation) -- so it
-	 * must never itself be captured inside a transaction. GUndo is suppressed for the duration of each
-	 * Build() call, exactly as the native pattern does, so an already-closed outer transaction (or the
-	 * complete absence of one) can never be reopened or polluted by whatever Modify() calls Build()
-	 * triggers internally (e.g. component re-registration).
-	 */
-	static bool BuildModifiedMeshes(const TArray<UStaticMesh*>& Meshes, FText& OutErrorText)
-	{
-		for (UStaticMesh* Mesh : Meshes)
-		{
-			if (!IsValid(Mesh))
-			{
-				continue;
-			}
-
-			TGuardValue<ITransaction*> SuppressTransaction(GUndo, nullptr);
-			TArray<FText> BuildErrors;
-			Mesh->Build(/*bInSilent=*/true, &BuildErrors);
-			if (!BuildErrors.IsEmpty())
-			{
-				OutErrorText = FText::Format(
-					LOCTEXT("AcceptBuildFailedFormat", "'{0}': Build failed after committing Vertex Colors: {1}"),
-					FText::FromString(Mesh->GetName()), BuildErrors[0]);
-				UE_LOG(LogVertexMaskForge, Error, TEXT("Vertex Mask Forge: Accept Build FAILED for '%s': %s"),
-					*Mesh->GetName(), *BuildErrors[0].ToString());
-				return false;
-			}
-			UE_LOG(LogVertexMaskForge, Log, TEXT("Vertex Mask Forge: Accept -- '%s': Build completed."), *Mesh->GetName());
-		}
-
 		return true;
 	}
 
@@ -13180,14 +12873,14 @@ bool SVertexMaskForgePanel::AcceptPendingChanges()
 	{
 		FScopedTransaction Transaction(LOCTEXT("AcceptVertexMaskForgeChanges", "Apply Vertex Mask"));
 
-		if (!Targets.IsEmpty() && !VertexMaskForgePanel::WriteAcceptTargets(Targets, ModifiedMeshes, ErrorText))
+		if (!Targets.IsEmpty() && !VertexMaskForgeAcceptWriter::WriteAcceptTargets(Targets, ModifiedMeshes, ErrorText))
 		{
 			OperationState = EVertexMaskForgeOperationState::Failed;
 			LastOperationErrorText = ErrorText;
 			UE_LOG(LogVertexMaskForge, Error, TEXT("Vertex Mask Forge: Accept failed while writing: %s"), *ErrorText.ToString());
 			return false;
 		}
-		if (!SourceTopologyTargets.IsEmpty() && !VertexMaskForgePanel::WriteSourceTopologyAcceptTargets(SourceTopologyTargets, ModifiedMeshes, ErrorText))
+		if (!SourceTopologyTargets.IsEmpty() && !VertexMaskForgeAcceptWriter::WriteSourceTopologyAcceptTargets(SourceTopologyTargets, ModifiedMeshes, ErrorText))
 		{
 			OperationState = EVertexMaskForgeOperationState::Failed;
 			LastOperationErrorText = ErrorText;
@@ -13199,7 +12892,7 @@ bool SVertexMaskForgePanel::AcceptPendingChanges()
 	// complete Undo History entry. Everything from here on (RenderData/Nanite rebuild, preview
 	// teardown) is DERIVED or transient and must never be captured inside it.
 
-	if (!VertexMaskForgePanel::BuildModifiedMeshes(ModifiedMeshes, ErrorText))
+	if (!VertexMaskForgeAcceptWriter::BuildModifiedMeshes(ModifiedMeshes, ErrorText))
 	{
 		OperationState = EVertexMaskForgeOperationState::Failed;
 		LastOperationErrorText = ErrorText;
