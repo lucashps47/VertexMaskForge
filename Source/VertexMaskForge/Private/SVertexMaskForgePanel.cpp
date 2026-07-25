@@ -33,6 +33,7 @@
 #include "UObject/Package.h"
 #include "UObject/UObjectGlobals.h"
 #include "VectorUtil.h"
+#include "VertexMaskForgeAcceptTargetBuilder.h"
 #include "VertexMaskForgeDisplayColorDerivation.h"
 #include "VertexMaskForgeMaskStackComposer.h"
 #include "SPrimaryButton.h"
@@ -3819,7 +3820,7 @@ namespace VertexMaskForgePanel
 	 * picks a "winning" instance -- returns true (conflict) the moment ANY live component disagrees with
 	 * the reference beyond tolerance.
 	 */
-	static bool HasConflictingWorldSpaceNormalTransforms(const TArray<FVertexMaskForgePreviewComponentState>& PreviewComponents, float& OutMaxRelativeDeviation)
+	bool HasConflictingWorldSpaceNormalTransforms(const TArray<FVertexMaskForgePreviewComponentState>& PreviewComponents, float& OutMaxRelativeDeviation)
 	{
 		OutMaxRelativeDeviation = 0.0f;
 
@@ -6589,248 +6590,6 @@ namespace VertexMaskForgePanel
 
 	// --- Accept: permanent write to Static Mesh asset(s) -------------------------------------
 
-	/** One Static Mesh asset targeted by an Accept operation, with its final, ready-to-write colors. */
-	struct FVertexMaskForgeAcceptTarget
-	{
-		TWeakObjectPtr<UStaticMesh> Mesh;
-		FString AssetName;
-		/** Render-vertex-order (LOD0), exactly as shown in Preview -- the data actually written. */
-		TArray<FColor> FinalColors;
-		/** AUDITED (V2-G): needed so WriteAcceptTargets can re-validate Thickness Mask freshness
-		 *  (Entry->WorkingMesh.ThicknessCache) immediately before the first Modify() -- see
-		 *  AreThicknessGeometrySnapshotsExactlyEquivalent. Null-safe: only dereferenced when
-		 *  Entry->WorkingMesh.ThicknessMask.State==Ready AND ThicknessCache is valid. */
-		TSharedPtr<FVertexMaskForgeSelectedMesh> Entry;
-	};
-
-	/**
-	 * Validates every SelectedMeshes entry eligible for Accept and, only if ALL of them pass,
-	 * returns the exact set of {Static Mesh, final render-order colors} to write. Nothing is written
-	 * here -- this function is pure validation + composition, so the caller can guarantee Accept is
-	 * all-or-nothing (validate every destination before starting any write).
-	 *
-	 * An entry is eligible when it has a Ready mask AND at least one live PreviewComponent (Content-
-	 * Browser-only entries, with no viewport component, are never eligible -- there is no baseline to
-	 * compose from). For an eligible entry:
-	 *   - composes render-order colors independently PER SourceComponent, using the same baseline
-	 *     priority as the live Preview (per-instance OverrideVertexColors, then asset colors, then
-	 *     white -- see UpdateWorkingColors);
-	 *   - entries are already 1-per-asset by construction (AddOrUpdateSelectedMesh keys InOutMeshes
-	 *     by asset path), so no separate cross-entry dedup by UStaticMesh identity is needed here --
-	 *     but if two or more COMPONENTS of that one entry's asset produce DIFFERENT composed results
-	 *     (because their per-instance baselines differ), the write target is AMBIGUOUS: Accept is
-	 *     blocked for the whole operation (not silently narrowed to one component), the Preview is
-	 *     left untouched, and OutErrorText names the asset;
-	 *   - otherwise, validates that FStaticMeshLODResources::WedgeMap (the engine's own deterministic
-	 *     wedge->render-vertex mapping, exactly as used by UMeshPaintingSubsystem::
-	 *     PropagateColorsToRawMesh) is present and matches the current MeshDescription's vertex
-	 *     instance count. If it does not, this function refuses -- it NEVER falls back to an
-	 *     approximate position-based remap, per the explicit architectural requirement (a stale/
-	 *     missing WedgeMap most commonly means the asset needs a Build first).
-	 *
-	 * AUDITED (recompute-at-Accept fix): this function NEVER calls UpdateWorkingColors, NEVER
-	 * re-evaluates GenerateBoundingBoxMask, and NEVER reads BoundingBoxBlendMode/BoundingBoxOpacity/
-	 * the Channel Filter -- it only READS each component's State.WorkingColors, exactly as
-	 * live regeneration last left it (see UpdateWorkingColors' own doc comment;
-	 * ApplyPreviewToEntry is the only other caller, and it is the SAME array). This is what
-	 * structurally guarantees Accept can never silently apply a parameter change that was never
-	 * actually generated: every parameter change either invalidates the mask (forcing OperationState
-	 * back to Idle, which disables Accept entirely until live regeneration re-populates
-	 * WorkingColors) or itself synchronously updates WorkingColors before Accept can ever see it
-	 * (Channel Filter). A component whose
-	 * WorkingColors is empty (never composed yet, or reset by RestoreComponentOriginal because its
-	 * own per-instance World Space mask evaluation was degenerate) is skipped -- the exact same
-	 * outcome the old per-component mask re-evaluation produced for that case, without needing to
-	 * redo the evaluation here.
-	 *
-	 * AUDITED (Preview-Mode-cannot-affect-Accept fix): takes NO EVertexMaskForgePreviewMode parameter
-	 * at all, and reads State.WorkingColors VERBATIM -- never through DeriveDisplayColors -- so the
-	 * persisted result is the same real multi-channel RGB regardless of which Preview Mode (Original
-	 * Material, Full RGB, Red/Green/Blue Channel) happens to be selected when Accept runs.
-	 * RecomputeOperationState() computes PendingChanges identically regardless of CurrentPreviewMode
-	 * (see its own doc comment), so this function needs no Preview-Mode check of its own either.
-	 */
-	static bool BuildAcceptTargets(
-		const TArray<TSharedPtr<FVertexMaskForgeSelectedMesh>>& SelectedMeshes,
-		const bool bDirectionalNormalMaskEnabled,
-		const EVertexMaskForgeNormalSpace DirectionalNormalSpace,
-		TArray<FVertexMaskForgeAcceptTarget>& OutTargets,
-		FText& OutErrorText)
-	{
-		OutTargets.Reset();
-
-		for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
-		{
-			// AUDITED (composition-stack checkpoint): eligible if EITHER slot is Ready -- this gate is
-			// only a coarse pre-filter anyway; the actual data persisted is always State.WorkingColors
-			// (read verbatim below), never re-derived from either mask here.
-			//
-			// AUDITED (Nanite source-topology support): a Source-Topology entry (every Nanite-enabled
-			// mesh -- see FVertexMaskForgeSelectedMesh::bUseSourceTopology) is handled EXCLUSIVELY by
-			// BuildSourceTopologyAcceptTargets/WriteSourceTopologyAcceptTargets, never by this function
-			// -- skip it here unconditionally, rather than letting it fall through to the WedgeMap
-			// check below (which would incorrectly reject a Nanite mesh that happens to have a valid
-			// WedgeMap too, since Source-Topology mode is chosen unconditionally for Nanite, not just
-			// when WedgeMap is invalid).
-			if (!Entry.IsValid() || Entry->bUseSourceTopology || Entry->PreviewComponents.IsEmpty()
-				|| (Entry->WorkingMesh.BoundingBoxMask.State != EVertexMaskForgeScalarMaskState::Ready
-					&& Entry->WorkingMesh.AmbientOcclusionMask.State != EVertexMaskForgeScalarMaskState::Ready
-					&& Entry->WorkingMesh.CurvatureMask.State != EVertexMaskForgeScalarMaskState::Ready
-					&& Entry->WorkingMesh.NoiseMask.State != EVertexMaskForgeScalarMaskState::Ready
-					&& Entry->WorkingMesh.MaterialSlotMask.State != EVertexMaskForgeScalarMaskState::Ready
-					&& Entry->WorkingMesh.DirectionalNormalMask.State != EVertexMaskForgeScalarMaskState::Ready
-					&& Entry->WorkingMesh.ThicknessMask.State != EVertexMaskForgeScalarMaskState::Ready))
-			{
-				continue;
-			}
-
-			// AUDITED (V2-E CORRECTIVE PASS, transform freshness): re-checked LIVE, right here,
-			// immediately before any Modify() -- NEVER trusts the cached WorkingMesh.
-			// bDirectionalNormalWorldSpaceConflict flag alone (that flag can only ever be as fresh as the
-			// last live regeneration pass; a component could have been moved since, faster than the
-			// debounce). Only evaluated when Directional Normal Mask is enabled AND in World Space --
-			// false/skipped in every other case, so this never blocks Accept for any other generator or
-			// for Local Space.
-			if (bDirectionalNormalMaskEnabled && DirectionalNormalSpace == EVertexMaskForgeNormalSpace::World)
-			{
-				float LiveDeviation = 0.0f;
-				if (VertexMaskForgePanel::HasConflictingWorldSpaceNormalTransforms(Entry->PreviewComponents, LiveDeviation))
-				{
-					OutErrorText = FText::Format(
-						LOCTEXT("AcceptDirectionalNormalWorldSpaceConflictFormat",
-							"'{0}': World Space Directional Normal Mask cannot write conflicting results from differently transformed instances of the same Static Mesh asset."),
-						FText::FromString(Entry->AssetName));
-					return false;
-				}
-			}
-
-			UStaticMesh* Mesh = Entry->Mesh.LoadSynchronous();
-			if (!IsValid(Mesh) || !Mesh->HasValidRenderData(/*bCheckLODForVerts=*/true, /*LODIndex=*/0))
-			{
-				OutErrorText = FText::Format(
-					LOCTEXT("AcceptInvalidMeshFormat", "'{0}': Static Mesh could not be resolved or has no valid LOD 0 render data."),
-					FText::FromString(Entry->AssetName));
-				return false;
-			}
-
-			const FStaticMeshRenderData* RenderData = Mesh->GetRenderData();
-			if (!RenderData || !RenderData->LODResources.IsValidIndex(0))
-			{
-				OutErrorText = FText::Format(
-					LOCTEXT("AcceptNoRenderDataFormat", "'{0}': no LOD 0 render data available."),
-					FText::FromString(Entry->AssetName));
-				return false;
-			}
-			const FStaticMeshLODResources& LOD0 = RenderData->LODResources[0];
-
-			// Compose independently per component and require agreement -- see the divergent-
-			// baseline case in the doc comment above.
-			TArray<FColor> ReferenceColors;
-			bool bHaveReference = false;
-			for (const FVertexMaskForgePreviewComponentState& State : Entry->PreviewComponents)
-			{
-				const UStaticMeshComponent* SourceComponent = State.SourceComponent.Get();
-				if (!IsValid(SourceComponent))
-				{
-					continue;
-				}
-
-				// AUDITED (recompute-at-Accept fix): read-only -- see this function's own doc comment.
-				// Empty WorkingColors means this component currently has no valid composed result
-				// (mirrors the old "per-instance mask not Ready" skip).
-				if (State.WorkingColors.IsEmpty())
-				{
-					continue;
-				}
-				// AUDITED (Preview-Mode-cannot-affect-Accept fix): the raw multi-channel result,
-				// verbatim -- never DeriveDisplayColors, never CurrentPreviewMode.
-				TArray<FColor> ComponentColors = State.WorkingColors;
-
-				if (!bHaveReference)
-				{
-					ReferenceColors = MoveTemp(ComponentColors);
-					bHaveReference = true;
-				}
-				else if (ComponentColors != ReferenceColors)
-				{
-					OutErrorText = FText::Format(
-						LOCTEXT("AcceptDivergentBaselineFormat",
-							"'{0}': different instances of this asset produced different Preview results (their per-instance Vertex Color overrides differ), so writing to the shared Static Mesh asset would be ambiguous. Accept is blocked for this operation; make the instances' overrides consistent, or Cancel."),
-						FText::FromString(Entry->AssetName));
-					return false;
-				}
-			}
-
-			if (!bHaveReference)
-			{
-				// Every tracked component became invalid since the Preview was last updated; nothing
-				// to accept for this entry -- not an error, just nothing eligible here.
-				continue;
-			}
-
-			// Deterministic wedge->render-vertex mapping check (audited): never approximate by
-			// position. Read-only check here (element count only); the mutable pass happens in
-			// WriteAcceptTargets.
-			//
-			// AUDITED (Nanite): confirmed against the actual UE 5.8 Nanite build source
-			// (StaticMeshBuilder.cpp's BuildNanite()) that for a Nanite-enabled asset WITHOUT an
-			// explicit HiRes Source Model (the common/default case), LODResources[0] is NOT a
-			// full-fidelity copy of the source mesh -- it is Nanite's own decimated/re-clustered
-			// fallback proxy (FallbackRelativeError defaults to 1.0, i.e. reduction IS applied), and
-			// FStaticMeshLODResources::WedgeMap for LOD 0 is never populated on that path at all (the
-			// Nanite build explicitly passes bNeedWedgeMap=false -- "mainly used by non-Nanite mesh
-			// painting"). So this same WedgeMap check that already protects every other asset ALSO
-			// correctly refuses Nanite assets on that default path -- it must NOT be bypassed or
-			// "fixed" with a position-based remap, which would silently paint the wrong (reduced)
-			// vertex set. Only the message differs, so the user is told the true, actionable reason
-			// instead of the generic "try rebuilding" text (rebuilding will not fix this for Nanite --
-			// the fallback is decimated by design).
-			const FMeshDescription* MeshDescription = Mesh->GetMeshDescription(0);
-			const bool bWedgeMapValid = MeshDescription
-				&& LOD0.WedgeMap.Num() != 0
-				&& LOD0.WedgeMap.Num() == MeshDescription->VertexInstances().Num()
-				&& ReferenceColors.Num() == static_cast<int32>(LOD0.GetNumVertices());
-			if (!bWedgeMapValid)
-			{
-				if (Mesh->IsNaniteEnabled())
-				{
-					OutErrorText = FText::Format(
-						LOCTEXT("AcceptNaniteReducedFallbackFormat",
-							"'{0}': this Static Mesh has Nanite enabled and its LOD 0 fallback is a reduced/re-clustered proxy (not 1:1 with the source mesh), so Vertex Mask Forge cannot currently write results back into it safely. Assigning an explicit High Res Source Model to this asset (Nanite Settings) restores a full-fidelity LOD 0 and may allow Accept to succeed; otherwise, source-topology write support for Nanite is not yet implemented."),
-						FText::FromString(Entry->AssetName));
-				}
-				else
-				{
-					OutErrorText = FText::Format(
-						LOCTEXT("AcceptNoWedgeMapFormat",
-							"'{0}': no deterministic wedge-to-render-vertex mapping is available (FStaticMeshLODResources::WedgeMap missing or stale for LOD 0). Refusing to write -- an approximate position-based remap could paint seams incorrectly. Try rebuilding this Static Mesh (Build) and Accept again."),
-						FText::FromString(Entry->AssetName));
-				}
-				return false;
-			}
-
-			FVertexMaskForgeAcceptTarget Target;
-			Target.Mesh = Mesh;
-			Target.AssetName = Entry->AssetName;
-			Target.FinalColors = MoveTemp(ReferenceColors);
-			Target.Entry = Entry;
-			OutTargets.Add(MoveTemp(Target));
-		}
-
-		// AUDITED (BUG FIX -- Nanite Accept root cause): this function used to treat an empty
-		// OutTargets as a hard failure on its own ("AcceptNothingEligible"). That was correct back when
-		// this was the ONLY Accept target builder, but since the Source-Topology split, a selection
-		// that is ENTIRELY Nanite (bUseSourceTopology, skipped above unconditionally) legitimately
-		// produces zero render-vertex targets while still having real, valid Source-Topology targets
-		// waiting in BuildSourceTopologyAcceptTargets. Returning false HERE made AcceptPendingChanges
-		// bail out immediately -- before BuildSourceTopologyAcceptTargets was ever called -- so a
-		// pure-Nanite Accept always failed with "No eligible pending changes to accept.", even though
-		// nothing had actually been validated yet, let alone written. "Nothing eligible in EITHER
-		// domain" is now decided ONCE, by the caller, after combining both builders' results -- see
-		// AcceptPendingChanges. An empty result here is not, by itself, an error.
-		return true;
-	}
-
 	/**
 	 * AUDITED (V2-G, Thickness freshness): the fingerprint/count checks already performed elsewhere in
 	 * this file (WedgeMap counts, ValidateSourceTopologyCorrespondence, GeometryFingerprint) prove
@@ -7026,9 +6785,9 @@ namespace VertexMaskForgePanel
 	 * automatically regenerates RenderData (and Nanite data) from the restored MeshDescription -- no
 	 * extra Undo/Redo handling is needed here for that part.
 	 */
-	static bool WriteAcceptTargets(const TArray<FVertexMaskForgeAcceptTarget>& Targets, TArray<UStaticMesh*>& OutModifiedMeshes, FText& OutErrorText)
+	static bool WriteAcceptTargets(const TArray<VertexMaskForgeAcceptTargetBuilder::FAcceptTarget>& Targets, TArray<UStaticMesh*>& OutModifiedMeshes, FText& OutErrorText)
 	{
-		for (const FVertexMaskForgeAcceptTarget& Target : Targets)
+		for (const VertexMaskForgeAcceptTargetBuilder::FAcceptTarget& Target : Targets)
 		{
 			UStaticMesh* Mesh = Target.Mesh.Get();
 			const FMeshDescription* MeshDescription = IsValid(Mesh) ? Mesh->GetMeshDescription(0) : nullptr;
@@ -7061,7 +6820,7 @@ namespace VertexMaskForgePanel
 			}
 		}
 
-		for (const FVertexMaskForgeAcceptTarget& Target : Targets)
+		for (const VertexMaskForgeAcceptTargetBuilder::FAcceptTarget& Target : Targets)
 		{
 			UStaticMesh* Mesh = Target.Mesh.Get();
 			FMeshDescription* MeshDescription = Mesh->GetMeshDescription(0);
@@ -7099,241 +6858,6 @@ namespace VertexMaskForgePanel
 	// --- Accept (Source-Topology / Nanite): permanent write to the SOURCE MeshDescription -----
 
 	/**
-	 * AUDITED (Nanite source-topology support): sibling of FVertexMaskForgeAcceptTarget/
-	 * BuildAcceptTargets/WriteAcceptTargets for Source-Topology entries (every Nanite-enabled mesh --
-	 * see FVertexMaskForgeSelectedMesh::bUseSourceTopology). Same validate-then-write, all-or-nothing
-	 * contract; same divergent-per-instance-baseline blocking rule; same shared-asset dedup (one
-	 * target per entry, entries are already 1-per-asset by construction). The only structural
-	 * difference: colors are in CORNER domain (see UpdateWorkingColorsSourceTopology), and the commit
-	 * itself writes via the TriangleID+corner correspondence (Entry->WorkingMesh.TriIDMap) instead of
-	 * FStaticMeshLODResources::WedgeMap -- exactly the route the native UE Paint Vertex Colors tool
-	 * uses (FDynamicMeshToMeshDescription::UpdateVertexColors), proven correct for Nanite by the
-	 * native-tool audit. Entry is kept alive (TSharedPtr) so WorkingMesh.Mesh/TriIDMap remain valid
-	 * from preflight through the write pass.
-	 */
-	struct FVertexMaskForgeSourceTopologyAcceptTarget
-	{
-		TWeakObjectPtr<UStaticMesh> Mesh;
-		FString AssetName;
-		/** Corner-domain colors (Entry->WorkingMesh.Mesh's own TriangleIndicesItr()+corner order),
-		 *  exactly as shown in Preview -- the data actually written. */
-		TArray<FColor> FinalColors;
-		TSharedPtr<FVertexMaskForgeSelectedMesh> Entry;
-	};
-
-	/**
-	 * AUDITED (Nanite source-topology support, commit preflight correction): full formal validation of
-	 * the TriangleID -> source FTriangleID -> VertexInstanceID correspondence a Source-Topology Accept
-	 * is about to rely on, BEFORE any write. Checks:
-	 *   - TriIDMap has a VALID entry for every triangle actually enumerated by WorkingMesh's own
-	 *     TriangleIndicesItr() (not just "non-empty") -- a partially-populated map is refused outright,
-	 *     never silently skipped mid-write the way the write loop's own defensive guards do (those
-	 *     exist as a last-resort safety net, not as the intended detection point).
-	 *   - Each mapped FTriangleID still exists in the LIVE MeshDescription
-	 *     (MeshDescription.IsTriangleValid) -- catches a stale TriIDMap if the asset's MeshDescription
-	 *     was ever rebuilt/edited since WorkingMesh was built, without WorkingMesh itself being rebuilt.
-	 *   - No two WorkingMesh triangles map to the SAME destination FTriangleID (TSet-based uniqueness) --
-	 *     two different corners silently writing into the same three VertexInstanceIDs would corrupt the
-	 *     write (last-write-wins on a shared slot) without ever raising an error otherwise.
-	 *   - Each destination triangle provides EXACTLY three VertexInstanceIDs, each itself still valid in
-	 *     the live MeshDescription (MeshDescription.IsVertexInstanceValid).
-	 * The corner ORDER itself is not a runtime check here -- it is a structural invariant: both
-	 * composition (UpdateWorkingColorsSourceTopology) and the write (WriteSourceTopologyAcceptTargets)
-	 * iterate the EXACT SAME Mesh.TriangleIndicesItr() + corner 0..2 sequence, so corner i of a given
-	 * TriangleID always means the same thing in both places by construction, not by a value that could
-	 * silently drift between them.
-	 */
-	static bool ValidateSourceTopologyCorrespondence(
-		const UE::Geometry::FDynamicMesh3& Mesh,
-		const TArray<FTriangleID>& TriIDMap,
-		const FMeshDescription& MeshDescription,
-		const FString& AssetName,
-		FText& OutErrorText)
-	{
-		TSet<int32> SeenDestinationTriangles;
-		SeenDestinationTriangles.Reserve(Mesh.TriangleCount());
-
-		for (const int32 TriangleID : Mesh.TriangleIndicesItr())
-		{
-			if (!TriIDMap.IsValidIndex(TriangleID))
-			{
-				OutErrorText = FText::Format(
-					LOCTEXT("AcceptSourceTopologyMissingTriIDMapEntryFormat",
-						"'{0}': the triangle/corner correspondence is missing an entry for one or more triangles. Try Refresh Selection again."),
-					FText::FromString(AssetName));
-				return false;
-			}
-
-			const FTriangleID SourceTriangleID = TriIDMap[TriangleID];
-			if (!MeshDescription.IsTriangleValid(SourceTriangleID))
-			{
-				OutErrorText = FText::Format(
-					LOCTEXT("AcceptSourceTopologyStaleTriangleFormat",
-						"'{0}': the correspondence points to a triangle that no longer exists in the Static Mesh's source data (it may have been rebuilt or reimported since the Preview was generated). Try Refresh Selection again."),
-					FText::FromString(AssetName));
-				return false;
-			}
-
-			bool bAlreadySeen = false;
-			SeenDestinationTriangles.Add(SourceTriangleID.GetValue(), &bAlreadySeen);
-			if (bAlreadySeen)
-			{
-				OutErrorText = FText::Format(
-					LOCTEXT("AcceptSourceTopologyDuplicateTriangleFormat",
-						"'{0}': two different triangles map to the same source triangle -- refusing to write an ambiguous correspondence. Try Refresh Selection again."),
-					FText::FromString(AssetName));
-				return false;
-			}
-
-			const TArrayView<const FVertexInstanceID> SourceInstances = MeshDescription.GetTriangleVertexInstances(SourceTriangleID);
-			if (SourceInstances.Num() != 3)
-			{
-				OutErrorText = FText::Format(
-					LOCTEXT("AcceptSourceTopologyBadInstanceCountFormat",
-						"'{0}': a destination triangle does not have exactly three Vertex Instances. Try Refresh Selection again."),
-					FText::FromString(AssetName));
-				return false;
-			}
-			for (const FVertexInstanceID InstanceID : SourceInstances)
-			{
-				if (!MeshDescription.IsVertexInstanceValid(InstanceID))
-				{
-					OutErrorText = FText::Format(
-						LOCTEXT("AcceptSourceTopologyInvalidInstanceFormat",
-							"'{0}': the correspondence points to a Vertex Instance that no longer exists. Try Refresh Selection again."),
-						FText::FromString(AssetName));
-					return false;
-				}
-			}
-		}
-
-		return true;
-	}
-
-	/**
-	 * Sibling of BuildAcceptTargets for Source-Topology entries. Only ever produces targets for
-	 * entries with bUseSourceTopology == true; BuildAcceptTargets skips those entries entirely (see
-	 * its own doc comment), so the two functions' outputs never overlap for the same asset.
-	 */
-	static bool BuildSourceTopologyAcceptTargets(
-		const TArray<TSharedPtr<FVertexMaskForgeSelectedMesh>>& SelectedMeshes,
-		const bool bDirectionalNormalMaskEnabled,
-		const EVertexMaskForgeNormalSpace DirectionalNormalSpace,
-		TArray<FVertexMaskForgeSourceTopologyAcceptTarget>& OutTargets,
-		FText& OutErrorText)
-	{
-		OutTargets.Reset();
-
-		for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
-		{
-			if (!Entry.IsValid() || !Entry->bUseSourceTopology || Entry->PreviewComponents.IsEmpty()
-				|| (Entry->WorkingMesh.BoundingBoxMask.State != EVertexMaskForgeScalarMaskState::Ready
-					&& Entry->WorkingMesh.AmbientOcclusionMask.State != EVertexMaskForgeScalarMaskState::Ready
-					&& Entry->WorkingMesh.CurvatureMask.State != EVertexMaskForgeScalarMaskState::Ready
-					&& Entry->WorkingMesh.NoiseMask.State != EVertexMaskForgeScalarMaskState::Ready
-					&& Entry->WorkingMesh.MaterialSlotMask.State != EVertexMaskForgeScalarMaskState::Ready
-					&& Entry->WorkingMesh.DirectionalNormalMask.State != EVertexMaskForgeScalarMaskState::Ready
-					&& Entry->WorkingMesh.ThicknessMask.State != EVertexMaskForgeScalarMaskState::Ready))
-			{
-				continue;
-			}
-
-			// AUDITED (V2-E CORRECTIVE PASS, transform freshness): same LIVE re-check as
-			// BuildAcceptTargets' own -- see its doc comment. Never trusts the cached
-			// bDirectionalNormalWorldSpaceConflict flag alone.
-			if (bDirectionalNormalMaskEnabled && DirectionalNormalSpace == EVertexMaskForgeNormalSpace::World)
-			{
-				float LiveDeviation = 0.0f;
-				if (VertexMaskForgePanel::HasConflictingWorldSpaceNormalTransforms(Entry->PreviewComponents, LiveDeviation))
-				{
-					OutErrorText = FText::Format(
-						LOCTEXT("AcceptSourceTopologyDirectionalNormalWorldSpaceConflictFormat",
-							"'{0}': World Space Directional Normal Mask cannot write conflicting results from differently transformed instances of the same Static Mesh asset."),
-						FText::FromString(Entry->AssetName));
-					return false;
-				}
-			}
-
-			UStaticMesh* Mesh = Entry->Mesh.LoadSynchronous();
-			if (!IsValid(Mesh) || !Entry->WorkingMesh.Mesh.IsValid())
-			{
-				OutErrorText = FText::Format(
-					LOCTEXT("AcceptSourceTopologyInvalidMeshFormat", "'{0}': Static Mesh or its working topology could not be resolved."),
-					FText::FromString(Entry->AssetName));
-				return false;
-			}
-
-			// Compose independently per component and require agreement -- same divergent-baseline
-			// rule as BuildAcceptTargets' own doc comment (no per-instance override in this domain, but
-			// World Space Bounding Box axes and Ambient Occlusion are both still per-instance-transform-
-			// dependent, so two components CAN legitimately disagree).
-			TArray<FColor> ReferenceColors;
-			bool bHaveReference = false;
-			for (const FVertexMaskForgePreviewComponentState& State : Entry->PreviewComponents)
-			{
-				const UStaticMeshComponent* SourceComponent = State.SourceComponent.Get();
-				if (!IsValid(SourceComponent))
-				{
-					continue;
-				}
-				if (State.SourceTopologyWorkingColors.IsEmpty())
-				{
-					continue;
-				}
-				TArray<FColor> ComponentColors = State.SourceTopologyWorkingColors;
-
-				if (!bHaveReference)
-				{
-					ReferenceColors = MoveTemp(ComponentColors);
-					bHaveReference = true;
-				}
-				else if (ComponentColors != ReferenceColors)
-				{
-					OutErrorText = FText::Format(
-						LOCTEXT("AcceptSourceTopologyDivergentBaselineFormat",
-							"'{0}': different instances of this asset produced different Preview results (World Space Bounding Box and/or Ambient Occlusion depend on each instance's own transform), so writing to the shared Static Mesh asset would be ambiguous. Accept is blocked for this operation; make the instances' transforms/results consistent, or Cancel."),
-						FText::FromString(Entry->AssetName));
-					return false;
-				}
-			}
-
-			if (!bHaveReference)
-			{
-				continue;
-			}
-
-			// Correspondence check: FinalColors must match the CURRENT corner count exactly -- never
-			// approximate -- and the full TriIDMap -> FTriangleID -> VertexInstanceID chain must be
-			// formally valid against the LIVE MeshDescription (see ValidateSourceTopologyCorrespondence
-			// for the complete list of what this proves).
-			const int32 NumCorners = Entry->WorkingMesh.Mesh->TriangleCount() * 3;
-			const FMeshDescription* LiveMeshDescription = Mesh->GetMeshDescription(0);
-			if (!LiveMeshDescription || ReferenceColors.Num() != NumCorners)
-			{
-				OutErrorText = FText::Format(
-					LOCTEXT("AcceptSourceTopologyCorrespondenceFormat",
-						"'{0}': the triangle/corner correspondence needed to write vertex colors is unavailable or stale. Try Refresh Selection again."),
-					FText::FromString(Entry->AssetName));
-				return false;
-			}
-			if (!ValidateSourceTopologyCorrespondence(
-				*Entry->WorkingMesh.Mesh, Entry->WorkingMesh.TriIDMap, *LiveMeshDescription, Entry->AssetName, OutErrorText))
-			{
-				return false;
-			}
-
-			FVertexMaskForgeSourceTopologyAcceptTarget Target;
-			Target.Mesh = Mesh;
-			Target.AssetName = Entry->AssetName;
-			Target.FinalColors = MoveTemp(ReferenceColors);
-			Target.Entry = Entry;
-			OutTargets.Add(MoveTemp(Target));
-		}
-
-		return true;
-	}
-
-	/**
 	 * Sibling of WriteAcceptTargets for Source-Topology entries. Writes ONLY VertexInstanceColors on
 	 * the SOURCE MeshDescription (Mesh->GetMeshDescription(0)) -- never positions, topology, normals,
 	 * UVs, polygon groups, or any other attribute -- via the TriangleID+corner correspondence
@@ -7349,11 +6873,11 @@ namespace VertexMaskForgePanel
 	 * transaction closes) and for the ModifyMeshDescription() root-cause explanation, which applies
 	 * identically here.
 	 */
-	static bool WriteSourceTopologyAcceptTargets(const TArray<FVertexMaskForgeSourceTopologyAcceptTarget>& Targets, TArray<UStaticMesh*>& OutModifiedMeshes, FText& OutErrorText)
+	static bool WriteSourceTopologyAcceptTargets(const TArray<VertexMaskForgeAcceptTargetBuilder::FSourceTopologyAcceptTarget>& Targets, TArray<UStaticMesh*>& OutModifiedMeshes, FText& OutErrorText)
 	{
 		using namespace UE::Geometry;
 
-		for (const FVertexMaskForgeSourceTopologyAcceptTarget& Target : Targets)
+		for (const VertexMaskForgeAcceptTargetBuilder::FSourceTopologyAcceptTarget& Target : Targets)
 		{
 			UStaticMesh* Mesh = Target.Mesh.Get();
 			const bool bEntryValid = Target.Entry.IsValid() && Target.Entry->WorkingMesh.Mesh.IsValid()
@@ -7372,7 +6896,7 @@ namespace VertexMaskForgePanel
 			// BuildSourceTopologyAcceptTargets' own preflight -- nothing else can have touched these
 			// assets between preflight and here (synchronous, same call), but re-proving it immediately
 			// before the first Modify() matches WriteAcceptTargets' own re-validation discipline exactly.
-			if (!ValidateSourceTopologyCorrespondence(
+			if (!VertexMaskForgeAcceptTargetBuilder::ValidateSourceTopologyCorrespondence(
 				*Target.Entry->WorkingMesh.Mesh, Target.Entry->WorkingMesh.TriIDMap, *MeshDescription, Target.AssetName, OutErrorText))
 			{
 				return false;
@@ -7394,7 +6918,7 @@ namespace VertexMaskForgePanel
 			}
 		}
 
-		for (const FVertexMaskForgeSourceTopologyAcceptTarget& Target : Targets)
+		for (const VertexMaskForgeAcceptTargetBuilder::FSourceTopologyAcceptTarget& Target : Targets)
 		{
 			UStaticMesh* Mesh = Target.Mesh.Get();
 			FMeshDescription* MeshDescription = Mesh->GetMeshDescription(0);
@@ -7997,11 +7521,12 @@ namespace VertexMaskForgePanel
 	 * hide, not per-component; see ActivatePreviewForComponent's own doc comment -- this plugin has no
 	 * transient-safe component-level visibility flag available in UE 5.8, so this is not a regression
 	 * specific to Nanite, it is the same pre-existing, documented trade-off the render-vertex preview
-	 * already has). WorkingColors here is SourceTopologyWorkingColors (corner domain), never
-	 * DeriveDisplayColors-reduced -- Preview Mode display reduction (Red/Green/Blue/Alpha Channel) is
-	 * intentionally NOT implemented for the Source-Topology preview in this checkpoint (RGB Vertex
-	 * Color only); the underlying WorkingColors data Accept reads is unaffected either way, matching the
-	 * render-vertex path's own "Preview Mode never affects Accept" guarantee.
+	 * already has). WorkingColors here is the CALLER's own DeriveDisplayColors-reduced copy of
+	 * SourceTopologyWorkingColors (see ApplyPreviewToEntry's own call site) -- Preview Mode display
+	 * reduction (Red/Green/Blue/Alpha Channel) IS implemented for the Source-Topology preview, exactly
+	 * mirroring the render-vertex path; the underlying SourceTopologyWorkingColors data Accept reads is
+	 * unaffected either way, matching the render-vertex path's own "Preview Mode never affects Accept"
+	 * guarantee.
 	 *
 	 * AUDITED (Original Textures fix): bUseOriginalMaterials forwarded verbatim to
 	 * ApplySourceTopologyColorsToPreviewComponent -- see that function's own doc comment. This is the
@@ -9562,9 +9087,9 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 	NoiseTypeOptions.Add(MakeShared<EVertexMaskForgeNoiseType>(EVertexMaskForgeNoiseType::Voronoi));
 	NoiseTypeOptions.Add(MakeShared<EVertexMaskForgeNoiseType>(EVertexMaskForgeNoiseType::Alligator));
 
-	// Z starts enabled to reproduce the exact previously-validated Local-Z-only default; X and Y
-	// start disabled (see BoundingBoxAxisParams' doc comment in the header).
-	BoundingBoxAxisParams[static_cast<int32>(EVertexMaskForgeBoundsAxis::Z)].bEnabled = true;
+	// AUDITED (pre-modularization UI/defaults pass): every axis (X/Y/Z) starts disabled -- see
+	// FVertexMaskForgeAxisMaskParams' own default member initializers in the header (bEnabled = false).
+	// No axis is force-enabled here anymore; a fresh session never generates a mask automatically.
 
 	// AUDITED (vertical scroll checkpoint): SBorder's single child previously received the full
 	// available area from ChildSlot and simply handed it straight to the root SVerticalBox -- with
@@ -9623,40 +9148,6 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 				SNew(SSeparator)
 			]
 
-			// AUDITED (UX1, explicit Edit Vertex Mask session entry): the sole entry point into an
-			// editing session -- placed next to the selection/target status line, before every control
-			// that modifies a mask, so it visually belongs to session lifecycle rather than to any one
-			// generator. Disabled while already editing (CanEditVertexMask) so a repeated click can
-			// never start a second, overlapping session.
-			+ SVerticalBox::Slot()
-			.AutoHeight()
-			.Padding(FMargin(0.f, 0.f, 0.f, 4.f))
-			[
-				SNew(SHorizontalBox)
-
-				+ SHorizontalBox::Slot()
-				.AutoWidth()
-				.VAlign(VAlign_Center)
-				.Padding(FMargin(0.f, 0.f, 8.f, 0.f))
-				[
-					SNew(SButton)
-					.Text(LOCTEXT("EditVertexMask", "Edit Vertex Mask"))
-					.ToolTipText(LOCTEXT("EditVertexMaskTooltip", "Start a vertex mask editing session for the current selection."))
-					.OnClicked(this, &SVertexMaskForgePanel::OnEditVertexMaskClicked)
-					.IsEnabled(this, &SVertexMaskForgePanel::CanEditVertexMask)
-				]
-
-				+ SHorizontalBox::Slot()
-				.FillWidth(1.f)
-				.VAlign(VAlign_Center)
-				[
-					SNew(STextBlock)
-					.Text(this, &SVertexMaskForgePanel::GetEditSessionStatusText)
-					.ColorAndOpacity(FSlateColor::UseSubduedForeground())
-					.AutoWrapText(true)
-				]
-			]
-
 			// AUDITED (UI reorganization checkpoint): "Active layers" moved here from inside the
 			// Ambient Occlusion Mask panel -- it reports the GLOBAL composition stack (Bounding Box
 			// and/or Ambient Occlusion, whichever are currently active), not something owned by AO
@@ -9677,12 +9168,12 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 			.AutoHeight()
 			[
 				SNew(SExpandableArea)
-				.InitiallyCollapsed(false)
+				.InitiallyCollapsed(true)
 				.Padding(FMargin(8.f))
 				.HeaderContent()
 				[
 					SNew(STextBlock)
-					.Text(LOCTEXT("BBoxMaskSectionTitle", "Bounding Box Mask"))
+					.Text(LOCTEXT("BBoxMaskSectionTitle", "Bounding Box"))
 					.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
 				]
 				.BodyContent()
@@ -9828,7 +9319,7 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 			// immediately BELOW the Bounding Box Mask panel above.
 			//
 			// AUDITED (UI reorganization checkpoint): now a collapsible SExpandableArea, matching
-			// Bounding Box exactly -- same header style/pattern, same InitiallyCollapsed(false) default.
+			// Bounding Box exactly -- same header style/pattern, same InitiallyCollapsed(true) default.
 			// The header shows ONLY the title (matching Bounding Box's header exactly); Enable moved
 			// into the body's first row (it is a mask PARAMETER, not always-visible chrome -- collapsing
 			// the area must never look like it disabled the layer, and it doesn't: bAOEnabled is
@@ -9839,12 +9330,12 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 			.Padding(FMargin(0.f, 12.f, 0.f, 0.f))
 			[
 				SNew(SExpandableArea)
-				.InitiallyCollapsed(false)
+				.InitiallyCollapsed(true)
 				.Padding(FMargin(8.f))
 				.HeaderContent()
 				[
 					SNew(STextBlock)
-					.Text(LOCTEXT("AOSectionTitle", "Ambient Occlusion Mask"))
+					.Text(LOCTEXT("AOSectionTitle", "Ambient Occlusion"))
 					.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
 				]
 				.BodyContent()
@@ -10139,12 +9630,12 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 			.Padding(FMargin(0.f, 12.f, 0.f, 0.f))
 			[
 				SNew(SExpandableArea)
-				.InitiallyCollapsed(false)
+				.InitiallyCollapsed(true)
 				.Padding(FMargin(8.f))
 				.HeaderContent()
 				[
 					SNew(STextBlock)
-					.Text(LOCTEXT("CurvatureSectionTitle", "Curvature Mask"))
+					.Text(LOCTEXT("CurvatureSectionTitle", "Curvature"))
 					.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
 				]
 				.BodyContent()
@@ -10269,7 +9760,7 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 						[
 							SAssignNew(CurvatureTypeComboBox, SComboBox<TSharedPtr<EVertexMaskForgeCurvatureType>>)
 							.OptionsSource(&CurvatureTypeOptions)
-							.InitiallySelectedItem(CurvatureTypeOptions[2])
+							.InitiallySelectedItem(CurvatureTypeOptions[1])
 							.OnGenerateWidget(this, &SVertexMaskForgePanel::OnGenerateCurvatureTypeRow)
 							.OnSelectionChanged(this, &SVertexMaskForgePanel::OnCurvatureTypeSelectionChanged)
 							.ToolTipText(LOCTEXT("CurvatureTypeTooltip",
@@ -10470,12 +9961,12 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 			.Padding(FMargin(0.f, 12.f, 0.f, 0.f))
 			[
 				SNew(SExpandableArea)
-				.InitiallyCollapsed(false)
+				.InitiallyCollapsed(true)
 				.Padding(FMargin(8.f))
 				.HeaderContent()
 				[
 					SNew(STextBlock)
-					.Text(LOCTEXT("DirectionalNormalMaskSectionTitle", "Directional Normal Mask"))
+					.Text(LOCTEXT("DirectionalNormalMaskSectionTitle", "Directional Normal"))
 					.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
 				]
 				.BodyContent()
@@ -10540,7 +10031,7 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 						.VAlign(VAlign_Center)
 						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
 						[
-							SNew(STextBlock).Text(LOCTEXT("DirectionalNormalMaskOpacityLabel", "Blend:"))
+							SNew(STextBlock).Text(LOCTEXT("DirectionalNormalMaskOpacityLabel", "Opacity:"))
 						]
 
 						+ SHorizontalBox::Slot()
@@ -10839,12 +10330,12 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 			.Padding(FMargin(0.f, 12.f, 0.f, 0.f))
 			[
 				SNew(SExpandableArea)
-				.InitiallyCollapsed(false)
+				.InitiallyCollapsed(true)
 				.Padding(FMargin(8.f))
 				.HeaderContent()
 				[
 					SNew(STextBlock)
-					.Text(LOCTEXT("ThicknessMaskSectionTitle", "Thickness Mask"))
+					.Text(LOCTEXT("ThicknessMaskSectionTitle", "Thickness"))
 					.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
 				]
 				.BodyContent()
@@ -10907,7 +10398,7 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 						.VAlign(VAlign_Center)
 						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
 						[
-							SNew(STextBlock).Text(LOCTEXT("ThicknessMaskOpacityLabel", "Blend:"))
+							SNew(STextBlock).Text(LOCTEXT("ThicknessMaskOpacityLabel", "Opacity:"))
 						]
 
 						+ SHorizontalBox::Slot()
@@ -11235,12 +10726,12 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 			.Padding(FMargin(0.f, 12.f, 0.f, 0.f))
 			[
 				SNew(SExpandableArea)
-				.InitiallyCollapsed(false)
+				.InitiallyCollapsed(true)
 				.Padding(FMargin(8.f))
 				.HeaderContent()
 				[
 					SNew(STextBlock)
-					.Text(LOCTEXT("NoiseSectionTitle", "Noise Mask"))
+					.Text(LOCTEXT("NoiseSectionTitle", "Noise"))
 					.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
 				]
 				.BodyContent()
@@ -11840,12 +11331,12 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 			.Padding(FMargin(0.f, 12.f, 0.f, 0.f))
 			[
 				SNew(SExpandableArea)
-				.InitiallyCollapsed(false)
+				.InitiallyCollapsed(true)
 				.Padding(FMargin(8.f))
 				.HeaderContent()
 				[
 					SNew(STextBlock)
-					.Text(LOCTEXT("MaterialSlotMaskSectionTitle", "Material Slot Mask"))
+					.Text(LOCTEXT("MaterialSlotMaskSectionTitle", "Material Slot"))
 					.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
 				]
 				.BodyContent()
@@ -11909,7 +11400,7 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 						.VAlign(VAlign_Center)
 						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
 						[
-							SNew(STextBlock).Text(LOCTEXT("MaterialSlotMaskOpacityLabel", "Blend:"))
+							SNew(STextBlock).Text(LOCTEXT("MaterialSlotMaskOpacityLabel", "Opacity:"))
 						]
 
 						+ SHorizontalBox::Slot()
@@ -12008,6 +11499,41 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 						.ColorAndOpacity(FSlateColor::UseSubduedForeground())
 						.AutoWrapText(true)
 					]
+				]
+			]
+
+			// AUDITED (pre-modularization UI/defaults pass): moved here, immediately below the Material
+			// Slot section and directly above Preview Mode -- the sole entry point into an editing
+			// session now sits next to session-level controls (Preview Mode/Fill) rather than above every
+			// generator panel. Disabled while already editing (CanEditVertexMask) so a repeated click can
+			// never start a second, overlapping session. Same widget/callback/tooltip/enablement as
+			// before -- moved, not recreated.
+			+ SVerticalBox::Slot()
+			.AutoHeight()
+			.Padding(FMargin(0.f, 12.f, 0.f, 4.f))
+			[
+				SNew(SHorizontalBox)
+
+				+ SHorizontalBox::Slot()
+				.AutoWidth()
+				.VAlign(VAlign_Center)
+				.Padding(FMargin(0.f, 0.f, 8.f, 0.f))
+				[
+					SNew(SButton)
+					.Text(LOCTEXT("EditVertexMask", "Edit Vertex Mask"))
+					.ToolTipText(LOCTEXT("EditVertexMaskTooltip", "Start a vertex mask editing session for the current selection."))
+					.OnClicked(this, &SVertexMaskForgePanel::OnEditVertexMaskClicked)
+					.IsEnabled(this, &SVertexMaskForgePanel::CanEditVertexMask)
+				]
+
+				+ SHorizontalBox::Slot()
+				.FillWidth(1.f)
+				.VAlign(VAlign_Center)
+				[
+					SNew(STextBlock)
+					.Text(this, &SVertexMaskForgePanel::GetEditSessionStatusText)
+					.ColorAndOpacity(FSlateColor::UseSubduedForeground())
+					.AutoWrapText(true)
 				]
 			]
 
@@ -13581,17 +13107,17 @@ bool SVertexMaskForgePanel::AcceptPendingChanges()
 	// targets for the same asset (an entry is exclusively one domain or the other -- see
 	// FVertexMaskForgeSelectedMesh::bUseSourceTopology), so there is no cross-domain collision to
 	// reconcile, only a combined "nothing eligible at all" / "confirm N assets total" presentation.
-	TArray<VertexMaskForgePanel::FVertexMaskForgeAcceptTarget> Targets;
-	TArray<VertexMaskForgePanel::FVertexMaskForgeSourceTopologyAcceptTarget> SourceTopologyTargets;
+	TArray<VertexMaskForgeAcceptTargetBuilder::FAcceptTarget> Targets;
+	TArray<VertexMaskForgeAcceptTargetBuilder::FSourceTopologyAcceptTarget> SourceTopologyTargets;
 	FText ErrorText;
-	if (!VertexMaskForgePanel::BuildAcceptTargets(SelectedMeshes, bDirectionalNormalMaskEnabled, DirectionalNormalSpace, Targets, ErrorText))
+	if (!VertexMaskForgeAcceptTargetBuilder::BuildAcceptTargets(SelectedMeshes, bDirectionalNormalMaskEnabled, DirectionalNormalSpace, Targets, ErrorText))
 	{
 		OperationState = EVertexMaskForgeOperationState::Failed;
 		LastOperationErrorText = ErrorText;
 		UE_LOG(LogVertexMaskForge, Warning, TEXT("Vertex Mask Forge: Accept blocked: %s"), *ErrorText.ToString());
 		return false;
 	}
-	if (!VertexMaskForgePanel::BuildSourceTopologyAcceptTargets(SelectedMeshes, bDirectionalNormalMaskEnabled, DirectionalNormalSpace, SourceTopologyTargets, ErrorText))
+	if (!VertexMaskForgeAcceptTargetBuilder::BuildSourceTopologyAcceptTargets(SelectedMeshes, bDirectionalNormalMaskEnabled, DirectionalNormalSpace, SourceTopologyTargets, ErrorText))
 	{
 		OperationState = EVertexMaskForgeOperationState::Failed;
 		LastOperationErrorText = ErrorText;
@@ -13614,11 +13140,11 @@ bool SVertexMaskForgePanel::AcceptPendingChanges()
 	// operation.
 	TArray<FString> AssetNames;
 	AssetNames.Reserve(Targets.Num() + SourceTopologyTargets.Num());
-	for (const VertexMaskForgePanel::FVertexMaskForgeAcceptTarget& Target : Targets)
+	for (const VertexMaskForgeAcceptTargetBuilder::FAcceptTarget& Target : Targets)
 	{
 		AssetNames.Add(Target.AssetName);
 	}
-	for (const VertexMaskForgePanel::FVertexMaskForgeSourceTopologyAcceptTarget& Target : SourceTopologyTargets)
+	for (const VertexMaskForgeAcceptTargetBuilder::FSourceTopologyAcceptTarget& Target : SourceTopologyTargets)
 	{
 		AssetNames.Add(FText::Format(LOCTEXT("AcceptConfirmNaniteSuffixFormat", "{0} (Nanite)"), FText::FromString(Target.AssetName)).ToString());
 	}
@@ -13819,14 +13345,24 @@ void SVertexMaskForgePanel::ApplyPreviewToEntry(
 	// contract as Curvature/Noise/Material Slot (never like Directional Normal World Space/AO).
 	const bool bThicknessMaskEntryReady = bThicknessMaskEnabled && WorkingMesh.ThicknessMask.State == EVertexMaskForgeScalarMaskState::Ready;
 	if (WorkingMesh.State != EVertexMaskForgeWorkingMeshState::Ready
-		|| !WorkingMesh.Mesh.IsValid()
-		|| (!bBBoxEntryReady && !bAOEntryReady && !bCurvatureEntryReady && !bNoiseEntryReady && !bMaterialSlotMaskEntryReady && !bDirectionalNormalMaskEntryReady && !bThicknessMaskEntryReady))
+		|| !WorkingMesh.Mesh.IsValid())
 	{
-		// Nothing safe to preview yet (both slots NotGenerated/Unavailable/DegenerateBounds/Invalid):
-		// show the original colors/materials rather than a stale or fabricated result. AUDITED
-		// (raw/composition separation checkpoint): visual-only -- this is not necessarily a geometric
-		// invalidation (e.g. AO alone was just disabled and BBox was never enabled), so AOCache must
-		// not be destroyed speculatively.
+		// Nothing safe to preview yet (working mesh itself invalid/not ready): show the original
+		// colors/materials rather than a stale or fabricated result. AUDITED (raw/composition
+		// separation checkpoint): visual-only -- not necessarily a geometric invalidation, so AOCache
+		// must not be destroyed speculatively.
+		//
+		// AUDITED (preview-stuck-on-Original-Material fix): "zero masks currently enabled/Ready" is
+		// deliberately NOT part of this gate -- an empty Layers set is a valid, fully-supported input
+		// to UpdateWorkingColors/UpdateWorkingColorsSourceTopology (see ComposeStack's own
+		// bOutAnyLayerContributed=false/CommittedColor-passthrough branch): it simply yields the
+		// current Baseline/Committed working colors, exactly what RGB/Channel Preview Modes must show
+		// when no mask is active. Bailing out here unconditionally on "no mask ready" used to skip the
+		// entire per-component composition + material-selection path below for EVERY Preview Mode,
+		// leaving the viewport visually stuck on the real component's original materials regardless of
+		// CurrentPreviewMode. The per-component loop below now only falls back to the real component's
+		// appearance on a genuine per-component evaluation failure (bAnyLayerFailed) -- an empty Layers
+		// set alone proceeds through composition/material-selection like any other case.
 		RestorePreviewForEntryVisualOnly(*Entry);
 		return;
 	}
@@ -14024,7 +13560,13 @@ void SVertexMaskForgePanel::ApplyPreviewToEntry(
 				}
 			}
 
-			if (bAnyLayerFailed || Layers.IsEmpty())
+			// AUDITED (preview-stuck-on-Original-Material fix): Layers.IsEmpty() alone is no longer
+			// part of this fallback -- see ApplyPreviewToEntry's entry-level gate doc comment above for
+			// why an empty Layers set (no mask currently enabled) is a valid, fully-supported input to
+			// UpdateWorkingColorsSourceTopology (it simply yields the current Baseline/Committed working
+			// colors). Only a genuine per-component evaluation failure still falls back to the real
+			// component's appearance here.
+			if (bAnyLayerFailed)
 			{
 				VertexMaskForgePanel::RestorePreviewVisualOnly(State, ActorHideStates);
 				continue;
@@ -14045,8 +13587,21 @@ void SVertexMaskForgePanel::ApplyPreviewToEntry(
 				TEXT("Vertex Mask Forge: composed %d/%d corner(s) for '%s' on component '%s' (Source Topology)."),
 				NumComposed, WorkingMesh.Mesh->TriangleCount() * 3, *Entry->AssetName, *SourceComponent->GetName());
 
+			// AUDITED (Preview Mode channel-isolation fix, Source Topology): reduces the raw composited
+			// corner-domain colors through the current Preview Mode -- see DeriveDisplayColors' own doc
+			// comment -- exactly mirroring the render-vertex path's RenderOrderColors below. Previously
+			// this call passed State.SourceTopologyWorkingColors directly (unreduced), so every non-
+			// Original-Material Preview Mode (RGB, Red, Green, Blue, Alpha Channel) rendered the SAME raw
+			// RGB for a Nanite/Source-Topology mesh -- isolated channel modes were indistinguishable from
+			// RGB Vertex Color. DISPLAY-ONLY: never mutates SourceTopologyWorkingColors, and Accept
+			// (BuildSourceTopologyAcceptTargets/WriteSourceTopologyAcceptTargets) reads
+			// SourceTopologyWorkingColors verbatim, never this reduced copy -- same "Preview Mode never
+			// affects Accept" guarantee the render-vertex path already has.
+			const TArray<FColor> SourceTopologyRenderOrderColors =
+				VertexMaskForgeDisplayColorDerivation::DeriveDisplayColors(State.SourceTopologyWorkingColors, CurrentPreviewMode);
+
 			VertexMaskForgePanel::ActivateSourceTopologyPreviewForComponent(
-				State, *WorkingMesh.Mesh, State.SourceTopologyWorkingColors, DebugMaterial, bUseOriginalMaterials, ActorHideStates);
+				State, *WorkingMesh.Mesh, SourceTopologyRenderOrderColors, DebugMaterial, bUseOriginalMaterials, ActorHideStates);
 			continue;
 		}
 
@@ -14201,13 +13756,15 @@ void SVertexMaskForgePanel::ApplyPreviewToEntry(
 			{
 				Layers.Add({ &WorkingMesh.ThicknessMask, ThicknessMaskBlendMode, ThicknessMaskOpacity });
 			}
-		if (bAnyLayerFailed || Layers.IsEmpty())
+		// AUDITED (preview-stuck-on-Original-Material fix): Layers.IsEmpty() alone is no longer part
+		// of this fallback -- see ApplyPreviewToEntry's entry-level gate doc comment above for why an
+		// empty Layers set (no mask currently enabled) is a valid, fully-supported input to
+		// UpdateWorkingColors (it simply yields the current Baseline/Committed working colors). Only a
+		// genuine per-component evaluation failure still falls back to the real component's appearance
+		// here; BaselineColors/CommittedColors/WorkingColors/AOCache survive this fallback untouched
+		// either way (see RestorePreviewVisualOnly's own doc comment).
+		if (bAnyLayerFailed)
 		{
-			// AUDITED (raw/composition separation checkpoint, AOCache lifetime fix): visual-only --
-			// see RestorePreviewVisualOnly's own doc comment. Neither "a per-component layer
-			// re-evaluation genuinely failed" nor "no layer is currently enabled" is a session end or
-			// a real geometric invalidation, so BaselineColors/CommittedColors/WorkingColors/AOCache
-			// must survive this fallback untouched.
 			VertexMaskForgePanel::RestorePreviewVisualOnly(State, ActorHideStates);
 			continue;
 		}

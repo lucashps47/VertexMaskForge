@@ -1088,6 +1088,21 @@ struct FVertexMaskForgePreviewComponentState
 	TArray<FColor> SourceTopologyWorkingColors;
 };
 
+namespace VertexMaskForgePanel
+{
+	/**
+	 * AUDITED (V2-E CORRECTIVE PASS): compares EVERY live component's own World-Space normal MATRIX
+	 * against a single reference matrix (the first valid one found) using full-matrix proportionality.
+	 * Consumed both by the live UI conflict diagnostic (RunAutoUpdatePreview) and by the Accept target
+	 * builders (VertexMaskForgeAcceptTargetBuilder::BuildAcceptTargets/BuildSourceTopologyAcceptTargets)
+	 * as a re-check immediately before Accept is allowed to proceed -- see the definition in
+	 * SVertexMaskForgePanel.cpp for the full algorithm doc comment.
+	 */
+	bool HasConflictingWorldSpaceNormalTransforms(
+		const TArray<FVertexMaskForgePreviewComponentState>& PreviewComponents,
+		float& OutMaxRelativeDeviation);
+}
+
 /**
  * One unique Static Mesh found in the current selection.
  * Kept small and self-contained for this checkpoint; safe to relocate to a
@@ -1383,9 +1398,9 @@ private:
 	/** Panel-level parameters for each of the 3 axes, indexed by EVertexMaskForgeBoundsAxis. Shared
 	 *  across every selected entry; per-instance World Space evaluation reads a component's own
 	 *  transform separately (see GenerateBoundingBoxMask) -- these parameters themselves never vary
-	 *  per entry or per component. Z starts bEnabled == true (matching the previously-validated
-	 *  single-axis default); X and Y start disabled, so a fresh panel reproduces the exact prior
-	 *  Local-Z-only behavior until the user explicitly enables another axis. */
+	 *  per entry or per component. AUDITED (pre-modularization UI/defaults pass): every axis starts
+	 *  disabled (bEnabled == false, the struct's own default) -- a fresh panel generates nothing
+	 *  automatically until the user explicitly enables an axis. */
 	TStaticArray<FVertexMaskForgeAxisMaskParams, 3> BoundingBoxAxisParams;
 
 	// --- Bounding Box Mask: Blend Mode + Opacity --------------------------------------------
@@ -1468,7 +1483,7 @@ private:
 
 	/** Clamped again in GenerateAmbientOcclusionMask itself; UI SpinBox already clamps to the same
 	 *  [8, 256] range. */
-	int32 AOSamples = 64;
+	int32 AOSamples = 16;
 
 	/** Unreal units (World Space); clamped again in GenerateAmbientOcclusionMask to (0, 10000]. */
 	float AOMaxDistance = 100.0f;
@@ -1514,7 +1529,7 @@ private:
 
 	/** Convex/Concave/Both -- see EVertexMaskForgeCurvatureType. Default Both (per explicit requirement):
 	 *  convex and concave regions both show, without cancelling each other out. */
-	EVertexMaskForgeCurvatureType CurvatureType = EVertexMaskForgeCurvatureType::Both;
+	EVertexMaskForgeCurvatureType CurvatureType = EVertexMaskForgeCurvatureType::Concave;
 
 	/** UI range [0, 10], default 1.0, clamped again in ApplyCurvatureArtisticParams to >= 0. Scales the
 	 *  Type-extracted magnitude BEFORE Blur/Levels -- 0 removes the layer's contribution entirely, 1 is
@@ -1844,7 +1859,7 @@ private:
 
 	/** UI default World (per the explicit suggested default) -- GENERATIVE, see
 	 *  OnDirectionalNormalMaskGenerativeParamChanged. */
-	EVertexMaskForgeNormalSpace DirectionalNormalSpace = EVertexMaskForgeNormalSpace::World;
+	EVertexMaskForgeNormalSpace DirectionalNormalSpace = EVertexMaskForgeNormalSpace::Local;
 
 	TSharedRef<SWidget> OnGenerateNormalDirectionRow(TSharedPtr<EVertexMaskForgeNormalDirection> InOption) const;
 	void OnNormalDirectionSelectionChanged(TSharedPtr<EVertexMaskForgeNormalDirection> NewSelection, ESelectInfo::Type SelectInfo);
