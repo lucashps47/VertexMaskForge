@@ -1,12 +1,12 @@
 #include "VertexMaskForgeAcceptWriter.h"
 
-#include "SVertexMaskForgePanel.h"
 #include "CoreGlobals.h"
 #include "DynamicMesh/DynamicMesh3.h"
 #include "Engine/StaticMesh.h"
 #include "MeshDescription.h"
 #include "StaticMeshAttributes.h"
 #include "StaticMeshResources.h"
+#include "VertexMaskForgeWorkingMeshTypes.h"
 
 #define LOCTEXT_NAMESPACE "SVertexMaskForgePanel"
 
@@ -38,7 +38,7 @@ namespace VertexMaskForgeAcceptWriter
 			// cheap proxy alone.
 			if (Target.Entry.IsValid() && Target.Entry->WorkingMesh.ThicknessMask.State == EVertexMaskForgeScalarMaskState::Ready
 				&& Target.Entry->WorkingMesh.ThicknessCache.IsValid()
-				&& !VertexMaskForgePanel::AreThicknessGeometrySnapshotsExactlyEquivalent(*Target.Entry->WorkingMesh.ThicknessCache, RenderData->LODResources[0]))
+				&& !VertexMaskForgeWorkingMeshTypes::AreThicknessGeometrySnapshotsExactlyEquivalent(*Target.Entry->WorkingMesh.ThicknessCache, RenderData->LODResources[0]))
 			{
 				OutErrorText = FText::Format(
 					LOCTEXT("AcceptThicknessFreshnessMismatchFormat", "'{0}': geometry or normals changed since Thickness Mask was generated; aborting Accept (nothing was modified). Regenerate the mask and try again."),
@@ -117,7 +117,7 @@ namespace VertexMaskForgeAcceptWriter
 			// slip through it silently. Only applies when this entry's result depends on Thickness.
 			if (Target.Entry->WorkingMesh.ThicknessMask.State == EVertexMaskForgeScalarMaskState::Ready
 				&& Target.Entry->WorkingMesh.SourceTopologyThicknessCache.IsValid()
-				&& !VertexMaskForgePanel::IsThicknessSourceTopologyContentUnchanged(
+				&& !VertexMaskForgeWorkingMeshTypes::IsThicknessSourceTopologyContentUnchanged(
 					*Target.Entry->WorkingMesh.Mesh, Target.Entry->WorkingMesh.TriIDMap, *MeshDescription))
 			{
 				OutErrorText = FText::Format(

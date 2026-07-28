@@ -1,10 +1,10 @@
 #include "VertexMaskForgeAcceptTargetBuilder.h"
 
-#include "SVertexMaskForgePanel.h"
 #include "DynamicMesh/DynamicMesh3.h"
 #include "Engine/StaticMesh.h"
 #include "MeshDescription.h"
 #include "StaticMeshResources.h"
+#include "VertexMaskForgeWorkingMeshTypes.h"
 
 #define LOCTEXT_NAMESPACE "SVertexMaskForgePanel"
 
@@ -121,7 +121,7 @@ namespace VertexMaskForgeAcceptTargetBuilder
 			if (bDirectionalNormalMaskEnabled && DirectionalNormalSpace == EVertexMaskForgeNormalSpace::World)
 			{
 				float LiveDeviation = 0.0f;
-				if (VertexMaskForgePanel::HasConflictingWorldSpaceNormalTransforms(Entry->PreviewComponents, LiveDeviation))
+				if (VertexMaskForgeWorkingMeshTypes::HasConflictingWorldSpaceNormalTransforms(Entry->PreviewComponents, LiveDeviation))
 				{
 					OutErrorText = FText::Format(
 						LOCTEXT("AcceptDirectionalNormalWorldSpaceConflictFormat",
@@ -287,7 +287,7 @@ namespace VertexMaskForgeAcceptTargetBuilder
 			if (bDirectionalNormalMaskEnabled && DirectionalNormalSpace == EVertexMaskForgeNormalSpace::World)
 			{
 				float LiveDeviation = 0.0f;
-				if (VertexMaskForgePanel::HasConflictingWorldSpaceNormalTransforms(Entry->PreviewComponents, LiveDeviation))
+				if (VertexMaskForgeWorkingMeshTypes::HasConflictingWorldSpaceNormalTransforms(Entry->PreviewComponents, LiveDeviation))
 				{
 					OutErrorText = FText::Format(
 						LOCTEXT("AcceptSourceTopologyDirectionalNormalWorldSpaceConflictFormat",
