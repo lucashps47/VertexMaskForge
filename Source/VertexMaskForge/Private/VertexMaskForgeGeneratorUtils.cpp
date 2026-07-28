@@ -247,4 +247,11 @@ namespace VertexMaskForgeGeneratorUtils
 		}
 		return Adjacency;
 	}
+
+	float ApplyCurvatureLevels(const float Value, const float LevelsMin, const float LevelsMax)
+	{
+		constexpr float Epsilon = 1e-4f;
+		const float Denom = FMath::Max(LevelsMax - LevelsMin, Epsilon);
+		return FMath::Clamp((Value - LevelsMin) / Denom, 0.0f, 1.0f);
+	}
 }

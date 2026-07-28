@@ -95,4 +95,16 @@ namespace VertexMaskForgeGeneratorUtils
 	 * ApplyTopologicalCurvatureBlur's own Vertex-ID-domain adjacency).
 	 */
 	TArray<TArray<int32>> BuildCornerAdjacency(const UE::Geometry::FDynamicMesh3& Mesh, const UE::Geometry::FDynamicMeshNormalOverlay* NormalOverlay, int32 NumCorners);
+
+	/**
+	 * AUDITED (Curvature layer): Levels Min/Max remap, same epsilon-safe-denominator/clamp contract as
+	 * ApplyAOLevelsAndInvert (see its own doc comment for the DIVIDE-BY-ZERO/NaN safety rationale --
+	 * LevelsMax <= LevelsMin degenerates to a deterministic hard step, never NaN/Inf) -- deliberately a
+	 * SEPARATE, smaller function rather than reusing ApplyAOLevelsAndInvert itself, since that function's
+	 * BaseAO = 1 - RawAO vanilla-inversion step and its trailing user Invert are AO-specific conventions
+	 * that do not apply to Curvature (Curvature has no Invert control at all, per the explicit
+	 * requirement) -- reusing it here would either silently invert Curvature or require threading a
+	 * meaningless bInvert=false through every call site. AO's own Levels behavior is untouched.
+	 */
+	float ApplyCurvatureLevels(float Value, float LevelsMin, float LevelsMax);
 }
