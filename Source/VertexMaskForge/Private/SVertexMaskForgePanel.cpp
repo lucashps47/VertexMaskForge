@@ -38,6 +38,7 @@
 #include "VertexMaskForgeDisplayColorDerivation.h"
 #include "VertexMaskForgeGeneratorUtils.h"
 #include "VertexMaskForgeMaskStackComposer.h"
+#include "VertexMaskForgeMaterialSlotGenerator.h"
 #include "VertexMaskForgeNoiseGenerator.h"
 #include "VertexMaskForgeThicknessGenerator.h"
 #include "SPrimaryButton.h"
@@ -2401,122 +2402,6 @@ namespace VertexMaskForgePanel
 		default:
 			return FText::GetEmpty();
 		}
-	}
-
-	/**
-	 * AUDITED (V2-D): the binary raw mask, render-vertex domain -- RawMask[i] = 1.0 iff
-	 * WorkingMesh.RenderVertexToMaterialSlot[i] == SelectedSlotIndex, else 0.0; Invert complements
-	 * (1.0<->0.0) AFTER that comparison, per the explicit formula. Refuses to generate (Unavailable) if
-	 * the lookup itself is invalid/ambiguous (see BuildMaterialSlotLookups) or SelectedSlotIndex is out
-	 * of range -- never silently produces a wrong/empty mask.
-	 */
-	static FVertexMaskForgeScalarMask GenerateMaterialSlotMask(
-		const FVertexMaskForgeWorkingMesh& WorkingMesh,
-		const FStaticMeshLODResources& LOD0,
-		const int32 SelectedSlotIndex,
-		const bool bInvert)
-	{
-		FVertexMaskForgeScalarMask Mask;
-		Mask.Source = EVertexMaskForgeScalarMaskSource::MaterialSlot;
-
-		const int32 NumRenderVerts = static_cast<int32>(LOD0.VertexBuffers.PositionVertexBuffer.GetNumVertices());
-		Mask.RenderVertexCount = NumRenderVerts;
-
-		if (NumRenderVerts <= 0
-			|| !WorkingMesh.bMaterialSlotResolutionValid
-			|| WorkingMesh.bRenderVertexMaterialSlotAmbiguous
-			|| WorkingMesh.RenderVertexToMaterialSlot.Num() != NumRenderVerts
-			|| !WorkingMesh.MaterialSlotOptions.IsValidIndex(SelectedSlotIndex))
-		{
-			Mask.State = EVertexMaskForgeScalarMaskState::Unavailable;
-			return Mask;
-		}
-
-		Mask.Values.SetNumUninitialized(NumRenderVerts);
-		Mask.bHasValue.Init(true, NumRenderVerts);
-
-		double Sum = 0.0;
-		for (int32 i = 0; i < NumRenderVerts; ++i)
-		{
-			const bool bSelected = WorkingMesh.RenderVertexToMaterialSlot[i] == SelectedSlotIndex;
-			const float Value = (bSelected != bInvert) ? 1.0f : 0.0f;
-			Mask.Values[i] = Value;
-			++Mask.NumValidValues;
-			Sum += Value;
-			Mask.MinValue = (Mask.NumValidValues == 1) ? Value : FMath::Min(Mask.MinValue, Value);
-			Mask.MaxValue = (Mask.NumValidValues == 1) ? Value : FMath::Max(Mask.MaxValue, Value);
-			if (Value <= FVertexMaskForgeScalarMask::Tolerance) { ++Mask.NumNearZero; }
-			if (Value >= 1.0f - FVertexMaskForgeScalarMask::Tolerance) { ++Mask.NumNearOne; }
-		}
-		Mask.MeanValue = (Mask.NumValidValues > 0) ? static_cast<float>(Sum / Mask.NumValidValues) : 0.0f;
-		Mask.State = (Mask.NumValidValues > 0) ? EVertexMaskForgeScalarMaskState::Ready : EVertexMaskForgeScalarMaskState::Unavailable;
-
-		return Mask;
-	}
-
-	/**
-	 * AUDITED (V2-D): sibling of GenerateMaterialSlotMask for Source-Topology (Nanite) entries --
-	 * CORNER-EXACT (Mesh.TriangleCount()*3, indexed by CornerIndex directly), deliberately NOT
-	 * Dynamic-Mesh-Vertex-domain like Curvature/Noise: all three corners of a triangle share that
-	 * triangle's OWN resolved slot (WorkingMesh.DynamicTriangleToMaterialSlot[TriangleID]), so two
-	 * corners at the same position/VertexID on opposite sides of a material boundary correctly read
-	 * different values -- see UpdateWorkingColorsSourceTopology's own IndexOverride switch (CornerIndex
-	 * case) for how this is consumed.
-	 */
-	static FVertexMaskForgeScalarMask GenerateMaterialSlotMaskFromDynamicMesh(
-		const FVertexMaskForgeWorkingMesh& WorkingMesh,
-		const int32 SelectedSlotIndex,
-		const bool bInvert)
-	{
-		using namespace UE::Geometry;
-
-		FVertexMaskForgeScalarMask Mask;
-		Mask.Source = EVertexMaskForgeScalarMaskSource::MaterialSlot;
-
-		if (!WorkingMesh.Mesh.IsValid() || !WorkingMesh.bMaterialSlotResolutionValid
-			|| !WorkingMesh.MaterialSlotOptions.IsValidIndex(SelectedSlotIndex))
-		{
-			Mask.State = EVertexMaskForgeScalarMaskState::Unavailable;
-			return Mask;
-		}
-
-		const FDynamicMesh3& Mesh = *WorkingMesh.Mesh;
-		const int32 NumCorners = Mesh.TriangleCount() * 3;
-		Mask.RenderVertexCount = NumCorners;
-
-		if (NumCorners <= 0)
-		{
-			Mask.State = EVertexMaskForgeScalarMaskState::Unavailable;
-			return Mask;
-		}
-
-		Mask.Values.SetNumUninitialized(NumCorners);
-		Mask.bHasValue.Init(true, NumCorners);
-
-		double Sum = 0.0;
-		int32 CornerIndex = 0;
-		for (const int32 TriangleID : Mesh.TriangleIndicesItr())
-		{
-			const int32 ResolvedSlot = WorkingMesh.DynamicTriangleToMaterialSlot.IsValidIndex(TriangleID)
-				? WorkingMesh.DynamicTriangleToMaterialSlot[TriangleID]
-				: INDEX_NONE;
-			const bool bSelected = ResolvedSlot == SelectedSlotIndex;
-			const float Value = (bSelected != bInvert) ? 1.0f : 0.0f;
-			for (int32 Corner = 0; Corner < 3; ++Corner, ++CornerIndex)
-			{
-				Mask.Values[CornerIndex] = Value;
-				++Mask.NumValidValues;
-				Sum += Value;
-				Mask.MinValue = (Mask.NumValidValues == 1) ? Value : FMath::Min(Mask.MinValue, Value);
-				Mask.MaxValue = (Mask.NumValidValues == 1) ? Value : FMath::Max(Mask.MaxValue, Value);
-				if (Value <= FVertexMaskForgeScalarMask::Tolerance) { ++Mask.NumNearZero; }
-				if (Value >= 1.0f - FVertexMaskForgeScalarMask::Tolerance) { ++Mask.NumNearOne; }
-			}
-		}
-		Mask.MeanValue = (Mask.NumValidValues > 0) ? static_cast<float>(Sum / Mask.NumValidValues) : 0.0f;
-		Mask.State = (Mask.NumValidValues > 0) ? EVertexMaskForgeScalarMaskState::Ready : EVertexMaskForgeScalarMaskState::Unavailable;
-
-		return Mask;
 	}
 
 	// --- Directional Normal Mask (V2-E) --------------------------------------------------------------
@@ -9988,9 +9873,9 @@ void SVertexMaskForgePanel::RunAutoUpdatePreview(const bool bIncludeAO)
 		if (bMaterialSlotMaskEnabled && IsMaterialSlotMaskAvailableForSelection())
 		{
 			FVertexMaskForgeScalarMask NewMaterialSlotMask = Entry->bUseSourceTopology
-				? VertexMaskForgePanel::GenerateMaterialSlotMaskFromDynamicMesh(
+				? VertexMaskForgeMaterialSlotGenerator::GenerateMaterialSlotMaskFromDynamicMesh(
 					Entry->WorkingMesh, SelectedMaterialSlotIndex, bMaterialSlotMaskInvert)
-				: VertexMaskForgePanel::GenerateMaterialSlotMask(
+				: VertexMaskForgeMaterialSlotGenerator::GenerateMaterialSlotMask(
 					Entry->WorkingMesh, RenderData->LODResources[0], SelectedMaterialSlotIndex, bMaterialSlotMaskInvert);
 			if (NewMaterialSlotMask.State == EVertexMaskForgeScalarMaskState::Ready)
 			{
