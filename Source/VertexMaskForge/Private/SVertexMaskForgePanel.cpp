@@ -36,6 +36,7 @@
 #include "VertexMaskForgeAcceptTargetBuilder.h"
 #include "VertexMaskForgeAcceptWriter.h"
 #include "VertexMaskForgeDisplayColorDerivation.h"
+#include "VertexMaskForgeGeneratorUtils.h"
 #include "VertexMaskForgeMaskStackComposer.h"
 #include "SPrimaryButton.h"
 #include "Styling/CoreStyle.h"
@@ -271,101 +272,6 @@ namespace VertexMaskForgePanel
 		FMeshNormals TempNormals(&Mesh);
 		TempNormals.ComputeVertexNormals();
 		TempNormals.CopyToOverlay(Mesh.Attributes()->PrimaryNormals());
-	}
-
-	/**
-	 * AUDITED (Nanite source-topology support, AO cache robustness fix -- CORRECTED per follow-up
-	 * review): content fingerprint of Mesh, covering everything that can affect the AABBTree/raycast
-	 * result: vertex positions, triangle CONNECTIVITY (not just counts), the normals used for ray
-	 * origins, and the corner -> Normal Element association. Combined via GetTypeHash/HashCombine in a
-	 * fixed, deterministic order (VertexIndicesItr / TriangleIndicesItr / ElementIndicesItr, all stable
-	 * for an unedited mesh -- never assumed dense; TriangleIndicesItr never assumed to be enumerated by
-	 * TriangleID value alone, see below). Computed ONCE, at working-mesh build time (see
-	 * BuildWorkingMeshForStaticMesh), and reused for the rest of the session -- Mesh is never mutated in
-	 * place afterward (EnsureNormalOverlay, the one exception, always runs BEFORE this is computed).
-	 *
-	 * CORRECTED: the original version hashed only positions and normal VALUES, in isolation from each
-	 * other and from topology -- two meshes with identical vertex positions/normal values but different
-	 * TRIANGLE CONNECTIVITY (e.g. a re-triangulated quad, or a corner rewired to a different Normal
-	 * Element) would have produced the SAME fingerprint despite the raycast result genuinely differing
-	 * (different triangles occlude different rays; a corner's ray now originates from a different
-	 * normal). Fixed by additionally hashing, per triangle (iterated via TriangleIndicesItr(), which
-	 * never assumes TriangleID is dense): the triangle's own ordinal position in that iteration (an
-	 * explicit delimiter -- see below) plus its three VertexIDs (Mesh.GetTriangle(TriangleID), corner
-	 * order preserved) plus, when a Normal Overlay is present and this triangle is set in it
-	 * (NormalOverlay->IsSetTriangle(TriangleID)), its three Normal Element IDs
-	 * (NormalOverlay->GetTriangle(TriangleID), corner order preserved).
-	 *
-	 * DELIMITER (per explicit requirement -- "impedir sequências ambíguas"): the running per-triangle
-	 * ordinal (0, 1, 2, ...) is hashed in BEFORE each triangle's own three-ID group, and the final
-	 * ordinal count is hashed in once more at the very end. This binds every VertexID/Normal Element ID
-	 * triple to its exact position in the iteration, so two different triangulations cannot produce the
-	 * same flattened ID sequence by coincidence (e.g. triangle boundaries shifting) the way an
-	 * undelimited flat concatenation of IDs could.
-	 */
-	static uint32 ComputeDynamicMeshGeometryFingerprint(const UE::Geometry::FDynamicMesh3& Mesh)
-	{
-		using namespace UE::Geometry;
-
-		const FDynamicMeshNormalOverlay* NormalOverlay =
-			(Mesh.HasAttributes() && Mesh.Attributes()->PrimaryNormals() != nullptr)
-			? Mesh.Attributes()->PrimaryNormals() : nullptr;
-
-		uint32 Hash = GetTypeHash(Mesh.VertexCount());
-		Hash = HashCombine(Hash, GetTypeHash(Mesh.TriangleCount()));
-
-		for (const int32 VertexID : Mesh.VertexIndicesItr())
-		{
-			const FVector3d P = Mesh.GetVertex(VertexID);
-			Hash = HashCombine(Hash, GetTypeHash(P.X));
-			Hash = HashCombine(Hash, GetTypeHash(P.Y));
-			Hash = HashCombine(Hash, GetTypeHash(P.Z));
-		}
-
-		if (NormalOverlay)
-		{
-			for (const int32 ElementID : NormalOverlay->ElementIndicesItr())
-			{
-				const FVector3f N = NormalOverlay->GetElement(ElementID);
-				Hash = HashCombine(Hash, GetTypeHash(N.X));
-				Hash = HashCombine(Hash, GetTypeHash(N.Y));
-				Hash = HashCombine(Hash, GetTypeHash(N.Z));
-			}
-		}
-
-		// Triangle connectivity + corner -> Normal Element association, delimited by ordinal position.
-		int32 TriangleOrdinal = 0;
-		for (const int32 TriangleID : Mesh.TriangleIndicesItr())
-		{
-			Hash = HashCombine(Hash, GetTypeHash(TriangleOrdinal));
-
-			const FIndex3i Tri = Mesh.GetTriangle(TriangleID);
-			Hash = HashCombine(Hash, GetTypeHash(Tri.A));
-			Hash = HashCombine(Hash, GetTypeHash(Tri.B));
-			Hash = HashCombine(Hash, GetTypeHash(Tri.C));
-
-			if (NormalOverlay && NormalOverlay->IsSetTriangle(TriangleID))
-			{
-				const FIndex3i NormalTri = NormalOverlay->GetTriangle(TriangleID);
-				Hash = HashCombine(Hash, GetTypeHash(NormalTri.A));
-				Hash = HashCombine(Hash, GetTypeHash(NormalTri.B));
-				Hash = HashCombine(Hash, GetTypeHash(NormalTri.C));
-			}
-			else
-			{
-				// Explicit "no Normal Element association" marker -- distinguishes this case from a
-				// genuine (0,0,0)-valued triple, and from the branch above being taken at all.
-				Hash = HashCombine(Hash, GetTypeHash(INDEX_NONE));
-			}
-
-			++TriangleOrdinal;
-		}
-		// Final delimiter: total triangle count actually iterated (as opposed to Mesh.TriangleCount(),
-		// which was already hashed above but is being re-affirmed here as a terminator specifically for
-		// the per-triangle sequence just written).
-		Hash = HashCombine(Hash, GetTypeHash(TriangleOrdinal));
-
-		return Hash;
 	}
 
 	/**
@@ -903,7 +809,7 @@ namespace VertexMaskForgePanel
 		// handed to a generator or cache. See EnsureNormalOverlay/ComputeDynamicMeshGeometryFingerprint
 		// for why (hard-edge AO correctness / cache identity robustness).
 		EnsureNormalOverlay(*WorkingMesh.Mesh, Mesh->GetName());
-		WorkingMesh.GeometryFingerprint = ComputeDynamicMeshGeometryFingerprint(*WorkingMesh.Mesh);
+		WorkingMesh.GeometryFingerprint = VertexMaskForgeGeneratorUtils::ComputeDynamicMeshGeometryFingerprint(*WorkingMesh.Mesh);
 
 		WorkingMesh.State = EVertexMaskForgeWorkingMeshState::Ready;
 		return WorkingMesh;
@@ -3509,229 +3415,6 @@ namespace VertexMaskForgePanel
 
 
 	/**
-	 * AUDITED (V2-F, Directional Normal Blur): the SAME iterative algorithm shape as
-	 * ApplyTopologicalCurvatureBlur (self-plus-neighbors average, repeated FullIterations times, plus a
-	 * fractional-iteration lerp toward one more pass -- see that function's own doc comment for the
-	 * "whole number = full iterations, fractional part blends toward one more" contract, preserved
-	 * verbatim here) -- but DELIBERATELY NOT ApplyTopologicalCurvatureBlur ITSELF: that function's
-	 * adjacency (Mesh.VtxVerticesItr(VertexID)) is Dynamic-Mesh-VERTEX-ID domain, one value per vertex --
-	 * correct for Curvature (a genuinely per-vertex geometric property) but WRONG for Directional Normal
-	 * Mask, whose raw values are deliberately CORNER-EXACT/per-render-vertex (never collapsed, so a hard
-	 * edge/UV seam's several corners at the same position can legitimately differ -- see
-	 * GenerateDirectionalNormalMaskFromDynamicMesh's own doc note). Blurring through
-	 * ApplyTopologicalCurvatureBlur would require collapsing to one value per Vertex ID first, silently
-	 * destroying exactly the split-normal independence V2-E was built to preserve. This generic function
-	 * instead takes an EXPLICIT, domain-appropriate adjacency list (built once per generation call by
-	 * BuildRenderVertexAdjacency or BuildCornerAdjacency below) -- everything else about the algorithm is
-	 * identical. Never allocates per element inside the hot loop (Adjacency is built once, up front).
-	 */
-	static TArray<float> ApplyAdjacencyTopologicalBlur(const TArray<TArray<int32>>& Adjacency, const TArray<float>& Input, const TArray<bool>& bHasValue, const float BlurAmount)
-	{
-		if (BlurAmount <= 0.0f || Input.IsEmpty())
-		{
-			return Input;
-		}
-
-		const int32 FullIterations = FMath::FloorToInt32(BlurAmount);
-		const float FractionalIteration = BlurAmount - static_cast<float>(FullIterations);
-
-		// Never lets an unwritten (degenerate-normal) element bleed into or receive a blurred value --
-		// an element with no raw value stays exactly as unwritten as it started (never guessed), and it
-		// never contributes to a neighbor's average either (there is nothing valid to contribute).
-		auto RunOneIteration = [&Adjacency, &bHasValue](const TArray<float>& Src) -> TArray<float>
-		{
-			TArray<float> Dst = Src;
-			for (int32 i = 0; i < Src.Num(); ++i)
-			{
-				if (!bHasValue.IsValidIndex(i) || !bHasValue[i])
-				{
-					continue;
-				}
-				float Sum = Src[i];
-				int32 Count = 1;
-				if (Adjacency.IsValidIndex(i))
-				{
-					for (const int32 NeighborIndex : Adjacency[i])
-					{
-						if (Src.IsValidIndex(NeighborIndex) && bHasValue.IsValidIndex(NeighborIndex) && bHasValue[NeighborIndex])
-						{
-							Sum += Src[NeighborIndex];
-							++Count;
-						}
-					}
-				}
-				Dst[i] = Sum / static_cast<float>(Count);
-			}
-			return Dst;
-		};
-
-		TArray<float> Current = Input;
-		for (int32 Iter = 0; Iter < FullIterations; ++Iter)
-		{
-			Current = RunOneIteration(Current);
-		}
-
-		if (FractionalIteration > UE_KINDA_SMALL_NUMBER)
-		{
-			TArray<float> OneMore = RunOneIteration(Current);
-			for (int32 i = 0; i < Current.Num(); ++i)
-			{
-				if (bHasValue.IsValidIndex(i) && bHasValue[i])
-				{
-					Current[i] = FMath::Lerp(Current[i], OneMore[i], FractionalIteration);
-				}
-			}
-		}
-
-		return Current;
-	}
-
-	/**
-	 * AUDITED (V2-F): render-vertex adjacency, built directly from LOD0's own IndexBuffer (the SAME
-	 * render-vertex domain GenerateDirectionalNormalMask itself reads normals from) -- render vertex i's
-	 * neighbors are the OTHER two render vertices of every triangle i participates in. A hard edge/UV
-	 * seam is ALREADY represented as physically SEPARATE render vertex entries in this domain (that is
-	 * what makes VertexTangentZ per-render-vertex correct for split normals in the first place -- see
-	 * GenerateDirectionalNormalMask's own doc note), so this adjacency never needs any special-casing to
-	 * avoid crossing a seam: a split vertex's two "halves" simply belong to disjoint triangle fans with
-	 * their own, separate neighbor sets by construction. Built once per generation call (not cached --
-	 * Directional Normal Mask has no raw cache of its own, matching Material Slot Mask's own "cheap
-	 * enough to just recompute" precedent).
-	 */
-	static TArray<TArray<int32>> BuildRenderVertexAdjacency(const FStaticMeshLODResources& LOD0, const int32 NumRenderVerts)
-	{
-		TArray<TArray<int32>> Adjacency;
-		Adjacency.SetNum(NumRenderVerts);
-
-		const FRawStaticIndexBuffer& IndexBuffer = LOD0.IndexBuffer;
-		const int32 NumIndices = IndexBuffer.GetNumIndices();
-		for (int32 TriStart = 0; TriStart + 2 < NumIndices; TriStart += 3)
-		{
-			const int32 I0 = static_cast<int32>(IndexBuffer.GetIndex(TriStart + 0));
-			const int32 I1 = static_cast<int32>(IndexBuffer.GetIndex(TriStart + 1));
-			const int32 I2 = static_cast<int32>(IndexBuffer.GetIndex(TriStart + 2));
-			if (!Adjacency.IsValidIndex(I0) || !Adjacency.IsValidIndex(I1) || !Adjacency.IsValidIndex(I2))
-			{
-				continue;
-			}
-			Adjacency[I0].AddUnique(I1); Adjacency[I0].AddUnique(I2);
-			Adjacency[I1].AddUnique(I0); Adjacency[I1].AddUnique(I2);
-			Adjacency[I2].AddUnique(I0); Adjacency[I2].AddUnique(I1);
-		}
-		return Adjacency;
-	}
-
-	/**
-	 * AUDITED (V2-F corrective pass): CORNER-exact adjacency for the Source-Topology domain, built from
-	 * real triangle topology (Mesh.GetTriNeighbourTris(TriangleID)/Mesh.GetTriEdge(), the SAME official
-	 * GeometryCore edge-adjacency query -- never a second/parallel topology representation). Corner c of
-	 * triangle T is connected to the OTHER TWO corners of T itself (unconditional -- a single face is
-	 * always internally continuous), plus, for each of T's up-to-3 edge-adjacent triangles, ONLY the ONE
-	 * corner of that neighbor that shares c's actual Mesh VertexID at that edge (matched by VertexID, not
-	 * by local Corner slot -- winding order is not guaranteed to agree across an edge) -- and ONLY when
-	 * NormalOverlay->IsSeamEdge() reports the PrimaryNormals overlay is CONTINUOUS there (no split/hard
-	 * edge). A boundary edge, an edge whose neighbor could not be resolved, or a genuine normal-overlay
-	 * seam all simply contribute no cross-triangle neighbor there. Deliberately keyed to the NORMAL
-	 * overlay specifically (not any UV overlay): a UV seam does not imply a normal split and must not by
-	 * itself interrupt this Blur. NEVER collapses distinct corners: every corner keeps its OWN entry in
-	 * the output CornerIndex-domain array, even when several corners share a position/Dynamic Mesh
-	 * VertexID with genuinely different normals (that is the entire reason this exists instead of reusing
-	 * ApplyTopologicalCurvatureBlur's own Vertex-ID-domain adjacency).
-	 */
-	static TArray<TArray<int32>> BuildCornerAdjacency(const UE::Geometry::FDynamicMesh3& Mesh, const UE::Geometry::FDynamicMeshNormalOverlay* NormalOverlay, const int32 NumCorners)
-	{
-		using namespace UE::Geometry;
-
-		TArray<TArray<int32>> Adjacency;
-		Adjacency.SetNum(NumCorners);
-
-		TMap<int32, int32> TriangleIDToCornerBase;
-		TriangleIDToCornerBase.Reserve(Mesh.TriangleCount());
-		{
-			int32 Base = 0;
-			for (const int32 TriangleID : Mesh.TriangleIndicesItr())
-			{
-				TriangleIDToCornerBase.Add(TriangleID, Base);
-				Base += 3;
-			}
-		}
-
-		int32 CornerBase = 0;
-		for (const int32 TriangleID : Mesh.TriangleIndicesItr())
-		{
-			// Within a single triangle, all 3 corners are always the same continuous surface --
-			// unconditional, no overlay check needed (a face can never be split from itself).
-			for (int32 C = 0; C < 3; ++C)
-			{
-				for (int32 C2 = 0; C2 < 3; ++C2)
-				{
-					if (C != C2)
-					{
-						Adjacency[CornerBase + C].Add(CornerBase + C2);
-					}
-				}
-			}
-
-			// AUDITED (V2-F corrective pass): cross-triangle connections must (a) link ONLY the two
-			// corners that are the actual shared-edge endpoints -- matched by underlying Mesh VertexID,
-			// never by local Corner slot 0/1/2, since winding order is not guaranteed to agree between
-			// two triangles on either side of an edge -- and (b) be skipped entirely when
-			// NormalOverlay->IsSeamEdge() reports the PrimaryNormals overlay has a split (different
-			// Element IDs on either side) at that edge, i.e. an authored hard edge. This is the SAME
-			// seam query FDynamicMeshNormalOverlay already exposes and other engine code relies on for
-			// this exact purpose -- not a second, hand-rolled continuity check. Deliberately keyed to the
-			// NORMAL overlay specifically, not any UV overlay: a UV seam does not imply a normal split
-			// (e.g. a cylinder cap seam can still be normal-smooth) and must not interrupt this Blur.
-			const FIndex3i TriVertices = Mesh.GetTriangle(TriangleID);
-			const FIndex3i NeighborTriangles = Mesh.GetTriNeighbourTris(TriangleID);
-			for (int32 Edge = 0; Edge < 3; ++Edge)
-			{
-				const int32 NeighborTriangleID = NeighborTriangles[Edge];
-				if (NeighborTriangleID == INDEX_NONE)
-				{
-					continue;
-				}
-				const int32* NeighborBasePtr = TriangleIDToCornerBase.Find(NeighborTriangleID);
-				if (!NeighborBasePtr)
-				{
-					continue;
-				}
-
-				const int32 EdgeID = Mesh.GetTriEdge(TriangleID, Edge);
-				if (NormalOverlay && NormalOverlay->IsSeamEdge(EdgeID))
-				{
-					continue; // Hard edge / split normal on the NORMAL overlay -- Blur must not cross it.
-				}
-
-				// Edge `Edge` connects local corners `Edge` and `(Edge+1)%3` of this triangle (the same
-				// convention GetTriNeighbourTris/GetTriEdge share -- see FDynamicMesh3::FindTriangleEdge).
-				const int32 LocalA = Edge;
-				const int32 LocalB = (Edge + 1) % 3;
-				const int32 VertexA = TriVertices[LocalA];
-				const int32 VertexB = TriVertices[LocalB];
-
-				const FIndex3i NeighborVertices = Mesh.GetTriangle(NeighborTriangleID);
-				int32 NeighborLocalA = INDEX_NONE, NeighborLocalB = INDEX_NONE;
-				for (int32 NC = 0; NC < 3; ++NC)
-				{
-					if (NeighborVertices[NC] == VertexA) { NeighborLocalA = NC; }
-					else if (NeighborVertices[NC] == VertexB) { NeighborLocalB = NC; }
-				}
-				if (NeighborLocalA == INDEX_NONE || NeighborLocalB == INDEX_NONE)
-				{
-					continue; // Should not happen for a genuine edge-neighbor, but never guess.
-				}
-
-				Adjacency[CornerBase + LocalA].Add(*NeighborBasePtr + NeighborLocalA);
-				Adjacency[CornerBase + LocalB].Add(*NeighborBasePtr + NeighborLocalB);
-			}
-
-			CornerBase += 3;
-		}
-		return Adjacency;
-	}
-
-	/**
 	 * AUDITED (V2-E): render-vertex domain -- one Directional Normal value per RenderIndex, read from
 	 * LOD0.VertexBuffers.StaticMeshVertexBuffer.VertexTangentZ, the SAME real render normal / SAME
 	 * render-vertex domain AO already uses for its own World Space transform (see
@@ -3813,8 +3496,8 @@ namespace VertexMaskForgePanel
 		TArray<float> BlurredValues = RawValues;
 		if (Blur > 0.0f)
 		{
-			const TArray<TArray<int32>> Adjacency = BuildRenderVertexAdjacency(LOD0, NumRenderVerts);
-			BlurredValues = ApplyAdjacencyTopologicalBlur(Adjacency, RawValues, bHasRawValue, Blur);
+			const TArray<TArray<int32>> Adjacency = VertexMaskForgeGeneratorUtils::BuildRenderVertexAdjacency(LOD0, NumRenderVerts);
+			BlurredValues = VertexMaskForgeGeneratorUtils::ApplyAdjacencyTopologicalBlur(Adjacency, RawValues, bHasRawValue, Blur);
 		}
 
 		// Pass 2: apply Invert (same order as CurvatureBlur/NoiseBlur -- Blur before Invert) and
@@ -3959,8 +3642,8 @@ namespace VertexMaskForgePanel
 		TArray<float> BlurredValues = RawValues;
 		if (Blur > 0.0f)
 		{
-			const TArray<TArray<int32>> Adjacency = BuildCornerAdjacency(Mesh, NormalOverlay, NumCorners);
-			BlurredValues = ApplyAdjacencyTopologicalBlur(Adjacency, RawValues, bHasRawValue, Blur);
+			const TArray<TArray<int32>> Adjacency = VertexMaskForgeGeneratorUtils::BuildCornerAdjacency(Mesh, NormalOverlay, NumCorners);
+			BlurredValues = VertexMaskForgeGeneratorUtils::ApplyAdjacencyTopologicalBlur(Adjacency, RawValues, bHasRawValue, Blur);
 		}
 
 		// Pass 2: apply Invert (Blur before Invert, matching CurvatureBlur/NoiseBlur) and accumulate stats.
@@ -4419,7 +4102,7 @@ namespace VertexMaskForgePanel
 			Cache.CachedDerivedDataKey = LOD0.DerivedDataKey;
 			Cache.CachedNumRenderVerts = NumRenderVerts;
 			Cache.CachedNumIndices = NumIndices;
-			Cache.CachedGeometryFingerprint = ComputeDynamicMeshGeometryFingerprint(*Cache.LocalMesh);
+			Cache.CachedGeometryFingerprint = VertexMaskForgeGeneratorUtils::ComputeDynamicMeshGeometryFingerprint(*Cache.LocalMesh);
 			Cache.bTreeValid = true;
 			Cache.bValuesValid = false;
 			Cache.NumDegenerateTrianglesDiscarded = NumDegenerateDiscarded;
@@ -4497,8 +4180,8 @@ namespace VertexMaskForgePanel
 		TArray<float> BlurredValues = RawMaskValues;
 		if (Blur > 0.0f)
 		{
-			const TArray<TArray<int32>> Adjacency = BuildRenderVertexAdjacency(LOD0, NumRenderVerts);
-			BlurredValues = ApplyAdjacencyTopologicalBlur(Adjacency, RawMaskValues, bHasRaw, Blur);
+			const TArray<TArray<int32>> Adjacency = VertexMaskForgeGeneratorUtils::BuildRenderVertexAdjacency(LOD0, NumRenderVerts);
+			BlurredValues = VertexMaskForgeGeneratorUtils::ApplyAdjacencyTopologicalBlur(Adjacency, RawMaskValues, bHasRaw, Blur);
 		}
 
 		MaskResult.Values.SetNumZeroed(NumRenderVerts);
@@ -4586,7 +4269,7 @@ namespace VertexMaskForgePanel
 		// (ComputeDynamicMeshGeometryFingerprint) already proven to hash position+normal+connectivity;
 		// recomputing it costs O(V+T) (no raycasting), bounded and far cheaper than the raycast pass
 		// itself, so this runs safely even during interactive Auto Update.
-		const uint32 CurrentFingerprint = ComputeDynamicMeshGeometryFingerprint(SourceMesh);
+		const uint32 CurrentFingerprint = VertexMaskForgeGeneratorUtils::ComputeDynamicMeshGeometryFingerprint(SourceMesh);
 		const bool bTreeStillValid = Cache.bTreeValid
 			&& Cache.CachedSourceMesh == &SourceMesh
 			&& Cache.CachedGeometryFingerprint == CurrentFingerprint;
@@ -4712,8 +4395,8 @@ namespace VertexMaskForgePanel
 		TArray<float> BlurredValues = RawMaskValues;
 		if (Blur > 0.0f)
 		{
-			const TArray<TArray<int32>> Adjacency = BuildCornerAdjacency(SourceMesh, SourceNormalOverlay, NumCorners);
-			BlurredValues = ApplyAdjacencyTopologicalBlur(Adjacency, RawMaskValues, bHasRaw, Blur);
+			const TArray<TArray<int32>> Adjacency = VertexMaskForgeGeneratorUtils::BuildCornerAdjacency(SourceMesh, SourceNormalOverlay, NumCorners);
+			BlurredValues = VertexMaskForgeGeneratorUtils::ApplyAdjacencyTopologicalBlur(Adjacency, RawMaskValues, bHasRaw, Blur);
 		}
 
 		MaskResult.Values.SetNumZeroed(NumCorners);
