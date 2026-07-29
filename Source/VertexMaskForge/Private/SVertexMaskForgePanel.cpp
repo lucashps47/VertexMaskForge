@@ -44,6 +44,7 @@
 #include "VertexMaskForgeMaskStackComposer.h"
 #include "VertexMaskForgeMaterialSlotGenerator.h"
 #include "VertexMaskForgeNoiseGenerator.h"
+#include "VertexMaskForgeRecipeTypes.h"
 #include "VertexMaskForgeThicknessGenerator.h"
 #include "SPrimaryButton.h"
 #include "Styling/CoreStyle.h"
