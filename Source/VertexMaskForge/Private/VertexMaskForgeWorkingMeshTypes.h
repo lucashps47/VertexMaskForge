@@ -217,6 +217,19 @@ enum class EVertexMaskForgeNormalSpace : uint8
 	World,
 };
 
+/** One of the six principal axis directions a surface normal can be compared against -- Unreal's own
+ *  convention (X+ Forward, Y+ Right, Z+ Up). See VertexMaskForgePanel::GetNormalDirectionVector for the
+ *  exact unit vectors. */
+enum class EVertexMaskForgeNormalDirection : uint8
+{
+	PositiveX,
+	NegativeX,
+	PositiveY,
+	NegativeY,
+	PositiveZ,
+	NegativeZ,
+};
+
 /** Coverage state of the LOD 0 Color Vertex Buffer. */
 enum class EVertexMaskForgeVertexColorState : uint8
 {

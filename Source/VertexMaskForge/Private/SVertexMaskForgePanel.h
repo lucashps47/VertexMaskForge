@@ -49,19 +49,6 @@ enum class EVertexMaskForgeOperationState : uint8
 	Failed,
 };
 
-/** One of the six principal axis directions a surface normal can be compared against -- Unreal's own
- *  convention (X+ Forward, Y+ Right, Z+ Up). See VertexMaskForgePanel::GetNormalDirectionVector for the
- *  exact unit vectors. */
-enum class EVertexMaskForgeNormalDirection : uint8
-{
-	PositiveX,
-	NegativeX,
-	PositiveY,
-	NegativeY,
-	PositiveZ,
-	NegativeZ,
-};
-
 /** Which of FVertexMaskForgeWorkingMesh::CurvatureRawConvexCache/CurvatureRawConcaveCache (or their
  *  union) Curvature Type selects as the mask magnitude -- see
  *  VertexMaskForgePanel::ApplyCurvatureArtisticParams. */
