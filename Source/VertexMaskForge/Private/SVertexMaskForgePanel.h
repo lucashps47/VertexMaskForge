@@ -67,34 +67,9 @@ enum class EVertexMaskForgeCurvatureType : uint8
 	Both,
 };
 
-/**
- * Per-axis bounds, either INDIVIDUAL (one Static Mesh's own LOD0, in its own chosen space) or
- * COLLECTIVE (Unified Bounds -- the union across every participating component's render vertices,
- * in that axis's chosen space), depending on which pass produced it. Domain-shape only; carries no
- * opinion about which mode produced it -- see VertexMaskForgePanel::GenerateBoundingBoxMask's
- * CollectiveBounds parameter and VertexMaskForgePanel::ComputeCollectiveAxisBounds.
- */
-struct FVertexMaskForgeAxisBoundsResult
-{
-	double MinCoord = 0.0;
-	double MaxCoord = 0.0;
-	bool bDegenerate = false;
-
-	/**
-	 * Only meaningful for an enabled Local-space axis (bWorldSpace == false) when these bounds are
-	 * COLLECTIVE (Unified Bounds on). World-space direction that every participating component's own
-	 * local axis maps to -- validated compatible across all participants (see
-	 * VertexMaskForgePanel::ResolveSharedLocalAxis) -- used to project each component's own
-	 * world-space render-vertex positions onto one shared coordinate line without discarding
-	 * translation between instances. Normalized. Zero vector / unused for World-space axes and for
-	 * Individual (non-Unified) bounds.
-	 */
-	FVector SharedLocalAxisDirection = FVector::ZeroVector;
-
-	/** World-space length of the (pre-normalization) transformed local axis vector for the same
-	 *  axis -- i.e. the shared scale along that axis. See SharedLocalAxisDirection. */
-	double SharedLocalAxisScale = 1.0;
-};
+// FVertexMaskForgeAxisBoundsResult now defined in VertexMaskForgeWorkingMeshTypes.h (M12 extraction,
+// moved so VertexMaskForgeBoundingBoxGenerator.h/.cpp can use it without including this header) -- see
+// that header for the struct's own doc comment.
 
 // EVertexMaskForgePreviewMode is now defined in VertexMaskForgeMaskTypes.h (M3 extraction, moved so
 // VertexMaskForgeDisplayColorDerivation.h/.cpp can use it without including this header) -- see that
@@ -1054,9 +1029,9 @@ private:
 	/**
 	 * False (default) preserves the tool's previously-validated behavior exactly: each component
 	 * normalizes its own render vertices against its OWN individual per-axis bounds (see
-	 * VertexMaskForgePanel::GenerateBoundingBoxMask's internal bounds pass). True: every enabled
+	 * VertexMaskForgeBoundingBoxGenerator::GenerateBoundingBoxMask's internal bounds pass). True: every enabled
 	 * axis is normalized against a COLLECTIVE domain -- the union of that axis's coordinate across
-	 * every participating component's render vertices (see VertexMaskForgePanel::
+	 * every participating component's render vertices (see VertexMaskForgeBoundingBoxGenerator::
 	 * ComputeCollectiveAxisBounds) -- computed fresh before each batch (every live regeneration,
 	 * Preview refresh, and Accept validation), never cached across calls,
 	 * consistent with the rest of the panel's "always recompute, never stale" design. Global for all

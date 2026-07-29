@@ -555,6 +555,35 @@ struct FVertexMaskForgeAxisMaskParams
 };
 
 /**
+ * Per-axis bounds, either INDIVIDUAL (one Static Mesh's own LOD0, in its own chosen space) or
+ * COLLECTIVE (Unified Bounds -- the union across every participating component's render vertices,
+ * in that axis's chosen space), depending on which pass produced it. Domain-shape only; carries no
+ * opinion about which mode produced it -- see VertexMaskForgeBoundingBoxGenerator::GenerateBoundingBoxMask's
+ * CollectiveBounds parameter and VertexMaskForgeBoundingBoxGenerator::ComputeCollectiveAxisBounds.
+ */
+struct FVertexMaskForgeAxisBoundsResult
+{
+	double MinCoord = 0.0;
+	double MaxCoord = 0.0;
+	bool bDegenerate = false;
+
+	/**
+	 * Only meaningful for an enabled Local-space axis (bWorldSpace == false) when these bounds are
+	 * COLLECTIVE (Unified Bounds on). World-space direction that every participating component's own
+	 * local axis maps to -- validated compatible across all participants (see
+	 * VertexMaskForgeBoundingBoxGenerator::ResolveSharedLocalAxis) -- used to project each component's own
+	 * world-space render-vertex positions onto one shared coordinate line without discarding
+	 * translation between instances. Normalized. Zero vector / unused for World-space axes and for
+	 * Individual (non-Unified) bounds.
+	 */
+	FVector SharedLocalAxisDirection = FVector::ZeroVector;
+
+	/** World-space length of the (pre-normalization) transformed local axis vector for the same
+	 *  axis -- i.e. the shared scale along that axis. See SharedLocalAxisDirection. */
+	double SharedLocalAxisScale = 1.0;
+};
+
+/**
  * A transient per-vertex scalar mask (e.g. the Bounding Box Mask), owned by exactly one
  * FVertexMaskForgeWorkingMesh. Exists only in memory; never written to the Primary Color Overlay,
  * MeshDescription, RenderData, or the source asset.
