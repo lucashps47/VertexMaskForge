@@ -49,23 +49,9 @@ enum class EVertexMaskForgeOperationState : uint8
 	Failed,
 };
 
-/** Which of FVertexMaskForgeWorkingMesh::CurvatureRawConvexCache/CurvatureRawConcaveCache (or their
- *  union) Curvature Type selects as the mask magnitude -- see
- *  VertexMaskForgePanel::ApplyCurvatureArtisticParams. */
-enum class EVertexMaskForgeCurvatureType : uint8
-{
-	/** Mask = RawConvexCurvature -- convex edges/bulges only; concave regions read as 0 (black). */
-	Convex,
-
-	/** Mask = RawConcaveCurvature -- concave cavities/creases only; convex regions read as 0 (black). */
-	Concave,
-
-	/** Mask = max(RawConvexCurvature, RawConcaveCurvature) -- a union of the two INDEPENDENTLY
-	 *  accumulated magnitude arrays (see FVertexMaskForgeWorkingMesh::CurvatureRawConvexCache's own doc
-	 *  comment); convex and concave NEVER cancel each other out, since neither is ever computed as a
-	 *  single signed sum in the first place. Default. */
-	Both,
-};
+// EVertexMaskForgeCurvatureType now defined in VertexMaskForgeWorkingMeshTypes.h (M13 extraction,
+// moved so VertexMaskForgeCurvatureGenerator.h/.cpp can use it without including this header) -- see
+// that header for the enum's own doc comment.
 
 // FVertexMaskForgeAxisBoundsResult now defined in VertexMaskForgeWorkingMeshTypes.h (M12 extraction,
 // moved so VertexMaskForgeBoundingBoxGenerator.h/.cpp can use it without including this header) -- see
@@ -481,7 +467,7 @@ private:
 
 	/** UI range [0, 10], default 0.0 (no blur). Integer part = full topological-averaging iterations;
 	 *  fractional part = a further lerp toward one more iteration -- see
-	 *  VertexMaskForgePanel::ApplyTopologicalCurvatureBlur for the exact algorithm. Purely a downstream
+	 *  VertexMaskForgeCurvatureGenerator::ApplyTopologicalCurvatureBlur for the exact algorithm. Purely a downstream
 	 *  reprocessing of the cached raw magnitudes; never re-derives adjacency/dihedral angles. */
 	float CurvatureBlur = 0.0f;
 

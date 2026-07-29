@@ -665,6 +665,24 @@ struct FVertexMaskForgeScalarMask
 	int32 SelectionMeshCount = 0;
 };
 
+/** Which of FVertexMaskForgeWorkingMesh::CurvatureRawConvexCache/CurvatureRawConcaveCache (or their
+ *  union) Curvature Type selects as the mask magnitude -- see
+ *  VertexMaskForgeCurvatureGenerator::ApplyCurvatureArtisticParams. */
+enum class EVertexMaskForgeCurvatureType : uint8
+{
+	/** Mask = RawConvexCurvature -- convex edges/bulges only; concave regions read as 0 (black). */
+	Convex,
+
+	/** Mask = RawConcaveCurvature -- concave cavities/creases only; convex regions read as 0 (black). */
+	Concave,
+
+	/** Mask = max(RawConvexCurvature, RawConcaveCurvature) -- a union of the two INDEPENDENTLY
+	 *  accumulated magnitude arrays (see FVertexMaskForgeWorkingMesh::CurvatureRawConvexCache's own doc
+	 *  comment); convex and concave NEVER cancel each other out, since neither is ever computed as a
+	 *  single signed sum in the first place. Default. */
+	Both,
+};
+
 /**
  * A transient, independent working copy of a Static Mesh's LOD 0, used as the basis for future
  * mask generators. Never written back to the source asset. Owns its FDynamicMesh3 by pointer so
