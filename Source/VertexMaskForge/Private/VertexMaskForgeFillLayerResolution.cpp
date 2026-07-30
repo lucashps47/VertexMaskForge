@@ -21,15 +21,28 @@ namespace VertexMaskForgeFillLayerResolution
 			return false;
 		}
 
-		// Resolve and validate every Mask Instance's keyed result UP FRONT, strictly in the Fill Layer's
-		// own MaskStack authoring order -- identity is exclusively InstanceId (never GeneratorType,
-		// parameters, slot index, array position, or payload equality). Nothing is written to OutResult
-		// until every entry below has been proven resolvable and cardinality-compatible.
+		// Resolve and validate every ENABLED Mask Instance's keyed result UP FRONT, strictly in the Fill
+		// Layer's own MaskStack authoring order -- identity is exclusively InstanceId (never
+		// GeneratorType, parameters, slot index, array position, or payload equality). Nothing is
+		// written to OutResult until every entry below has been proven resolvable and
+		// cardinality-compatible.
+		//
+		// AUDITED (M16-I.1): a disabled Mask Instance (bEnabled == false) is semantically ABSENT --
+		// skipped here BEFORE InstanceId is validated and BEFORE any result-store lookup, so its own
+		// GUID/GeneratorType/Params can never cause this call to fail. ResolvedResults keeps one slot per
+		// MaskStack position (nullptr for a disabled/skipped entry) so later indices below still line up
+		// 1:1 with FillLayer.MaskStack and MaskInputs.
 		TArray<const FVertexMaskForgeInstanceMaskResult*> ResolvedResults;
-		ResolvedResults.Reserve(FillLayer.MaskStack.Num());
+		ResolvedResults.Init(nullptr, FillLayer.MaskStack.Num());
 
-		for (const FVertexMaskForgeMaskInstance& Instance : FillLayer.MaskStack)
+		for (int32 InstanceIndex = 0; InstanceIndex < FillLayer.MaskStack.Num(); ++InstanceIndex)
 		{
+			const FVertexMaskForgeMaskInstance& Instance = FillLayer.MaskStack[InstanceIndex];
+			if (!Instance.bEnabled)
+			{
+				continue;
+			}
+
 			if (!Instance.InstanceId.IsValid())
 			{
 				UE_LOG(LogVertexMaskForge, Warning,
@@ -54,7 +67,7 @@ namespace VertexMaskForgeFillLayerResolution
 				return false;
 			}
 
-			ResolvedResults.Add(Found);
+			ResolvedResults[InstanceIndex] = Found;
 		}
 
 		// Compute entirely into local storage -- OutResult is only touched after total success (see this
@@ -72,6 +85,20 @@ namespace VertexMaskForgeFillLayerResolution
 			for (int32 InstanceIndex = 0; InstanceIndex < FillLayer.MaskStack.Num(); ++InstanceIndex)
 			{
 				const FVertexMaskForgeMaskInstance& Instance = FillLayer.MaskStack[InstanceIndex];
+				FVertexMaskForgeMaskEvaluationInput& Input = MaskInputs[InstanceIndex];
+
+				if (!Instance.bEnabled)
+				{
+					// AUDITED (M16-I.1): disabled -- ResolvedResults[InstanceIndex] is deliberately
+					// nullptr (never resolved above), so it is never dereferenced here. Safe default
+					// MaskValue; bEnabled=false means EvaluateMaskStack never folds this entry in.
+					Input.MaskValue = 0.0f;
+					Input.BlendMode = Instance.BlendMode;
+					Input.Opacity = Instance.Opacity;
+					Input.bEnabled = false;
+					continue;
+				}
+
 				float Value = 0.0f;
 				if (!ResolvedResults[InstanceIndex]->TryGetValue(Index, Value))
 				{
@@ -81,7 +108,6 @@ namespace VertexMaskForgeFillLayerResolution
 					return false;
 				}
 
-				FVertexMaskForgeMaskEvaluationInput& Input = MaskInputs[InstanceIndex];
 				Input.MaskValue = Value;
 				Input.BlendMode = Instance.BlendMode;
 				Input.Opacity = Instance.Opacity;

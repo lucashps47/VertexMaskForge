@@ -218,6 +218,12 @@ struct FVertexMaskForgeMaskInstance
 	 *  below, not one mask's blend within its own stack). */
 	float Opacity = 1.0f;
 
+	/** AUDITED (M16-I.1): a disabled Mask Instance is treated as semantically ABSENT by resolution and
+	 *  generation -- ignored before InstanceId validation, before any result-store lookup, and before
+	 *  GeneratorType/Params are ever inspected (see VertexMaskForgeFillLayerResolution::
+	 *  EvaluateFillLayerFromKeyedResults and VertexMaskForgeRecipeInstanceGeneration::
+	 *  GenerateRequiredInstanceResultsForRecipe). Its own InstanceId/GeneratorType/Params can therefore
+	 *  never cause a failure, and it never requires or triggers generation. */
 	bool bEnabled = true;
 
 	/** The sanctioned way to create a new Mask Instance: a fresh, unique identity, a coherent

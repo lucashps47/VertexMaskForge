@@ -64,6 +64,18 @@ namespace VertexMaskForgeRecipeInstanceGeneration
 
 			for (const FVertexMaskForgeMaskInstance& Instance : Layer.MaskStack)
 			{
+				if (!Instance.bEnabled)
+				{
+					// AUDITED (M16-I.1): a disabled Mask Instance is semantically ABSENT -- skipped
+					// before InstanceId validation, before GeneratorType/Params are inspected, before
+					// store lookup, before deduplication/collision detection, and before classification.
+					// It never establishes or participates in a requirement. If the same InstanceId also
+					// has an enabled occurrence elsewhere in the recipe, that enabled occurrence (whether
+					// earlier or later in authoring order) is the one that establishes the requirement --
+					// this disabled occurrence contributes nothing either way.
+					continue;
+				}
+
 				if (!Instance.InstanceId.IsValid())
 				{
 					UE_LOG(LogVertexMaskForge, Warning,

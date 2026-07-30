@@ -73,11 +73,14 @@ namespace VertexMaskForgeRecipeInstanceGeneration
 	 * contract):
 	 *   1. DISCOVERY: walk Recipe.FillLayers in authoring order; layers with bEnabled==false are skipped
 	 *      ENTIRELY -- no lookup, no validation, no inspection of their Mask Instances' GeneratorType or
-	 *      Params, no possibility of failing because of their content. For each Mask Instance in an
-	 *      enabled layer's MaskStack, in authoring order: its InstanceId must be valid
-	 *      (FGuid::IsValid()), or the whole call fails immediately, before any generation. Identity is
-	 *      exclusively InstanceId -- GeneratorType, Params, BlendMode, Opacity, LayerId, and array
-	 *      position are never used for lookup or deduplication.
+	 *      Params, no possibility of failing because of their content. Within an enabled layer's
+	 *      MaskStack, in authoring order: a Mask Instance with bEnabled==false is ALSO skipped entirely
+	 *      (AUDITED, M16-I.1) -- semantically absent, before its InstanceId is even validated, so its own
+	 *      InstanceId/GeneratorType/Params can never cause a failure and it never establishes or
+	 *      participates in a requirement. For each remaining (enabled) Mask Instance: its InstanceId must
+	 *      be valid (FGuid::IsValid()), or the whole call fails immediately, before any generation.
+	 *      Identity is exclusively InstanceId -- GeneratorType, Params, BlendMode, Opacity, LayerId, and
+	 *      array position are never used for lookup or deduplication.
 	 *   2. DEDUPLICATION + COLLISION DETECTION: the SAME InstanceId, referenced any number of times
 	 *      (within one layer, across different layers, anywhere in the recipe), establishes exactly ONE
 	 *      requirement, at its first occurrence's authoring order. Every later occurrence of that same

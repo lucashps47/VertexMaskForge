@@ -72,13 +72,22 @@ namespace VertexMaskForgeFillLayerResolution
 	 * (Num() > 0) -- same "domain size must be known and positive, never invented" contract the M16-F
 	 * ExpectedCardinality parameter already enforced, now expressed through the base array itself.
 	 *
+	 * AUDITED (M16-I.1): a Mask Stack entry with bEnabled == false is semantically ABSENT -- skipped
+	 * BEFORE its InstanceId is validated and BEFORE any result-store lookup. Its own InstanceId (even
+	 * invalid), GeneratorType, or Params can therefore never cause this call to fail, and it never
+	 * requires an existing keyed result. A Mask Stack containing only disabled entries evaluates
+	 * identically to an empty Mask Stack (EffectiveMask uniformly 1.0 -- see EvaluateMaskStack's own
+	 * empty-array contract).
+	 *
 	 * Validation (in order, matching this function's own atomicity contract -- OutResult is only written
 	 * after every step below succeeds; on any failure OutResult is left completely untouched, PerSampleBase
 	 * is never mutated, and ResultStore is never mutated):
 	 *   1. PerSampleBase.Num() must be > 0.
-	 *   2. Every FillLayer.MaskStack entry's InstanceId must be valid (FGuid::IsValid()).
-	 *   3. Every InstanceId must resolve via ResultStore.Find() (a missing entry fails outright -- no
-	 *      generator is ever run to produce one, no fallback to white/black/legacy/another GUID).
+	 *   2. Every ENABLED FillLayer.MaskStack entry's InstanceId must be valid (FGuid::IsValid()) --
+	 *      disabled entries are skipped before this check.
+	 *   3. Every enabled entry's InstanceId must resolve via ResultStore.Find() (a missing entry fails
+	 *      outright -- no generator is ever run to produce one, no fallback to white/black/legacy/another
+	 *      GUID).
 	 *   4. Every resolved result's Values.Num() must equal PerSampleBase.Num() exactly (no resampling,
 	 *      remapping, padding, or truncation across mismatched cardinalities/domains).
 	 *   5. Every resolved result must have TryGetValue() succeed at every index in [0, PerSampleBase.Num())

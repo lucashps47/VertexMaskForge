@@ -682,4 +682,173 @@ bool FVertexMaskForgeFillLayerResolutionMaterialSlotCompatibilityTest::RunTest(c
 	return true;
 }
 
+// --- M16-I.1: disabled Mask Instance semantics -----------------------------------------------------
+// A disabled Mask Instance (bEnabled == false) is semantically ABSENT: skipped before InstanceId
+// validation and before any store lookup, never folded, and a Mask Stack containing only disabled
+// entries behaves exactly like an empty one.
+
+// A. Disabled instance with an invalid InstanceId never causes a failure.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeFillLayerResolutionDisabledInvalidGuidTest, "VertexMaskForge.FillLayerResolution.DisabledInstanceInvalidGuid", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeFillLayerResolutionDisabledInvalidGuidTest::RunTest(const FString& Parameters)
+{
+	FVertexMaskForgeInstanceResultStore Store; // Empty -- must never be queried.
+	FVertexMaskForgeMaskInstance Disabled = MakeFillLayerTestInstance(EVertexMaskForgeBlendMode::Copy, 1.0f, /*bEnabled=*/false);
+	Disabled.InstanceId = FGuid(); // Deliberately invalid.
+
+	FVertexMaskForgeFillLayer Layer = MakeWhiteFillCopyLayer();
+	Layer.MaskStack.Add(Disabled);
+
+	const TArray<FVector3f> Base = { FVector3f(0.3f, 0.3f, 0.3f) };
+	FVertexMaskForgeFillLayerEvaluationOutput Output;
+	const bool bSuccess = VertexMaskForgeFillLayerResolution::EvaluateFillLayerFromKeyedResults(Layer, Store, Base, Output);
+
+	TestTrue(TEXT("Succeeds despite invalid GUID -- disabled instance never inspected"), bSuccess);
+	if (bSuccess)
+	{
+		TestNearlyEqual(TEXT("EffectiveMask == 1.0 (empty-stack semantics)"), Output.EffectiveMask[0], 1.0f, FLR_Tolerance);
+		ExpectVector(*this, TEXT("Composite == white"), Output.Composite[0], FVector3f(1.0f, 1.0f, 1.0f));
+	}
+	TestEqual(TEXT("Store stayed empty"), Store.Num(), 0);
+
+	return true;
+}
+
+// B. Disabled instance with a valid GUID but no store entry never causes a failure.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeFillLayerResolutionDisabledMissingResultTest, "VertexMaskForge.FillLayerResolution.DisabledInstanceMissingResult", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeFillLayerResolutionDisabledMissingResultTest::RunTest(const FString& Parameters)
+{
+	FVertexMaskForgeInstanceResultStore Store; // Empty -- the disabled instance's (valid) GUID is never stored.
+	const FVertexMaskForgeMaskInstance Disabled = MakeFillLayerTestInstance(EVertexMaskForgeBlendMode::Copy, 1.0f, /*bEnabled=*/false);
+
+	FVertexMaskForgeFillLayer Layer = MakeWhiteFillCopyLayer();
+	Layer.MaskStack.Add(Disabled);
+
+	const TArray<FVector3f> Base = { FVector3f(0.3f, 0.3f, 0.3f) };
+	FVertexMaskForgeFillLayerEvaluationOutput Output;
+	const bool bSuccess = VertexMaskForgeFillLayerResolution::EvaluateFillLayerFromKeyedResults(Layer, Store, Base, Output);
+
+	TestTrue(TEXT("Succeeds -- no result is ever required for a disabled instance"), bSuccess);
+	if (bSuccess)
+	{
+		TestNearlyEqual(TEXT("EffectiveMask == 1.0"), Output.EffectiveMask[0], 1.0f, FLR_Tolerance);
+	}
+	TestEqual(TEXT("Store stayed empty"), Store.Num(), 0);
+
+	return true;
+}
+
+// C. Disabled instance whose GUID has a sparse/incompatible existing entry: still never inspected.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeFillLayerResolutionDisabledInvalidExistingResultTest, "VertexMaskForge.FillLayerResolution.DisabledInstanceInvalidExistingResult", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeFillLayerResolutionDisabledInvalidExistingResultTest::RunTest(const FString& Parameters)
+{
+	FVertexMaskForgeInstanceResultStore Store;
+	const FVertexMaskForgeMaskInstance Disabled = MakeFillLayerTestInstance(EVertexMaskForgeBlendMode::Copy, 1.0f, /*bEnabled=*/false);
+
+	// A store entry that would fail validation if this instance were enabled (cardinality mismatch: 1
+	// sample expected, 3 stored) -- representable via the real type, unlike a "failed/stale" State enum
+	// which FVertexMaskForgeInstanceMaskResult does not have.
+	Store.StoreOrReplace(Disabled.InstanceId, MakeFillLayerTestResult({ 0.1f, 0.2f, 0.3f }));
+
+	FVertexMaskForgeFillLayer Layer = MakeWhiteFillCopyLayer();
+	Layer.MaskStack.Add(Disabled);
+
+	const TArray<FVector3f> Base = { FVector3f(0.3f, 0.3f, 0.3f) }; // Cardinality 1 -- would mismatch the stored 3.
+	FVertexMaskForgeFillLayerEvaluationOutput Output;
+	const bool bSuccess = VertexMaskForgeFillLayerResolution::EvaluateFillLayerFromKeyedResults(Layer, Store, Base, Output);
+
+	TestTrue(TEXT("Succeeds -- the incompatible existing entry is never read for a disabled instance"), bSuccess);
+	if (bSuccess)
+	{
+		TestNearlyEqual(TEXT("EffectiveMask == 1.0"), Output.EffectiveMask[0], 1.0f, FLR_Tolerance);
+	}
+	TestEqual(TEXT("Store unaffected"), Store.Num(), 1);
+
+	return true;
+}
+
+// D. Mixed enabled/disabled stack: result equals folding only the enabled entries.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeFillLayerResolutionMixedStackTest, "VertexMaskForge.FillLayerResolution.MixedEnabledDisabledStack", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeFillLayerResolutionMixedStackTest::RunTest(const FString& Parameters)
+{
+	FVertexMaskForgeInstanceResultStore Store;
+	FVertexMaskForgeMaskInstance TrulyDisabled = MakeFillLayerTestInstance(EVertexMaskForgeBlendMode::Copy, 1.0f, /*bEnabled=*/false);
+	TrulyDisabled.InstanceId = FGuid(); // Invalid -- must not matter.
+
+	const FVertexMaskForgeMaskInstance Enabled = MakeFillLayerTestInstance(EVertexMaskForgeBlendMode::Copy, 1.0f, /*bEnabled=*/true);
+	Store.StoreOrReplace(Enabled.InstanceId, MakeFillLayerTestResult({ 0.4f }));
+
+	FVertexMaskForgeFillLayer Layer = MakeWhiteFillCopyLayer();
+	Layer.MaskStack.Add(TrulyDisabled); // Before the enabled entry -- must not affect the fold.
+	Layer.MaskStack.Add(Enabled);
+
+	const TArray<FVector3f> Base = { FVector3f::ZeroVector };
+	FVertexMaskForgeFillLayerEvaluationOutput Output;
+	const bool bSuccess = VertexMaskForgeFillLayerResolution::EvaluateFillLayerFromKeyedResults(Layer, Store, Base, Output);
+
+	TestTrue(TEXT("Succeeds"), bSuccess);
+	if (bSuccess)
+	{
+		// Only the enabled Copy(0.4) entry folds: seed 1.0 -> Copy(0.4) -> 0.4.
+		TestNearlyEqual(TEXT("EffectiveMask == 0.4 (only the enabled entry)"), Output.EffectiveMask[0], 0.4f, FLR_Tolerance);
+		ExpectVector(*this, TEXT("Composite"), Output.Composite[0], FVector3f(0.4f, 0.4f, 0.4f));
+	}
+
+	return true;
+}
+
+// E. A disabled instance's own resolvable value, even if present, is never folded into the result.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeFillLayerResolutionDisabledValueNeverFoldedTest, "VertexMaskForge.FillLayerResolution.DisabledValueNeverFolded", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeFillLayerResolutionDisabledValueNeverFoldedTest::RunTest(const FString& Parameters)
+{
+	FVertexMaskForgeInstanceResultStore Store;
+	const FVertexMaskForgeMaskInstance Disabled = MakeFillLayerTestInstance(EVertexMaskForgeBlendMode::Copy, 1.0f, /*bEnabled=*/false);
+	// A value that, if folded (Copy), would drive EffectiveMask to 0.9 -- clearly distinct from the
+	// empty-stack value of 1.0 this test expects instead.
+	Store.StoreOrReplace(Disabled.InstanceId, MakeFillLayerTestResult({ 0.9f }));
+
+	FVertexMaskForgeFillLayer Layer = MakeWhiteFillCopyLayer();
+	Layer.MaskStack.Add(Disabled);
+
+	const TArray<FVector3f> Base = { FVector3f::ZeroVector };
+	FVertexMaskForgeFillLayerEvaluationOutput Output;
+	const bool bSuccess = VertexMaskForgeFillLayerResolution::EvaluateFillLayerFromKeyedResults(Layer, Store, Base, Output);
+
+	TestTrue(TEXT("Succeeds"), bSuccess);
+	if (bSuccess)
+	{
+		TestNearlyEqual(TEXT("EffectiveMask == 1.0, NOT 0.9 -- disabled value never folded"), Output.EffectiveMask[0], 1.0f, FLR_Tolerance);
+	}
+
+	return true;
+}
+
+// F. A Mask Stack containing only disabled instances (with deliberately invalid content) behaves
+// exactly like an empty Mask Stack.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeFillLayerResolutionOnlyDisabledStackTest, "VertexMaskForge.FillLayerResolution.OnlyDisabledStack", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeFillLayerResolutionOnlyDisabledStackTest::RunTest(const FString& Parameters)
+{
+	FVertexMaskForgeInstanceResultStore Store; // Empty -- must never be queried.
+	FVertexMaskForgeMaskInstance DisabledInvalidGuid = MakeFillLayerTestInstance(EVertexMaskForgeBlendMode::Multiply, 0.5f, /*bEnabled=*/false);
+	DisabledInvalidGuid.InstanceId = FGuid();
+	const FVertexMaskForgeMaskInstance DisabledUnstored = MakeFillLayerTestInstance(EVertexMaskForgeBlendMode::Subtract, 1.0f, /*bEnabled=*/false);
+
+	FVertexMaskForgeFillLayer Layer = MakeWhiteFillCopyLayer();
+	Layer.MaskStack.Add(DisabledInvalidGuid);
+	Layer.MaskStack.Add(DisabledUnstored);
+
+	const TArray<FVector3f> Base = { FVector3f(0.2f, 0.2f, 0.2f) };
+	FVertexMaskForgeFillLayerEvaluationOutput Output;
+	const bool bSuccess = VertexMaskForgeFillLayerResolution::EvaluateFillLayerFromKeyedResults(Layer, Store, Base, Output);
+
+	TestTrue(TEXT("Succeeds -- equivalent to an empty Mask Stack"), bSuccess);
+	if (bSuccess)
+	{
+		TestNearlyEqual(TEXT("EffectiveMask == 1.0"), Output.EffectiveMask[0], 1.0f, FLR_Tolerance);
+		ExpectVector(*this, TEXT("Composite == white"), Output.Composite[0], FVector3f(1.0f, 1.0f, 1.0f));
+	}
+	TestEqual(TEXT("Store stayed empty"), Store.Num(), 0);
+
+	return true;
+}
+
 #endif // WITH_DEV_AUTOMATION_TESTS

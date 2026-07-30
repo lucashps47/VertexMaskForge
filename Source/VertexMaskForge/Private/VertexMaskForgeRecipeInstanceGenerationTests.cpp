@@ -782,4 +782,296 @@ bool FVertexMaskForgeRecipeInstanceGenerationEquivalenceWithM16ETest::RunTest(co
 	return true;
 }
 
+// --- M16-I.1: disabled Mask Instance semantics -----------------------------------------------------
+// A disabled Mask Instance is semantically ABSENT: skipped before InstanceId validation, before
+// GeneratorType/Params are read, before store lookup, before deduplication/collision detection, and
+// before classification. It never establishes or participates in a requirement.
+
+// A. Disabled instance with an invalid InstanceId is skipped -- no failure, zero generation.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeRecipeInstanceGenerationDisabledInvalidGuidTest, "VertexMaskForge.RecipeInstanceGeneration.DisabledInvalidGuidSkipped", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeRecipeInstanceGenerationDisabledInvalidGuidTest::RunTest(const FString& Parameters)
+{
+	FVertexMaskForgeWorkingMesh WorkingMesh = BuildRIGFixtureWorkingMesh(0, 1);
+	FVertexMaskForgeMaskInstance Disabled = MakeRIGMaterialSlotInstance(0);
+	Disabled.InstanceId = FGuid();
+	Disabled.bEnabled = false;
+
+	FVertexMaskForgeFillLayer Layer = MakeRIGLayer(true);
+	Layer.MaskStack.Add(Disabled);
+	FVertexMaskForgeRecipe Recipe;
+	Recipe.FillLayers.Add(Layer);
+
+	FVertexMaskForgeRecipeInstanceGenerationOutput Output;
+	const bool bSuccess = VertexMaskForgeRecipeInstanceGeneration::GenerateRequiredInstanceResultsForRecipe(
+		Recipe, WorkingMesh, true, nullptr, Output);
+
+	TestTrue(TEXT("Succeeds -- disabled instance's invalid GUID never inspected"), bSuccess);
+	TestEqual(TEXT("NumRequired"), Output.NumRequired, 0);
+	TestEqual(TEXT("NumGenerated"), Output.NumGenerated, 0);
+	TestEqual(TEXT("Store untouched"), WorkingMesh.InstanceResults.Num(), 0);
+
+	return true;
+}
+
+// B. Disabled instance of an unsupported generator is skipped -- no failure, no fallback.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeRecipeInstanceGenerationDisabledUnsupportedTest, "VertexMaskForge.RecipeInstanceGeneration.DisabledUnsupportedGeneratorSkipped", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeRecipeInstanceGenerationDisabledUnsupportedTest::RunTest(const FString& Parameters)
+{
+	FVertexMaskForgeWorkingMesh WorkingMesh = BuildRIGFixtureWorkingMesh(0, 1);
+	FVertexMaskForgeMaskInstance Disabled = MakeUnsupportedInstance();
+	Disabled.bEnabled = false;
+
+	FVertexMaskForgeFillLayer Layer = MakeRIGLayer(true);
+	Layer.MaskStack.Add(Disabled);
+	FVertexMaskForgeRecipe Recipe;
+	Recipe.FillLayers.Add(Layer);
+
+	FVertexMaskForgeRecipeInstanceGenerationOutput Output;
+	const bool bSuccess = VertexMaskForgeRecipeInstanceGeneration::GenerateRequiredInstanceResultsForRecipe(
+		Recipe, WorkingMesh, true, nullptr, Output);
+
+	TestTrue(TEXT("Succeeds -- disabled unsupported-generator instance never inspected"), bSuccess);
+	TestEqual(TEXT("NumRequired"), Output.NumRequired, 0);
+	TestEqual(TEXT("Store untouched"), WorkingMesh.InstanceResults.Num(), 0);
+
+	return true;
+}
+
+// C. Disabled Material Slot instance is skipped even though the domain would allow generation.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeRecipeInstanceGenerationDisabledMaterialSlotTest, "VertexMaskForge.RecipeInstanceGeneration.DisabledMaterialSlotSkipped", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeRecipeInstanceGenerationDisabledMaterialSlotTest::RunTest(const FString& Parameters)
+{
+	FVertexMaskForgeWorkingMesh WorkingMesh = BuildRIGFixtureWorkingMesh(0, 1); // Would generate successfully if enabled.
+	FVertexMaskForgeMaskInstance Disabled = MakeRIGMaterialSlotInstance(0);
+	Disabled.bEnabled = false;
+
+	FVertexMaskForgeFillLayer Layer = MakeRIGLayer(true);
+	Layer.MaskStack.Add(Disabled);
+	FVertexMaskForgeRecipe Recipe;
+	Recipe.FillLayers.Add(Layer);
+
+	FVertexMaskForgeRecipeInstanceGenerationOutput Output;
+	const bool bSuccess = VertexMaskForgeRecipeInstanceGeneration::GenerateRequiredInstanceResultsForRecipe(
+		Recipe, WorkingMesh, true, nullptr, Output);
+
+	TestTrue(TEXT("Succeeds"), bSuccess);
+	TestEqual(TEXT("NumRequired == 0 -- no generation was required"), Output.NumRequired, 0);
+	TestEqual(TEXT("NumGenerated == 0"), Output.NumGenerated, 0);
+	TestFalse(TEXT("No entry created for the disabled instance's GUID"), WorkingMesh.InstanceResults.Contains(Disabled.InstanceId));
+	TestEqual(TEXT("Store untouched"), WorkingMesh.InstanceResults.Num(), 0);
+
+	return true;
+}
+
+// D. Mixed enabled/disabled stack: only the enabled Material Slot instance is generated.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeRecipeInstanceGenerationMixedEnabledDisabledTest, "VertexMaskForge.RecipeInstanceGeneration.MixedEnabledDisabledStack", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeRecipeInstanceGenerationMixedEnabledDisabledTest::RunTest(const FString& Parameters)
+{
+	FVertexMaskForgeWorkingMesh WorkingMesh = BuildRIGFixtureWorkingMesh(0, 1);
+	const FVertexMaskForgeMaskInstance Enabled = MakeRIGMaterialSlotInstance(0);
+	FVertexMaskForgeMaskInstance DisabledUnsupported = MakeUnsupportedInstance();
+	DisabledUnsupported.bEnabled = false;
+
+	FVertexMaskForgeFillLayer Layer = MakeRIGLayer(true);
+	Layer.MaskStack.Add(DisabledUnsupported); // Would fail the whole call if it were enabled.
+	Layer.MaskStack.Add(Enabled);
+	FVertexMaskForgeRecipe Recipe;
+	Recipe.FillLayers.Add(Layer);
+
+	FVertexMaskForgeRecipeInstanceGenerationOutput Output;
+	const bool bSuccess = VertexMaskForgeRecipeInstanceGeneration::GenerateRequiredInstanceResultsForRecipe(
+		Recipe, WorkingMesh, true, nullptr, Output);
+
+	TestTrue(TEXT("Succeeds"), bSuccess);
+	TestEqual(TEXT("NumRequired == 1 (only the enabled instance)"), Output.NumRequired, 1);
+	TestEqual(TEXT("NumGenerated == 1"), Output.NumGenerated, 1);
+	TestEqual(TEXT("Store has exactly the enabled instance's entry"), WorkingMesh.InstanceResults.Num(), 1);
+	TestTrue(TEXT("Enabled entry present"), WorkingMesh.InstanceResults.Contains(Enabled.InstanceId));
+
+	return true;
+}
+
+// E1. Same GUID: disabled occurrence BEFORE the enabled one, with divergent (irrelevant) params.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeRecipeInstanceGenerationSameGuidDisabledThenEnabledTest, "VertexMaskForge.RecipeInstanceGeneration.SameGuidDisabledThenEnabled", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeRecipeInstanceGenerationSameGuidDisabledThenEnabledTest::RunTest(const FString& Parameters)
+{
+	FVertexMaskForgeWorkingMesh WorkingMesh = BuildRIGFixtureWorkingMesh(0, 1);
+	const FVertexMaskForgeMaskInstance Enabled = MakeRIGMaterialSlotInstance(0);
+	FVertexMaskForgeMaskInstance Disabled = Enabled; // Same InstanceId.
+	Disabled.Params.Get<FVertexMaskForgeMaterialSlotParams>().SelectedSlotIndex = 1; // Divergent -- must not matter.
+	Disabled.bEnabled = false;
+
+	FVertexMaskForgeFillLayer Layer = MakeRIGLayer(true);
+	Layer.MaskStack.Add(Disabled); // Before.
+	Layer.MaskStack.Add(Enabled);
+	FVertexMaskForgeRecipe Recipe;
+	Recipe.FillLayers.Add(Layer);
+
+	FVertexMaskForgeRecipeInstanceGenerationOutput Output;
+	const bool bSuccess = VertexMaskForgeRecipeInstanceGeneration::GenerateRequiredInstanceResultsForRecipe(
+		Recipe, WorkingMesh, true, nullptr, Output);
+
+	TestTrue(TEXT("Succeeds -- no collision, disabled occurrence never inspected"), bSuccess);
+	TestEqual(TEXT("NumRequired == 1"), Output.NumRequired, 1);
+	TestEqual(TEXT("NumGenerated == 1"), Output.NumGenerated, 1);
+	TestEqual(TEXT("One entry"), WorkingMesh.InstanceResults.Num(), 1);
+
+	const FVertexMaskForgeInstanceMaskResult* Found = WorkingMesh.InstanceResults.Find(Enabled.InstanceId);
+	TestNotNull(TEXT("Found"), Found);
+	if (Found && Found->Values.Num() == 6)
+	{
+		// Slot 0 (the ENABLED occurrence's own param) selected -> corners 0-2 = 1.0, 3-5 = 0.0.
+		TestNearlyEqual(TEXT("Values[0] reflects the enabled occurrence's own slot 0"), Found->Values[0], 1.0f, RIG_Tolerance);
+	}
+
+	return true;
+}
+
+// E2. Same GUID: enabled occurrence BEFORE the disabled one, with divergent (irrelevant) params.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeRecipeInstanceGenerationSameGuidEnabledThenDisabledTest, "VertexMaskForge.RecipeInstanceGeneration.SameGuidEnabledThenDisabled", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeRecipeInstanceGenerationSameGuidEnabledThenDisabledTest::RunTest(const FString& Parameters)
+{
+	FVertexMaskForgeWorkingMesh WorkingMesh = BuildRIGFixtureWorkingMesh(0, 1);
+	const FVertexMaskForgeMaskInstance Enabled = MakeRIGMaterialSlotInstance(0);
+	FVertexMaskForgeMaskInstance Disabled = Enabled; // Same InstanceId.
+	Disabled.Params.Get<FVertexMaskForgeMaterialSlotParams>().SelectedSlotIndex = 1; // Divergent -- must not matter.
+	Disabled.bEnabled = false;
+
+	FVertexMaskForgeFillLayer Layer = MakeRIGLayer(true);
+	Layer.MaskStack.Add(Enabled);
+	Layer.MaskStack.Add(Disabled); // After.
+	FVertexMaskForgeRecipe Recipe;
+	Recipe.FillLayers.Add(Layer);
+
+	FVertexMaskForgeRecipeInstanceGenerationOutput Output;
+	const bool bSuccess = VertexMaskForgeRecipeInstanceGeneration::GenerateRequiredInstanceResultsForRecipe(
+		Recipe, WorkingMesh, true, nullptr, Output);
+
+	TestTrue(TEXT("Succeeds -- no collision"), bSuccess);
+	TestEqual(TEXT("NumRequired == 1"), Output.NumRequired, 1);
+	TestEqual(TEXT("One entry"), WorkingMesh.InstanceResults.Num(), 1);
+
+	return true;
+}
+
+// E3. Same GUID across two different enabled layers: one reference disabled, the other enabled.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeRecipeInstanceGenerationSameGuidAcrossLayersMixedTest, "VertexMaskForge.RecipeInstanceGeneration.SameGuidAcrossLayersMixedEnabled", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeRecipeInstanceGenerationSameGuidAcrossLayersMixedTest::RunTest(const FString& Parameters)
+{
+	FVertexMaskForgeWorkingMesh WorkingMesh = BuildRIGFixtureWorkingMesh(0, 1);
+	const FVertexMaskForgeMaskInstance Enabled = MakeRIGMaterialSlotInstance(0);
+	FVertexMaskForgeMaskInstance Disabled = Enabled;
+	Disabled.Params.Get<FVertexMaskForgeMaterialSlotParams>().SelectedSlotIndex = 1;
+	Disabled.bEnabled = false;
+
+	FVertexMaskForgeFillLayer Layer0 = MakeRIGLayer(true);
+	Layer0.MaskStack.Add(Disabled);
+	FVertexMaskForgeFillLayer Layer1 = MakeRIGLayer(true);
+	Layer1.MaskStack.Add(Enabled);
+
+	FVertexMaskForgeRecipe Recipe;
+	Recipe.FillLayers.Add(Layer0);
+	Recipe.FillLayers.Add(Layer1);
+
+	FVertexMaskForgeRecipeInstanceGenerationOutput Output;
+	const bool bSuccess = VertexMaskForgeRecipeInstanceGeneration::GenerateRequiredInstanceResultsForRecipe(
+		Recipe, WorkingMesh, true, nullptr, Output);
+
+	TestTrue(TEXT("Succeeds"), bSuccess);
+	TestEqual(TEXT("NumRequired == 1"), Output.NumRequired, 1);
+	TestEqual(TEXT("One entry"), WorkingMesh.InstanceResults.Num(), 1);
+
+	return true;
+}
+
+// F. Same GUID referenced only by disabled occurrences: zero requirement, zero entry.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeRecipeInstanceGenerationSameGuidOnlyDisabledTest, "VertexMaskForge.RecipeInstanceGeneration.SameGuidOnlyDisabled", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeRecipeInstanceGenerationSameGuidOnlyDisabledTest::RunTest(const FString& Parameters)
+{
+	FVertexMaskForgeWorkingMesh WorkingMesh = BuildRIGFixtureWorkingMesh(0, 1);
+	FVertexMaskForgeMaskInstance DisabledA = MakeRIGMaterialSlotInstance(0);
+	DisabledA.bEnabled = false;
+	FVertexMaskForgeMaskInstance DisabledB = DisabledA; // Same InstanceId, divergent slot, both disabled.
+	DisabledB.Params.Get<FVertexMaskForgeMaterialSlotParams>().SelectedSlotIndex = 1;
+
+	FVertexMaskForgeFillLayer Layer = MakeRIGLayer(true);
+	Layer.MaskStack.Add(DisabledA);
+	Layer.MaskStack.Add(DisabledB);
+	FVertexMaskForgeRecipe Recipe;
+	Recipe.FillLayers.Add(Layer);
+
+	FVertexMaskForgeRecipeInstanceGenerationOutput Output;
+	const bool bSuccess = VertexMaskForgeRecipeInstanceGeneration::GenerateRequiredInstanceResultsForRecipe(
+		Recipe, WorkingMesh, true, nullptr, Output);
+
+	TestTrue(TEXT("Succeeds"), bSuccess);
+	TestEqual(TEXT("NumRequired == 0"), Output.NumRequired, 0);
+	TestEqual(TEXT("Store untouched"), WorkingMesh.InstanceResults.Num(), 0);
+
+	return true;
+}
+
+// G. A GUID referenced only by a disabled instance leaves an unrelated existing entry for that same
+// GUID completely untouched (no regeneration, since there is no requirement for it at all).
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeRecipeInstanceGenerationDisabledExistingResultTest, "VertexMaskForge.RecipeInstanceGeneration.DisabledExistingResultUntouched", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeRecipeInstanceGenerationDisabledExistingResultTest::RunTest(const FString& Parameters)
+{
+	FVertexMaskForgeWorkingMesh WorkingMesh = BuildRIGFixtureWorkingMesh(0, 1);
+	FVertexMaskForgeMaskInstance Disabled = MakeRIGMaterialSlotInstance(0);
+	Disabled.bEnabled = false;
+	WorkingMesh.InstanceResults.StoreOrReplace(Disabled.InstanceId, MakeRIGResult({ 0.77f, 0.77f, 0.77f, 0.77f, 0.77f, 0.77f }));
+
+	FVertexMaskForgeFillLayer Layer = MakeRIGLayer(true);
+	Layer.MaskStack.Add(Disabled);
+	FVertexMaskForgeRecipe Recipe;
+	Recipe.FillLayers.Add(Layer);
+
+	FVertexMaskForgeRecipeInstanceGenerationOutput Output;
+	const bool bSuccess = VertexMaskForgeRecipeInstanceGeneration::GenerateRequiredInstanceResultsForRecipe(
+		Recipe, WorkingMesh, true, nullptr, Output);
+
+	TestTrue(TEXT("Succeeds"), bSuccess);
+	TestEqual(TEXT("NumRequired == 0 (disabled instance created no requirement)"), Output.NumRequired, 0);
+	const FVertexMaskForgeInstanceMaskResult* Found = WorkingMesh.InstanceResults.Find(Disabled.InstanceId);
+	TestNotNull(TEXT("Existing entry still present"), Found);
+	if (Found && Found->Values.Num() == 6)
+	{
+		TestNearlyEqual(TEXT("Existing payload unchanged"), Found->Values[0], 0.77f, RIG_Tolerance);
+	}
+	TestEqual(TEXT("Store still has exactly one entry"), WorkingMesh.InstanceResults.Num(), 1);
+
+	return true;
+}
+
+// H. Control: enabled-only behavior is unchanged by the M16-I.1 fix.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeRecipeInstanceGenerationEnabledControlTest, "VertexMaskForge.RecipeInstanceGeneration.EnabledBehaviorUnchanged", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeRecipeInstanceGenerationEnabledControlTest::RunTest(const FString& Parameters)
+{
+	FVertexMaskForgeWorkingMesh WorkingMesh = BuildRIGFixtureWorkingMesh(0, 1);
+	const FVertexMaskForgeMaskInstance A = MakeRIGMaterialSlotInstance(0); // bEnabled defaults to true via Make().
+
+	FVertexMaskForgeFillLayer Layer = MakeRIGLayer(true);
+	Layer.MaskStack.Add(A);
+	FVertexMaskForgeRecipe Recipe;
+	Recipe.FillLayers.Add(Layer);
+
+	FVertexMaskForgeRecipeInstanceGenerationOutput Output;
+	const bool bSuccess = VertexMaskForgeRecipeInstanceGeneration::GenerateRequiredInstanceResultsForRecipe(
+		Recipe, WorkingMesh, true, nullptr, Output);
+
+	TestTrue(TEXT("Succeeds"), bSuccess);
+	TestEqual(TEXT("NumRequired"), Output.NumRequired, 1);
+	TestEqual(TEXT("NumReused"), Output.NumReused, 0);
+	TestEqual(TEXT("NumGenerated"), Output.NumGenerated, 1);
+	const FVertexMaskForgeInstanceMaskResult* Found = WorkingMesh.InstanceResults.Find(A.InstanceId);
+	TestNotNull(TEXT("Found"), Found);
+	if (Found && Found->Values.Num() == 6)
+	{
+		TestNearlyEqual(TEXT("Values[0]"), Found->Values[0], 1.0f, RIG_Tolerance);
+		TestNearlyEqual(TEXT("Values[3]"), Found->Values[3], 0.0f, RIG_Tolerance);
+	}
+
+	return true;
+}
+
 #endif // WITH_DEV_AUTOMATION_TESTS
