@@ -10,14 +10,14 @@ namespace VertexMaskForgeFillLayerResolution
 	bool EvaluateFillLayerFromKeyedResults(
 		const FVertexMaskForgeFillLayer& FillLayer,
 		const FVertexMaskForgeInstanceResultStore& ResultStore,
-		const int32 ExpectedCardinality,
-		const FVector3f& BaseValue,
+		const TConstArrayView<FVector3f> PerSampleBase,
 		FVertexMaskForgeFillLayerEvaluationOutput& OutResult)
 	{
+		const int32 ExpectedCardinality = PerSampleBase.Num();
 		if (ExpectedCardinality <= 0)
 		{
 			UE_LOG(LogVertexMaskForge, Warning,
-				TEXT("VertexMaskForgeFillLayerResolution::EvaluateFillLayerFromKeyedResults: ExpectedCardinality must be > 0."));
+				TEXT("VertexMaskForgeFillLayerResolution::EvaluateFillLayerFromKeyedResults: PerSampleBase must be non-empty."));
 			return false;
 		}
 
@@ -101,9 +101,10 @@ namespace VertexMaskForgeFillLayerResolution
 			LayerInput.EffectiveMask = Effective;
 
 			// Exactly one Fill Layer -- a single-element view into the real Fill Layer evaluator, never a
-			// reimplementation of EvaluateFillLayerStep's math.
+			// reimplementation of EvaluateFillLayerStep's math. PerSampleBase[Index] is read verbatim, once,
+			// for this exact index -- never averaged, reduced, broadcast from index 0, padded, or truncated.
 			LocalComposite[Index] = VertexMaskForgeSequentialEvaluator::EvaluateFillLayers(
-				BaseValue, MakeArrayView(&LayerInput, 1));
+				PerSampleBase[Index], MakeArrayView(&LayerInput, 1));
 		}
 
 		OutResult.EffectiveMask = MoveTemp(LocalEffectiveMask);
