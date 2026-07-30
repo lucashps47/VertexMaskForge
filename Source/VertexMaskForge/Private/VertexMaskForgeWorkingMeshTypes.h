@@ -8,6 +8,7 @@
 #include "UObject/SoftObjectPtr.h"
 #include "UObject/StrongObjectPtr.h"
 #include "UObject/WeakObjectPtr.h"
+#include "VertexMaskForgeInstanceResultStore.h"
 #include "VertexMaskForgeMaskTypes.h"
 
 class AActor;
@@ -1000,6 +1001,19 @@ struct FVertexMaskForgeWorkingMesh
 
 	/** Source-Topology sibling of ThicknessCache -- see FVertexMaskForgeSourceTopologyThicknessCache. */
 	TUniquePtr<FVertexMaskForgeSourceTopologyThicknessCache> SourceTopologyThicknessCache;
+
+	/**
+	 * M16-C: per-entry keyed instance-result storage for the future Mask Stack architecture -- see
+	 * VertexMaskForgeInstanceResultStore.h's own module comment. Holds results for whichever future
+	 * Mask Instances are transform-independent (computed once per entry, shared across every component
+	 * of this asset -- the same "computed ONCE PER ENTRY" contract CurvatureMask/NoiseMask/
+	 * MaterialSlotMask/ThicknessMask already have above). Empty and unused in this checkpoint: no
+	 * generator writes to it, no orchestration reads from it, and it has no effect on any existing
+	 * named mask/cache field above. Moves naturally with this struct (already move-only; TMap moves
+	 * trivially) -- no change was needed to the move constructor/assignment operator, both still
+	 * `= default` in the .cpp.
+	 */
+	FVertexMaskForgeInstanceResultStore InstanceResults;
 };
 
 /**
@@ -1193,6 +1207,18 @@ struct FVertexMaskForgePreviewComponentState
 	TArray<FColor> SourceTopologyBaselineColors;
 	TArray<FColor> SourceTopologyCommittedColors;
 	TArray<FColor> SourceTopologyWorkingColors;
+
+	/**
+	 * M16-C: per-component keyed instance-result storage for the future Mask Stack architecture -- see
+	 * VertexMaskForgeInstanceResultStore.h's own module comment. Holds results for whichever future
+	 * Mask Instances are transform-dependent (re-evaluated per component -- the same reason
+	 * AOCache/SourceTopologyAOCache already live here rather than on FVertexMaskForgeWorkingMesh).
+	 * Empty and unused in this checkpoint: no generator writes to it, no orchestration reads from it,
+	 * and it has no effect on any existing named cache/color field above. Moves naturally with this
+	 * struct (already move-only; TMap moves trivially) -- no change was needed to the move
+	 * constructor/assignment operator, both still `= default` in the .cpp.
+	 */
+	FVertexMaskForgeInstanceResultStore InstanceResults;
 };
 
 namespace VertexMaskForgeWorkingMeshTypes
