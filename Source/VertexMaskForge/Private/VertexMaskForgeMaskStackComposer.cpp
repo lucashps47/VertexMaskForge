@@ -13,7 +13,7 @@ namespace VertexMaskForgeMaskStackComposer
 	 * Copy does -- for M < 1 the two diverge (Linear also factors in B), which is the whole point of
 	 * offering it as a distinct mode.
 	 */
-	static float ApplyMaskBlendMode(const float Base, const float Mask, const EVertexMaskForgeBlendMode Mode)
+	float ApplyMaskBlendMode(const float Base, const float Mask, const EVertexMaskForgeBlendMode Mode)
 	{
 		switch (Mode)
 		{
@@ -46,7 +46,7 @@ namespace VertexMaskForgeMaskStackComposer
 	 * agree if intermediate saturation is never clamped away mid-fold). Clamping now happens ONLY at
 	 * the two audited boundaries inside ComposeStack -- see that function's own doc comment.
 	 */
-	static float BlendMaskValueUnclamped(const float Base, const float Mask, const EVertexMaskForgeBlendMode Mode, const float Opacity)
+	float BlendMaskValueUnclamped(const float Base, const float Mask, const EVertexMaskForgeBlendMode Mode, const float Opacity)
 	{
 		const float BlendResult = ApplyMaskBlendMode(Base, Mask, Mode);
 		return FMath::Lerp(Base, BlendResult, Opacity);

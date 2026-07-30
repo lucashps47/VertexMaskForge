@@ -17,6 +17,26 @@
 namespace VertexMaskForgeMaskStackComposer
 {
 	/**
+	 * AUDITED (M16-B): the raw, un-opacitized blend-mode formula for one channel, operating on
+	 * already-normalized [0,1] Base ("B")/Mask ("M") values. Pure function -- mutates nothing, never
+	 * clamps. Moved here from an internal-linkage (panel-file-local `static`) definition inside
+	 * VertexMaskForgeMaskStackComposer.cpp so the new sequential evaluators
+	 * (VertexMaskForgeSequentialEvaluator.h/.cpp) can reuse the exact same formula ComposeStack itself
+	 * calls -- body unchanged, linkage only. See VertexMaskForgeMaskStackComposer.cpp for the full
+	 * per-mode derivation/doc comment.
+	 */
+	float ApplyMaskBlendMode(float Base, float Mask, EVertexMaskForgeBlendMode Mode);
+
+	/**
+	 * AUDITED (M16-B): the Opacity lerp, WITHOUT any clamp -- BlendResult = ApplyMaskBlendMode(...),
+	 * Result = Lerp(Base, BlendResult, Opacity). Same linkage-only extraction as ApplyMaskBlendMode
+	 * above; body unchanged. Both the legacy ComposeStack (unmodified, still stage-grouped) and the new
+	 * sequential evaluators call this exact function -- there is only one implementation of these
+	 * formulas anywhere in the plugin.
+	 */
+	float BlendMaskValueUnclamped(float Base, float Mask, EVertexMaskForgeBlendMode Mode, float Opacity);
+
+	/**
 	 * ONE mask generator's already-resolved contribution to a single vertex/corner's composition --
 	 * exactly the (MaskValue, BlendMode, Opacity) triple the fixed-stage fold in ComposeStack needs,
 	 * and nothing else. Deliberately carries no pointer back to the mask that produced this value, no
