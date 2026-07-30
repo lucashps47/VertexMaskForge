@@ -5,6 +5,7 @@
 struct FVertexMaskForgeScalarMask;
 struct FVertexMaskForgeWorkingMesh;
 struct FStaticMeshLODResources;
+struct FVertexMaskForgeMaskInstance;
 
 namespace VertexMaskForgeMaterialSlotGenerator
 {
@@ -34,4 +35,38 @@ namespace VertexMaskForgeMaterialSlotGenerator
 		const FVertexMaskForgeWorkingMesh& WorkingMesh,
 		int32 SelectedSlotIndex,
 		bool bInvert);
+
+	/**
+	 * M16-E: the first real integration between a FVertexMaskForgeMaskInstance (M16-A authoring state)
+	 * and FVertexMaskForgeInstanceResultStore (M16-C keyed result storage), scoped to Material Slot
+	 * only -- see the M16-E checkpoint's own contract for why this is a focused function rather than a
+	 * generic per-generator dispatcher.
+	 *
+	 * A thin orchestration layer, not a reimplementation: calls the SAME GenerateMaterialSlotMask /
+	 * GenerateMaterialSlotMaskFromDynamicMesh entry points above (bUseSourceTopology selects which,
+	 * exactly mirroring SVertexMaskForgePanel's own legacy call site), then converts the resulting
+	 * FVertexMaskForgeScalarMask's Values/bHasValue into a FVertexMaskForgeInstanceMaskResult and stores
+	 * it via WorkingMesh.InstanceResults.StoreOrReplace(MaskInstance.InstanceId, ...) -- never touches
+	 * WorkingMesh.MaterialSlotMask (the named legacy result), never touches
+	 * FVertexMaskForgePreviewComponentState::InstanceResults, never calls the sequential evaluator.
+	 *
+	 * Rejects deterministically, with no store mutation and no crash/ensure/exception, when:
+	 *   - MaskInstance.InstanceId is invalid (FGuid::IsValid() == false);
+	 *   - MaskInstance.GeneratorType is not EVertexMaskForgeGeneratorType::MaterialSlot;
+	 *   - MaskInstance.Params does not actually hold a FVertexMaskForgeMaterialSlotParams (defensive --
+	 *     should be unreachable given the GeneratorType/Params coherence invariant, but never assumed);
+	 *   - bUseSourceTopology is false and LOD0 is null (render-vertex domain requires it);
+	 *   - the underlying generator call itself returns anything other than
+	 *     EVertexMaskForgeScalarMaskState::Ready (mirrors the legacy call site's own "auto-update never
+	 *     replaces a valid Preview with incomplete/degenerate data" contract -- a prior valid result for
+	 *     the same InstanceId, if any, is left completely untouched on failure).
+	 *
+	 * LOD0 is ignored when bUseSourceTopology is true (may be null). Returns true iff the result was
+	 * computed and stored/replaced in WorkingMesh.InstanceResults.
+	 */
+	bool GenerateMaterialSlotMaskInstanceResult(
+		const FVertexMaskForgeMaskInstance& MaskInstance,
+		FVertexMaskForgeWorkingMesh& WorkingMesh,
+		bool bUseSourceTopology,
+		const FStaticMeshLODResources* LOD0);
 }

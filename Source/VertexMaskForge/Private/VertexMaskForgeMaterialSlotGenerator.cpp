@@ -2,6 +2,7 @@
 
 #include "DynamicMesh/DynamicMesh3.h"
 #include "StaticMeshResources.h"
+#include "VertexMaskForgeRecipeTypes.h"
 #include "VertexMaskForgeWorkingMeshTypes.h"
 
 namespace VertexMaskForgeMaterialSlotGenerator
@@ -104,5 +105,72 @@ namespace VertexMaskForgeMaterialSlotGenerator
 		Mask.State = (Mask.NumValidValues > 0) ? EVertexMaskForgeScalarMaskState::Ready : EVertexMaskForgeScalarMaskState::Unavailable;
 
 		return Mask;
+	}
+
+	bool GenerateMaterialSlotMaskInstanceResult(
+		const FVertexMaskForgeMaskInstance& MaskInstance,
+		FVertexMaskForgeWorkingMesh& WorkingMesh,
+		const bool bUseSourceTopology,
+		const FStaticMeshLODResources* LOD0)
+	{
+		// AUDITED (M16-E): same quiet, deterministic, non-crashing rejection policy already established
+		// by FVertexMaskForgeInstanceResultStore::StoreOrReplace (M16-C) -- a plain Warning-level log, no
+		// ensure()/check(), no second policy introduced here.
+		if (!MaskInstance.InstanceId.IsValid())
+		{
+			UE_LOG(LogVertexMaskForge, Warning,
+				TEXT("VertexMaskForgeMaterialSlotGenerator::GenerateMaterialSlotMaskInstanceResult: refusing to run for an invalid InstanceId."));
+			return false;
+		}
+
+		if (MaskInstance.GeneratorType != EVertexMaskForgeGeneratorType::MaterialSlot)
+		{
+			UE_LOG(LogVertexMaskForge, Warning,
+				TEXT("VertexMaskForgeMaterialSlotGenerator::GenerateMaterialSlotMaskInstanceResult: MaskInstance %s is not a Material Slot instance."),
+				*MaskInstance.InstanceId.ToString());
+			return false;
+		}
+
+		// Defensive only -- GeneratorType/Params are expected to always stay coherent (see
+		// FVertexMaskForgeMaskInstance::Make/MakeVertexMaskForgeGeneratorParams), but this function never
+		// assumes that invariant holds without checking.
+		const FVertexMaskForgeMaterialSlotParams* Params = MaskInstance.Params.TryGet<FVertexMaskForgeMaterialSlotParams>();
+		if (!Params)
+		{
+			UE_LOG(LogVertexMaskForge, Warning,
+				TEXT("VertexMaskForgeMaterialSlotGenerator::GenerateMaterialSlotMaskInstanceResult: MaskInstance %s has GeneratorType MaterialSlot but Params does not hold FVertexMaskForgeMaterialSlotParams."),
+				*MaskInstance.InstanceId.ToString());
+			return false;
+		}
+
+		if (!bUseSourceTopology && !LOD0)
+		{
+			UE_LOG(LogVertexMaskForge, Warning,
+				TEXT("VertexMaskForgeMaterialSlotGenerator::GenerateMaterialSlotMaskInstanceResult: MaskInstance %s requires a valid LOD0 in the render-vertex domain."),
+				*MaskInstance.InstanceId.ToString());
+			return false;
+		}
+
+		// Same generator entry points the legacy panel call site uses (SVertexMaskForgePanel::
+		// RunAutoUpdatePreview) -- never a reimplementation of the Material Slot algorithm. Computed
+		// entirely into a local value first; the keyed store is only touched after a Ready result is
+		// confirmed below (atomicity -- see the function's own header doc comment).
+		FVertexMaskForgeScalarMask Mask = bUseSourceTopology
+			? GenerateMaterialSlotMaskFromDynamicMesh(WorkingMesh, Params->SelectedSlotIndex, Params->bInvert)
+			: GenerateMaterialSlotMask(WorkingMesh, *LOD0, Params->SelectedSlotIndex, Params->bInvert);
+
+		if (Mask.State != EVertexMaskForgeScalarMaskState::Ready)
+		{
+			// No store mutation -- any prior valid result for this exact InstanceId is left untouched,
+			// exactly mirroring the legacy call site's own "auto-update never replaces a valid Preview
+			// with incomplete/degenerate data" contract.
+			return false;
+		}
+
+		FVertexMaskForgeInstanceMaskResult Result;
+		Result.Values = MoveTemp(Mask.Values);
+		Result.bHasValue = MoveTemp(Mask.bHasValue);
+
+		return WorkingMesh.InstanceResults.StoreOrReplace(MaskInstance.InstanceId, MoveTemp(Result));
 	}
 }
