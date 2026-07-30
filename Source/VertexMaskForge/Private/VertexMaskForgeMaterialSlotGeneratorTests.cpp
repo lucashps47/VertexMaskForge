@@ -279,20 +279,28 @@ bool FVertexMaskForgeMaterialSlotInstanceLegacyPreservedTest::RunTest(const FStr
 {
 	FVertexMaskForgeWorkingMesh WorkingMesh = BuildFixtureWorkingMesh(/*SlotForTri0=*/0, /*SlotForTri1=*/1);
 
+	// M16-J.0B.1 (WorkingMesh Domain Split): the legacy named result (MaterialSlotMask) no longer lives on
+	// FVertexMaskForgeWorkingMesh at all -- it moved to FVertexMaskForgeGeneratorState, a sibling struct
+	// GenerateMaterialSlotMaskInstanceResult is never even given a reference to. This local GeneratorState
+	// stands in for that sibling: since the function under test only ever touches WorkingMesh, proving it
+	// leaves this sentinel value alone is the exact same proof the test always made, just against the
+	// field's new home.
+	FVertexMaskForgeGeneratorState GeneratorState;
+
 	// Sentinel legacy result, deliberately unrelated to what the new path would compute.
-	WorkingMesh.MaterialSlotMask.State = EVertexMaskForgeScalarMaskState::Ready;
-	WorkingMesh.MaterialSlotMask.Values = { 0.42f };
-	WorkingMesh.MaterialSlotMask.bHasValue.Init(true, 1);
-	WorkingMesh.MaterialSlotMask.NumValidValues = 1;
+	GeneratorState.MaterialSlotMask.State = EVertexMaskForgeScalarMaskState::Ready;
+	GeneratorState.MaterialSlotMask.Values = { 0.42f };
+	GeneratorState.MaterialSlotMask.bHasValue.Init(true, 1);
+	GeneratorState.MaterialSlotMask.NumValidValues = 1;
 
 	const FVertexMaskForgeMaskInstance A = MakeMaterialSlotInstance(/*SelectedSlotIndex=*/0);
 	VertexMaskForgeMaterialSlotGenerator::GenerateMaterialSlotMaskInstanceResult(A, WorkingMesh, true, nullptr);
 
-	TestTrue(TEXT("Legacy MaterialSlotMask.State unchanged"), WorkingMesh.MaterialSlotMask.State == EVertexMaskForgeScalarMaskState::Ready);
-	TestEqual(TEXT("Legacy MaterialSlotMask.Values.Num() unchanged"), WorkingMesh.MaterialSlotMask.Values.Num(), 1);
-	if (WorkingMesh.MaterialSlotMask.Values.Num() == 1)
+	TestTrue(TEXT("Legacy MaterialSlotMask.State unchanged"), GeneratorState.MaterialSlotMask.State == EVertexMaskForgeScalarMaskState::Ready);
+	TestEqual(TEXT("Legacy MaterialSlotMask.Values.Num() unchanged"), GeneratorState.MaterialSlotMask.Values.Num(), 1);
+	if (GeneratorState.MaterialSlotMask.Values.Num() == 1)
 	{
-		TestEqual(TEXT("Legacy MaterialSlotMask sentinel value unchanged"), WorkingMesh.MaterialSlotMask.Values[0], 0.42f);
+		TestEqual(TEXT("Legacy MaterialSlotMask sentinel value unchanged"), GeneratorState.MaterialSlotMask.Values[0], 0.42f);
 	}
 	TestEqual(TEXT("Keyed result was still created"), WorkingMesh.InstanceResults.Num(), 1);
 

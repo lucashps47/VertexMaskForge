@@ -6,6 +6,7 @@
 #include "MeshDescription.h"
 #include "StaticMeshAttributes.h"
 #include "StaticMeshResources.h"
+#include "VertexMaskForgeWorkingMeshOwner.h"
 #include "VertexMaskForgeWorkingMeshTypes.h"
 
 #define LOCTEXT_NAMESPACE "SVertexMaskForgePanel"
@@ -36,9 +37,9 @@ namespace VertexMaskForgeAcceptWriter
 			// comparison to entries/generators that never used Thickness. No fingerprint short-circuit
 			// here -- the full semantic comparison always runs, so a match can never be assumed from a
 			// cheap proxy alone.
-			if (Target.Entry.IsValid() && Target.Entry->WorkingMesh.ThicknessMask.State == EVertexMaskForgeScalarMaskState::Ready
-				&& Target.Entry->WorkingMesh.ThicknessCache.IsValid()
-				&& !VertexMaskForgeWorkingMeshTypes::AreThicknessGeometrySnapshotsExactlyEquivalent(*Target.Entry->WorkingMesh.ThicknessCache, RenderData->LODResources[0]))
+			if (Target.Entry.IsValid() && Target.Entry->GeneratorState.ThicknessMask.State == EVertexMaskForgeScalarMaskState::Ready
+				&& Target.Entry->GeneratorState.ThicknessCache.IsValid()
+				&& !VertexMaskForgeWorkingMeshTypes::AreThicknessGeometrySnapshotsExactlyEquivalent(*Target.Entry->GeneratorState.ThicknessCache, RenderData->LODResources[0]))
 			{
 				OutErrorText = FText::Format(
 					LOCTEXT("AcceptThicknessFreshnessMismatchFormat", "'{0}': geometry or normals changed since Thickness Mask was generated; aborting Accept (nothing was modified). Regenerate the mask and try again."),
@@ -89,10 +90,14 @@ namespace VertexMaskForgeAcceptWriter
 		for (const VertexMaskForgeAcceptTargetBuilder::FSourceTopologyAcceptTarget& Target : Targets)
 		{
 			UStaticMesh* Mesh = Target.Mesh.Get();
-			const bool bEntryValid = Target.Entry.IsValid() && Target.Entry->WorkingMesh.Mesh.IsValid()
-				&& !Target.Entry->WorkingMesh.TriIDMap.IsEmpty();
+			// AUDITED (M16-J.0B.1 corrective pass): Target.Entry->MeshOwner->GetWorkingMesh() is only
+			// dereferenced once Target.Entry.IsValid() is already known true, via && short-circuiting --
+			// mirrors the exact same safety the removed WorkingMesh reference member never actually needed
+			// to provide (Entry itself being valid was always the real precondition).
+			const bool bEntryValid = Target.Entry.IsValid() && Target.Entry->MeshOwner->GetWorkingMesh().Mesh.IsValid()
+				&& !Target.Entry->MeshOwner->GetWorkingMesh().TriIDMap.IsEmpty();
 			const FMeshDescription* MeshDescription = IsValid(Mesh) ? Mesh->GetMeshDescription(0) : nullptr;
-			const int32 NumCorners = bEntryValid ? Target.Entry->WorkingMesh.Mesh->TriangleCount() * 3 : 0;
+			const int32 NumCorners = bEntryValid ? Target.Entry->MeshOwner->GetWorkingMesh().Mesh->TriangleCount() * 3 : 0;
 
 			if (!MeshDescription || !bEntryValid || Target.FinalColors.Num() != NumCorners)
 			{
@@ -101,12 +106,18 @@ namespace VertexMaskForgeAcceptWriter
 					FText::FromString(Target.AssetName));
 				return false;
 			}
+
+			// bEntryValid == true (checked above) guarantees Target.Entry is valid from this point on, so
+			// a short-lived local view is safe to take here (see FVertexMaskForgeSelectedMesh::MeshOwner's
+			// own doc comment on why this is never cached beyond one function's own scope).
+			const FVertexMaskForgeWorkingMesh& WorkingMesh = Target.Entry->MeshOwner->GetWorkingMesh();
+
 			// AUDITED (commit preflight correction): full correspondence re-check, same as
 			// BuildSourceTopologyAcceptTargets' own preflight -- nothing else can have touched these
 			// assets between preflight and here (synchronous, same call), but re-proving it immediately
 			// before the first Modify() matches WriteAcceptTargets' own re-validation discipline exactly.
 			if (!VertexMaskForgeAcceptTargetBuilder::ValidateSourceTopologyCorrespondence(
-				*Target.Entry->WorkingMesh.Mesh, Target.Entry->WorkingMesh.TriIDMap, *MeshDescription, Target.AssetName, OutErrorText))
+				*WorkingMesh.Mesh, WorkingMesh.TriIDMap, *MeshDescription, Target.AssetName, OutErrorText))
 			{
 				return false;
 			}
@@ -115,10 +126,10 @@ namespace VertexMaskForgeAcceptWriter
 			// proves structural/ID correspondence (TriangleID/VertexInstanceID validity) -- it never
 			// compares position or normal VALUES, so a reimport/edit preserving every count and ID would
 			// slip through it silently. Only applies when this entry's result depends on Thickness.
-			if (Target.Entry->WorkingMesh.ThicknessMask.State == EVertexMaskForgeScalarMaskState::Ready
-				&& Target.Entry->WorkingMesh.SourceTopologyThicknessCache.IsValid()
+			if (Target.Entry->GeneratorState.ThicknessMask.State == EVertexMaskForgeScalarMaskState::Ready
+				&& Target.Entry->GeneratorState.SourceTopologyThicknessCache.IsValid()
 				&& !VertexMaskForgeWorkingMeshTypes::IsThicknessSourceTopologyContentUnchanged(
-					*Target.Entry->WorkingMesh.Mesh, Target.Entry->WorkingMesh.TriIDMap, *MeshDescription))
+					*WorkingMesh.Mesh, WorkingMesh.TriIDMap, *MeshDescription))
 			{
 				OutErrorText = FText::Format(
 					LOCTEXT("AcceptSourceTopologyThicknessFreshnessMismatchFormat", "'{0}': geometry or normals changed since Thickness Mask was generated; aborting Accept (nothing was modified). Regenerate the mask and try again."),
@@ -131,8 +142,11 @@ namespace VertexMaskForgeAcceptWriter
 		{
 			UStaticMesh* Mesh = Target.Mesh.Get();
 			FMeshDescription* MeshDescription = Mesh->GetMeshDescription(0);
-			const FDynamicMesh3& WorkingDynamicMesh = *Target.Entry->WorkingMesh.Mesh;
-			const TArray<FTriangleID>& TriIDMap = Target.Entry->WorkingMesh.TriIDMap;
+			// AUDITED (M16-J.0B.1 corrective pass): this second loop only ever runs targets that already
+			// survived the first loop's bEntryValid gate above (same Targets array, same Entry pointers),
+			// so Target.Entry is known valid here too.
+			const FDynamicMesh3& WorkingDynamicMesh = *Target.Entry->MeshOwner->GetWorkingMesh().Mesh;
+			const TArray<FTriangleID>& TriIDMap = Target.Entry->MeshOwner->GetWorkingMesh().TriIDMap;
 
 			// AUDITED (Undo/Redo fix): see WriteAcceptTargets' own doc comment -- ModifyMeshDescription
 			// is the call that actually makes the source data participate in the Transaction Buffer.

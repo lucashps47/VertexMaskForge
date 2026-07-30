@@ -47,8 +47,9 @@ namespace VertexMaskForgeMaterialSlotGenerator
 	 * exactly mirroring SVertexMaskForgePanel's own legacy call site), then converts the resulting
 	 * FVertexMaskForgeScalarMask's Values/bHasValue into a FVertexMaskForgeInstanceMaskResult and stores
 	 * it via WorkingMesh.InstanceResults.StoreOrReplace(MaskInstance.InstanceId, ...) -- never touches
-	 * WorkingMesh.MaterialSlotMask (the named legacy result), never touches
-	 * FVertexMaskForgePreviewComponentState::InstanceResults, never calls the sequential evaluator.
+	 * the named legacy result (MaterialSlotMask, which lives on FVertexMaskForgeGeneratorState as of
+	 * M16-J.0B.1's WorkingMesh Domain Split -- this function is never even given a reference to it), never
+	 * touches FVertexMaskForgePreviewComponentState::InstanceResults, never calls the sequential evaluator.
 	 *
 	 * Rejects deterministically, with no store mutation and no crash/ensure/exception, when:
 	 *   - MaskInstance.InstanceId is invalid (FGuid::IsValid() == false);

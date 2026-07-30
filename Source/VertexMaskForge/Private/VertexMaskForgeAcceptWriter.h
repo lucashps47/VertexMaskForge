@@ -29,7 +29,7 @@ namespace VertexMaskForgeAcceptWriter
 	 * Sibling of WriteAcceptTargets for Source-Topology entries. Writes ONLY VertexInstanceColors on
 	 * the SOURCE MeshDescription (Mesh->GetMeshDescription(0)) -- never positions, topology, normals,
 	 * UVs, polygon groups, or any other attribute -- via the TriangleID+corner correspondence
-	 * (Entry->WorkingMesh.TriIDMap), reproducing exactly what
+	 * (Entry->MeshOwner->GetWorkingMesh().TriIDMap), reproducing exactly what
 	 * UE::Geometry::FDynamicMeshToMeshDescription::UpdateVertexColors does for the native Paint Vertex
 	 * Colors tool's own commit. Same two-pass (re-validate everything, THEN write) discipline as
 	 * WriteAcceptTargets -- if this returns false, nothing was modified. Like its render-vertex

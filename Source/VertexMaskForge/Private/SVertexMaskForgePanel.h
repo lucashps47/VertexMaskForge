@@ -25,6 +25,7 @@ class UDynamicMeshComponent;
 template <typename OptionType> class SComboBox;
 enum class ECheckBoxState : uint8;
 namespace ESelectInfo { enum Type : int; }
+enum class EVertexMaskForgeWorkingColorsPublicationValidationStatus : uint8;
 
 namespace UE::Geometry { class FDynamicMesh3; }
 
@@ -1081,6 +1082,21 @@ private:
 	 *  RenderData/debug material failed to resolve) -- none of these are a session end or a genuine
 	 *  geometric invalidation, so the AO geometry cache must survive them untouched. */
 	void RestorePreviewForEntryVisualOnly(FVertexMaskForgeSelectedMesh& Entry);
+
+	/**
+	 * M16-J.0B (rejection-corrective pass): the real, production-ready binding seam -- locates the
+	 * FVertexMaskForgeSelectedMesh entry and FVertexMaskForgeWorkingStateOwner that own Component (via
+	 * SourceComponent identity, the same key AddOrUpdateSelectedMesh already dedups by), then calls that
+	 * StateOwner's own CreateBinding()/ValidateBinding() -- the official validation path, never a
+	 * hand-rolled substitute. Returns an unset TOptional if Component is not currently tracked by any
+	 * entry/StateOwner (clean failure, never a crash or a fabricated status).
+	 *
+	 * Read-only: never mutates any state, never executes recipe/M16-H/M16-I/M16-J, never applies
+	 * anything visually. This is available now for diagnostics (see its own call site in
+	 * ApplyPreviewToEntry) and is the exact API the future M16-J boundary will call to authenticate a
+	 * publication target -- it is not itself that boundary.
+	 */
+	TOptional<EVertexMaskForgeWorkingColorsPublicationValidationStatus> ValidatePublicationBindingForComponent(const UStaticMeshComponent* Component) const;
 
 	/**
 	 * Restores every currently-tracked entry's preview components. Called before Refresh Selection

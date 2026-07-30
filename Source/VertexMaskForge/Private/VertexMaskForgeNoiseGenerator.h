@@ -4,6 +4,7 @@
 
 struct FVertexMaskForgeScalarMask;
 struct FVertexMaskForgeWorkingMesh;
+struct FVertexMaskForgeGeneratorState;
 struct FVertexMaskForgeNoiseGenerativeParams;
 struct FStaticMeshLODResources;
 
@@ -20,7 +21,8 @@ namespace VertexMaskForgeNoiseGenerator
 	 * including identical duplicated values for UV-seam-split wedges at the same source position).
 	 */
 	FVertexMaskForgeScalarMask GenerateNoiseMask(
-		FVertexMaskForgeWorkingMesh& WorkingMesh,
+		const FVertexMaskForgeWorkingMesh& WorkingMesh,
+		FVertexMaskForgeGeneratorState& GeneratorState,
 		const FStaticMeshLODResources& LOD0,
 		const FVertexMaskForgeNoiseGenerativeParams& Params,
 		float Multiplier,
@@ -36,7 +38,8 @@ namespace VertexMaskForgeNoiseGenerator
 	 * already use in this mode.
 	 */
 	FVertexMaskForgeScalarMask GenerateNoiseMaskFromDynamicMesh(
-		FVertexMaskForgeWorkingMesh& WorkingMesh,
+		const FVertexMaskForgeWorkingMesh& WorkingMesh,
+		FVertexMaskForgeGeneratorState& GeneratorState,
 		const FVertexMaskForgeNoiseGenerativeParams& Params,
 		float Multiplier,
 		float LevelsMin,

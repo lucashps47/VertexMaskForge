@@ -22,9 +22,10 @@
  *      FVertexMaskForgePreviewComponentState) -- untouched, unmoved, unreorganized by this checkpoint.
  *
  * No generator writes to this storage yet, and nothing reads from it yet -- the legacy fixed panel
- * flow continues to read/write only its own named fields (WorkingMesh.CurvatureMask,
- * PreviewComponentState.AOCache, etc.), completely unaware this storage exists. Coexistence is
- * strictly additive.
+ * flow continues to read/write only its own named fields (GeneratorState.CurvatureMask -- see
+ * M16-J.0B.1's WorkingMesh Domain Split, which moved this and its sibling artistic-state fields off
+ * FVertexMaskForgeWorkingMesh -- PreviewComponentState.AOCache, etc.), completely unaware this storage
+ * exists. Coexistence is strictly additive.
  */
 
 /**

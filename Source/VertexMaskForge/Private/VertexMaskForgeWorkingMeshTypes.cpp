@@ -7,6 +7,8 @@
 #include "MeshDescription.h"
 #include "StaticMeshAttributes.h"
 #include "StaticMeshResources.h"
+#include "VertexMaskForgeWorkingMeshOwner.h"
+#include "VertexMaskForgeWorkingStateOwner.h"
 
 // FDynamicMesh3 is a complete type in the header now (M6), but these special member functions stay
 // defined out-of-line here, unchanged from before M6.
@@ -18,6 +20,19 @@ FVertexMaskForgeWorkingMesh& FVertexMaskForgeWorkingMesh::operator=(FVertexMaskF
 FVertexMaskForgePreviewComponentState::~FVertexMaskForgePreviewComponentState() = default;
 FVertexMaskForgePreviewComponentState::FVertexMaskForgePreviewComponentState(FVertexMaskForgePreviewComponentState&&) = default;
 FVertexMaskForgePreviewComponentState& FVertexMaskForgePreviewComponentState::operator=(FVertexMaskForgePreviewComponentState&&) = default;
+
+// M16-J.0B / M16-J.0B.1: FVertexMaskForgeWorkingMeshOwner/FVertexMaskForgeWorkingStateOwner are complete
+// types only here (see FVertexMaskForgeSelectedMesh's own doc comment on why the header cannot include
+// them directly -- circular include). MeshOwner is constructed fresh (empty, unconfigured) here. M16-J.0B.1
+// corrective pass: no WorkingMesh reference member to bind anymore -- callers take a short-lived local view
+// via Entry->MeshOwner->GetWorkingMesh() at their own point of use instead (see that member's own doc
+// comment). GeneratorState is default-constructed fresh (its own default member initializers).
+FVertexMaskForgeSelectedMesh::FVertexMaskForgeSelectedMesh()
+	: MeshOwner(MakeShared<FVertexMaskForgeWorkingMeshOwner>())
+{
+}
+
+FVertexMaskForgeSelectedMesh::~FVertexMaskForgeSelectedMesh() = default;
 
 namespace VertexMaskForgeWorkingMeshTypes
 {
@@ -155,7 +170,7 @@ namespace VertexMaskForgeWorkingMeshTypes
 	 * picks a "winning" instance -- returns true (conflict) the moment ANY live component disagrees with
 	 * the reference beyond tolerance.
 	 */
-	bool HasConflictingWorldSpaceNormalTransforms(const TArray<FVertexMaskForgePreviewComponentState>& PreviewComponents, float& OutMaxRelativeDeviation)
+	bool HasConflictingWorldSpaceNormalTransforms(const TArray<TUniquePtr<FVertexMaskForgeWorkingStateOwner>>& PreviewComponents, float& OutMaxRelativeDeviation)
 	{
 		OutMaxRelativeDeviation = 0.0f;
 
@@ -163,9 +178,10 @@ namespace VertexMaskForgeWorkingMeshTypes
 		bool bHaveReference = false;
 		bool bAnyConflict = false;
 
-		for (const FVertexMaskForgePreviewComponentState& State : PreviewComponents)
+		for (const TUniquePtr<FVertexMaskForgeWorkingStateOwner>& StateOwner : PreviewComponents)
 		{
-			const UStaticMeshComponent* Component = State.SourceComponent.Get();
+			const FVertexMaskForgePreviewComponentState& State = StateOwner->GetPreviewState();
+			const UStaticMeshComponent* Component = State.GetSourceComponent().Get();
 			if (!IsValid(Component))
 			{
 				continue;

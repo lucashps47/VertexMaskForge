@@ -349,7 +349,7 @@ namespace
 	}
 
 	/**
-	 * AUDITED (Curvature CLASSIFICATION FIX): guarantees WorkingMesh.CurvatureRawConvexCache/
+	 * AUDITED (Curvature CLASSIFICATION FIX): guarantees GeneratorState.CurvatureRawConvexCache/
 	 * CurvatureRawConcaveCache/CurvatureRenderVertexToDynamicMeshVertex are valid for WorkingMesh.Mesh's
 	 * CURRENT geometry -- the ONE place the expensive analysis (ComputeRawCurvatureMagnitudes) and the
 	 * render-vertex correspondence (ComputeCurvatureRenderVertexCorrespondence) are ever invoked. Reuses
@@ -359,10 +359,14 @@ namespace
 	 * ApplyCurvatureArtisticParams path directly), so this only ever runs again after a genuine geometry
 	 * change (RefreshSelection building a new WorkingMesh, whose fingerprint differs by construction).
 	 * MeshDescription/LOD0 are optional -- omitted (nullptr) for a Source-Topology entry, which has no
-	 * use for the render-vertex correspondence at all.
+	 * use for the render-vertex correspondence at all. WorkingMesh (const, Identity) and GeneratorState
+	 * (mutable, Artistic State -- M16-J.0B.1's WorkingMesh Domain Split) are two separate references since
+	 * the cache written here lives on GeneratorState while the fingerprint/geometry read here lives on
+	 * WorkingMesh.
 	 */
 	void EnsureCurvatureRawCache(
-		FVertexMaskForgeWorkingMesh& WorkingMesh,
+		const FVertexMaskForgeWorkingMesh& WorkingMesh,
+		FVertexMaskForgeGeneratorState& GeneratorState,
 		const FMeshDescription* MeshDescriptionForCorrespondence,
 		const FStaticMeshLODResources* LOD0ForCorrespondence)
 	{
@@ -370,31 +374,31 @@ namespace
 		{
 			return;
 		}
-		if (WorkingMesh.CurvatureCacheFingerprint == WorkingMesh.GeometryFingerprint
-			&& !WorkingMesh.CurvatureRawConvexCache.IsEmpty())
+		if (GeneratorState.CurvatureCacheFingerprint == WorkingMesh.GeometryFingerprint
+			&& !GeneratorState.CurvatureRawConvexCache.IsEmpty())
 		{
 			return;
 		}
 
 		FVertexMaskForgeCurvatureRawResult RawResult = ComputeRawCurvatureMagnitudes(*WorkingMesh.Mesh);
-		WorkingMesh.CurvatureRawConvexCache = MoveTemp(RawResult.ConvexMagnitude);
-		WorkingMesh.CurvatureRawConcaveCache = MoveTemp(RawResult.ConcaveMagnitude);
+		GeneratorState.CurvatureRawConvexCache = MoveTemp(RawResult.ConvexMagnitude);
+		GeneratorState.CurvatureRawConcaveCache = MoveTemp(RawResult.ConcaveMagnitude);
 
 		if (MeshDescriptionForCorrespondence && LOD0ForCorrespondence)
 		{
-			WorkingMesh.CurvatureRenderVertexToDynamicMeshVertex = ComputeCurvatureRenderVertexCorrespondence(
+			GeneratorState.CurvatureRenderVertexToDynamicMeshVertex = ComputeCurvatureRenderVertexCorrespondence(
 				*WorkingMesh.Mesh, WorkingMesh.TriIDMap, *MeshDescriptionForCorrespondence, *LOD0ForCorrespondence);
 		}
 		else
 		{
-			WorkingMesh.CurvatureRenderVertexToDynamicMeshVertex.Reset();
+			GeneratorState.CurvatureRenderVertexToDynamicMeshVertex.Reset();
 		}
 
-		WorkingMesh.CurvatureCacheFingerprint = WorkingMesh.GeometryFingerprint;
+		GeneratorState.CurvatureCacheFingerprint = WorkingMesh.GeometryFingerprint;
 
 		UE_LOG(LogVertexMaskForge, Log,
 			TEXT("Vertex Mask Forge: Curvature raw analysis computed (%d vertices)."),
-			WorkingMesh.CurvatureRawConvexCache.Num());
+			GeneratorState.CurvatureRawConvexCache.Num());
 	}
 
 	/**
@@ -540,7 +544,8 @@ namespace
 namespace VertexMaskForgeCurvatureGenerator
 {
 	FVertexMaskForgeScalarMask GenerateCurvatureMask(
-		FVertexMaskForgeWorkingMesh& WorkingMesh,
+		const FVertexMaskForgeWorkingMesh& WorkingMesh,
+		FVertexMaskForgeGeneratorState& GeneratorState,
 		const FMeshDescription* MeshDescription,
 		const FStaticMeshLODResources& LOD0,
 		const EVertexMaskForgeCurvatureType Type,
@@ -562,15 +567,15 @@ namespace VertexMaskForgeCurvatureGenerator
 			return Mask;
 		}
 
-		EnsureCurvatureRawCache(WorkingMesh, MeshDescription, &LOD0);
-		if (WorkingMesh.CurvatureRawConvexCache.IsEmpty() || WorkingMesh.CurvatureRenderVertexToDynamicMeshVertex.Num() != NumRenderVerts)
+		EnsureCurvatureRawCache(WorkingMesh, GeneratorState, MeshDescription, &LOD0);
+		if (GeneratorState.CurvatureRawConvexCache.IsEmpty() || GeneratorState.CurvatureRenderVertexToDynamicMeshVertex.Num() != NumRenderVerts)
 		{
 			Mask.State = EVertexMaskForgeScalarMaskState::Unavailable;
 			return Mask;
 		}
 
 		const TArray<float> DynamicMeshValues = ApplyCurvatureArtisticParams(
-			*WorkingMesh.Mesh, WorkingMesh.CurvatureRawConvexCache, WorkingMesh.CurvatureRawConcaveCache,
+			*WorkingMesh.Mesh, GeneratorState.CurvatureRawConvexCache, GeneratorState.CurvatureRawConcaveCache,
 			Type, Multiplier, Blur, LevelsMin, LevelsMax, bInvert);
 
 		Mask.Values.SetNumZeroed(NumRenderVerts);
@@ -579,7 +584,7 @@ namespace VertexMaskForgeCurvatureGenerator
 		double Sum = 0.0;
 		for (int32 RenderIndex = 0; RenderIndex < NumRenderVerts; ++RenderIndex)
 		{
-			const int32 DynamicVertexID = WorkingMesh.CurvatureRenderVertexToDynamicMeshVertex[RenderIndex];
+			const int32 DynamicVertexID = GeneratorState.CurvatureRenderVertexToDynamicMeshVertex[RenderIndex];
 			if (DynamicVertexID == INDEX_NONE || !DynamicMeshValues.IsValidIndex(DynamicVertexID))
 			{
 				continue;
@@ -601,7 +606,8 @@ namespace VertexMaskForgeCurvatureGenerator
 	}
 
 	FVertexMaskForgeScalarMask GenerateCurvatureMaskFromDynamicMesh(
-		FVertexMaskForgeWorkingMesh& WorkingMesh,
+		const FVertexMaskForgeWorkingMesh& WorkingMesh,
+		FVertexMaskForgeGeneratorState& GeneratorState,
 		const EVertexMaskForgeCurvatureType Type,
 		const float Multiplier,
 		const float Blur,
@@ -622,15 +628,15 @@ namespace VertexMaskForgeCurvatureGenerator
 		const FDynamicMesh3& Mesh = *WorkingMesh.Mesh;
 		Mask.RenderVertexCount = Mesh.VertexCount();
 
-		EnsureCurvatureRawCache(WorkingMesh, nullptr, nullptr);
-		if (WorkingMesh.CurvatureRawConvexCache.IsEmpty())
+		EnsureCurvatureRawCache(WorkingMesh, GeneratorState, nullptr, nullptr);
+		if (GeneratorState.CurvatureRawConvexCache.IsEmpty())
 		{
 			Mask.State = EVertexMaskForgeScalarMaskState::Unavailable;
 			return Mask;
 		}
 
 		const TArray<float> DynamicMeshValues = ApplyCurvatureArtisticParams(
-			Mesh, WorkingMesh.CurvatureRawConvexCache, WorkingMesh.CurvatureRawConcaveCache,
+			Mesh, GeneratorState.CurvatureRawConvexCache, GeneratorState.CurvatureRawConcaveCache,
 			Type, Multiplier, Blur, LevelsMin, LevelsMax, bInvert);
 
 		const int32 MaxVID = Mesh.MaxVertexID();

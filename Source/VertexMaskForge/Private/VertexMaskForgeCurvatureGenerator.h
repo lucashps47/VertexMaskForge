@@ -18,7 +18,8 @@ namespace VertexMaskForgeCurvatureGenerator
 	 * correspondence (INDEX_NONE) is left unwritten (bHasValue false), never guessed.
 	 */
 	FVertexMaskForgeScalarMask GenerateCurvatureMask(
-		FVertexMaskForgeWorkingMesh& WorkingMesh,
+		const FVertexMaskForgeWorkingMesh& WorkingMesh,
+		FVertexMaskForgeGeneratorState& GeneratorState,
 		const FMeshDescription* MeshDescription,
 		const FStaticMeshLODResources& LOD0,
 		const EVertexMaskForgeCurvatureType Type,
@@ -36,7 +37,8 @@ namespace VertexMaskForgeCurvatureGenerator
 	 * domain BoundingBoxMask already uses in this mode.
 	 */
 	FVertexMaskForgeScalarMask GenerateCurvatureMaskFromDynamicMesh(
-		FVertexMaskForgeWorkingMesh& WorkingMesh,
+		const FVertexMaskForgeWorkingMesh& WorkingMesh,
+		FVertexMaskForgeGeneratorState& GeneratorState,
 		const EVertexMaskForgeCurvatureType Type,
 		const float Multiplier,
 		const float Blur,

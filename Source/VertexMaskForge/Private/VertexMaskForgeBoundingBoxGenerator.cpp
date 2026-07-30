@@ -5,6 +5,7 @@
 #include "Engine/StaticMesh.h"
 #include "StaticMeshResources.h"
 #include "VertexMaskForgeWorkingMeshTypes.h"
+#include "VertexMaskForgeWorkingStateOwner.h"
 
 #define LOCTEXT_NAMESPACE "SVertexMaskForgePanel"
 
@@ -495,9 +496,9 @@ namespace VertexMaskForgeBoundingBoxGenerator
 			}
 
 			const bool bParticipates = bForGeneration
-				? (Entry->WorkingMesh.State == EVertexMaskForgeWorkingMeshState::Ready)
-				: (Entry->WorkingMesh.BoundingBoxMask.Source == EVertexMaskForgeScalarMaskSource::BoundingBox
-					&& Entry->WorkingMesh.BoundingBoxMask.State == EVertexMaskForgeScalarMaskState::Ready);
+				? (Entry->MeshOwner->GetWorkingMesh().State == EVertexMaskForgeWorkingMeshState::Ready)
+				: (Entry->GeneratorState.BoundingBoxMask.Source == EVertexMaskForgeScalarMaskSource::BoundingBox
+					&& Entry->GeneratorState.BoundingBoxMask.State == EVertexMaskForgeScalarMaskState::Ready);
 			if (!bParticipates)
 			{
 				continue;
@@ -514,9 +515,9 @@ namespace VertexMaskForgeBoundingBoxGenerator
 				continue;
 			}
 
-			for (const FVertexMaskForgePreviewComponentState& State : Entry->PreviewComponents)
+			for (const TUniquePtr<FVertexMaskForgeWorkingStateOwner>& StateOwner : Entry->PreviewComponents)
 			{
-				const UStaticMeshComponent* SourceComponent = State.SourceComponent.Get();
+				const UStaticMeshComponent* SourceComponent = StateOwner->GetPreviewState().GetSourceComponent().Get();
 				if (!IsValid(SourceComponent))
 				{
 					continue;

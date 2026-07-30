@@ -21,9 +21,9 @@ namespace VertexMaskForgeAcceptTargetBuilder
 		/** Render-vertex-order (LOD0), exactly as shown in Preview -- the data actually written. */
 		TArray<FColor> FinalColors;
 		/** AUDITED (V2-G): needed so WriteAcceptTargets can re-validate Thickness Mask freshness
-		 *  (Entry->WorkingMesh.ThicknessCache) immediately before the first Modify() -- see
+		 *  (Entry->GeneratorState.ThicknessCache) immediately before the first Modify() -- see
 		 *  AreThicknessGeometrySnapshotsExactlyEquivalent. Null-safe: only dereferenced when
-		 *  Entry->WorkingMesh.ThicknessMask.State==Ready AND ThicknessCache is valid. */
+		 *  Entry->GeneratorState.ThicknessMask.State==Ready AND ThicknessCache is valid. */
 		TSharedPtr<FVertexMaskForgeSelectedMesh> Entry;
 	};
 
@@ -34,18 +34,18 @@ namespace VertexMaskForgeAcceptTargetBuilder
 	 * contract; same divergent-per-instance-baseline blocking rule; same shared-asset dedup (one
 	 * target per entry, entries are already 1-per-asset by construction). The only structural
 	 * difference: colors are in CORNER domain (see UpdateWorkingColorsSourceTopology), and the commit
-	 * itself writes via the TriangleID+corner correspondence (Entry->WorkingMesh.TriIDMap) instead of
-	 * FStaticMeshLODResources::WedgeMap -- exactly the route the native UE Paint Vertex Colors tool
-	 * uses (FDynamicMeshToMeshDescription::UpdateVertexColors), proven correct for Nanite by the
-	 * native-tool audit. Entry is kept alive (TSharedPtr) so WorkingMesh.Mesh/TriIDMap remain valid
+	 * itself writes via the TriangleID+corner correspondence (Entry->MeshOwner->GetWorkingMesh().TriIDMap)
+	 * instead of FStaticMeshLODResources::WedgeMap -- exactly the route the native UE Paint Vertex Colors
+	 * tool uses (FDynamicMeshToMeshDescription::UpdateVertexColors), proven correct for Nanite by the
+	 * native-tool audit. Entry is kept alive (TSharedPtr) so MeshOwner and its Mesh/TriIDMap remain valid
 	 * from preflight through the write pass.
 	 */
 	struct FSourceTopologyAcceptTarget
 	{
 		TWeakObjectPtr<UStaticMesh> Mesh;
 		FString AssetName;
-		/** Corner-domain colors (Entry->WorkingMesh.Mesh's own TriangleIndicesItr()+corner order),
-		 *  exactly as shown in Preview -- the data actually written. */
+		/** Corner-domain colors (Entry->MeshOwner->GetWorkingMesh().Mesh's own TriangleIndicesItr()+corner
+		 *  order), exactly as shown in Preview -- the data actually written. */
 		TArray<FColor> FinalColors;
 		TSharedPtr<FVertexMaskForgeSelectedMesh> Entry;
 	};

@@ -551,7 +551,7 @@ namespace
 	}
 
 	/**
-	 * AUDITED (Noise V1): guarantees WorkingMesh.NoiseRawCache is valid for WorkingMesh's CURRENT
+	 * AUDITED (Noise V1): guarantees GeneratorState.NoiseRawCache is valid for WorkingMesh's CURRENT
 	 * geometry AND the CURRENT generative parameters -- the ONE place ComputeRawNoiseValue is ever
 	 * invoked in a loop. Reuses the cache verbatim only when BOTH NoiseCacheFingerprint ==
 	 * WorkingMesh.GeometryFingerprint AND NoiseCacheUsedParams == Params (see
@@ -562,10 +562,14 @@ namespace
 	 * PARALLELIZED (audited): one ParallelFor over the domain's own vertex count, matching
 	 * GenerateAmbientOcclusionMask's own audited pattern -- ComputeRawNoiseValue's only dependency is
 	 * the read-only Params/SeedOffset (captured by reference, never mutated) and each vertex's own
-	 * position, so results never depend on execution order.
+	 * position, so results never depend on execution order. WorkingMesh (const, Identity) and
+	 * GeneratorState (mutable, Artistic State -- M16-J.0B.1's WorkingMesh Domain Split) are two separate
+	 * references since the cache written here lives on GeneratorState while the fingerprint/geometry read
+	 * here lives on WorkingMesh.
 	 */
 	void EnsureNoiseRawCache(
-		FVertexMaskForgeWorkingMesh& WorkingMesh,
+		const FVertexMaskForgeWorkingMesh& WorkingMesh,
+		FVertexMaskForgeGeneratorState& GeneratorState,
 		const bool bUseSourceTopology,
 		const FStaticMeshLODResources* LOD0ForRenderVertexDomain,
 		const FVertexMaskForgeNoiseGenerativeParams& Params)
@@ -574,9 +578,9 @@ namespace
 		{
 			return;
 		}
-		if (WorkingMesh.NoiseCacheFingerprint == WorkingMesh.GeometryFingerprint
-			&& WorkingMesh.NoiseCacheUsedParams == Params
-			&& !WorkingMesh.NoiseRawCache.IsEmpty())
+		if (GeneratorState.NoiseCacheFingerprint == WorkingMesh.GeometryFingerprint
+			&& GeneratorState.NoiseCacheUsedParams == Params
+			&& !GeneratorState.NoiseRawCache.IsEmpty())
 		{
 			return;
 		}
@@ -601,7 +605,7 @@ namespace
 				RawValues[VertexID] = ComputeRawNoiseValue(LocalPosition, Params, SeedOffset);
 			});
 
-			WorkingMesh.NoiseRawCache = MoveTemp(RawValues);
+			GeneratorState.NoiseRawCache = MoveTemp(RawValues);
 		}
 		else if (LOD0ForRenderVertexDomain)
 		{
@@ -616,20 +620,20 @@ namespace
 				RawValues[RenderIndex] = ComputeRawNoiseValue(LocalPosition, Params, SeedOffset);
 			});
 
-			WorkingMesh.NoiseRawCache = MoveTemp(RawValues);
+			GeneratorState.NoiseRawCache = MoveTemp(RawValues);
 		}
 		else
 		{
-			WorkingMesh.NoiseRawCache.Reset();
+			GeneratorState.NoiseRawCache.Reset();
 			return;
 		}
 
-		WorkingMesh.NoiseCacheFingerprint = WorkingMesh.GeometryFingerprint;
-		WorkingMesh.NoiseCacheUsedParams = Params;
+		GeneratorState.NoiseCacheFingerprint = WorkingMesh.GeometryFingerprint;
+		GeneratorState.NoiseCacheUsedParams = Params;
 
 		UE_LOG(LogVertexMaskForge, Log,
 			TEXT("Vertex Mask Forge: Noise raw pattern computed (%d vertices)."),
-			WorkingMesh.NoiseRawCache.Num());
+			GeneratorState.NoiseRawCache.Num());
 	}
 
 	/**
@@ -667,7 +671,8 @@ namespace
 namespace VertexMaskForgeNoiseGenerator
 {
 	FVertexMaskForgeScalarMask GenerateNoiseMask(
-		FVertexMaskForgeWorkingMesh& WorkingMesh,
+		const FVertexMaskForgeWorkingMesh& WorkingMesh,
+		FVertexMaskForgeGeneratorState& GeneratorState,
 		const FStaticMeshLODResources& LOD0,
 		const FVertexMaskForgeNoiseGenerativeParams& Params,
 		const float Multiplier,
@@ -687,14 +692,14 @@ namespace VertexMaskForgeNoiseGenerator
 			return Mask;
 		}
 
-		EnsureNoiseRawCache(WorkingMesh, /*bUseSourceTopology=*/false, &LOD0, Params);
-		if (WorkingMesh.NoiseRawCache.Num() != NumRenderVerts)
+		EnsureNoiseRawCache(WorkingMesh, GeneratorState, /*bUseSourceTopology=*/false, &LOD0, Params);
+		if (GeneratorState.NoiseRawCache.Num() != NumRenderVerts)
 		{
 			Mask.State = EVertexMaskForgeScalarMaskState::Unavailable;
 			return Mask;
 		}
 
-		const TArray<float> Processed = ApplyNoiseArtisticParams(WorkingMesh.NoiseRawCache, Multiplier, LevelsMin, LevelsMax, bInvert);
+		const TArray<float> Processed = ApplyNoiseArtisticParams(GeneratorState.NoiseRawCache, Multiplier, LevelsMin, LevelsMax, bInvert);
 
 		Mask.Values = Processed;
 		Mask.bHasValue.Init(true, NumRenderVerts);
@@ -717,7 +722,8 @@ namespace VertexMaskForgeNoiseGenerator
 	}
 
 	FVertexMaskForgeScalarMask GenerateNoiseMaskFromDynamicMesh(
-		FVertexMaskForgeWorkingMesh& WorkingMesh,
+		const FVertexMaskForgeWorkingMesh& WorkingMesh,
+		FVertexMaskForgeGeneratorState& GeneratorState,
 		const FVertexMaskForgeNoiseGenerativeParams& Params,
 		const float Multiplier,
 		const float LevelsMin,
@@ -737,14 +743,14 @@ namespace VertexMaskForgeNoiseGenerator
 		const FDynamicMesh3& Mesh = *WorkingMesh.Mesh;
 		Mask.RenderVertexCount = Mesh.VertexCount();
 
-		EnsureNoiseRawCache(WorkingMesh, /*bUseSourceTopology=*/true, nullptr, Params);
-		if (WorkingMesh.NoiseRawCache.IsEmpty())
+		EnsureNoiseRawCache(WorkingMesh, GeneratorState, /*bUseSourceTopology=*/true, nullptr, Params);
+		if (GeneratorState.NoiseRawCache.IsEmpty())
 		{
 			Mask.State = EVertexMaskForgeScalarMaskState::Unavailable;
 			return Mask;
 		}
 
-		const TArray<float> Processed = ApplyNoiseArtisticParams(WorkingMesh.NoiseRawCache, Multiplier, LevelsMin, LevelsMax, bInvert);
+		const TArray<float> Processed = ApplyNoiseArtisticParams(GeneratorState.NoiseRawCache, Multiplier, LevelsMin, LevelsMax, bInvert);
 
 		const int32 MaxVID = Mesh.MaxVertexID();
 		Mask.Values.SetNumZeroed(MaxVID);

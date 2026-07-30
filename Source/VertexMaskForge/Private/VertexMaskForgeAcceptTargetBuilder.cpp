@@ -5,6 +5,7 @@
 #include "MeshDescription.h"
 #include "StaticMeshResources.h"
 #include "VertexMaskForgeWorkingMeshTypes.h"
+#include "VertexMaskForgeWorkingStateOwner.h"
 
 #define LOCTEXT_NAMESPACE "SVertexMaskForgePanel"
 
@@ -100,13 +101,13 @@ namespace VertexMaskForgeAcceptTargetBuilder
 			// WedgeMap too, since Source-Topology mode is chosen unconditionally for Nanite, not just
 			// when WedgeMap is invalid).
 			if (!Entry.IsValid() || Entry->bUseSourceTopology || Entry->PreviewComponents.IsEmpty()
-				|| (Entry->WorkingMesh.BoundingBoxMask.State != EVertexMaskForgeScalarMaskState::Ready
-					&& Entry->WorkingMesh.AmbientOcclusionMask.State != EVertexMaskForgeScalarMaskState::Ready
-					&& Entry->WorkingMesh.CurvatureMask.State != EVertexMaskForgeScalarMaskState::Ready
-					&& Entry->WorkingMesh.NoiseMask.State != EVertexMaskForgeScalarMaskState::Ready
-					&& Entry->WorkingMesh.MaterialSlotMask.State != EVertexMaskForgeScalarMaskState::Ready
-					&& Entry->WorkingMesh.DirectionalNormalMask.State != EVertexMaskForgeScalarMaskState::Ready
-					&& Entry->WorkingMesh.ThicknessMask.State != EVertexMaskForgeScalarMaskState::Ready))
+				|| (Entry->GeneratorState.BoundingBoxMask.State != EVertexMaskForgeScalarMaskState::Ready
+					&& Entry->GeneratorState.AmbientOcclusionMask.State != EVertexMaskForgeScalarMaskState::Ready
+					&& Entry->GeneratorState.CurvatureMask.State != EVertexMaskForgeScalarMaskState::Ready
+					&& Entry->GeneratorState.NoiseMask.State != EVertexMaskForgeScalarMaskState::Ready
+					&& Entry->GeneratorState.MaterialSlotMask.State != EVertexMaskForgeScalarMaskState::Ready
+					&& Entry->GeneratorState.DirectionalNormalMask.State != EVertexMaskForgeScalarMaskState::Ready
+					&& Entry->GeneratorState.ThicknessMask.State != EVertexMaskForgeScalarMaskState::Ready))
 			{
 				continue;
 			}
@@ -154,9 +155,10 @@ namespace VertexMaskForgeAcceptTargetBuilder
 			// baseline case in the doc comment above.
 			TArray<FColor> ReferenceColors;
 			bool bHaveReference = false;
-			for (const FVertexMaskForgePreviewComponentState& State : Entry->PreviewComponents)
+			for (const TUniquePtr<FVertexMaskForgeWorkingStateOwner>& StateOwner : Entry->PreviewComponents)
 			{
-				const UStaticMeshComponent* SourceComponent = State.SourceComponent.Get();
+				const FVertexMaskForgePreviewComponentState& State = StateOwner->GetPreviewState();
+				const UStaticMeshComponent* SourceComponent = State.GetSourceComponent().Get();
 				if (!IsValid(SourceComponent))
 				{
 					continue;
@@ -165,13 +167,13 @@ namespace VertexMaskForgeAcceptTargetBuilder
 				// AUDITED (recompute-at-Accept fix): read-only -- see this function's own doc comment.
 				// Empty WorkingColors means this component currently has no valid composed result
 				// (mirrors the old "per-instance mask not Ready" skip).
-				if (State.WorkingColors.IsEmpty())
+				if (State.GetWorkingColors().IsEmpty())
 				{
 					continue;
 				}
 				// AUDITED (Preview-Mode-cannot-affect-Accept fix): the raw multi-channel result,
 				// verbatim -- never DeriveDisplayColors, never CurrentPreviewMode.
-				TArray<FColor> ComponentColors = State.WorkingColors;
+				TArray<FColor> ComponentColors = State.GetWorkingColors();
 
 				if (!bHaveReference)
 				{
@@ -270,13 +272,13 @@ namespace VertexMaskForgeAcceptTargetBuilder
 		for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
 		{
 			if (!Entry.IsValid() || !Entry->bUseSourceTopology || Entry->PreviewComponents.IsEmpty()
-				|| (Entry->WorkingMesh.BoundingBoxMask.State != EVertexMaskForgeScalarMaskState::Ready
-					&& Entry->WorkingMesh.AmbientOcclusionMask.State != EVertexMaskForgeScalarMaskState::Ready
-					&& Entry->WorkingMesh.CurvatureMask.State != EVertexMaskForgeScalarMaskState::Ready
-					&& Entry->WorkingMesh.NoiseMask.State != EVertexMaskForgeScalarMaskState::Ready
-					&& Entry->WorkingMesh.MaterialSlotMask.State != EVertexMaskForgeScalarMaskState::Ready
-					&& Entry->WorkingMesh.DirectionalNormalMask.State != EVertexMaskForgeScalarMaskState::Ready
-					&& Entry->WorkingMesh.ThicknessMask.State != EVertexMaskForgeScalarMaskState::Ready))
+				|| (Entry->GeneratorState.BoundingBoxMask.State != EVertexMaskForgeScalarMaskState::Ready
+					&& Entry->GeneratorState.AmbientOcclusionMask.State != EVertexMaskForgeScalarMaskState::Ready
+					&& Entry->GeneratorState.CurvatureMask.State != EVertexMaskForgeScalarMaskState::Ready
+					&& Entry->GeneratorState.NoiseMask.State != EVertexMaskForgeScalarMaskState::Ready
+					&& Entry->GeneratorState.MaterialSlotMask.State != EVertexMaskForgeScalarMaskState::Ready
+					&& Entry->GeneratorState.DirectionalNormalMask.State != EVertexMaskForgeScalarMaskState::Ready
+					&& Entry->GeneratorState.ThicknessMask.State != EVertexMaskForgeScalarMaskState::Ready))
 			{
 				continue;
 			}
@@ -298,7 +300,8 @@ namespace VertexMaskForgeAcceptTargetBuilder
 			}
 
 			UStaticMesh* Mesh = Entry->Mesh.LoadSynchronous();
-			if (!IsValid(Mesh) || !Entry->WorkingMesh.Mesh.IsValid())
+			const FVertexMaskForgeWorkingMesh& WorkingMesh = Entry->MeshOwner->GetWorkingMesh();
+			if (!IsValid(Mesh) || !WorkingMesh.Mesh.IsValid())
 			{
 				OutErrorText = FText::Format(
 					LOCTEXT("AcceptSourceTopologyInvalidMeshFormat", "'{0}': Static Mesh or its working topology could not be resolved."),
@@ -312,18 +315,19 @@ namespace VertexMaskForgeAcceptTargetBuilder
 			// dependent, so two components CAN legitimately disagree).
 			TArray<FColor> ReferenceColors;
 			bool bHaveReference = false;
-			for (const FVertexMaskForgePreviewComponentState& State : Entry->PreviewComponents)
+			for (const TUniquePtr<FVertexMaskForgeWorkingStateOwner>& StateOwner : Entry->PreviewComponents)
 			{
-				const UStaticMeshComponent* SourceComponent = State.SourceComponent.Get();
+				const FVertexMaskForgePreviewComponentState& State = StateOwner->GetPreviewState();
+				const UStaticMeshComponent* SourceComponent = State.GetSourceComponent().Get();
 				if (!IsValid(SourceComponent))
 				{
 					continue;
 				}
-				if (State.SourceTopologyWorkingColors.IsEmpty())
+				if (State.GetSourceTopologyWorkingColors().IsEmpty())
 				{
 					continue;
 				}
-				TArray<FColor> ComponentColors = State.SourceTopologyWorkingColors;
+				TArray<FColor> ComponentColors = State.GetSourceTopologyWorkingColors();
 
 				if (!bHaveReference)
 				{
@@ -349,7 +353,7 @@ namespace VertexMaskForgeAcceptTargetBuilder
 			// approximate -- and the full TriIDMap -> FTriangleID -> VertexInstanceID chain must be
 			// formally valid against the LIVE MeshDescription (see ValidateSourceTopologyCorrespondence
 			// for the complete list of what this proves).
-			const int32 NumCorners = Entry->WorkingMesh.Mesh->TriangleCount() * 3;
+			const int32 NumCorners = WorkingMesh.Mesh->TriangleCount() * 3;
 			const FMeshDescription* LiveMeshDescription = Mesh->GetMeshDescription(0);
 			if (!LiveMeshDescription || ReferenceColors.Num() != NumCorners)
 			{
@@ -360,7 +364,7 @@ namespace VertexMaskForgeAcceptTargetBuilder
 				return false;
 			}
 			if (!ValidateSourceTopologyCorrespondence(
-				*Entry->WorkingMesh.Mesh, Entry->WorkingMesh.TriIDMap, *LiveMeshDescription, Entry->AssetName, OutErrorText))
+				*WorkingMesh.Mesh, WorkingMesh.TriIDMap, *LiveMeshDescription, Entry->AssetName, OutErrorText))
 			{
 				return false;
 			}

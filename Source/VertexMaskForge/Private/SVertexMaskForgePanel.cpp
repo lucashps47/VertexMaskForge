@@ -46,6 +46,8 @@
 #include "VertexMaskForgeNoiseGenerator.h"
 #include "VertexMaskForgeRecipeTypes.h"
 #include "VertexMaskForgeThicknessGenerator.h"
+#include "VertexMaskForgeWorkingMeshOwner.h"
+#include "VertexMaskForgeWorkingStateOwner.h"
 #include "SPrimaryButton.h"
 #include "Styling/CoreStyle.h"
 #include "Widgets/Input/SButton.h"
@@ -112,17 +114,22 @@ namespace VertexMaskForgePanel
 		// DestroyAllPreviews()), so no duplicate can accumulate across refreshes either.
 		if (SourceComponent)
 		{
-			TArray<FVertexMaskForgePreviewComponentState>& PreviewComponents = InOutMeshes[EntryIndex]->PreviewComponents;
+			TArray<TUniquePtr<FVertexMaskForgeWorkingStateOwner>>& PreviewComponents = InOutMeshes[EntryIndex]->PreviewComponents;
 			const bool bAlreadyTracked = PreviewComponents.ContainsByPredicate(
-				[SourceComponent](const FVertexMaskForgePreviewComponentState& State)
+				[SourceComponent](const TUniquePtr<FVertexMaskForgeWorkingStateOwner>& StateOwner)
 				{
-					return State.SourceComponent.Get() == SourceComponent;
+					return StateOwner->GetPreviewState().GetSourceComponent().Get() == SourceComponent;
 				});
 			if (!bAlreadyTracked)
 			{
-				FVertexMaskForgePreviewComponentState NewComponentState;
-				NewComponentState.SourceComponent = SourceComponent;
-				PreviewComponents.Add(MoveTemp(NewComponentState));
+				// M16-J.0B: the state owner's target component is configured here, and it is attached
+				// to THIS entry's own mesh owner immediately -- the mesh owner may not have its identity/
+				// Working Mesh installed yet (that happens later, in BuildWorkingMeshes), but the
+				// attachment itself (a TWeakPtr) is always safe to establish early.
+				TUniquePtr<FVertexMaskForgeWorkingStateOwner> NewStateOwner = MakeUnique<FVertexMaskForgeWorkingStateOwner>();
+				NewStateOwner->ConfigureTarget(SourceComponent);
+				NewStateOwner->AttachToMeshOwner(InOutMeshes[EntryIndex]->MeshOwner);
+				PreviewComponents.Add(MoveTemp(NewStateOwner));
 			}
 			else
 			{
@@ -1177,86 +1184,73 @@ namespace VertexMaskForgePanel
 	}
 
 	/**
-	 * Updates BaselineColors/CommittedColors/WorkingColors (see FVertexMaskForgePreviewComponentState's
-	 * own doc comments for the full architectural contract) IN PLACE for one component. This is the
-	 * ONLY function that ever writes to any of the three arrays, and both Preview and Accept consume
-	 * WorkingColors as this function leaves it, so both always see the exact same result.
-	 *
-	 * AUDITED (baseline-snapshot fix): BaselineColors is captured ONCE per component per session --
-	 * exactly when it is empty or stale-sized (first composition of a new session, or the render
-	 * vertex count changed since, e.g. the mesh was rebuilt) -- and is NEVER touched again after
-	 * that until RestoreComponentOriginal resets all three arrays together (session end, or this one
-	 * component's per-instance mask falling back to degenerate -- see its own doc comment).
-	 * InstanceOverrideColors/AssetRenderColors (the LIVE, real, read-only sources) are consulted
-	 * ONLY during that one initial-capture branch. CommittedColors is seeded from BaselineColors
-	 * verbatim at that same moment. Priority used for the ONE-TIME capture (audited, Problem 3):
-	 *   1. InstanceOverrideColors (SourceComponent's own, PRE-EXISTING per-instance
-	 *      FStaticMeshComponentLODInfo::OverrideVertexColors, e.g. from a prior Mesh Paint session or
-	 *      an earlier Accept as Instance Override on this placed instance) IF non-null and its vertex
-	 *      count matches LOD0's -- this is what the artist actually sees in the level, and it is
-	 *      read-only here: never written to.
+	 * M16-J.0B (2nd rejection-corrective pass): the ONE-TIME baseline capture, extracted out of the
+	 * composition math below so it can run BEFORE FVertexMaskForgeWorkingStateOwner::EnsureBaselineCaptured
+	 * -- the owner now exclusively decides whether a real capture happens (idempotent on its own
+	 * AreColorsInitialized() state), never this function; this function only ever computes what the
+	 * bytes WOULD be if asked. Same exact priority as before this checkpoint (AUDITED, Problem 3):
+	 *   1. InstanceOverrideColors (SourceComponent's own PRE-EXISTING per-instance OverrideVertexColors)
+	 *      IF non-null and its vertex count matches LOD0's.
 	 *   2. Otherwise, the asset's own LOD0 ColorVertexBuffer (RenderData), if its count matches.
-	 *   3. Otherwise, white -- consistent with the rest of the panel's "no original colors" fallback.
-	 * A buffer present but with a mismatched vertex count (partial/invalid) is treated exactly like
-	 * "absent" and safely falls through to the next priority; it is never partially applied or
-	 * index-clamped.
-	 *
-	 * AUDITED (Channel Filter toggle fix): on EVERY call (not just the first), WorkingColors is
-	 * rebuilt FRESH from CommittedColors -- `WorkingColors = CommittedColors;` -- BEFORE any channel
-	 * is composed, never carried forward from WorkingColors' own previous value. Each channel
-	 * currently enabled in the Channel Filter (see ComposeMaskStack) is then recomputed from
-	 * BaselineColors.Channel through the WHOLE layer stack -- ALWAYS starting from BaselineColors,
-	 * never from CommittedColors or WorkingColors' prior value, which is what prevents that channel
-	 * from ever accumulating ACROSS repeated recompositions (live regeneration re-running, toggling
-	 * Opacity/Blend Mode/any axis parameter) -- see ComposeMaskStack's own doc comment
-	 * for why building on the PREVIOUS LAYER's result WITHIN one pass is a different thing and fully
-	 * intended. A channel NOT currently enabled is simply whatever CommittedColors already holds -- so
-	 * unchecking a channel that was never consolidated immediately, visibly reverts it to
-	 * BaselineColors; one that WAS consolidated (by an earlier Fill) reverts to that
-	 * consolidated result, never to a leftover transient value. OutNumComposed reports how many
-	 * vertices had AT LEAST ONE layer contribute a value this call; a vertex where every layer skipped
-	 * it (Mask.TryGetValue failed for all of them) keeps WorkingColors[i] exactly as the
-	 * CommittedColors copy left it (R/G/B), with Alpha still refreshed from BaselineColors.
-	 *
-	 * bCommit: if true, CommittedColors is promoted to WorkingColors' just-composed result at the end
-	 * of this call -- ONLY a Fill White/Black action passes true
-	 * (see UpdateAllPreviews' own doc comment for the exhaustive list of callers and their bCommit
-	 * value); live regeneration and Channel Filter toggles always pass false, so a transient edit
-	 * is never silently consolidated.
-	 *
-	 * AUDITED (peer-mask composition checkpoint): Layers is an UNORDERED set of every enabled+Ready
-	 * mask generator for this component, resolved entirely by the caller (ApplyPreviewToEntry) BEFORE
-	 * this call -- Bounding Box and Ambient Occlusion are STRUCTURAL PEERS here, neither one has a
-	 * fixed position; each carries its own per-component-evaluated FVertexMaskForgeScalarMask plus its
-	 * own BlendMode/Opacity. (A single Fill/Constant layer, when that is the active result for this
-	 * pass, is just one more Layers entry the caller already set to Copy@1.0 -- see ApplyPreviewToEntry
-	 * -- nothing here treats it specially.) This function sorts Layers ONCE by Mask->Source (a fixed,
-	 * stable generator identifier -- never UI position, never enable order) before the per-vertex loop,
-	 * then hands the same sorted view to ComposeMaskStack for every vertex -- see that function's own
-	 * doc comment for the full canonical-order/stage-grouping contract this sort enables. This function
-	 * itself has NO knowledge of Bounding Box or Ambient Occlusion specifically -- it only ever sees an
-	 * opaque set of (Mask, BlendMode, Opacity) layers, which is exactly what lets a future generator
-	 * (Curvature, Thickness, ...) participate in this SAME pipeline by simply appearing as one more
-	 * Layers entry, with no special-cased combination code anywhere in this function.
+	 *   3. Otherwise, white.
+	 * A buffer present but with a mismatched vertex count is treated exactly like absent.
 	 */
-	static void UpdateWorkingColors(
-		TArray<FColor>& BaselineColors,
-		TArray<FColor>& CommittedColors,
-		TArray<FColor>& WorkingColors,
+	static TArray<FColor> CaptureBaselineColorsRenderVertex(const FStaticMeshLODResources& LOD0, const FColorVertexBuffer* InstanceOverrideColors)
+	{
+		const FPositionVertexBuffer& RenderPositions = LOD0.VertexBuffers.PositionVertexBuffer;
+		const uint32 NumRenderVerts = RenderPositions.GetNumVertices();
+
+		const FColorVertexBuffer& AssetRenderColors = LOD0.VertexBuffers.ColorVertexBuffer;
+		const bool bHasInstanceOverride =
+			InstanceOverrideColors != nullptr && InstanceOverrideColors->GetNumVertices() == NumRenderVerts;
+		const bool bHasAssetColors = !bHasInstanceOverride && AssetRenderColors.GetNumVertices() == NumRenderVerts;
+
+		TArray<FColor> Captured;
+		Captured.SetNumUninitialized(NumRenderVerts);
+		for (uint32 i = 0; i < NumRenderVerts; ++i)
+		{
+			// This render vertex's OWN effective original color -- never a value borrowed from a
+			// different render vertex (preserves seams).
+			Captured[i] = bHasInstanceOverride ? InstanceOverrideColors->VertexColor(i)
+				: bHasAssetColors ? AssetRenderColors.VertexColor(i)
+				: FColor::White;
+		}
+		return Captured;
+	}
+
+	/**
+	 * M16-J.0B (2nd rejection-corrective pass): computes the composed RGB result for one component's
+	 * render-vertex domain -- reads BaselineColors/CommittedColors as CONST INPUT (owned by
+	 * FVertexMaskForgeWorkingStateOwner, obtained via its own GetBaselineColors()/GetCommittedColors()
+	 * getters), writes the result into a FRESH, INDEPENDENT local array (OutFinalColors) the caller then
+	 * hands to FVertexMaskForgeWorkingStateOwner::ApplyComposedColorsRGB -- this function never touches
+	 * owner storage, mutable or otherwise. The composition MATH ITSELF (sort order, ComposeMaskStack
+	 * call, per-vertex Alpha-from-Baseline, "no layer contributed" fallback to Committed) is byte-for-
+	 * byte UNCHANGED from before this checkpoint; only where the result is written changed.
+	 *
+	 * AUDITED (Channel Filter toggle fix): OutFinalColors starts as a copy of CommittedColors (never
+	 * carried forward from any previous call's result) -- BEFORE any channel is composed. Each channel
+	 * currently enabled in the Channel Filter is then recomputed from BaselineColors through the WHOLE
+	 * layer stack -- ALWAYS starting from BaselineColors, never from CommittedColors or a prior result,
+	 * which is what prevents that channel from ever accumulating ACROSS repeated recompositions. A
+	 * channel NOT currently enabled is simply whatever CommittedColors already holds. OutNumComposed
+	 * reports how many vertices had AT LEAST ONE layer contribute a value this call.
+	 *
+	 * AUDITED (peer-mask composition checkpoint): Layers is an UNORDERED set of every enabled+Ready mask
+	 * generator for this component, resolved entirely by the caller (ApplyPreviewToEntry) BEFORE this
+	 * call. This function sorts Layers ONCE by Mask->Source before the per-vertex loop, then hands the
+	 * same sorted view to ComposeMaskStack for every vertex.
+	 */
+	static void ComputeComposedColorsRGB(
+		TConstArrayView<FColor> BaselineColors,
+		TConstArrayView<FColor> CommittedColors,
 		TArrayView<const FVertexMaskForgeMaskLayerParams> Layers,
-		const FStaticMeshLODResources& LOD0,
-		const FColorVertexBuffer* InstanceOverrideColors,
 		const bool bFilterR, const bool bFilterG, const bool bFilterB,
-		const bool bCommit,
+		TArray<FColor>& OutFinalColors,
 		int32& OutNumComposed)
 	{
 		OutNumComposed = 0;
 
-		// AUDITED (peer-mask composition checkpoint): sorted ONCE here, by Mask->Source (the fixed
-		// generator identifier), never per-vertex -- the canonical order ComposeMaskStack relies on is
-		// the SAME for every render vertex in this component (only each mask's per-vertex VALUE
-		// changes, never the set of generators or their Blend Modes/Opacities), so sorting once here
-		// and reusing the sorted view for every vertex is both correct and the efficient choice.
 		TArray<FVertexMaskForgeMaskLayerParams, TInlineAllocator<8>> SortedLayers(Layers.GetData(), Layers.Num());
 		SortedLayers.Sort([](const FVertexMaskForgeMaskLayerParams& A, const FVertexMaskForgeMaskLayerParams& B)
 		{
@@ -1265,46 +1259,22 @@ namespace VertexMaskForgePanel
 			return SourceA < SourceB;
 		});
 
-		const FPositionVertexBuffer& RenderPositions = LOD0.VertexBuffers.PositionVertexBuffer;
-		const uint32 NumRenderVerts = RenderPositions.GetNumVertices();
+		const int32 NumRenderVerts = BaselineColors.Num();
 
-		// ONE-TIME capture: empty (session's first composition for this component) or stale-sized
-		// (render vertex count changed since, e.g. mesh rebuilt -- a genuine reconstruction case, not
-		// an ordinary parameter change). InstanceOverrideColors/AssetRenderColors are read HERE ONLY;
-		// every other line in this function reads BaselineColors/CommittedColors exclusively.
-		if (BaselineColors.Num() != static_cast<int32>(NumRenderVerts))
+		OutFinalColors.SetNumUninitialized(NumRenderVerts);
+		for (int32 i = 0; i < NumRenderVerts; ++i)
 		{
-			const FColorVertexBuffer& AssetRenderColors = LOD0.VertexBuffers.ColorVertexBuffer;
-			const bool bHasInstanceOverride =
-				InstanceOverrideColors != nullptr && InstanceOverrideColors->GetNumVertices() == NumRenderVerts;
-			const bool bHasAssetColors = !bHasInstanceOverride && AssetRenderColors.GetNumVertices() == NumRenderVerts;
-
-			BaselineColors.SetNumUninitialized(NumRenderVerts);
-			for (uint32 i = 0; i < NumRenderVerts; ++i)
-			{
-				// This render vertex's OWN effective original color -- never a value borrowed from a
-				// different render vertex (preserves seams).
-				BaselineColors[i] = bHasInstanceOverride ? InstanceOverrideColors->VertexColor(i)
-					: bHasAssetColors ? AssetRenderColors.VertexColor(i)
-					: FColor::White;
-			}
-
-			// "CommittedColors starts as BaselineColors" -- seeded verbatim, exactly once, right here.
-			CommittedColors = BaselineColors;
+			OutFinalColors[i] = CommittedColors[i];
 		}
 
-		// WorkingColors is rebuilt FRESH from CommittedColors every single call -- never carried
-		// forward from WorkingColors' own previous value. This is what makes unchecking a channel in
-		// the Channel Filter immediately, visibly revert it to its last CONSOLIDATED state.
-		WorkingColors = CommittedColors;
-
-		for (uint32 i = 0; i < NumRenderVerts; ++i)
+		for (int32 i = 0; i < NumRenderVerts; ++i)
 		{
 			const FColor& BaselineRenderColor = BaselineColors[i];
 
-			// Alpha always tracks the baseline unconditionally, whether or not any layer has a value
-			// for this vertex this call.
-			WorkingColors[i].A = BaselineRenderColor.A;
+			// Alpha always tracks the baseline unconditionally -- also re-forced unconditionally by
+			// FVertexMaskForgeWorkingStateOwner::ApplyComposedColorsRGB itself once this result is
+			// handed over, so this assignment is defense-in-depth, not the sole guarantee.
+			OutFinalColors[i].A = BaselineRenderColor.A;
 
 			const FVector4f BaselineColorF(
 				BaselineRenderColor.R / 255.f, BaselineRenderColor.G / 255.f,
@@ -1316,66 +1286,70 @@ namespace VertexMaskForgePanel
 
 			bool bAnyLayerContributed = false;
 			const FVector4f Composite = ComposeMaskStack(
-				BaselineColorF, CommittedColorF, static_cast<int32>(i), SortedLayers,
+				BaselineColorF, CommittedColorF, i, SortedLayers,
 				bFilterR, bFilterG, bFilterB, bAnyLayerContributed);
 			if (!bAnyLayerContributed)
 			{
-				// No layer had a value for this vertex -- R/G/B already carry CommittedColors[i]
-				// from the copy above; nothing new to compose.
 				continue;
 			}
 			++OutNumComposed;
-			WorkingColors[i] = ToDisplayFColor(Composite);
-		}
-
-		// Consolidate: ONLY a Fill action requests this (bCommit == true) -- live regeneration and
-		// Channel Filter toggles never do.
-		if (bCommit)
-		{
-			CommittedColors = WorkingColors;
+			OutFinalColors[i] = ToDisplayFColor(Composite);
 		}
 	}
 
 	/**
-	 * AUDITED (Nanite source-topology support): sibling of UpdateWorkingColors for Source-Topology
-	 * entries. Operates in TRIANGLE-CORNER domain (one slot per (TriangleID, corner) pair, enumerated
-	 * by iterating Mesh.TriangleIndicesItr() in a fixed, deterministic order, corners 0/1/2 in that
-	 * same order every call) instead of render vertex index -- this is the EXACT granularity that gets
-	 * committed (MeshDescription VertexInstanceColors, one slot per triangle corner -- see
-	 * WriteSourceTopologyAcceptTargets), so two corners sharing a vertex position (a UV seam or hard
-	 * edge) never collapse onto one slot and never lose an independently-authored baseline color.
-	 *
-	 * Per corner:
-	 *   - Baseline color: read from Mesh's own Primary Color Overlay (this corner's own authored
-	 *     color), or white if the source has no color overlay at all -- same "own effective original
-	 *     color, never borrowed from a different corner" contract UpdateWorkingColors already
-	 *     guarantees for render vertices, just at corner granularity here. No per-instance
-	 *     OverrideVertexColors priority in this domain (unlike UpdateWorkingColors): Nanite's renderer
-	 *     never reads per-instance overrides at all, so there is no per-instance baseline to
-	 *     prioritize -- baseline always comes from the asset's own source color overlay.
-	 *   - Bounding Box layer's value: looked up by DYNAMIC MESH VERTEX ID (Mesh.GetTriangle(tid)[corner])
-	 *     -- BBox is a pure function of position, so corner-level granularity is not needed for the
-	 *     VALUE itself, only for where it gets written.
-	 *   - Ambient Occlusion layer's value: looked up by NORMAL OVERLAY ELEMENT ID
-	 *     (NormalOverlay->GetTriangle(tid)[corner]) -- preserves hard-edge AO correctness, see
-	 *     GenerateAmbientOcclusionMaskFromDynamicMesh's own doc comment.
-	 *   - A Fill/Constant layer's value: looked up by CORNER INDEX itself (GenerateConstantMaskForCornerDomain
-	 *     is built in this exact domain already).
-	 * Every lookup is wired through FVertexMaskForgeMaskLayerParams::IndexOverride (see its own doc
-	 * comment), set per corner just before each ComposeMaskStack call -- the composition math itself
-	 * (ComposeMaskStack) is completely unmodified/unaware of any of this; it just sees whatever index
-	 * each layer asks it to look up. Layers is sorted ONCE, by Mask->Source, exactly like
-	 * UpdateWorkingColors -- IndexOverride is mutated per corner on that SAME sorted array afterward,
-	 * which never changes sort order (sort key is Source, never IndexOverride).
+	 * M16-J.0B (2nd rejection-corrective pass): sibling of CaptureBaselineColorsRenderVertex for the
+	 * Source-Topology corner domain -- same "compute what the bytes would be, never write anywhere"
+	 * contract. Baseline color: read from Mesh's own Primary Color Overlay (this corner's own authored
+	 * color), or white if the source has no color overlay at all. No per-instance OverrideVertexColors
+	 * priority in this domain (Nanite's renderer never reads per-instance overrides).
 	 */
-	static void UpdateWorkingColorsSourceTopology(
-		TArray<FColor>& BaselineColors,
-		TArray<FColor>& CommittedColors,
-		TArray<FColor>& WorkingColors,
+	static TArray<FColor> CaptureBaselineColorsSourceTopology(const UE::Geometry::FDynamicMesh3& Mesh)
+	{
+		using namespace UE::Geometry;
+
+		const FDynamicMeshColorOverlay* ColorOverlay = Mesh.HasAttributes() ? Mesh.Attributes()->PrimaryColors() : nullptr;
+		const int32 NumCorners = Mesh.TriangleCount() * 3;
+
+		TArray<FColor> Captured;
+		Captured.SetNumUninitialized(NumCorners);
+		int32 SeedCornerIndex = 0;
+		for (const int32 TriangleID : Mesh.TriangleIndicesItr())
+		{
+			const FIndex3i ColorTri = ColorOverlay ? ColorOverlay->GetTriangle(TriangleID) : FIndex3i(INDEX_NONE, INDEX_NONE, INDEX_NONE);
+			for (int32 Corner = 0; Corner < 3; ++Corner)
+			{
+				FColor Color = FColor::White;
+				const int32 ElementID = ColorTri[Corner];
+				if (ColorOverlay && ElementID != INDEX_NONE && ColorOverlay->IsElement(ElementID))
+				{
+					Color = ToDisplayFColor(ColorOverlay->GetElement(ElementID));
+				}
+				Captured[SeedCornerIndex] = Color;
+				++SeedCornerIndex;
+			}
+		}
+		return Captured;
+	}
+
+	/**
+	 * M16-J.0B (2nd rejection-corrective pass): sibling of ComputeComposedColorsRGB for the Source-
+	 * Topology corner domain -- same "const input, fresh independent result, no owner storage touched"
+	 * contract. The composition MATH ITSELF (IndexOverride wiring per Mask->Source, ComposeMaskStack
+	 * call, per-corner Alpha-from-Baseline, "no layer contributed" fallback to Committed) is byte-for-
+	 * byte UNCHANGED from before this checkpoint; only where the result is written changed. See
+	 * ComputeComposedColorsRGB's own doc comment for the shared parts of this contract, and the
+	 * per-generator IndexOverride domain notes originally on UpdateWorkingColorsSourceTopology (Bounding
+	 * Box/Curvature/Noise -> Dynamic Mesh Vertex ID, Ambient Occlusion -> Normal Overlay Element ID,
+	 * Material Slot/Directional Normal/Fill -> corner-exact).
+	 */
+	static void ComputeComposedColorsRGBSourceTopology(
+		TConstArrayView<FColor> BaselineColors,
+		TConstArrayView<FColor> CommittedColors,
 		TArrayView<const FVertexMaskForgeMaskLayerParams> Layers,
 		const UE::Geometry::FDynamicMesh3& Mesh,
 		const bool bFilterR, const bool bFilterG, const bool bFilterB,
-		const bool bCommit,
+		TArray<FColor>& OutFinalColors,
 		int32& OutNumComposed)
 	{
 		using namespace UE::Geometry;
@@ -1390,37 +1364,14 @@ namespace VertexMaskForgePanel
 			return SourceA < SourceB;
 		});
 
-		const FDynamicMeshColorOverlay* ColorOverlay = Mesh.HasAttributes() ? Mesh.Attributes()->PrimaryColors() : nullptr;
 		const FDynamicMeshNormalOverlay* NormalOverlay = Mesh.HasAttributes() ? Mesh.Attributes()->PrimaryNormals() : nullptr;
 
-		const int32 NumCorners = Mesh.TriangleCount() * 3;
-
-		// ONE-TIME capture (session's first composition, or a genuine reconstruction -- corner count
-		// changed since, e.g. Refresh Selection rebuilt WorkingMesh). ColorOverlay is read HERE ONLY;
-		// every other line below reads BaselineColors/CommittedColors exclusively.
-		if (BaselineColors.Num() != NumCorners)
+		const int32 NumCorners = BaselineColors.Num();
+		OutFinalColors.SetNumUninitialized(NumCorners);
+		for (int32 i = 0; i < NumCorners; ++i)
 		{
-			BaselineColors.SetNumUninitialized(NumCorners);
-			int32 SeedCornerIndex = 0;
-			for (const int32 TriangleID : Mesh.TriangleIndicesItr())
-			{
-				const FIndex3i ColorTri = ColorOverlay ? ColorOverlay->GetTriangle(TriangleID) : FIndex3i(INDEX_NONE, INDEX_NONE, INDEX_NONE);
-				for (int32 Corner = 0; Corner < 3; ++Corner)
-				{
-					FColor Color = FColor::White;
-					const int32 ElementID = ColorTri[Corner];
-					if (ColorOverlay && ElementID != INDEX_NONE && ColorOverlay->IsElement(ElementID))
-					{
-						Color = ToDisplayFColor(ColorOverlay->GetElement(ElementID));
-					}
-					BaselineColors[SeedCornerIndex] = Color;
-					++SeedCornerIndex;
-				}
-			}
-			CommittedColors = BaselineColors;
+			OutFinalColors[i] = CommittedColors[i];
 		}
-
-		WorkingColors = CommittedColors;
 
 		int32 CornerIndex = 0;
 		for (const int32 TriangleID : Mesh.TriangleIndicesItr())
@@ -1445,44 +1396,25 @@ namespace VertexMaskForgePanel
 						Layer.IndexOverride = NormalTri[Corner];
 						break;
 					case EVertexMaskForgeScalarMaskSource::Curvature:
-						// AUDITED (Curvature layer): same domain as BoundingBox -- Curvature is cached
-						// and generated by DYNAMIC MESH VERTEX ID (see GenerateCurvatureMaskFromDynamicMesh),
-						// never per-corner or per-normal-element, so a UV seam/hard edge's several
-						// corners at the same source mesh vertex all read the identical value.
 						Layer.IndexOverride = VertTri[Corner];
 						break;
 					case EVertexMaskForgeScalarMaskSource::Noise:
-						// AUDITED (Noise V1): same domain as BoundingBox/Curvature -- Noise is cached and
-						// generated by DYNAMIC MESH VERTEX ID/local position (see
-						// GenerateNoiseMaskFromDynamicMesh), so a UV seam's several corners at the same
-						// source mesh vertex all read the identical value.
 						Layer.IndexOverride = VertTri[Corner];
 						break;
 					case EVertexMaskForgeScalarMaskSource::MaterialSlot:
-						// AUDITED (V2-D): deliberately NOT VertTri[Corner] -- Material Slot Mask is
-						// CORNER-EXACT (see GenerateMaterialSlotMaskFromDynamicMesh's own doc comment),
-						// same domain as the Fill/Constant case below, so two corners sharing a position/
-						// VertexID on opposite sides of a material boundary correctly read different values.
 						Layer.IndexOverride = CornerIndex;
 						break;
 					case EVertexMaskForgeScalarMaskSource::DirectionalNormal:
-						// AUDITED (V2-E): same CORNER-EXACT domain as MaterialSlot above, deliberately NOT
-						// VertTri[Corner] or NormalTri[Corner] -- GenerateDirectionalNormalMaskFromDynamicMesh
-						// already writes Values in CornerIndex order directly (it reads the Normal Overlay
-						// element per-corner internally, but stores the RESULT per CornerIndex), so two
-						// corners sharing a position/VertexID with different split normals correctly read
-						// different values.
 						Layer.IndexOverride = CornerIndex;
 						break;
-					default: // ConstantWhite / ConstantBlack (Fill) -- corner-domain mask, see
-						// GenerateConstantMaskForCornerDomain.
+					default: // ConstantWhite / ConstantBlack (Fill) -- corner-domain mask.
 						Layer.IndexOverride = CornerIndex;
 						break;
 					}
 				}
 
 				const FColor& BaselineRenderColor = BaselineColors[CornerIndex];
-				WorkingColors[CornerIndex].A = BaselineRenderColor.A;
+				OutFinalColors[CornerIndex].A = BaselineRenderColor.A;
 
 				const FVector4f BaselineColorF(
 					BaselineRenderColor.R / 255.f, BaselineRenderColor.G / 255.f,
@@ -1501,13 +1433,8 @@ namespace VertexMaskForgePanel
 					continue;
 				}
 				++OutNumComposed;
-				WorkingColors[CornerIndex] = ToDisplayFColor(Composite);
+				OutFinalColors[CornerIndex] = ToDisplayFColor(Composite);
 			}
-		}
-
-		if (bCommit)
-		{
-			CommittedColors = WorkingColors;
 		}
 	}
 
@@ -1553,7 +1480,7 @@ namespace VertexMaskForgePanel
 			return Existing;
 		}
 
-		UStaticMeshComponent* SourceComponent = State.SourceComponent.Get();
+		UStaticMeshComponent* SourceComponent = State.GetSourceComponent().Get();
 		if (!IsValid(SourceComponent) || !IsValid(SourceComponent->GetWorld()))
 		{
 			return nullptr;
@@ -1692,7 +1619,7 @@ namespace VertexMaskForgePanel
 			return Existing;
 		}
 
-		UStaticMeshComponent* SourceComponent = State.SourceComponent.Get();
+		UStaticMeshComponent* SourceComponent = State.GetSourceComponent().Get();
 		if (!IsValid(SourceComponent) || !IsValid(SourceComponent->GetWorld()))
 		{
 			return nullptr;
@@ -1939,7 +1866,7 @@ namespace VertexMaskForgePanel
 		const bool bUseOriginalMaterials,
 		TMap<TWeakObjectPtr<AActor>, FVertexMaskForgeActorHideState>& ActorHideStates)
 	{
-		UStaticMeshComponent* SourceComponent = State.SourceComponent.Get();
+		UStaticMeshComponent* SourceComponent = State.GetSourceComponent().Get();
 		if (!IsValid(SourceComponent))
 		{
 			return;
@@ -1998,7 +1925,7 @@ namespace VertexMaskForgePanel
 		const bool bUseOriginalMaterials,
 		TMap<TWeakObjectPtr<AActor>, FVertexMaskForgeActorHideState>& ActorHideStates)
 	{
-		UStaticMeshComponent* SourceComponent = State.SourceComponent.Get();
+		UStaticMeshComponent* SourceComponent = State.GetSourceComponent().Get();
 		if (!IsValid(SourceComponent))
 		{
 			return;
@@ -2160,9 +2087,10 @@ namespace VertexMaskForgePanel
 	 * used by ApplyPreviewToEntry instead since the raw/composition separation checkpoint).
 	 */
 	static void RestoreComponentOriginal(
-		FVertexMaskForgePreviewComponentState& State,
+		FVertexMaskForgeWorkingStateOwner& StateOwner,
 		TMap<TWeakObjectPtr<AActor>, FVertexMaskForgeActorHideState>& ActorHideStates)
 	{
+		FVertexMaskForgePreviewComponentState& State = StateOwner.GetVisualSessionStateMutable();
 		RestorePreviewVisualOnly(State, ActorHideStates);
 
 		// Step 6: the baseline snapshot, the last consolidated result, the transient working result,
@@ -2171,16 +2099,13 @@ namespace VertexMaskForgePanel
 		// (this component's geometry/transform may have changed since, e.g. Accept just wrote new
 		// colors, or the level was edited), never reusing a tree/raycast result computed for a
 		// concluded operation.
-		State.BaselineColors.Reset();
-		State.CommittedColors.Reset();
-		State.WorkingColors.Reset();
-
-		// AUDITED (Nanite source-topology support): the corner-domain arrays and the Source-Topology AO
-		// cache belong to the same concluded session -- reset together, same rule as the render-vertex
-		// arrays above.
-		State.SourceTopologyBaselineColors.Reset();
-		State.SourceTopologyCommittedColors.Reset();
-		State.SourceTopologyWorkingColors.Reset();
+		//
+		// M16-J.0B: the six color arrays (render-vertex + Source-Topology corner-domain) and the
+		// authenticated alpha authority now live inside StateOwner -- StateOwner.Reset() clears exactly
+		// those six arrays and invalidates authority together (see that method's own doc comment), the
+		// same "reset together, never independently" invariant this comment already documented before
+		// this checkpoint, just now enforced by the owner itself rather than six manual .Reset() calls.
+		StateOwner.Reset();
 
 		// DIAGNOSTICS (raw/composition separation checkpoint): low-volume -- this function is only
 		// ever called at genuine session-end points (Cancel, Accept, RefreshSelection, World cleanup),
@@ -2189,7 +2114,7 @@ namespace VertexMaskForgePanel
 		{
 			UE_LOG(LogVertexMaskForge, Log,
 				TEXT("Vertex Mask Forge: AO cache destroyed (session end/component teardown) for '%s'."),
-				State.SourceComponent.IsValid() ? *State.SourceComponent->GetName() : TEXT("<invalid component>"));
+				State.GetSourceComponent().IsValid() ? *State.GetSourceComponent()->GetName() : TEXT("<invalid component>"));
 		}
 		State.AOCache.Reset();
 
@@ -2197,7 +2122,7 @@ namespace VertexMaskForgePanel
 		{
 			UE_LOG(LogVertexMaskForge, Log,
 				TEXT("Vertex Mask Forge: AO (Source Topology) cache destroyed (session end/component teardown) for '%s'."),
-				State.SourceComponent.IsValid() ? *State.SourceComponent->GetName() : TEXT("<invalid component>"));
+				State.GetSourceComponent().IsValid() ? *State.GetSourceComponent()->GetName() : TEXT("<invalid component>"));
 		}
 		State.SourceTopologyAOCache.Reset();
 	}
@@ -2235,7 +2160,7 @@ void SVertexMaskForgePanel::OnAxisInvertChanged(const int32 AxisIndex, const ECh
 	{
 		if (Entry.IsValid())
 		{
-			Entry->WorkingMesh.BoundingBoxMask = FVertexMaskForgeScalarMask();
+			Entry->GeneratorState.BoundingBoxMask = FVertexMaskForgeScalarMask();
 		}
 	}
 
@@ -2302,7 +2227,7 @@ void SVertexMaskForgePanel::OnAOEnableChanged(const ECheckBoxState NewState)
 	bool bAnyEntryNeedsGeneration = false;
 	for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
 	{
-		if (Entry.IsValid() && Entry->WorkingMesh.AmbientOcclusionMask.State != EVertexMaskForgeScalarMaskState::Ready)
+		if (Entry.IsValid() && Entry->GeneratorState.AmbientOcclusionMask.State != EVertexMaskForgeScalarMaskState::Ready)
 		{
 			bAnyEntryNeedsGeneration = true;
 			break;
@@ -2389,7 +2314,7 @@ void SVertexMaskForgePanel::OnCurvatureEnableChanged(const ECheckBoxState NewSta
 	bool bAnyEntryNeedsGeneration = false;
 	for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
 	{
-		if (Entry.IsValid() && Entry->WorkingMesh.CurvatureMask.State != EVertexMaskForgeScalarMaskState::Ready)
+		if (Entry.IsValid() && Entry->GeneratorState.CurvatureMask.State != EVertexMaskForgeScalarMaskState::Ready)
 		{
 			bAnyEntryNeedsGeneration = true;
 			break;
@@ -2456,16 +2381,17 @@ void SVertexMaskForgePanel::OnCurvatureParamChanged()
 	// function only ever reprocesses what already exists.
 	for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
 	{
-		if (!Entry.IsValid() || !bCurvatureEnabled || Entry->WorkingMesh.CurvatureRawConvexCache.IsEmpty())
+		if (!Entry.IsValid() || !bCurvatureEnabled || Entry->GeneratorState.CurvatureRawConvexCache.IsEmpty())
 		{
 			continue;
 		}
 
+		const FVertexMaskForgeWorkingMesh& WorkingMesh = Entry->MeshOwner->GetWorkingMesh();
 		FVertexMaskForgeScalarMask NewCurvatureMask;
 		if (Entry->bUseSourceTopology)
 		{
 			NewCurvatureMask = VertexMaskForgeCurvatureGenerator::GenerateCurvatureMaskFromDynamicMesh(
-				Entry->WorkingMesh, CurvatureType, CurvatureMultiplier, CurvatureBlur, CurvatureLevelsMin, CurvatureLevelsMax, bCurvatureInvert);
+				WorkingMesh, Entry->GeneratorState, CurvatureType, CurvatureMultiplier, CurvatureBlur, CurvatureLevelsMin, CurvatureLevelsMax, bCurvatureInvert);
 		}
 		else
 		{
@@ -2476,13 +2402,13 @@ void SVertexMaskForgePanel::OnCurvatureParamChanged()
 				continue;
 			}
 			NewCurvatureMask = VertexMaskForgeCurvatureGenerator::GenerateCurvatureMask(
-				Entry->WorkingMesh, Mesh->GetMeshDescription(0), RenderData->LODResources[0],
+				WorkingMesh, Entry->GeneratorState, Mesh->GetMeshDescription(0), RenderData->LODResources[0],
 				CurvatureType, CurvatureMultiplier, CurvatureBlur, CurvatureLevelsMin, CurvatureLevelsMax, bCurvatureInvert);
 		}
 
 		if (NewCurvatureMask.State == EVertexMaskForgeScalarMaskState::Ready)
 		{
-			Entry->WorkingMesh.CurvatureMask = MoveTemp(NewCurvatureMask);
+			Entry->GeneratorState.CurvatureMask = MoveTemp(NewCurvatureMask);
 		}
 	}
 
@@ -2519,7 +2445,7 @@ void SVertexMaskForgePanel::InvalidateNoiseRawMask()
 	{
 		if (Entry.IsValid())
 		{
-			Entry->WorkingMesh.NoiseMask = FVertexMaskForgeScalarMask();
+			Entry->GeneratorState.NoiseMask = FVertexMaskForgeScalarMask();
 		}
 	}
 
@@ -2536,7 +2462,8 @@ void SVertexMaskForgePanel::ReconcileMaterialSlotSelection()
 		const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry = SelectedMeshes[0];
 		if (Entry.IsValid())
 		{
-			for (const FVertexMaskForgeMaterialSlotInfo& Info : Entry->WorkingMesh.MaterialSlotOptions)
+			const FVertexMaskForgeWorkingMesh& WorkingMesh = Entry->MeshOwner->GetWorkingMesh();
+			for (const FVertexMaskForgeMaterialSlotInfo& Info : WorkingMesh.MaterialSlotOptions)
 			{
 				MaterialSlotOptions.Add(MakeShared<FVertexMaskForgeMaterialSlotInfo>(Info));
 			}
@@ -2545,7 +2472,7 @@ void SVertexMaskForgePanel::ReconcileMaterialSlotSelection()
 			// non-destructive re-selection of the SAME mesh); otherwise fall back to Slot 0 -- never
 			// leaves a stale index that belonged to a DIFFERENT mesh's slot table silently selected
 			// against this one.
-			if (!Entry->WorkingMesh.MaterialSlotOptions.IsValidIndex(SelectedMaterialSlotIndex))
+			if (!WorkingMesh.MaterialSlotOptions.IsValidIndex(SelectedMaterialSlotIndex))
 			{
 				SelectedMaterialSlotIndex = 0;
 			}
@@ -2576,15 +2503,16 @@ FText SVertexMaskForgePanel::GetMaterialSlotMaskDiagnosticText() const
 	{
 		return FText::GetEmpty();
 	}
-	if (Entry->WorkingMesh.MaterialSlotOptions.IsEmpty())
+	const FVertexMaskForgeWorkingMesh& WorkingMesh = Entry->MeshOwner->GetWorkingMesh();
+	if (WorkingMesh.MaterialSlotOptions.IsEmpty())
 	{
 		return LOCTEXT("MaterialSlotMaskNoSlots", "The selected mesh has no usable Material Slots.");
 	}
-	if (!Entry->WorkingMesh.bMaterialSlotResolutionValid)
+	if (!WorkingMesh.bMaterialSlotResolutionValid)
 	{
 		return LOCTEXT("MaterialSlotMaskResolutionInvalid", "Material Slot Mask unavailable: one or more Material Slots could not be resolved unambiguously (duplicate or missing slot names). Preview/Accept for this layer are blocked.");
 	}
-	if (Entry->WorkingMesh.bRenderVertexMaterialSlotAmbiguous && !Entry->bUseSourceTopology)
+	if (WorkingMesh.bRenderVertexMaterialSlotAmbiguous && !Entry->bUseSourceTopology)
 	{
 		return LOCTEXT("MaterialSlotMaskRenderVertexAmbiguous", "Material Slot Mask unavailable: this mesh has render vertices shared between different Material Slots. Preview/Accept for this layer are blocked.");
 	}
@@ -2628,7 +2556,7 @@ void SVertexMaskForgePanel::InvalidateMaterialSlotMaskRawMask()
 	{
 		if (Entry.IsValid())
 		{
-			Entry->WorkingMesh.MaterialSlotMask = FVertexMaskForgeScalarMask();
+			Entry->GeneratorState.MaterialSlotMask = FVertexMaskForgeScalarMask();
 		}
 	}
 
@@ -2665,7 +2593,7 @@ void SVertexMaskForgePanel::OnMaterialSlotMaskEnableChanged(const ECheckBoxState
 	bool bAnyEntryNeedsGeneration = false;
 	for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
 	{
-		if (Entry.IsValid() && Entry->WorkingMesh.MaterialSlotMask.State != EVertexMaskForgeScalarMaskState::Ready)
+		if (Entry.IsValid() && Entry->GeneratorState.MaterialSlotMask.State != EVertexMaskForgeScalarMaskState::Ready)
 		{
 			bAnyEntryNeedsGeneration = true;
 			break;
@@ -2723,8 +2651,8 @@ void SVertexMaskForgePanel::InvalidateDirectionalNormalMaskRawMask()
 	{
 		if (Entry.IsValid())
 		{
-			Entry->WorkingMesh.DirectionalNormalMask = FVertexMaskForgeScalarMask();
-			Entry->WorkingMesh.bDirectionalNormalWorldSpaceConflict = false;
+			Entry->GeneratorState.DirectionalNormalMask = FVertexMaskForgeScalarMask();
+			Entry->GeneratorState.bDirectionalNormalWorldSpaceConflict = false;
 		}
 	}
 
@@ -2762,7 +2690,7 @@ void SVertexMaskForgePanel::OnDirectionalNormalMaskEnableChanged(const ECheckBox
 	bool bAnyEntryNeedsGeneration = false;
 	for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
 	{
-		if (Entry.IsValid() && Entry->WorkingMesh.DirectionalNormalMask.State != EVertexMaskForgeScalarMaskState::Ready)
+		if (Entry.IsValid() && Entry->GeneratorState.DirectionalNormalMask.State != EVertexMaskForgeScalarMaskState::Ready)
 		{
 			bAnyEntryNeedsGeneration = true;
 			break;
@@ -2868,11 +2796,11 @@ FText SVertexMaskForgePanel::GetDirectionalNormalMaskDiagnosticText() const
 		{
 			continue;
 		}
-		if (Entry->WorkingMesh.bDirectionalNormalWorldSpaceConflict)
+		if (Entry->GeneratorState.bDirectionalNormalWorldSpaceConflict)
 		{
 			bAnyConflict = true;
 		}
-		if (Entry->WorkingMesh.DirectionalNormalMask.State == EVertexMaskForgeScalarMaskState::Invalid)
+		if (Entry->GeneratorState.DirectionalNormalMask.State == EVertexMaskForgeScalarMaskState::Invalid)
 		{
 			bAnyInvalid = true;
 		}
@@ -2900,9 +2828,9 @@ void SVertexMaskForgePanel::InvalidateThicknessMaskRawMask()
 	{
 		if (Entry.IsValid())
 		{
-			Entry->WorkingMesh.ThicknessMask = FVertexMaskForgeScalarMask();
-			Entry->WorkingMesh.ThicknessCache.Reset();
-			Entry->WorkingMesh.SourceTopologyThicknessCache.Reset();
+			Entry->GeneratorState.ThicknessMask = FVertexMaskForgeScalarMask();
+			Entry->GeneratorState.ThicknessCache.Reset();
+			Entry->GeneratorState.SourceTopologyThicknessCache.Reset();
 		}
 	}
 
@@ -2958,7 +2886,7 @@ void SVertexMaskForgePanel::OnThicknessMaskEnableChanged(const ECheckBoxState Ne
 	bool bAnyEntryNeedsGeneration = false;
 	for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
 	{
-		if (Entry.IsValid() && Entry->WorkingMesh.ThicknessMask.State != EVertexMaskForgeScalarMaskState::Ready)
+		if (Entry.IsValid() && Entry->GeneratorState.ThicknessMask.State != EVertexMaskForgeScalarMaskState::Ready)
 		{
 			bAnyEntryNeedsGeneration = true;
 			break;
@@ -3025,27 +2953,27 @@ FText SVertexMaskForgePanel::GetThicknessMaskDiagnosticText() const
 		{
 			continue;
 		}
-		if (Entry->WorkingMesh.ThicknessMask.State == EVertexMaskForgeScalarMaskState::Invalid
-			|| Entry->WorkingMesh.ThicknessMask.State == EVertexMaskForgeScalarMaskState::Unavailable)
+		if (Entry->GeneratorState.ThicknessMask.State == EVertexMaskForgeScalarMaskState::Invalid
+			|| Entry->GeneratorState.ThicknessMask.State == EVertexMaskForgeScalarMaskState::Unavailable)
 		{
 			bAnyInvalid = true;
 		}
-		if (Entry->WorkingMesh.ThicknessMask.State == EVertexMaskForgeScalarMaskState::Ready
-			&& Entry->WorkingMesh.ThicknessMask.NumValidValues == 0)
+		if (Entry->GeneratorState.ThicknessMask.State == EVertexMaskForgeScalarMaskState::Ready
+			&& Entry->GeneratorState.ThicknessMask.NumValidValues == 0)
 		{
 			bAnyStructurallyReadyButEmpty = true;
 		}
-		if (Entry->WorkingMesh.ThicknessCache.IsValid())
+		if (Entry->GeneratorState.ThicknessCache.IsValid())
 		{
-			TotalNoHit += Entry->WorkingMesh.ThicknessCache->NumNoHit;
-			TotalDegenerateDiscarded += Entry->WorkingMesh.ThicknessCache->NumDegenerateTrianglesDiscarded;
-			TotalInvalidOriginNormal += Entry->WorkingMesh.ThicknessCache->NumInvalidOriginNormal;
+			TotalNoHit += Entry->GeneratorState.ThicknessCache->NumNoHit;
+			TotalDegenerateDiscarded += Entry->GeneratorState.ThicknessCache->NumDegenerateTrianglesDiscarded;
+			TotalInvalidOriginNormal += Entry->GeneratorState.ThicknessCache->NumInvalidOriginNormal;
 		}
-		if (Entry->WorkingMesh.SourceTopologyThicknessCache.IsValid())
+		if (Entry->GeneratorState.SourceTopologyThicknessCache.IsValid())
 		{
-			TotalNoHit += Entry->WorkingMesh.SourceTopologyThicknessCache->NumNoHit;
-			TotalDegenerateDiscarded += Entry->WorkingMesh.SourceTopologyThicknessCache->NumDegenerateTrianglesDiscarded;
-			TotalInvalidOriginNormal += Entry->WorkingMesh.SourceTopologyThicknessCache->NumInvalidOriginNormal;
+			TotalNoHit += Entry->GeneratorState.SourceTopologyThicknessCache->NumNoHit;
+			TotalDegenerateDiscarded += Entry->GeneratorState.SourceTopologyThicknessCache->NumDegenerateTrianglesDiscarded;
+			TotalInvalidOriginNormal += Entry->GeneratorState.SourceTopologyThicknessCache->NumInvalidOriginNormal;
 		}
 	}
 
@@ -3085,7 +3013,7 @@ void SVertexMaskForgePanel::OnNoiseEnableChanged(const ECheckBoxState NewState)
 	bool bAnyEntryNeedsGeneration = false;
 	for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
 	{
-		if (Entry.IsValid() && Entry->WorkingMesh.NoiseMask.State != EVertexMaskForgeScalarMaskState::Ready)
+		if (Entry.IsValid() && Entry->GeneratorState.NoiseMask.State != EVertexMaskForgeScalarMaskState::Ready)
 		{
 			bAnyEntryNeedsGeneration = true;
 			break;
@@ -3199,16 +3127,17 @@ void SVertexMaskForgePanel::OnNoiseArtisticParamChanged()
 	// Mask/Auto Update are what populate the cache in the first place.
 	for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
 	{
-		if (!Entry.IsValid() || !bNoiseEnabled || Entry->WorkingMesh.NoiseRawCache.IsEmpty())
+		if (!Entry.IsValid() || !bNoiseEnabled || Entry->GeneratorState.NoiseRawCache.IsEmpty())
 		{
 			continue;
 		}
 
+		const FVertexMaskForgeWorkingMesh& WorkingMesh = Entry->MeshOwner->GetWorkingMesh();
 		FVertexMaskForgeScalarMask NewNoiseMask;
 		if (Entry->bUseSourceTopology)
 		{
 			NewNoiseMask = VertexMaskForgeNoiseGenerator::GenerateNoiseMaskFromDynamicMesh(
-				Entry->WorkingMesh, Entry->WorkingMesh.NoiseCacheUsedParams,
+				WorkingMesh, Entry->GeneratorState, Entry->GeneratorState.NoiseCacheUsedParams,
 				NoiseMultiplier, NoiseLevelsMin, NoiseLevelsMax, bNoiseInvert);
 		}
 		else
@@ -3220,14 +3149,14 @@ void SVertexMaskForgePanel::OnNoiseArtisticParamChanged()
 				continue;
 			}
 			NewNoiseMask = VertexMaskForgeNoiseGenerator::GenerateNoiseMask(
-				Entry->WorkingMesh, RenderData->LODResources[0],
-				Entry->WorkingMesh.NoiseCacheUsedParams,
+				WorkingMesh, Entry->GeneratorState, RenderData->LODResources[0],
+				Entry->GeneratorState.NoiseCacheUsedParams,
 				NoiseMultiplier, NoiseLevelsMin, NoiseLevelsMax, bNoiseInvert);
 		}
 
 		if (NewNoiseMask.State == EVertexMaskForgeScalarMaskState::Ready)
 		{
-			Entry->WorkingMesh.NoiseMask = MoveTemp(NewNoiseMask);
+			Entry->GeneratorState.NoiseMask = MoveTemp(NewNoiseMask);
 		}
 	}
 
@@ -6309,9 +6238,9 @@ void SVertexMaskForgePanel::OnActorMovedForDirectionalNormal(AActor* Actor)
 			continue;
 		}
 		bool bThisEntryAffected = false;
-		for (const FVertexMaskForgePreviewComponentState& State : Entry->PreviewComponents)
+		for (const TUniquePtr<FVertexMaskForgeWorkingStateOwner>& StateOwner : Entry->PreviewComponents)
 		{
-			const UStaticMeshComponent* Component = State.SourceComponent.Get();
+			const UStaticMeshComponent* Component = StateOwner->GetPreviewState().GetSourceComponent().Get();
 			if (IsValid(Component) && Component->GetOwner() == Actor)
 			{
 				bThisEntryAffected = true;
@@ -6320,8 +6249,8 @@ void SVertexMaskForgePanel::OnActorMovedForDirectionalNormal(AActor* Actor)
 		}
 		if (bThisEntryAffected)
 		{
-			Entry->WorkingMesh.DirectionalNormalMask = FVertexMaskForgeScalarMask();
-			Entry->WorkingMesh.bDirectionalNormalWorldSpaceConflict = false;
+			Entry->GeneratorState.DirectionalNormalMask = FVertexMaskForgeScalarMask();
+			Entry->GeneratorState.bDirectionalNormalWorldSpaceConflict = false;
 			bAnyEntryAffected = true;
 		}
 	}
@@ -6639,11 +6568,33 @@ void SVertexMaskForgePanel::BuildWorkingMeshes(TArray<TSharedPtr<FVertexMaskForg
 		}
 
 		// Resolved only for the duration of this call; no raw pointer is stored on Entry.
-		const UStaticMesh* Mesh = VertexMaskForgePanel::ResolveWorkingStaticMesh(Entry->Mesh);
-		Entry->WorkingMesh = VertexMaskForgePanel::BuildWorkingMeshForStaticMesh(Mesh, Entry->Diagnostics);
+		UStaticMesh* Mesh = const_cast<UStaticMesh*>(VertexMaskForgePanel::ResolveWorkingStaticMesh(Entry->Mesh));
+		FVertexMaskForgeWorkingMesh NewWorkingMesh = VertexMaskForgePanel::BuildWorkingMeshForStaticMesh(Mesh, Entry->Diagnostics);
 		Entry->bUseSourceTopology = VertexMaskForgePanel::ShouldUseSourceTopology(Mesh);
 
-		if (Entry->WorkingMesh.State == EVertexMaskForgeWorkingMeshState::Ready)
+		// M16-J.0B: the geometry itself is still produced by the exact same, unmodified builder call
+		// above -- MeshOwner only ever authenticates/owns the RESULT, once per entry (never per
+		// component), via its own real generation/Provenance lifecycle (see InstallWorkingMesh's own doc
+		// comment). ExpectedCardinality mirrors the real per-sample domain (LOD0 render-vertex count, or
+		// Mesh.TriangleCount()*3 for Source-Topology) -- never fabricated, never treated as identity
+		// proof by the validator.
+		int32 ExpectedCardinality = 0;
+		if (NewWorkingMesh.State == EVertexMaskForgeWorkingMeshState::Ready)
+		{
+			if (Entry->bUseSourceTopology && NewWorkingMesh.Mesh.IsValid())
+			{
+				ExpectedCardinality = NewWorkingMesh.Mesh->TriangleCount() * 3;
+			}
+			else if (!Entry->bUseSourceTopology && IsValid(Mesh) && Mesh->GetRenderData() && Mesh->GetRenderData()->LODResources.IsValidIndex(0))
+			{
+				ExpectedCardinality = static_cast<int32>(Mesh->GetRenderData()->LODResources[0].VertexBuffers.PositionVertexBuffer.GetNumVertices());
+			}
+		}
+
+		Entry->MeshOwner->ConfigureIdentity(Mesh, /*LODIndex=*/0, Entry->bUseSourceTopology);
+		Entry->MeshOwner->InstallWorkingMesh(MoveTemp(NewWorkingMesh), ExpectedCardinality);
+
+		if (Entry->MeshOwner->GetWorkingMesh().State == EVertexMaskForgeWorkingMeshState::Ready)
 		{
 			++NumReady;
 		}
@@ -6695,7 +6646,7 @@ void SVertexMaskForgePanel::InvalidateBoundingBoxRawMask()
 	{
 		if (Entry.IsValid())
 		{
-			Entry->WorkingMesh.BoundingBoxMask = FVertexMaskForgeScalarMask();
+			Entry->GeneratorState.BoundingBoxMask = FVertexMaskForgeScalarMask();
 		}
 	}
 }
@@ -6714,7 +6665,7 @@ void SVertexMaskForgePanel::InvalidateAODerivedMask()
 	{
 		if (Entry.IsValid())
 		{
-			Entry->WorkingMesh.AmbientOcclusionMask = FVertexMaskForgeScalarMask();
+			Entry->GeneratorState.AmbientOcclusionMask = FVertexMaskForgeScalarMask();
 		}
 	}
 }
@@ -6737,7 +6688,7 @@ bool SVertexMaskForgePanel::CanRunFill() const
 
 	for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
 	{
-		if (Entry.IsValid() && Entry->WorkingMesh.State == EVertexMaskForgeWorkingMeshState::Ready)
+		if (Entry.IsValid() && Entry->MeshOwner->GetWorkingMesh().State == EVertexMaskForgeWorkingMeshState::Ready)
 		{
 			return true;
 		}
@@ -6767,11 +6718,12 @@ void SVertexMaskForgePanel::RunConstantFill(
 		{
 			continue;
 		}
+		const FVertexMaskForgeWorkingMesh& WorkingMesh = Entry->MeshOwner->GetWorkingMesh();
 
 		// Same entry-level validity gating as live generation -- but a failure
 		// here leaves the entry's existing mask COMPLETELY UNTOUCHED (preserve the last valid
 		// Preview), rather than resetting it to Unavailable.
-		if (Entry->WorkingMesh.State != EVertexMaskForgeWorkingMeshState::Ready)
+		if (WorkingMesh.State != EVertexMaskForgeWorkingMeshState::Ready)
 		{
 			++NumFailed;
 			if (FirstFailedAssetName.IsEmpty())
@@ -6807,7 +6759,7 @@ void SVertexMaskForgePanel::RunConstantFill(
 		// corner domain (3 * TriangleCount), matching UpdateWorkingColorsSourceTopology's own domain --
 		// never RenderData->LODResources[0] (the reduced Nanite fallback).
 		FVertexMaskForgeScalarMask NewMask = Entry->bUseSourceTopology
-			? VertexMaskForgePanel::GenerateConstantMaskForCornerDomain(Entry->WorkingMesh.Mesh->TriangleCount() * 3, ConstantValue, Source)
+			? VertexMaskForgePanel::GenerateConstantMaskForCornerDomain(WorkingMesh.Mesh->TriangleCount() * 3, ConstantValue, Source)
 			: VertexMaskForgePanel::GenerateConstantMask(RenderData->LODResources[0], ConstantValue, Source);
 		if (NewMask.State != EVertexMaskForgeScalarMaskState::Ready)
 		{
@@ -6819,7 +6771,7 @@ void SVertexMaskForgePanel::RunConstantFill(
 			continue;
 		}
 
-		Entry->WorkingMesh.BoundingBoxMask = MoveTemp(NewMask);
+		Entry->GeneratorState.BoundingBoxMask = MoveTemp(NewMask);
 		++NumReady;
 	}
 
@@ -6983,10 +6935,15 @@ void SVertexMaskForgePanel::RunAutoUpdatePreview(const bool bIncludeAO)
 
 	for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
 	{
-		if (!Entry.IsValid() || Entry->WorkingMesh.State != EVertexMaskForgeWorkingMeshState::Ready)
+		if (!Entry.IsValid() || Entry->MeshOwner->GetWorkingMesh().State != EVertexMaskForgeWorkingMeshState::Ready)
 		{
 			continue;
 		}
+		// M16-J.0B.1 corrective pass: local, short-lived const view -- see
+		// FVertexMaskForgeSelectedMesh::MeshOwner's own doc comment on why this is never cached in a
+		// persistent member. Valid for this entire loop iteration since Entry (and therefore its
+		// MeshOwner) is held alive by the range-for's own reference to the array element.
+		const FVertexMaskForgeWorkingMesh& WorkingMesh = Entry->MeshOwner->GetWorkingMesh();
 
 		const UStaticMesh* Mesh = Entry->Mesh.LoadSynchronous();
 		if (!IsValid(Mesh) || !Mesh->HasValidRenderData(/*bCheckLODForVerts=*/true, /*LODIndex=*/0))
@@ -7004,9 +6961,9 @@ void SVertexMaskForgePanel::RunAutoUpdatePreview(const bool bIncludeAO)
 
 		FTransform ReferenceTransform = FTransform::Identity;
 		bool bHasLiveComponent = false;
-		for (const FVertexMaskForgePreviewComponentState& State : Entry->PreviewComponents)
+		for (const TUniquePtr<FVertexMaskForgeWorkingStateOwner>& StateOwner : Entry->PreviewComponents)
 		{
-			if (const UStaticMeshComponent* SourceComponent = State.SourceComponent.Get())
+			if (const UStaticMeshComponent* SourceComponent = StateOwner->GetPreviewState().GetSourceComponent().Get())
 			{
 				ReferenceTransform = SourceComponent->GetComponentTransform();
 				bHasLiveComponent = true;
@@ -7024,14 +6981,14 @@ void SVertexMaskForgePanel::RunAutoUpdatePreview(const bool bIncludeAO)
 		{
 			FVertexMaskForgeScalarMask NewBBoxMask = Entry->bUseSourceTopology
 				? VertexMaskForgeBoundingBoxGenerator::GenerateBoundingBoxMaskFromDynamicMesh(
-					*Entry->WorkingMesh.Mesh, BoundingBoxAxisParams, ReferenceTransform)
+					*WorkingMesh.Mesh, BoundingBoxAxisParams, ReferenceTransform)
 				: VertexMaskForgeBoundingBoxGenerator::GenerateBoundingBoxMask(
 					RenderData->LODResources[0], BoundingBoxAxisParams, ReferenceTransform, CollectiveBoundsPtr);
 			NewBBoxMask.SelectionMeshCount = SelectedMeshes.Num();
 
 			if (NewBBoxMask.State == EVertexMaskForgeScalarMaskState::Ready)
 			{
-				Entry->WorkingMesh.BoundingBoxMask = MoveTemp(NewBBoxMask);
+				Entry->GeneratorState.BoundingBoxMask = MoveTemp(NewBBoxMask);
 			}
 			else
 			{
@@ -7044,7 +7001,7 @@ void SVertexMaskForgePanel::RunAutoUpdatePreview(const bool bIncludeAO)
 		}
 		else if (!bAnyAxisEnabled)
 		{
-			Entry->WorkingMesh.BoundingBoxMask = FVertexMaskForgeScalarMask();
+			Entry->GeneratorState.BoundingBoxMask = FVertexMaskForgeScalarMask();
 		}
 
 		// AUDITED (double-AO-execution fix): Ambient Occlusion slot -- ENTRY-LEVEL VALIDATION ONLY,
@@ -7059,10 +7016,10 @@ void SVertexMaskForgePanel::RunAutoUpdatePreview(const bool bIncludeAO)
 		{
 			if (bAOEnabled)
 			{
-				Entry->WorkingMesh.AmbientOcclusionMask = FVertexMaskForgeScalarMask();
-				Entry->WorkingMesh.AmbientOcclusionMask.Source = EVertexMaskForgeScalarMaskSource::AmbientOcclusion;
+				Entry->GeneratorState.AmbientOcclusionMask = FVertexMaskForgeScalarMask();
+				Entry->GeneratorState.AmbientOcclusionMask.Source = EVertexMaskForgeScalarMaskSource::AmbientOcclusion;
 				const bool bAOInputValid = Entry->bUseSourceTopology
-					? VertexMaskForgeAmbientOcclusionGenerator::IsAmbientOcclusionInputValidForDynamicMesh(Entry->WorkingMesh.Mesh.Get())
+					? VertexMaskForgeAmbientOcclusionGenerator::IsAmbientOcclusionInputValidForDynamicMesh(WorkingMesh.Mesh.Get())
 					: VertexMaskForgeAmbientOcclusionGenerator::IsAmbientOcclusionInputValid(RenderData->LODResources[0]);
 				if (bHasLiveComponent && bAOInputValid)
 				{
@@ -7073,20 +7030,20 @@ void SVertexMaskForgePanel::RunAutoUpdatePreview(const bool bIncludeAO)
 					Params.bInvert = bAOInvert;
 					Params.LevelsMin = AOLevelsMin;
 					Params.LevelsMax = AOLevelsMax;
-					Entry->WorkingMesh.AmbientOcclusionMask.UsedAOParams = Params;
-					Entry->WorkingMesh.AmbientOcclusionMask.RenderVertexCount = Entry->bUseSourceTopology
-						? Entry->WorkingMesh.Mesh->VertexCount()
+					Entry->GeneratorState.AmbientOcclusionMask.UsedAOParams = Params;
+					Entry->GeneratorState.AmbientOcclusionMask.RenderVertexCount = Entry->bUseSourceTopology
+						? WorkingMesh.Mesh->VertexCount()
 						: static_cast<int32>(RenderData->LODResources[0].VertexBuffers.PositionVertexBuffer.GetNumVertices());
-					Entry->WorkingMesh.AmbientOcclusionMask.State = EVertexMaskForgeScalarMaskState::Ready;
+					Entry->GeneratorState.AmbientOcclusionMask.State = EVertexMaskForgeScalarMaskState::Ready;
 				}
 				else
 				{
-					Entry->WorkingMesh.AmbientOcclusionMask.State = EVertexMaskForgeScalarMaskState::Unavailable;
+					Entry->GeneratorState.AmbientOcclusionMask.State = EVertexMaskForgeScalarMaskState::Unavailable;
 				}
 			}
 			else
 			{
-				Entry->WorkingMesh.AmbientOcclusionMask = FVertexMaskForgeScalarMask();
+				Entry->GeneratorState.AmbientOcclusionMask = FVertexMaskForgeScalarMask();
 			}
 		}
 
@@ -7101,20 +7058,20 @@ void SVertexMaskForgePanel::RunAutoUpdatePreview(const bool bIncludeAO)
 		{
 			FVertexMaskForgeScalarMask NewCurvatureMask = Entry->bUseSourceTopology
 				? VertexMaskForgeCurvatureGenerator::GenerateCurvatureMaskFromDynamicMesh(
-					Entry->WorkingMesh, CurvatureType, CurvatureMultiplier, CurvatureBlur, CurvatureLevelsMin, CurvatureLevelsMax, bCurvatureInvert)
+					WorkingMesh, Entry->GeneratorState, CurvatureType, CurvatureMultiplier, CurvatureBlur, CurvatureLevelsMin, CurvatureLevelsMax, bCurvatureInvert)
 				: VertexMaskForgeCurvatureGenerator::GenerateCurvatureMask(
-					Entry->WorkingMesh, MeshDescription, RenderData->LODResources[0],
+					WorkingMesh, Entry->GeneratorState, MeshDescription, RenderData->LODResources[0],
 					CurvatureType, CurvatureMultiplier, CurvatureBlur, CurvatureLevelsMin, CurvatureLevelsMax, bCurvatureInvert);
 			if (NewCurvatureMask.State == EVertexMaskForgeScalarMaskState::Ready)
 			{
-				Entry->WorkingMesh.CurvatureMask = MoveTemp(NewCurvatureMask);
+				Entry->GeneratorState.CurvatureMask = MoveTemp(NewCurvatureMask);
 			}
 			// else: preserve whatever CurvatureMask this entry already had -- same "auto-update never
 			// replaces a valid Preview with incomplete/degenerate data" contract as Bounding Box above.
 		}
 		else
 		{
-			Entry->WorkingMesh.CurvatureMask = FVertexMaskForgeScalarMask();
+			Entry->GeneratorState.CurvatureMask = FVertexMaskForgeScalarMask();
 		}
 
 		// AUDITED (Noise V1): same "real, entry-level computation, cache-reusing" contract as the
@@ -7124,20 +7081,20 @@ void SVertexMaskForgePanel::RunAutoUpdatePreview(const bool bIncludeAO)
 		{
 			FVertexMaskForgeScalarMask NewNoiseMask = Entry->bUseSourceTopology
 				? VertexMaskForgeNoiseGenerator::GenerateNoiseMaskFromDynamicMesh(
-					Entry->WorkingMesh, NoiseGenerativeParams, NoiseMultiplier, NoiseLevelsMin, NoiseLevelsMax, bNoiseInvert)
+					WorkingMesh, Entry->GeneratorState, NoiseGenerativeParams, NoiseMultiplier, NoiseLevelsMin, NoiseLevelsMax, bNoiseInvert)
 				: VertexMaskForgeNoiseGenerator::GenerateNoiseMask(
-					Entry->WorkingMesh, RenderData->LODResources[0],
+					WorkingMesh, Entry->GeneratorState, RenderData->LODResources[0],
 					NoiseGenerativeParams, NoiseMultiplier, NoiseLevelsMin, NoiseLevelsMax, bNoiseInvert);
 			if (NewNoiseMask.State == EVertexMaskForgeScalarMaskState::Ready)
 			{
-				Entry->WorkingMesh.NoiseMask = MoveTemp(NewNoiseMask);
+				Entry->GeneratorState.NoiseMask = MoveTemp(NewNoiseMask);
 			}
 			// else: preserve whatever NoiseMask this entry already had -- same "auto-update never
 			// replaces a valid Preview with incomplete/degenerate data" contract as Bounding Box/Curvature.
 		}
 		else
 		{
-			Entry->WorkingMesh.NoiseMask = FVertexMaskForgeScalarMask();
+			Entry->GeneratorState.NoiseMask = FVertexMaskForgeScalarMask();
 		}
 
 		// AUDITED (V2-D): same "real, entry-level computation" contract as Curvature/Noise above, but
@@ -7147,19 +7104,19 @@ void SVertexMaskForgePanel::RunAutoUpdatePreview(const bool bIncludeAO)
 		{
 			FVertexMaskForgeScalarMask NewMaterialSlotMask = Entry->bUseSourceTopology
 				? VertexMaskForgeMaterialSlotGenerator::GenerateMaterialSlotMaskFromDynamicMesh(
-					Entry->WorkingMesh, SelectedMaterialSlotIndex, bMaterialSlotMaskInvert)
+					WorkingMesh, SelectedMaterialSlotIndex, bMaterialSlotMaskInvert)
 				: VertexMaskForgeMaterialSlotGenerator::GenerateMaterialSlotMask(
-					Entry->WorkingMesh, RenderData->LODResources[0], SelectedMaterialSlotIndex, bMaterialSlotMaskInvert);
+					WorkingMesh, RenderData->LODResources[0], SelectedMaterialSlotIndex, bMaterialSlotMaskInvert);
 			if (NewMaterialSlotMask.State == EVertexMaskForgeScalarMaskState::Ready)
 			{
-				Entry->WorkingMesh.MaterialSlotMask = MoveTemp(NewMaterialSlotMask);
+				Entry->GeneratorState.MaterialSlotMask = MoveTemp(NewMaterialSlotMask);
 			}
 			// else: preserve whatever MaterialSlotMask this entry already had -- same "auto-update never
 			// replaces a valid Preview with incomplete/degenerate data" contract as the other generators.
 		}
 		else
 		{
-			Entry->WorkingMesh.MaterialSlotMask = FVertexMaskForgeScalarMask();
+			Entry->GeneratorState.MaterialSlotMask = FVertexMaskForgeScalarMask();
 		}
 
 		// AUDITED (V2-E): entry-level reference, cheap enough to just recompute every pass. Never
@@ -7168,31 +7125,31 @@ void SVertexMaskForgePanel::RunAutoUpdatePreview(const bool bIncludeAO)
 		{
 			FVertexMaskForgeScalarMask NewDirectionalNormalMask = Entry->bUseSourceTopology
 				? VertexMaskForgeDirectionalNormalGenerator::GenerateDirectionalNormalMaskFromDynamicMesh(
-					Entry->WorkingMesh, DirectionalNormalSpace, DirectionalNormalDirection,
+					WorkingMesh, DirectionalNormalSpace, DirectionalNormalDirection,
 					DirectionalNormalAngle, DirectionalNormalFalloff, DirectionalNormalBlur, bDirectionalNormalMaskInvert, ReferenceTransform)
 				: VertexMaskForgeDirectionalNormalGenerator::GenerateDirectionalNormalMask(
 					RenderData->LODResources[0], DirectionalNormalSpace, DirectionalNormalDirection,
 					DirectionalNormalAngle, DirectionalNormalFalloff, DirectionalNormalBlur, bDirectionalNormalMaskInvert, ReferenceTransform);
 
-			Entry->WorkingMesh.bDirectionalNormalWorldSpaceConflict = false;
+			Entry->GeneratorState.bDirectionalNormalWorldSpaceConflict = false;
 			if (DirectionalNormalSpace == EVertexMaskForgeNormalSpace::World)
 			{
 				float MaxDeviationDegrees = 0.0f;
-				Entry->WorkingMesh.bDirectionalNormalWorldSpaceConflict =
+				Entry->GeneratorState.bDirectionalNormalWorldSpaceConflict =
 					VertexMaskForgeWorkingMeshTypes::HasConflictingWorldSpaceNormalTransforms(Entry->PreviewComponents, MaxDeviationDegrees);
 			}
 
 			if (NewDirectionalNormalMask.State == EVertexMaskForgeScalarMaskState::Ready)
 			{
-				Entry->WorkingMesh.DirectionalNormalMask = MoveTemp(NewDirectionalNormalMask);
+				Entry->GeneratorState.DirectionalNormalMask = MoveTemp(NewDirectionalNormalMask);
 			}
 			// else: preserve whatever DirectionalNormalMask this entry already had -- same "auto-update
 			// never replaces a valid Preview with incomplete/degenerate data" contract as the others.
 		}
 		else
 		{
-			Entry->WorkingMesh.DirectionalNormalMask = FVertexMaskForgeScalarMask();
-			Entry->WorkingMesh.bDirectionalNormalWorldSpaceConflict = false;
+			Entry->GeneratorState.DirectionalNormalMask = FVertexMaskForgeScalarMask();
+			Entry->GeneratorState.bDirectionalNormalWorldSpaceConflict = false;
 		}
 
 		// AUDITED (V2-G): entry-level reference, cheap enough to just recompute every pass -- Asset
@@ -7203,19 +7160,19 @@ void SVertexMaskForgePanel::RunAutoUpdatePreview(const bool bIncludeAO)
 		{
 			FVertexMaskForgeScalarMask NewThicknessMask = Entry->bUseSourceTopology
 				? VertexMaskForgeThicknessGenerator::GenerateThicknessMaskFromDynamicMesh(
-					Entry->WorkingMesh.SourceTopologyThicknessCache, Entry->WorkingMesh,
+					Entry->GeneratorState.SourceTopologyThicknessCache, WorkingMesh,
 					ThicknessMinThickness, ThicknessMaxThickness, ThicknessSearchDistance, ThicknessBias, ThicknessBlur, bThicknessMaskInvert)
 				: VertexMaskForgeThicknessGenerator::GenerateThicknessMask(
-					Entry->WorkingMesh.ThicknessCache, Mesh, RenderData->LODResources[0],
+					Entry->GeneratorState.ThicknessCache, Mesh, RenderData->LODResources[0],
 					ThicknessMinThickness, ThicknessMaxThickness, ThicknessSearchDistance, ThicknessBias, ThicknessBlur, bThicknessMaskInvert);
 			if (NewThicknessMask.State == EVertexMaskForgeScalarMaskState::Ready)
 			{
-				Entry->WorkingMesh.ThicknessMask = MoveTemp(NewThicknessMask);
+				Entry->GeneratorState.ThicknessMask = MoveTemp(NewThicknessMask);
 			}
 		}
 		else
 		{
-			Entry->WorkingMesh.ThicknessMask = FVertexMaskForgeScalarMask();
+			Entry->GeneratorState.ThicknessMask = FVertexMaskForgeScalarMask();
 		}
 	}
 
@@ -7301,13 +7258,13 @@ FText SVertexMaskForgePanel::GetPreviewStatusText() const
 		}
 
 		bAnyViewportComponent = true;
-		if (Entry->WorkingMesh.BoundingBoxMask.State == EVertexMaskForgeScalarMaskState::Ready
-			|| Entry->WorkingMesh.AmbientOcclusionMask.State == EVertexMaskForgeScalarMaskState::Ready
-			|| Entry->WorkingMesh.CurvatureMask.State == EVertexMaskForgeScalarMaskState::Ready
-			|| Entry->WorkingMesh.NoiseMask.State == EVertexMaskForgeScalarMaskState::Ready
-			|| Entry->WorkingMesh.MaterialSlotMask.State == EVertexMaskForgeScalarMaskState::Ready
-			|| Entry->WorkingMesh.DirectionalNormalMask.State == EVertexMaskForgeScalarMaskState::Ready
-			|| Entry->WorkingMesh.ThicknessMask.State == EVertexMaskForgeScalarMaskState::Ready)
+		if (Entry->GeneratorState.BoundingBoxMask.State == EVertexMaskForgeScalarMaskState::Ready
+			|| Entry->GeneratorState.AmbientOcclusionMask.State == EVertexMaskForgeScalarMaskState::Ready
+			|| Entry->GeneratorState.CurvatureMask.State == EVertexMaskForgeScalarMaskState::Ready
+			|| Entry->GeneratorState.NoiseMask.State == EVertexMaskForgeScalarMaskState::Ready
+			|| Entry->GeneratorState.MaterialSlotMask.State == EVertexMaskForgeScalarMaskState::Ready
+			|| Entry->GeneratorState.DirectionalNormalMask.State == EVertexMaskForgeScalarMaskState::Ready
+			|| Entry->GeneratorState.ThicknessMask.State == EVertexMaskForgeScalarMaskState::Ready)
 		{
 			bAnyReady = true;
 		}
@@ -7432,13 +7389,13 @@ void SVertexMaskForgePanel::RecomputeOperationState()
 	for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
 	{
 		if (Entry.IsValid() && !Entry->PreviewComponents.IsEmpty()
-			&& (Entry->WorkingMesh.BoundingBoxMask.State == EVertexMaskForgeScalarMaskState::Ready
-				|| Entry->WorkingMesh.AmbientOcclusionMask.State == EVertexMaskForgeScalarMaskState::Ready
-				|| Entry->WorkingMesh.CurvatureMask.State == EVertexMaskForgeScalarMaskState::Ready
-				|| Entry->WorkingMesh.NoiseMask.State == EVertexMaskForgeScalarMaskState::Ready
-				|| Entry->WorkingMesh.MaterialSlotMask.State == EVertexMaskForgeScalarMaskState::Ready
-				|| Entry->WorkingMesh.DirectionalNormalMask.State == EVertexMaskForgeScalarMaskState::Ready
-				|| Entry->WorkingMesh.ThicknessMask.State == EVertexMaskForgeScalarMaskState::Ready))
+			&& (Entry->GeneratorState.BoundingBoxMask.State == EVertexMaskForgeScalarMaskState::Ready
+				|| Entry->GeneratorState.AmbientOcclusionMask.State == EVertexMaskForgeScalarMaskState::Ready
+				|| Entry->GeneratorState.CurvatureMask.State == EVertexMaskForgeScalarMaskState::Ready
+				|| Entry->GeneratorState.NoiseMask.State == EVertexMaskForgeScalarMaskState::Ready
+				|| Entry->GeneratorState.MaterialSlotMask.State == EVertexMaskForgeScalarMaskState::Ready
+				|| Entry->GeneratorState.DirectionalNormalMask.State == EVertexMaskForgeScalarMaskState::Ready
+				|| Entry->GeneratorState.ThicknessMask.State == EVertexMaskForgeScalarMaskState::Ready))
 		{
 			bHasPending = true;
 			break;
@@ -7724,18 +7681,43 @@ bool SVertexMaskForgePanel::HasNaniteMeshInSelection() const
 
 void SVertexMaskForgePanel::RestorePreviewForEntry(FVertexMaskForgeSelectedMesh& Entry)
 {
-	for (FVertexMaskForgePreviewComponentState& State : Entry.PreviewComponents)
+	for (TUniquePtr<FVertexMaskForgeWorkingStateOwner>& StateOwner : Entry.PreviewComponents)
 	{
-		VertexMaskForgePanel::RestoreComponentOriginal(State, ActorHideStates);
+		VertexMaskForgePanel::RestoreComponentOriginal(*StateOwner, ActorHideStates);
 	}
 }
 
 void SVertexMaskForgePanel::RestorePreviewForEntryVisualOnly(FVertexMaskForgeSelectedMesh& Entry)
 {
-	for (FVertexMaskForgePreviewComponentState& State : Entry.PreviewComponents)
+	for (TUniquePtr<FVertexMaskForgeWorkingStateOwner>& StateOwner : Entry.PreviewComponents)
 	{
-		VertexMaskForgePanel::RestorePreviewVisualOnly(State, ActorHideStates);
+		VertexMaskForgePanel::RestorePreviewVisualOnly(StateOwner->GetVisualSessionStateMutable(), ActorHideStates);
 	}
+}
+
+TOptional<EVertexMaskForgeWorkingColorsPublicationValidationStatus> SVertexMaskForgePanel::ValidatePublicationBindingForComponent(const UStaticMeshComponent* Component) const
+{
+	if (!IsValid(Component))
+	{
+		return TOptional<EVertexMaskForgeWorkingColorsPublicationValidationStatus>();
+	}
+
+	for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
+	{
+		if (!Entry.IsValid())
+		{
+			continue;
+		}
+		for (const TUniquePtr<FVertexMaskForgeWorkingStateOwner>& StateOwner : Entry->PreviewComponents)
+		{
+			if (StateOwner->GetPreviewState().GetSourceComponent().Get() == Component)
+			{
+				return StateOwner->ValidateBinding();
+			}
+		}
+	}
+
+	return TOptional<EVertexMaskForgeWorkingColorsPublicationValidationStatus>();
 }
 
 void SVertexMaskForgePanel::ApplyPreviewToEntry(
@@ -7771,35 +7753,45 @@ void SVertexMaskForgePanel::ApplyPreviewToEntry(
 		return;
 	}
 
-	const FVertexMaskForgeWorkingMesh& WorkingMesh = Entry->WorkingMesh;
+	// M16-J.0B.1 corrective pass: local, short-lived const view (no persistent WorkingMesh reference member
+	// exists on FVertexMaskForgeSelectedMesh anymore -- see that member's own removed doc comment). Valid
+	// for this whole function call since Entry (held by the caller) keeps MeshOwner alive throughout.
+	const FVertexMaskForgeWorkingMesh& WorkingMesh = Entry->MeshOwner->GetWorkingMesh();
+	// M16-J.0B.1 (WorkingMesh Domain Split): Generator Artistic State (BoundingBoxMask/AmbientOcclusionMask/
+	// CurvatureMask/NoiseMask/MaterialSlotMask/DirectionalNormalMask/ThicknessMask and their raw caches) no
+	// longer lives on WorkingMesh -- this is the one function that reads both the const Identity view
+	// (WorkingMesh, e.g. WorkingMesh.Mesh below) and the mutable Artistic State in the same expressions, so
+	// both references are declared side by side here (see FVertexMaskForgeGeneratorState's own module
+	// comment for why these fields moved).
+	FVertexMaskForgeGeneratorState& GeneratorState = Entry->GeneratorState;
 	// AUDITED (composition-stack checkpoint): proceed if EITHER slot is Ready -- Bounding Box and
 	// Ambient Occlusion are independent, optional layers now (see BoundingBoxMask's own doc comment).
-	const bool bBBoxEntryReady = WorkingMesh.BoundingBoxMask.State == EVertexMaskForgeScalarMaskState::Ready;
+	const bool bBBoxEntryReady = GeneratorState.BoundingBoxMask.State == EVertexMaskForgeScalarMaskState::Ready;
 	// AUDITED (raw/composition separation checkpoint): gated LIVE on bAOEnabled, not just State --
 	// disabling AO (OnAOEnableChanged, pure composition) never touches AmbientOcclusionMask/AOCache at
 	// all (see that handler's own doc comment), so State can legitimately still read Ready while the
 	// layer is meant to be excluded from the stack; bAOEnabled is the live, authoritative "is this
 	// layer currently supposed to participate" signal.
-	const bool bAOEntryReady = bAOEnabled && WorkingMesh.AmbientOcclusionMask.State == EVertexMaskForgeScalarMaskState::Ready;
+	const bool bAOEntryReady = bAOEnabled && GeneratorState.AmbientOcclusionMask.State == EVertexMaskForgeScalarMaskState::Ready;
 	// AUDITED (Curvature layer): same live-gating rationale as bAOEntryReady above, and same
 	// "entry-level result IS the per-component contribution" property as bBBoxEntryReady when no
 	// per-component re-evaluation is needed (Curvature never needs one -- see CurvatureMask's own doc
-	// comment) -- WorkingMesh.CurvatureMask.State can legitimately still read Ready while disabled.
-	const bool bCurvatureEntryReady = bCurvatureEnabled && WorkingMesh.CurvatureMask.State == EVertexMaskForgeScalarMaskState::Ready;
+	// comment) -- GeneratorState.CurvatureMask.State can legitimately still read Ready while disabled.
+	const bool bCurvatureEntryReady = bCurvatureEnabled && GeneratorState.CurvatureMask.State == EVertexMaskForgeScalarMaskState::Ready;
 	// AUDITED (Noise V1): same live-gating rationale as bCurvatureEntryReady above -- Noise is also
 	// entry-level, real values, no per-component re-evaluation needed.
-	const bool bNoiseEntryReady = bNoiseEnabled && WorkingMesh.NoiseMask.State == EVertexMaskForgeScalarMaskState::Ready;
+	const bool bNoiseEntryReady = bNoiseEnabled && GeneratorState.NoiseMask.State == EVertexMaskForgeScalarMaskState::Ready;
 	// AUDITED (V2-D): same live-gating rationale as bCurvatureEntryReady/bNoiseEntryReady above --
 	// Material Slot Mask is also entry-level, real values, no per-component re-evaluation needed.
-	const bool bMaterialSlotMaskEntryReady = bMaterialSlotMaskEnabled && WorkingMesh.MaterialSlotMask.State == EVertexMaskForgeScalarMaskState::Ready;
+	const bool bMaterialSlotMaskEntryReady = bMaterialSlotMaskEnabled && GeneratorState.MaterialSlotMask.State == EVertexMaskForgeScalarMaskState::Ready;
 	// AUDITED (V2-E): same live-gating rationale as bAOEntryReady above -- in World Space,
-	// WorkingMesh.DirectionalNormalMask.State is VALIDATION ONLY (same contract as AmbientOcclusionMask),
+	// GeneratorState.DirectionalNormalMask.State is VALIDATION ONLY (same contract as AmbientOcclusionMask),
 	// the real per-component result is computed fresh below; in Local Space it holds the real, final
 	// entry-level values directly, like Curvature/Noise/Material Slot.
-	const bool bDirectionalNormalMaskEntryReady = bDirectionalNormalMaskEnabled && WorkingMesh.DirectionalNormalMask.State == EVertexMaskForgeScalarMaskState::Ready;
+	const bool bDirectionalNormalMaskEntryReady = bDirectionalNormalMaskEnabled && GeneratorState.DirectionalNormalMask.State == EVertexMaskForgeScalarMaskState::Ready;
 	// AUDITED (V2-G): Thickness is ALWAYS Asset Local Space -- same "no per-component re-evaluation"
 	// contract as Curvature/Noise/Material Slot (never like Directional Normal World Space/AO).
-	const bool bThicknessMaskEntryReady = bThicknessMaskEnabled && WorkingMesh.ThicknessMask.State == EVertexMaskForgeScalarMaskState::Ready;
+	const bool bThicknessMaskEntryReady = bThicknessMaskEnabled && GeneratorState.ThicknessMask.State == EVertexMaskForgeScalarMaskState::Ready;
 	if (WorkingMesh.State != EVertexMaskForgeWorkingMeshState::Ready
 		|| !WorkingMesh.Mesh.IsValid())
 	{
@@ -7858,9 +7850,19 @@ void SVertexMaskForgePanel::ApplyPreviewToEntry(
 	// per-instance paint can legitimately get different preview results. Always starts fresh from
 	// each render vertex's own effective original color (preserving seams) and the current mask --
 	// never from a previous composition -- so repeated filter/mode toggling cannot accumulate.
-	for (FVertexMaskForgePreviewComponentState& State : Entry->PreviewComponents)
+	for (TUniquePtr<FVertexMaskForgeWorkingStateOwner>& StateOwner : Entry->PreviewComponents)
 	{
-		UStaticMeshComponent* SourceComponent = State.SourceComponent.Get();
+		// M16-J.0B (2nd rejection-corrective pass): the real composition MATH below (ComputeComposedColorsRGB
+		// et al.) is unchanged -- only the storage State refers to has moved, from an array element
+		// directly embedded in FVertexMaskForgeSelectedMesh to StateOwner's own internal
+		// PreviewComponentState. GetVisualSessionStateMutable() only grants access to the panel-owned
+		// visual/session fields this loop needs directly (AOCache, PreviewComponent, ...) plus read-only
+		// access to SourceComponent via its own getter -- BaselineColors/CommittedColors/WorkingColors are
+		// reached separately below, via StateOwner's own const getters (for reads) and
+		// EnsureBaselineCaptured/ApplyComposedColorsRGB (for the two authorized writes), never through
+		// State itself (those fields are private on the struct now, unreachable through this reference).
+		FVertexMaskForgePreviewComponentState& State = StateOwner->GetVisualSessionStateMutable();
+		UStaticMeshComponent* SourceComponent = State.GetSourceComponent().Get();
 		if (!IsValid(SourceComponent))
 		{
 			continue;
@@ -7873,7 +7875,7 @@ void SVertexMaskForgePanel::ApplyPreviewToEntry(
 		// called in below is NOT semantically meaningful (Bounding Box happens to be checked first in
 		// this code only for readability; it carries no priority) -- see ComposeMaskStack for why.
 		// Two shapes:
-		//   - Fill/Constant override (WorkingMesh.BoundingBoxMask.Source == ConstantWhite/Black): a
+		//   - Fill/Constant override (GeneratorState.BoundingBoxMask.Source == ConstantWhite/Black): a
 		//     SINGLE hard layer, exactly the pre-existing Fill contract -- Bounding Box axes/Ambient
 		//     Occlusion are NOT combined with a Fill result (Fill is transform-independent, so the
 		//     shared entry-level reference is reused directly, same as before this checkpoint).
@@ -7901,21 +7903,21 @@ void SVertexMaskForgePanel::ApplyPreviewToEntry(
 		// rule.
 		if (Entry->bUseSourceTopology)
 		{
-			if (WorkingMesh.BoundingBoxMask.Source == EVertexMaskForgeScalarMaskSource::ConstantWhite
-				|| WorkingMesh.BoundingBoxMask.Source == EVertexMaskForgeScalarMaskSource::ConstantBlack)
+			if (GeneratorState.BoundingBoxMask.Source == EVertexMaskForgeScalarMaskSource::ConstantWhite
+				|| GeneratorState.BoundingBoxMask.Source == EVertexMaskForgeScalarMaskSource::ConstantBlack)
 			{
 				// GenerateConstantMaskForCornerDomain (see RunConstantFill) already built this mask in
 				// the corner domain for a Source-Topology entry -- IndexOverride's default (-1) resolves
 				// to the shared CornerIndex UpdateWorkingColorsSourceTopology passes as VertexIndex,
 				// exactly like the render-vertex Fill path does with render vertex index.
-				Layers.Add({ &WorkingMesh.BoundingBoxMask, EVertexMaskForgeBlendMode::Copy, 1.0f });
+				Layers.Add({ &GeneratorState.BoundingBoxMask, EVertexMaskForgeBlendMode::Copy, 1.0f });
 			}
 			else
 			{
 				if (bBBoxEntryReady)
 				{
 					PerComponentBBoxMask = VertexMaskForgeBoundingBoxGenerator::GenerateBoundingBoxMaskFromDynamicMesh(
-						*WorkingMesh.Mesh, WorkingMesh.BoundingBoxMask.UsedAxisParams, SourceComponent->GetComponentTransform());
+						*WorkingMesh.Mesh, GeneratorState.BoundingBoxMask.UsedAxisParams, SourceComponent->GetComponentTransform());
 					if (PerComponentBBoxMask.State != EVertexMaskForgeScalarMaskState::Ready)
 					{
 						bAnyLayerFailed = true;
@@ -7933,7 +7935,7 @@ void SVertexMaskForgePanel::ApplyPreviewToEntry(
 					// are LIVE overrides too, for the identical reason -- purely compositional, applied
 					// fresh from AOCache.RawValues every call (see ApplyAOLevelsAndInvert), never
 					// requiring a raycast/Tree rebuild.
-					FVertexMaskForgeAOParams EffectiveAOParams = WorkingMesh.AmbientOcclusionMask.UsedAOParams;
+					FVertexMaskForgeAOParams EffectiveAOParams = GeneratorState.AmbientOcclusionMask.UsedAOParams;
 					EffectiveAOParams.bInvert = bAOInvert;
 					EffectiveAOParams.LevelsMin = AOLevelsMin;
 					EffectiveAOParams.LevelsMax = AOLevelsMax;
@@ -7950,35 +7952,35 @@ void SVertexMaskForgePanel::ApplyPreviewToEntry(
 					}
 				}
 				// AUDITED (Curvature layer): NO per-component re-evaluation, unlike Bounding Box/Ambient
-				// Occlusion above -- WorkingMesh.CurvatureMask already holds the REAL, final values for
+				// Occlusion above -- GeneratorState.CurvatureMask already holds the REAL, final values for
 				// every component of this entry (see its own doc comment), so this simply adds the
 				// entry-level mask directly. IndexOverride is resolved per-corner by
 				// UpdateWorkingColorsSourceTopology's own switch (Curvature -> Dynamic Mesh Vertex ID).
 				if (!bAnyLayerFailed && bCurvatureEntryReady)
 				{
-					Layers.Add({ &WorkingMesh.CurvatureMask, CurvatureBlendMode, CurvatureOpacity });
+					Layers.Add({ &GeneratorState.CurvatureMask, CurvatureBlendMode, CurvatureOpacity });
 				}
 				// AUDITED (Noise V1): same "no per-component re-evaluation" contract as Curvature above --
-				// WorkingMesh.NoiseMask already holds the REAL, final values for every component of this
+				// GeneratorState.NoiseMask already holds the REAL, final values for every component of this
 				// entry. Composed AFTER Curvature, per the explicit ordering requirement (Bounding Box ->
 				// Ambient Occlusion -> Curvature -> Noise) -- though see ComposeMaskStack's own doc
 				// comment: canonical composition order is actually determined by each layer's OWN Blend
 				// Mode, not by Layers.Add() call order, which only matters for documentation clarity here.
 				if (!bAnyLayerFailed && bNoiseEntryReady)
 				{
-					Layers.Add({ &WorkingMesh.NoiseMask, NoiseBlendMode, NoiseOpacity });
+					Layers.Add({ &GeneratorState.NoiseMask, NoiseBlendMode, NoiseOpacity });
 				}
 				// AUDITED (V2-D): same "no per-component re-evaluation" contract as Curvature/Noise above
-				// -- WorkingMesh.MaterialSlotMask already holds the REAL, final, CORNER-EXACT values (see
+				// -- GeneratorState.MaterialSlotMask already holds the REAL, final, CORNER-EXACT values (see
 				// its own doc comment) for every component of this entry. IndexOverride is resolved
 				// per-corner by UpdateWorkingColorsSourceTopology's own switch (MaterialSlot -> CornerIndex,
 				// NOT Dynamic Mesh Vertex ID -- unlike Curvature/Noise, since two corners at the same
 				// position on opposite sides of a material boundary must read different values).
 				if (!bAnyLayerFailed && bMaterialSlotMaskEntryReady)
 				{
-					Layers.Add({ &WorkingMesh.MaterialSlotMask, MaterialSlotMaskBlendMode, MaterialSlotMaskOpacity });
+					Layers.Add({ &GeneratorState.MaterialSlotMask, MaterialSlotMaskBlendMode, MaterialSlotMaskOpacity });
 				}
-				// AUDITED (V2-E): Local Space is transform-independent -- WorkingMesh.DirectionalNormalMask
+				// AUDITED (V2-E): Local Space is transform-independent -- GeneratorState.DirectionalNormalMask
 				// already holds the REAL, final, CORNER-EXACT values (see its own doc comment), reused
 				// directly like Curvature/Noise/Material Slot above. World Space is ALWAYS transform-
 				// dependent (like Ambient Occlusion) -- re-evaluated fresh per component, using THIS
@@ -7988,7 +7990,7 @@ void SVertexMaskForgePanel::ApplyPreviewToEntry(
 				{
 					if (DirectionalNormalSpace == EVertexMaskForgeNormalSpace::Local)
 					{
-						Layers.Add({ &WorkingMesh.DirectionalNormalMask, DirectionalNormalMaskBlendMode, DirectionalNormalMaskOpacity });
+						Layers.Add({ &GeneratorState.DirectionalNormalMask, DirectionalNormalMaskBlendMode, DirectionalNormalMaskOpacity });
 					}
 					else
 					{
@@ -8008,11 +8010,11 @@ void SVertexMaskForgePanel::ApplyPreviewToEntry(
 				}
 				// AUDITED (V2-G): Thickness is ALWAYS Asset Local Space -- no per-component
 				// re-evaluation, same "no per-component re-evaluation" contract as Curvature/Noise/
-				// Material Slot above -- WorkingMesh.ThicknessMask already holds the REAL, final,
+				// Material Slot above -- GeneratorState.ThicknessMask already holds the REAL, final,
 				// CORNER-EXACT values for every component of this entry.
 				if (!bAnyLayerFailed && bThicknessMaskEntryReady)
 				{
-					Layers.Add({ &WorkingMesh.ThicknessMask, ThicknessMaskBlendMode, ThicknessMaskOpacity });
+					Layers.Add({ &GeneratorState.ThicknessMask, ThicknessMaskBlendMode, ThicknessMaskOpacity });
 				}
 			}
 
@@ -8028,16 +8030,47 @@ void SVertexMaskForgePanel::ApplyPreviewToEntry(
 				continue;
 			}
 
-			// AUDITED: mutates State.SourceTopologyBaselineColors/CommittedColors/WorkingColors in
-			// place -- the SAME arrays Accept (source-topology commit) reads, never writes. bCommit
-			// forwarded exactly like the render-vertex call below.
+			// M16-J.0B (2nd rejection-corrective pass): Baseline/Committed/Working (Source-Topology
+			// corner domain) live inside StateOwner as PRIVATE fields -- this call site never receives a
+			// mutable reference/pointer into them. EnsureBaselineCaptured is idempotent (a no-op once
+			// already initialized), so the (O(NumCorners)) capture below only actually runs once per
+			// generation. The composition math itself (ComputeComposedColorsRGBSourceTopology) is
+			// byte-for-byte the same algorithm as before this checkpoint; only the caller now computes a
+			// fresh, independent result instead of writing into owner storage directly.
+			if (!StateOwner->AreColorsInitialized())
+			{
+				StateOwner->EnsureBaselineCaptured(VertexMaskForgePanel::CaptureBaselineColorsSourceTopology(*WorkingMesh.Mesh));
+			}
+
+			TArray<FColor> FinalColors;
 			int32 NumComposed = 0;
-			VertexMaskForgePanel::UpdateWorkingColorsSourceTopology(
-				State.SourceTopologyBaselineColors, State.SourceTopologyCommittedColors, State.SourceTopologyWorkingColors,
+			VertexMaskForgePanel::ComputeComposedColorsRGBSourceTopology(
+				StateOwner->GetBaselineColors(), StateOwner->GetCommittedColors(),
 				Layers, *WorkingMesh.Mesh,
 				bChannelFilterR, bChannelFilterG, bChannelFilterB,
-				bCommit,
-				NumComposed);
+				FinalColors, NumComposed);
+
+			// AUDITED: this operation, not the caller, preserves Alpha byte-identical (forced from the
+			// owner's own Baseline unconditionally), validates cardinality, decides whether Committed is
+			// promoted (bCommit forwarded exactly as before -- ONLY a Fill Black/White action passes
+			// true), and re-derives Authority as a direct consequence. See ApplyComposedColorsRGB's own
+			// doc comment.
+			if (!StateOwner->ApplyComposedColorsRGB(MoveTemp(FinalColors),
+				bCommit ? FVertexMaskForgeWorkingStateOwner::EColorCommitMode::Consolidate : FVertexMaskForgeWorkingStateOwner::EColorCommitMode::PreviewOnly))
+			{
+				VertexMaskForgePanel::RestorePreviewVisualOnly(State, ActorHideStates);
+				continue;
+			}
+
+			// M16-J.0B: real, production call site of the binding seam -- diagnostic only, never
+			// consumed for any decision, never executes recipe/M16-H/M16-I/M16-J. Proves
+			// CreateBinding()/ValidateBinding() work end-to-end against the panel's own real storage.
+			if (const TOptional<EVertexMaskForgeWorkingColorsPublicationValidationStatus> BindingStatus = ValidatePublicationBindingForComponent(SourceComponent))
+			{
+				UE_LOG(LogVertexMaskForge, VeryVerbose,
+					TEXT("Vertex Mask Forge: publication binding status for '%s' (Source Topology) = %d."),
+					*SourceComponent->GetName(), static_cast<int32>(*BindingStatus));
+			}
 
 			UE_LOG(LogVertexMaskForge, Verbose,
 				TEXT("Vertex Mask Forge: composed %d/%d corner(s) for '%s' on component '%s' (Source Topology)."),
@@ -8046,15 +8079,14 @@ void SVertexMaskForgePanel::ApplyPreviewToEntry(
 			// AUDITED (Preview Mode channel-isolation fix, Source Topology): reduces the raw composited
 			// corner-domain colors through the current Preview Mode -- see DeriveDisplayColors' own doc
 			// comment -- exactly mirroring the render-vertex path's RenderOrderColors below. Previously
-			// this call passed State.SourceTopologyWorkingColors directly (unreduced), so every non-
-			// Original-Material Preview Mode (RGB, Red, Green, Blue, Alpha Channel) rendered the SAME raw
-			// RGB for a Nanite/Source-Topology mesh -- isolated channel modes were indistinguishable from
-			// RGB Vertex Color. DISPLAY-ONLY: never mutates SourceTopologyWorkingColors, and Accept
-			// (BuildSourceTopologyAcceptTargets/WriteSourceTopologyAcceptTargets) reads
-			// SourceTopologyWorkingColors verbatim, never this reduced copy -- same "Preview Mode never
-			// affects Accept" guarantee the render-vertex path already has.
+			// this call passed the raw working colors directly (unreduced), so every non-Original-Material
+			// Preview Mode (RGB, Red, Green, Blue, Alpha Channel) rendered the SAME raw RGB for a Nanite/
+			// Source-Topology mesh -- isolated channel modes were indistinguishable from RGB Vertex Color.
+			// DISPLAY-ONLY: never mutates the working buffer, and Accept (BuildSourceTopologyAcceptTargets/
+			// WriteSourceTopologyAcceptTargets) reads it verbatim, never this reduced copy -- same "Preview
+			// Mode never affects Accept" guarantee the render-vertex path already has.
 			const TArray<FColor> SourceTopologyRenderOrderColors =
-				VertexMaskForgeDisplayColorDerivation::DeriveDisplayColors(State.SourceTopologyWorkingColors, CurrentPreviewMode);
+				VertexMaskForgeDisplayColorDerivation::DeriveDisplayColors(StateOwner->GetWorkingColors(), CurrentPreviewMode);
 
 			VertexMaskForgePanel::ActivateSourceTopologyPreviewForComponent(
 				State, *WorkingMesh.Mesh, SourceTopologyRenderOrderColors, DebugMaterial, bUseOriginalMaterials, ActorHideStates);
@@ -8068,7 +8100,7 @@ void SVertexMaskForgePanel::ApplyPreviewToEntry(
 		// called in below is NOT semantically meaningful (Bounding Box happens to be checked first in
 		// this code only for readability; it carries no priority) -- see ComposeMaskStack for why.
 		// Two shapes:
-		//   - Fill/Constant override (WorkingMesh.BoundingBoxMask.Source == ConstantWhite/Black): a
+		//   - Fill/Constant override (GeneratorState.BoundingBoxMask.Source == ConstantWhite/Black): a
 		//     SINGLE hard layer, exactly the pre-existing Fill contract -- Bounding Box axes/Ambient
 		//     Occlusion are NOT combined with a Fill result (Fill is transform-independent, so the
 		//     shared entry-level reference is reused directly, same as before this checkpoint).
@@ -8083,17 +8115,17 @@ void SVertexMaskForgePanel::ApplyPreviewToEntry(
 		//     Space bounds, or an AO input that failed structural validation), OR the resulting set is
 		//     empty, this component falls back to its original appearance -- never a stale or
 		//     fabricated result.
-		if (WorkingMesh.BoundingBoxMask.Source == EVertexMaskForgeScalarMaskSource::ConstantWhite
-			|| WorkingMesh.BoundingBoxMask.Source == EVertexMaskForgeScalarMaskSource::ConstantBlack)
+		if (GeneratorState.BoundingBoxMask.Source == EVertexMaskForgeScalarMaskSource::ConstantWhite
+			|| GeneratorState.BoundingBoxMask.Source == EVertexMaskForgeScalarMaskSource::ConstantBlack)
 		{
-			Layers.Add({ &WorkingMesh.BoundingBoxMask, EVertexMaskForgeBlendMode::Copy, 1.0f });
+			Layers.Add({ &GeneratorState.BoundingBoxMask, EVertexMaskForgeBlendMode::Copy, 1.0f });
 		}
 		else
 		{
 			if (bBBoxEntryReady)
 			{
 				PerComponentBBoxMask = VertexMaskForgeBoundingBoxGenerator::GenerateBoundingBoxMask(
-					RenderData->LODResources[0], WorkingMesh.BoundingBoxMask.UsedAxisParams, SourceComponent->GetComponentTransform(),
+					RenderData->LODResources[0], GeneratorState.BoundingBoxMask.UsedAxisParams, SourceComponent->GetComponentTransform(),
 					CollectiveBoundsPtr);
 				if (PerComponentBBoxMask.State != EVertexMaskForgeScalarMaskState::Ready)
 				{
@@ -8136,7 +8168,7 @@ void SVertexMaskForgePanel::ApplyPreviewToEntry(
 				// AUDITED (AO Levels): LevelsMin/Max are LIVE overrides too, same reasoning as bInvert --
 				// purely compositional, applied fresh from AOCache.RawValues every call (see
 				// ApplyAOLevelsAndInvert), never requiring a raycast/Tree rebuild.
-				FVertexMaskForgeAOParams EffectiveAOParams = WorkingMesh.AmbientOcclusionMask.UsedAOParams;
+				FVertexMaskForgeAOParams EffectiveAOParams = GeneratorState.AmbientOcclusionMask.UsedAOParams;
 				EffectiveAOParams.bInvert = bAOInvert;
 				EffectiveAOParams.LevelsMin = AOLevelsMin;
 				EffectiveAOParams.LevelsMax = AOLevelsMax;
@@ -8153,29 +8185,29 @@ void SVertexMaskForgePanel::ApplyPreviewToEntry(
 				}
 			}
 			// AUDITED (Curvature layer): same "no per-component re-evaluation needed" contract as the
-			// Source-Topology branch above -- WorkingMesh.CurvatureMask already holds the REAL, final
+			// Source-Topology branch above -- GeneratorState.CurvatureMask already holds the REAL, final
 			// per-render-vertex values (see its own doc comment); IndexOverride stays at its default
 			// (-1), so ComposeMaskStack simply looks it up by the shared render vertex index, exactly
 			// like Bounding Box/Ambient Occlusion already do in this domain.
 			if (!bAnyLayerFailed && bCurvatureEntryReady)
 			{
-				Layers.Add({ &WorkingMesh.CurvatureMask, CurvatureBlendMode, CurvatureOpacity });
+				Layers.Add({ &GeneratorState.CurvatureMask, CurvatureBlendMode, CurvatureOpacity });
 			}
 			// AUDITED (Noise V1): same "no per-component re-evaluation needed" contract as Curvature
-			// above -- WorkingMesh.NoiseMask already holds the REAL, final per-render-vertex values;
+			// above -- GeneratorState.NoiseMask already holds the REAL, final per-render-vertex values;
 			// IndexOverride stays at its default (-1), looked up by the shared render vertex index.
 			if (!bAnyLayerFailed && bNoiseEntryReady)
 			{
-				Layers.Add({ &WorkingMesh.NoiseMask, NoiseBlendMode, NoiseOpacity });
+				Layers.Add({ &GeneratorState.NoiseMask, NoiseBlendMode, NoiseOpacity });
 			}
 			// AUDITED (V2-D): same "no per-component re-evaluation needed" contract as Curvature/Noise
-			// above -- WorkingMesh.MaterialSlotMask already holds the REAL, final per-render-vertex
+			// above -- GeneratorState.MaterialSlotMask already holds the REAL, final per-render-vertex
 			// values; IndexOverride stays at its default (-1), looked up by the shared render vertex
 			// index (this is the RENDER-VERTEX domain, unlike the Source-Topology branch's corner-exact
 			// one -- see GenerateMaterialSlotMask's own doc comment).
 			if (!bAnyLayerFailed && bMaterialSlotMaskEntryReady)
 			{
-				Layers.Add({ &WorkingMesh.MaterialSlotMask, MaterialSlotMaskBlendMode, MaterialSlotMaskOpacity });
+				Layers.Add({ &GeneratorState.MaterialSlotMask, MaterialSlotMaskBlendMode, MaterialSlotMaskOpacity });
 			}
 			// AUDITED (V2-E): Local Space reuses the REAL, final per-render-vertex entry-level values
 			// directly (IndexOverride default -1), like Curvature/Noise/Material Slot above. World Space
@@ -8185,7 +8217,7 @@ void SVertexMaskForgePanel::ApplyPreviewToEntry(
 			{
 				if (DirectionalNormalSpace == EVertexMaskForgeNormalSpace::Local)
 				{
-					Layers.Add({ &WorkingMesh.DirectionalNormalMask, DirectionalNormalMaskBlendMode, DirectionalNormalMaskOpacity });
+					Layers.Add({ &GeneratorState.DirectionalNormalMask, DirectionalNormalMaskBlendMode, DirectionalNormalMaskOpacity });
 				}
 				else
 				{
@@ -8210,7 +8242,7 @@ void SVertexMaskForgePanel::ApplyPreviewToEntry(
 			// Noise/Material Slot above -- no per-component re-evaluation.
 			if (!bAnyLayerFailed && bThicknessMaskEntryReady)
 			{
-				Layers.Add({ &WorkingMesh.ThicknessMask, ThicknessMaskBlendMode, ThicknessMaskOpacity });
+				Layers.Add({ &GeneratorState.ThicknessMask, ThicknessMaskBlendMode, ThicknessMaskOpacity });
 			}
 		// AUDITED (preview-stuck-on-Original-Material fix): Layers.IsEmpty() alone is no longer part
 		// of this fallback -- see ApplyPreviewToEntry's entry-level gate doc comment above for why an
@@ -8233,18 +8265,38 @@ void SVertexMaskForgePanel::ApplyPreviewToEntry(
 		// vertex count directly proves the 1:1 correspondence in the log, per-component, every time
 		// the preview is (re)applied.
 		//
-		// AUDITED (recompute-at-Accept fix / Channel Filter toggle fix): mutates
-		// State.BaselineColors/CommittedColors/WorkingColors in place -- the SAME arrays Accept reads
-		// (never writes). bCommit forwarded from this call's own
-		// caller (UpdateAllPreviews) -- true ONLY for an explicit Fill. See
-		// UpdateWorkingColors' own doc comment for the full baseline/committed/working contract.
+		// M16-J.0B (2nd rejection-corrective pass): see the Source-Topology sibling call's own comment
+		// above -- same EnsureBaselineCaptured/ComputeComposedColorsRGB/ApplyComposedColorsRGB contract.
+		// bCommit forwarded from this call's own caller (UpdateAllPreviews) -- true ONLY for an explicit
+		// Fill.
+		if (!StateOwner->AreColorsInitialized())
+		{
+			StateOwner->EnsureBaselineCaptured(VertexMaskForgePanel::CaptureBaselineColorsRenderVertex(RenderData->LODResources[0], InstanceOverrideColors));
+		}
+
+		TArray<FColor> FinalColors;
 		int32 NumComposed = 0;
-		VertexMaskForgePanel::UpdateWorkingColors(
-			State.BaselineColors, State.CommittedColors, State.WorkingColors, Layers, RenderData->LODResources[0], InstanceOverrideColors,
+		VertexMaskForgePanel::ComputeComposedColorsRGB(
+			StateOwner->GetBaselineColors(), StateOwner->GetCommittedColors(), Layers,
 			bChannelFilterR, bChannelFilterG, bChannelFilterB,
-			bCommit,
-			NumComposed);
-		const TArray<FColor> RenderOrderColors = VertexMaskForgeDisplayColorDerivation::DeriveDisplayColors(State.WorkingColors, CurrentPreviewMode);
+			FinalColors, NumComposed);
+
+		if (!StateOwner->ApplyComposedColorsRGB(MoveTemp(FinalColors),
+			bCommit ? FVertexMaskForgeWorkingStateOwner::EColorCommitMode::Consolidate : FVertexMaskForgeWorkingStateOwner::EColorCommitMode::PreviewOnly))
+		{
+			VertexMaskForgePanel::RestorePreviewVisualOnly(State, ActorHideStates);
+			continue;
+		}
+
+		// M16-J.0B: same real, diagnostic-only binding seam call site as the Source-Topology branch above.
+		if (const TOptional<EVertexMaskForgeWorkingColorsPublicationValidationStatus> BindingStatus = ValidatePublicationBindingForComponent(SourceComponent))
+		{
+			UE_LOG(LogVertexMaskForge, VeryVerbose,
+				TEXT("Vertex Mask Forge: publication binding status for '%s' = %d."),
+				*SourceComponent->GetName(), static_cast<int32>(*BindingStatus));
+		}
+
+		const TArray<FColor> RenderOrderColors = VertexMaskForgeDisplayColorDerivation::DeriveDisplayColors(StateOwner->GetWorkingColors(), CurrentPreviewMode);
 
 		const int32 NumRenderVertsForLog = static_cast<int32>(RenderData->LODResources[0].VertexBuffers.PositionVertexBuffer.GetNumVertices());
 		UE_LOG(LogVertexMaskForge, Verbose,
@@ -8280,7 +8332,7 @@ void SVertexMaskForgePanel::UpdateAllPreviews(const bool bCommit)
 		{
 			for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
 			{
-				if (Entry.IsValid() && Entry->WorkingMesh.BoundingBoxMask.Source == EVertexMaskForgeScalarMaskSource::BoundingBox)
+				if (Entry.IsValid() && Entry->GeneratorState.BoundingBoxMask.Source == EVertexMaskForgeScalarMaskSource::BoundingBox)
 				{
 					// AUDITED (raw/composition separation checkpoint): visual-only -- this failure is
 					// Unified Bounds (Bounding-Box-specific); Ambient Occlusion's own AOCache is
@@ -8335,9 +8387,10 @@ void SVertexMaskForgePanel::OnWorldCleanup(UWorld* World, bool bSessionEnded, bo
 			continue;
 		}
 
-		for (FVertexMaskForgePreviewComponentState& State : Entry->PreviewComponents)
+		for (TUniquePtr<FVertexMaskForgeWorkingStateOwner>& StateOwner : Entry->PreviewComponents)
 		{
-			const UStaticMeshComponent* SourceComponent = State.SourceComponent.Get();
+			const FVertexMaskForgePreviewComponentState& State = StateOwner->GetPreviewState();
+			const UStaticMeshComponent* SourceComponent = State.GetSourceComponent().Get();
 			const UStaticMeshComponent* PreviewComponentPtr = State.PreviewComponent.Get();
 			const AActor* HiddenOwnerPtr = State.HiddenOwner.Get();
 
@@ -8350,7 +8403,7 @@ void SVertexMaskForgePanel::OnWorldCleanup(UWorld* World, bool bSessionEnded, bo
 				continue;
 			}
 
-			VertexMaskForgePanel::RestoreComponentOriginal(State, ActorHideStates);
+			VertexMaskForgePanel::RestoreComponentOriginal(*StateOwner, ActorHideStates);
 		}
 	}
 

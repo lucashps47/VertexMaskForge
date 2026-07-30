@@ -10,11 +10,21 @@
 #include "UObject/WeakObjectPtr.h"
 #include "VertexMaskForgeInstanceResultStore.h"
 #include "VertexMaskForgeMaskTypes.h"
+#include "VertexMaskForgeWorkingColorsProvenance.h"
 
 class AActor;
 class UStaticMesh;
 class UStaticMeshComponent;
-class UDynamicMeshComponent;
+class FVertexMaskForgeWorkingMeshOwner;
+class FVertexMaskForgeWorkingStateOwner;
+
+// AUDITED (M16-J.0): full include, not a forward declaration -- FVertexMaskForgePreviewComponentState's
+// own inline `= default` constructor instantiates TStrongObjectPtr<UDynamicMeshComponent>
+// (SourceTopologyPreviewComponent below), which requires the complete type at that point regardless of
+// Unity Build blob grouping. Previously relied on SVertexMaskForgePanel.cpp's own include of this header
+// happening to share a Unity blob with the first instantiation -- a latent fragility exposed (not
+// introduced) by this checkpoint's own new translation units shifting Unity blob boundaries.
+#include "Components/DynamicMeshComponent.h"
 
 #include "DynamicMesh/DynamicMesh3.h"
 #include "DynamicMesh/DynamicMeshAABBTree3.h"
@@ -691,6 +701,15 @@ enum class EVertexMaskForgeCurvatureType : uint8
  */
 struct FVertexMaskForgeWorkingMesh
 {
+	// M16-J.0B (rejection-corrective pass): FVertexMaskForgeWorkingMeshOwner is the only class allowed
+	// to wholesale-replace an installed Working Mesh (via its own private move-assignment access below)
+	// -- see that operator's own doc comment for why. It has no access to anything else here; every
+	// individual field below remains a plain public member, exactly as before, since none of them
+	// (other than Provenance, itself already separately encapsulated -- see
+	// FVertexMaskForgeWorkingMeshProvenance's own doc comment) are part of the authenticated identity
+	// contract this checkpoint protects.
+	friend class FVertexMaskForgeWorkingMeshOwner;
+
 	/** Small explicit tolerance used for the non-white / non-black element counts, in 0-1 color space. */
 	static constexpr float ColorChannelTolerance = 1.0f / 255.0f;
 
@@ -708,10 +727,29 @@ struct FVertexMaskForgeWorkingMesh
 	FVertexMaskForgeWorkingMesh(const FVertexMaskForgeWorkingMesh&) = delete;
 	FVertexMaskForgeWorkingMesh& operator=(const FVertexMaskForgeWorkingMesh&) = delete;
 
-	/** Declared here, defined in the .cpp for the same reason as the destructor. */
+	/** Declared here, defined in the .cpp for the same reason as the destructor. Move CONSTRUCTION stays
+	 *  public (it only ever creates a new, independent instance -- e.g. binding a temporary into
+	 *  FVertexMaskForgeWorkingMeshOwner::InstallWorkingMesh's `&&` parameter -- it never overwrites an
+	 *  owner's already-installed storage). */
 	FVertexMaskForgeWorkingMesh(FVertexMaskForgeWorkingMesh&&);
+
+private:
+	/**
+	 * M16-J.0B (rejection-corrective pass): move-ASSIGNMENT is private, friended only to
+	 * FVertexMaskForgeWorkingMeshOwner. Assigning THROUGH a mutable FVertexMaskForgeWorkingMesh&
+	 * reference (e.g. FVertexMaskForgeSelectedMesh::WorkingMesh) can mutate individual fields freely
+	 * (that is the whole point -- BoundingBoxMask/CurvatureMask/NoiseMask/MaterialSlotMask/
+	 * DirectionalNormalMask/ThicknessMask/their raw caches/InstanceResults are ordinary, unauthenticated
+	 * generator/cache state, never part of this checkpoint's contract), but wholesale-REPLACING the
+	 * entire object (`SomeWorkingMesh = MoveTemp(Other);`) would silently discard the currently-
+	 * installed Provenance without going through FVertexMaskForgeWorkingMeshOwner::InstallWorkingMesh's
+	 * own generation-stamping -- exactly the "substituir a WorkingMesh inteira" gap this fix closes.
+	 * BuildWorkingMeshes' only real call site already goes through InstallWorkingMesh, never this
+	 * operator directly.
+	 */
 	FVertexMaskForgeWorkingMesh& operator=(FVertexMaskForgeWorkingMesh&&);
 
+public:
 	EVertexMaskForgeWorkingMeshState State = EVertexMaskForgeWorkingMeshState::InvalidSource;
 
 	/** Null unless State == Ready. Explicit, exclusive ownership; never shared or persisted elsewhere. */
@@ -769,152 +807,15 @@ struct FVertexMaskForgeWorkingMesh
 	EVertexMaskForgeWorkingVertexColorState VertexColorState = EVertexMaskForgeWorkingVertexColorState::Unavailable;
 	FVertexMaskForgeColorStats ColorStats;
 
-	/**
-	 * The Bounding Box slot's mask (across up to 3 axes), OR a Constant Fill result -- the two are
-	 * mutually exclusive WITHIN this one field/slot (Source discriminates which). This is the
-	 * ENTRY-LEVEL reference: generated using the first live PreviewComponent's transform (or
-	 * FTransform::Identity if none), used for gating (Ready check), the row summary text, and
-	 * Content-Browser-only entries. When Source == BoundingBox and at least one axis uses World
-	 * Space, actual Preview/Accept composition RE-EVALUATES the mask per component with that
-	 * component's own transform (see ApplyPreviewToEntry / BuildAcceptTargets) rather than reusing
-	 * this shared reference -- so two instances of this asset can legitimately show different
-	 * results, exactly like a divergent per-instance OverrideVertexColors baseline already does. A
-	 * fresh FVertexMaskForgeWorkingMesh is always constructed on Refresh Selection (see
-	 * BuildWorkingMeshForStaticMesh), so this starts at NotGenerated automatically every time the
-	 * working mesh itself is rebuilt -- there is no separate invalidation step needed for that case.
-	 * Parameter-change invalidation is handled by the panel explicitly resetting this field.
-	 *
-	 * AUDITED (composition-stack checkpoint): NO LONGER mutually exclusive with AmbientOcclusionMask
-	 * below -- Bounding Box and Ambient Occlusion are independent, optional STACK LAYERS that can both
-	 * be Ready and both contribute to composition at once (see VertexMaskForgePanel::ApplyPreviewToEntry
-	 * building an ordered Layers list from whichever of the two slots below are Ready, and
-	 * ComposeMaskStack/UpdateWorkingColors applying each enabled layer sequentially). Only a Constant
-	 * Fill result (Source == ConstantWhite/ConstantBlack, stored in THIS field) remains a hard override
-	 * that supersedes both slots entirely for that one pass -- see ApplyPreviewToEntry's own doc note.
-	 */
-	FVertexMaskForgeScalarMask BoundingBoxMask;
-
-	/**
-	 * The Ambient Occlusion slot's ENTRY-LEVEL mask -- populated ONLY as a cheap, geometry-cache-free
-	 * VALIDATION result (NumRenderVerts/triangles/normal-buffer sanity, and UsedAOParams snapshot with
-	 * Samples resolved to the full, user-chosen value -- see RunAutoUpdatePreview, the tool's single
-	 * live-regeneration entry point). Values/bHasValue are ALWAYS left empty here -- this field is NEVER used to
-	 * read actual per-vertex AO values; ApplyPreviewToEntry unconditionally re-evaluates the REAL,
-	 * per-component result (using that component's own AOCache) from UsedAOParams, exactly once per
-	 * component, every time. This is what guarantees Ambient Occlusion is ever computed in exactly ONE
-	 * place (ApplyPreviewToEntry) -- see that function's own doc comment for the audited fix this
-	 * replaced (a redundant entry-level real computation that could double the raycast cost per
-	 * update). Independent of BoundingBoxMask -- see that field's own doc comment on the composition
-	 * stack. Reset together with BoundingBoxMask by the same invalidation points (parameter changes,
-	 * RefreshSelection).
-	 */
-	FVertexMaskForgeScalarMask AmbientOcclusionMask;
-
-	/**
-	 * The Curvature slot's ENTRY-LEVEL mask -- and, UNLIKE AmbientOcclusionMask above, this DOES hold
-	 * the REAL, final Values/bHasValue directly usable by every component: Curvature is a pure function
-	 * of the asset's own local-space topology (see EVertexMaskForgeScalarMaskSource::Curvature's own
-	 * doc comment) with no per-component/per-transform variation, so there is no per-component
-	 * re-evaluation step for it in ApplyPreviewToEntry the way Bounding Box's World Space axes and
-	 * Ambient Occlusion require -- this entry-level result IS the per-component contribution, for every
-	 * tracked component of this entry. Populated by VertexMaskForgePanel::GenerateCurvatureMask
-	 * (render-vertex domain) or GenerateCurvatureMaskFromDynamicMesh (Source-Topology/Nanite domain),
-	 * exactly mirroring BoundingBoxMask's own domain split. Reset together with BoundingBoxMask/
-	 * AmbientOcclusionMask (parameter changes, RefreshSelection) -- see CurvatureRawConvexCache below for
-	 * what is DELIBERATELY NOT reset by a Curvature Type/Multiplier/Blur/Levels/Invert change.
-	 */
-	FVertexMaskForgeScalarMask CurvatureMask;
-
-	/**
-	 * AUDITED (Curvature CLASSIFICATION FIX): the EXPENSIVE, geometry-only half of Curvature generation,
-	 * cached separately from CurvatureMask.Values so that Curvature Type/Multiplier/Blur/Levels/Invert/
-	 * Opacity/Blend Mode changes -- all cheap, purely-downstream reprocessing -- never repeat the
-	 * adjacency/dihedral-angle analysis. Indexed by DYNAMIC MESH VERTEX ID (WorkingMesh.Mesh's own
-	 * domain -- the "source mesh vertex" a UV seam/hard edge's several render vertices/corners all
-	 * share).
-	 *
-	 * TWO SEPARATE non-negative magnitude arrays (Convex and Concave), NOT one signed scalar -- see
-	 * VertexMaskForgePanel::ComputeRawCurvatureMagnitudes' own doc comment for why a single signed sum
-	 * per vertex allowed positive and negative per-edge contributions to cancel BEFORE Curvature Type
-	 * ever saw them (the actual root cause of the Convex/Concave misclassification bug this fix
-	 * addresses), and for the exact algorithm/normalization. Both arrays share the SAME normalization
-	 * scale (computed once, together) and are both in [0, 1]. Empty until Curvature is generated at
-	 * least once for this entry.
-	 *
-	 * Valid ONLY when CurvatureCacheFingerprint == GeometryFingerprint (see that field's own doc
-	 * comment) -- compared, never assumed, every time Curvature is (re)generated; a mismatch (including
-	 * the initial 0/0 state on a freshly built WorkingMesh, which never matches a real, non-zero
-	 * GeometryFingerprint) forces a full recompute. A brand new FVertexMaskForgeWorkingMesh (built fresh
-	 * on every RefreshSelection) always starts with this empty and CurvatureCacheFingerprint at 0, so a
-	 * genuine geometry change is caught automatically, with no separate invalidation step needed.
-	 */
-	TArray<float> CurvatureRawConvexCache;
-	TArray<float> CurvatureRawConcaveCache;
-
-	/**
-	 * AUDITED (Curvature layer): render-vertex-domain correspondence cache, valid ONLY for a non-Source-
-	 * Topology (non-Nanite) entry -- maps each LOD0 render vertex index to the DYNAMIC MESH VERTEX ID
-	 * (CurvatureRawConvexCache/CurvatureRawConcaveCache's own domain) it was converted from, derived once
-	 * from WorkingMesh.TriIDMap + the source MeshDescription's own VertexInstance->Vertex/WedgeMap
-	 * correspondence (see VertexMaskForgePanel::ComputeCurvatureRenderVertexCorrespondence). This is what
-	 * makes a UV seam's several split render vertices all read the SAME cached curvature value, rather
-	 * than each being (mis)treated as topologically isolated. Rebuilt together with the raw caches (same
-	 * fingerprint check); empty and unused for a Source-Topology entry, which looks up the raw caches
-	 * directly by Dynamic Mesh Vertex ID per triangle corner instead (see
-	 * UpdateWorkingColorsSourceTopology).
-	 */
-	TArray<int32> CurvatureRenderVertexToDynamicMeshVertex;
-
-	/** GeometryFingerprint CurvatureRawConvexCache/CurvatureRawConcaveCache/
-	 *  CurvatureRenderVertexToDynamicMeshVertex were last built from -- see CurvatureRawConvexCache's own
-	 *  doc comment for the exact reuse/recompute rule. */
-	uint32 CurvatureCacheFingerprint = 0;
-
-	/**
-	 * AUDITED (Noise V1): the Noise slot's ENTRY-LEVEL mask -- same "holds REAL, final values directly
-	 * usable by every component" contract as CurvatureMask (see that field's own doc comment): Noise is
-	 * a pure function of local-space position, never a component transform, so there is no per-component
-	 * re-evaluation step for it in ApplyPreviewToEntry either. Populated by
-	 * VertexMaskForgePanel::GenerateNoiseMask (render-vertex domain) or GenerateNoiseMaskFromDynamicMesh
-	 * (Source-Topology/Nanite domain).
-	 */
-	FVertexMaskForgeScalarMask NoiseMask;
-
-	/**
-	 * AUDITED (Noise V1): the RAW procedural pattern -- FMath::PerlinNoise3D/FBM already reduced to
-	 * [0, 1] (signed*0.5+0.5, saturated) but with NO Multiplier/Levels/Invert applied yet -- cached
-	 * separately from NoiseMask.Values so that those three purely-artistic controls never repeat the
-	 * per-vertex Perlin evaluation. UNLIKE Curvature's raw cache, this is NOT purely geometric: it also
-	 * depends on the GENERATIVE parameters (see FVertexMaskForgeNoiseGenerativeParams) that determine
-	 * WHAT pattern is sampled -- so reuse requires BOTH GeometryFingerprint AND NoiseCacheUsedParams to
-	 * still match (see NoiseCacheFingerprint's own doc comment). Domain matches whichever generator
-	 * (GenerateNoiseMask/GenerateNoiseMaskFromDynamicMesh) last populated it for this entry -- render
-	 * vertex index for a non-Source-Topology entry, Dynamic Mesh Vertex ID for a Source-Topology one --
-	 * exactly like NoiseMask.Values' own domain, since bUseSourceTopology never changes at runtime for a
-	 * given entry.
-	 */
-	TArray<float> NoiseRawCache;
-
-	/** GeometryFingerprint NoiseRawCache was last built from -- compared, never assumed, alongside
-	 *  NoiseCacheUsedParams (see NoiseRawCache's own doc comment) every time Noise is (re)generated. */
-	uint32 NoiseCacheFingerprint = 0;
-
-	/** Generative parameters NoiseRawCache was last built from -- see NoiseRawCache's own doc comment.
-	 *  Compared by value (FVertexMaskForgeNoiseGenerativeParams::operator==) every regeneration. */
-	FVertexMaskForgeNoiseGenerativeParams NoiseCacheUsedParams;
-
-	// --- Material Slot Mask (V2-D) -----------------------------------------------------------
-
-	/**
-	 * The Material Slot Mask slot's ENTRY-LEVEL mask -- same "holds REAL, final values directly usable
-	 * by every component" contract as CurvatureMask/NoiseMask, EXCEPT this one is corner-EXACT in the
-	 * Source-Topology domain (Values sized Mesh.TriangleCount()*3, indexed by CornerIndex directly --
-	 * see GenerateMaterialSlotMaskFromDynamicMesh) rather than Dynamic Mesh Vertex ID, because two
-	 * corners sharing a position/VertexID on opposite sides of a material boundary must be able to read
-	 * different values. Populated by VertexMaskForgePanel::GenerateMaterialSlotMask (render-vertex
-	 * domain) or GenerateMaterialSlotMaskFromDynamicMesh (Source-Topology domain).
-	 */
-	FVertexMaskForgeScalarMask MaterialSlotMask;
+	// M16-J.0B.1 (WorkingMesh Domain Split): BoundingBoxMask/AmbientOcclusionMask/CurvatureMask/its raw
+	// caches/NoiseMask/its raw cache/MaterialSlotMask/DirectionalNormalMask/its conflict flag/ThicknessMask/
+	// its caches all MOVED to FVertexMaskForgeGeneratorState (defined immediately after this struct) --
+	// see that struct's own module comment for why: they are Generator Artistic State (freely mutable,
+	// never authenticated, never gated by generation), structurally distinct from this struct's own
+	// Authenticated Geometry/Identity contract (State/Mesh/GeometryFingerprint/TriIDMap/Provenance/the
+	// Material-Slot LOOKUP TABLES below, which stay here because they are built ONCE by the builder,
+	// alongside the rest of this struct's identity fields, and never touched by any per-invocation
+	// generator code afterward).
 
 	/** This entry's mesh's real Material Slots (from UStaticMesh::GetStaticMaterials()), rebuilt every
 	 *  BuildWorkingMeshForStaticMesh call -- the source of truth the panel's dropdown is built from. */
@@ -957,50 +858,10 @@ struct FVertexMaskForgeWorkingMesh
 	 *  slots; every other generator, and the Source-Topology domain, are completely unaffected. */
 	bool bRenderVertexMaterialSlotAmbiguous = false;
 
-	// --- Directional Normal Mask (V2-E) --------------------------------------------------------
-
-	/**
-	 * The Directional Normal Mask slot's ENTRY-LEVEL reference -- dual contract depending on the
-	 * panel's current Space setting (mirrors CurvatureMask/AmbientOcclusionMask's own split, chosen
-	 * dynamically):
-	 *  - LOCAL Space: holds the REAL, final per-element values, exactly like CurvatureMask/NoiseMask/
-	 *    MaterialSlotMask (transform-independent -- every component of this entry shares it directly).
-	 *  - WORLD Space: VALIDATION ONLY (Values/bHasValue left empty, same "State decides Ready, never
-	 *    read for real values" contract as AmbientOcclusionMask) -- ApplyPreviewToEntry re-evaluates the
-	 *    REAL result per component, using each component's own transform, exactly like Bounding Box's
-	 *    own World Space axes and Ambient Occlusion.
-	 * Render-vertex domain sized like BoundingBoxMask/CurvatureMask; Source-Topology domain is CORNER-
-	 * EXACT (Mesh.TriangleCount()*3, like MaterialSlotMask -- NEVER collapsed to Dynamic Mesh Vertex ID,
-	 * since two corners at the same position can legitimately have different split normals).
-	 */
-	FVertexMaskForgeScalarMask DirectionalNormalMask;
-
-	/**
-	 * True if BuildWorkingMeshForStaticMesh (or a later per-component check) found this entry's live
-	 * PreviewComponents producing DIFFERENT effective World-Space normal-transform results for the SAME
-	 * underlying asset (see VertexMaskForgeWorkingMeshTypes::HasConflictingWorldSpaceNormalTransforms) --
-	 * only meaningful when Directional Normal Mask is enabled AND Space == World; checked live at
-	 * generation and Accept time (never cached stale), never affects Local Space or any other generator.
-	 */
-	bool bDirectionalNormalWorldSpaceConflict = false;
-
-	/**
-	 * Thickness Mask (V2-G) -- Asset Local Space, transform-independent, so (unlike
-	 * DirectionalNormalMask's World Space branch) always holds REAL final values directly usable by
-	 * every component of this entry, same "computed ONCE PER ENTRY" contract as CurvatureMask/NoiseMask.
-	 * Render-vertex domain for a non-Source-Topology entry, CORNER-EXACT (Mesh.TriangleCount()*3) for a
-	 * Source-Topology entry -- never collapsed to Dynamic Mesh Vertex ID, same reason as
-	 * DirectionalNormalMask/MaterialSlotMask.
-	 */
-	FVertexMaskForgeScalarMask ThicknessMask;
-
-	/** Non-Nanite Thickness cache (local spatial tree + raw hit distances + freshness snapshot). Lives
-	 *  here (per-entry), never in FVertexMaskForgePreviewComponentState, because Thickness has zero
-	 *  Component Transform dependency -- see FVertexMaskForgeThicknessCache's own doc comment. */
-	TUniquePtr<FVertexMaskForgeThicknessCache> ThicknessCache;
-
-	/** Source-Topology sibling of ThicknessCache -- see FVertexMaskForgeSourceTopologyThicknessCache. */
-	TUniquePtr<FVertexMaskForgeSourceTopologyThicknessCache> SourceTopologyThicknessCache;
+	// --- Directional Normal Mask (V2-E) / Thickness Mask (V2-G) --------------------------------
+	// DirectionalNormalMask/bDirectionalNormalWorldSpaceConflict/ThicknessMask/ThicknessCache/
+	// SourceTopologyThicknessCache all moved to FVertexMaskForgeGeneratorState -- see this struct's own
+	// leading AUDITED note above.
 
 	/**
 	 * M16-C: per-entry keyed instance-result storage for the future Mask Stack architecture -- see
@@ -1014,6 +875,71 @@ struct FVertexMaskForgeWorkingMesh
 	 * `= default` in the .cpp.
 	 */
 	FVertexMaskForgeInstanceResultStore InstanceResults;
+
+	/**
+	 * M16-J.0 / M16-J.0A / M16-J.0A.1: persistent provenance identity for this Working Mesh -- WHO/WHAT
+	 * it was authoritatively built from (Static Mesh, domain, LOD, generation Revision, expected
+	 * cardinality -- no component: this Working Mesh is shared across every component of its
+	 * FVertexMaskForgeSelectedMesh entry, see FVertexMaskForgeWorkingMeshOwner's own module comment).
+	 * See VertexMaskForgeWorkingColorsProvenance.h's own module comment. Invalid (IsValid() == false) by
+	 * default -- a freshly built FVertexMaskForgeWorkingMesh carries no provenance until
+	 * FVertexMaskForgeWorkingMeshOwner::InstallWorkingMesh stamps it internally (see
+	 * VertexMaskForgeWorkingMeshOwner.h); nothing in the existing legacy flow sets this yet, and no
+	 * public factory can fabricate a valid one (Provenance's fields are private, friended only to
+	 * FVertexMaskForgeWorkingMeshOwner). Moves naturally with this struct (plain TWeakObjectPtr/POD
+	 * fields only) -- no change was needed to the move constructor/assignment operator, both still
+	 * `= default` in the .cpp.
+	 */
+	FVertexMaskForgeWorkingMeshProvenance Provenance;
+};
+
+/**
+ * M16-J.0B.1 (WorkingMesh Domain Split): Generator Artistic State -- every per-generator mask RESULT and
+ * its purely-derived cache, extracted out of FVertexMaskForgeWorkingMesh so that class can remain a
+ * const-exposed, MeshOwner-authenticated Identity/Geometry type (see that struct's own leading AUDITED
+ * note). None of the fields here are part of any authenticated identity contract: they are freely
+ * mutable by the real generator call sites (BoundingBoxGenerator, AmbientOcclusionGenerator,
+ * CurvatureGenerator, NoiseGenerator, MaterialSlotGenerator, DirectionalNormalGenerator,
+ * ThicknessGenerator, all still living in SVertexMaskForgePanel.cpp/their own generator .cpp files,
+ * completely UNCHANGED in algorithm), never gated by generation, never touch Provenance, never touch
+ * InstanceResults. One instance per FVertexMaskForgeSelectedMesh entry (see that struct's own
+ * GeneratorState field) -- exactly the same "one per entry, shared by every component" lifetime
+ * FVertexMaskForgeWorkingMesh's own masks already had before this split, just now in its own type.
+ *
+ * Move-only (ThicknessCache/SourceTopologyThicknessCache are TUniquePtr) -- same reasoning and pattern as
+ * FVertexMaskForgeWorkingMesh's own special members.
+ */
+struct FVertexMaskForgeGeneratorState
+{
+	FVertexMaskForgeGeneratorState() = default;
+	~FVertexMaskForgeGeneratorState() = default;
+
+	FVertexMaskForgeGeneratorState(const FVertexMaskForgeGeneratorState&) = delete;
+	FVertexMaskForgeGeneratorState& operator=(const FVertexMaskForgeGeneratorState&) = delete;
+
+	FVertexMaskForgeGeneratorState(FVertexMaskForgeGeneratorState&&) = default;
+	FVertexMaskForgeGeneratorState& operator=(FVertexMaskForgeGeneratorState&&) = default;
+
+	/** See FVertexMaskForgeWorkingMesh::BoundingBoxMask's own (former) doc comment -- unchanged contract,
+	 *  only the owning struct changed. Same for every other field below: unchanged contract/semantics,
+	 *  moved verbatim out of FVertexMaskForgeWorkingMesh. */
+	FVertexMaskForgeScalarMask BoundingBoxMask;
+	FVertexMaskForgeScalarMask AmbientOcclusionMask;
+	FVertexMaskForgeScalarMask CurvatureMask;
+	TArray<float> CurvatureRawConvexCache;
+	TArray<float> CurvatureRawConcaveCache;
+	TArray<int32> CurvatureRenderVertexToDynamicMeshVertex;
+	uint32 CurvatureCacheFingerprint = 0;
+	FVertexMaskForgeScalarMask NoiseMask;
+	TArray<float> NoiseRawCache;
+	uint32 NoiseCacheFingerprint = 0;
+	FVertexMaskForgeNoiseGenerativeParams NoiseCacheUsedParams;
+	FVertexMaskForgeScalarMask MaterialSlotMask;
+	FVertexMaskForgeScalarMask DirectionalNormalMask;
+	bool bDirectionalNormalWorldSpaceConflict = false;
+	FVertexMaskForgeScalarMask ThicknessMask;
+	TUniquePtr<FVertexMaskForgeThicknessCache> ThicknessCache;
+	TUniquePtr<FVertexMaskForgeSourceTopologyThicknessCache> SourceTopologyThicknessCache;
 };
 
 /**
@@ -1032,6 +958,8 @@ struct FVertexMaskForgeWorkingMesh
  */
 struct FVertexMaskForgePreviewComponentState
 {
+	friend class FVertexMaskForgeWorkingStateOwner;
+
 	FVertexMaskForgePreviewComponentState() = default;
 
 	/**
@@ -1051,9 +979,33 @@ struct FVertexMaskForgePreviewComponentState
 	FVertexMaskForgePreviewComponentState(FVertexMaskForgePreviewComponentState&&);
 	FVertexMaskForgePreviewComponentState& operator=(FVertexMaskForgePreviewComponentState&&);
 
-	/** The real, selected component. Read-only source for mesh/transform; never mutated. */
+	// --- M16-J.0B (rejection-corrective pass): read-only accessors for every field that moved to
+	// `private` below. These fields are the ones a future M16-J boundary must authenticate -- target
+	// component identity, the three color arrays (in both domains), InstanceResults, and the alpha
+	// authority itself -- so no external code (not even through a mutable reference to this whole
+	// struct) can reassign them outside FVertexMaskForgeWorkingStateOwner's own controlled API. This is
+	// enforced by the compiler (private + friend), not by convention or a method name. Fields that are
+	// NOT part of this authenticated contract (PreviewComponent, AOCache, HiddenOwner, bOverrideActive,
+	// bHasAcquiredActorHide, SourceTopologyPreviewComponent, SourceTopologyAOCache -- all panel-owned
+	// visual/session bookkeeping, explicitly out of scope for the owner infrastructure) remain plain
+	// public fields below, unchanged.
+	TWeakObjectPtr<UStaticMeshComponent> GetSourceComponent() const { return SourceComponent; }
+	const TArray<FColor>& GetBaselineColors() const { return BaselineColors; }
+	const TArray<FColor>& GetCommittedColors() const { return CommittedColors; }
+	const TArray<FColor>& GetWorkingColors() const { return WorkingColors; }
+	const TArray<FColor>& GetSourceTopologyBaselineColors() const { return SourceTopologyBaselineColors; }
+	const TArray<FColor>& GetSourceTopologyCommittedColors() const { return SourceTopologyCommittedColors; }
+	const TArray<FColor>& GetSourceTopologyWorkingColors() const { return SourceTopologyWorkingColors; }
+	const FVertexMaskForgeInstanceResultStore& GetInstanceResults() const { return InstanceResults; }
+	const FVertexMaskForgeWorkingColorsAuthority& GetWorkingColorsAuthority() const { return WorkingColorsAuthority; }
+
+private:
+	/** The real, selected component. Read-only source for mesh/transform; never mutated except by
+	 *  FVertexMaskForgeWorkingStateOwner::ConfigureTarget (private, friended -- see GetSourceComponent()
+	 *  above for the public read-only accessor). */
 	TWeakObjectPtr<UStaticMeshComponent> SourceComponent;
 
+public:
 	/**
 	 * Transient duplicate created only while preview is active, destroyed on cleanup. Outer is
 	 * GetTransientPackage() and it is never added to SourceComponent's owning Actor's component
@@ -1083,6 +1035,7 @@ struct FVertexMaskForgePreviewComponentState
 	/** The Actor this State acquired a hide token for, captured at acquire time. */
 	TWeakObjectPtr<AActor> HiddenOwner;
 
+private:
 	/**
 	 * Immutable-after-capture snapshot of this component's effective input Vertex Colors at the
 	 * START of the current operation/session, in render-vertex order (LOD0-sized). Empty until the
@@ -1157,6 +1110,7 @@ struct FVertexMaskForgePreviewComponentState
 	 */
 	TArray<FColor> WorkingColors;
 
+public:
 	/**
 	 * Per-component Ambient Occlusion memoization: the world-space-baked occluder tree (rebuilt only
 	 * when this component's geometry/transform actually changes) and the last-computed raw
@@ -1192,6 +1146,7 @@ struct FVertexMaskForgePreviewComponentState
 	 */
 	TStrongObjectPtr<UDynamicMeshComponent> SourceTopologyPreviewComponent;
 
+private:
 	/**
 	 * AUDITED (Nanite source-topology support): per-TRIANGLE-CORNER (not per render vertex, not per
 	 * Dynamic Mesh vertex) baseline/committed/working colors -- domain mirrors exactly what gets
@@ -1219,6 +1174,22 @@ struct FVertexMaskForgePreviewComponentState
 	 * constructor/assignment operator, both still `= default` in the .cpp.
 	 */
 	FVertexMaskForgeInstanceResultStore InstanceResults;
+
+	/**
+	 * M16-J.0 / M16-J.0A / M16-J.0A.1: explicit authority over THIS component state's own WorkingColors/
+	 * SourceTopologyWorkingColors buffer (selected by the authority's own GetUseSourceTopology()) --
+	 * proves the buffer's alpha channel is currently meaningful and which FVertexMaskForgeWorkingMeshOwner's
+	 * provenance it corresponds to (see Authority::GetMeshOwnerId()), instead of merely having the
+	 * "right" Num(). See VertexMaskForgeWorkingColorsProvenance.h's own module comment. Invalid
+	 * (IsValid() == false) by default -- nothing in the existing legacy flow establishes this yet; it has
+	 * no effect on any existing named color field above until
+	 * FVertexMaskForgeWorkingStateOwner::InitializeColors stamps it internally (see
+	 * VertexMaskForgeWorkingStateOwner.h) -- no public factory can fabricate a valid one (Authority's
+	 * fields are private, friended only to FVertexMaskForgeWorkingStateOwner). Moves naturally with this
+	 * struct (plain TWeakObjectPtr/POD fields only) -- no change was needed to the move constructor/
+	 * assignment operator, both still `= default` in the .cpp.
+	 */
+	FVertexMaskForgeWorkingColorsAuthority WorkingColorsAuthority;
 };
 
 namespace VertexMaskForgeWorkingMeshTypes
@@ -1248,7 +1219,7 @@ namespace VertexMaskForgeWorkingMeshTypes
 	 * VertexMaskForgeWorkingMeshTypes.cpp for the full algorithm doc comment.
 	 */
 	bool HasConflictingWorldSpaceNormalTransforms(
-		const TArray<FVertexMaskForgePreviewComponentState>& PreviewComponents,
+		const TArray<TUniquePtr<FVertexMaskForgeWorkingStateOwner>>& PreviewComponents,
 		float& OutMaxRelativeDeviation);
 
 	/**
@@ -1293,6 +1264,19 @@ namespace VertexMaskForgeWorkingMeshTypes
  */
 struct FVertexMaskForgeSelectedMesh
 {
+	/**
+	 * M16-J.0B: declared here, defined in VertexMaskForgeWorkingMeshTypes.cpp -- MeshOwner's constructor
+	 * body (MakeShared<FVertexMaskForgeWorkingMeshOwner>()) needs FVertexMaskForgeWorkingMeshOwner to be
+	 * a complete type, which this header deliberately does not include (would create a circular include:
+	 * VertexMaskForgeWorkingMeshOwner.h/.cpp already include THIS header for FVertexMaskForgeWorkingMesh)
+	 * -- same reasoning as FVertexMaskForgeWorkingMesh's own out-of-line special members below.
+	 */
+	FVertexMaskForgeSelectedMesh();
+
+	/** Declared here, defined in the .cpp for the same reason as the constructor (TUniquePtr<
+	 *  FVertexMaskForgeWorkingStateOwner> element destruction needs the complete type). */
+	~FVertexMaskForgeSelectedMesh();
+
 	/** Editor-safe soft reference to the asset. Does not force it to stay loaded. */
 	TSoftObjectPtr<UStaticMesh> Mesh;
 
@@ -1304,7 +1288,50 @@ struct FVertexMaskForgeSelectedMesh
 
 	FVertexMaskForgeMeshDiagnostics Diagnostics;
 
-	FVertexMaskForgeWorkingMesh WorkingMesh;
+	/**
+	 * M16-J.0B: owns this entry's single, shared Working Mesh lifecycle -- geometry, generation,
+	 * Provenance -- see FVertexMaskForgeWorkingMeshOwner's own module comment for why geometry ownership
+	 * lives here (per-ENTRY), never per-component. TSharedPtr so FVertexMaskForgeWorkingStateOwner
+	 * instances (one per component of this entry) can attach to it via TWeakPtr -- see
+	 * FVertexMaskForgeWorkingStateOwner::AttachToMeshOwner. Always valid (constructed in this struct's
+	 * own constructor) -- never null for a real entry.
+	 */
+	TSharedPtr<FVertexMaskForgeWorkingMeshOwner> MeshOwner;
+
+	/**
+	 * M16-J.0B.1 corrective pass: there is deliberately NO persistent WorkingMesh reference member here
+	 * anymore. A prior revision of this checkpoint bound one in the constructor
+	 * (WorkingMesh(MeshOwner->GetWorkingMesh())); an audit correctly flagged that as an unproven-lifetime
+	 * alias pattern -- a reference member is exactly the shape of bug that silently dangles the moment
+	 * anyone adds a copy/move path to this struct in the future, and proving it safe today by pointing at
+	 * this struct's CURRENT accidental non-copyability (a TUniquePtr element in PreviewComponents below,
+	 * a user-declared destructor suppressing the implicit move) is a fragile argument to keep re-deriving
+	 * forever. Every real call site now obtains a fresh, short-lived const view at its own point of use:
+	 *
+	 *     const FVertexMaskForgeWorkingMesh& WorkingMesh = Entry->MeshOwner->GetWorkingMesh();
+	 *
+	 * MeshOwner (below) is the single source of truth; GetWorkingMesh() is O(1) and side-effect-free, so
+	 * there is no performance reason to cache the result beyond one function's own scope. See
+	 * FVertexMaskForgeWorkingMeshOwner::GetWorkingMesh's own doc comment for why ITS returned reference is
+	 * safe to use this way: it aliases a member that lives inside the SAME heap allocation as MeshOwner's
+	 * own pointee (a TSharedPtr<FVertexMaskForgeWorkingMeshOwner> control block never relocates the
+	 * pointee), so a short-lived local view taken from it is valid for as long as the caller also holds
+	 * (directly or transitively) a reference to that same MeshOwner -- which every real call site does,
+	 * via Entry.
+	 */
+
+	/**
+	 * M16-J.0B.1 (WorkingMesh Domain Split): this entry's Generator Artistic State (BoundingBoxMask,
+	 * CurvatureMask, NoiseMask, MaterialSlotMask, DirectionalNormalMask, ThicknessMask, their raw caches
+	 * -- see FVertexMaskForgeGeneratorState's own module comment). Owned directly BY VALUE (not via an
+	 * owner/generation contract -- this state was never part of the authenticated identity this
+	 * checkpoint protects), default-constructed fresh for every entry -- since a brand new
+	 * FVertexMaskForgeSelectedMesh is always constructed on RefreshSelection (never reused), this
+	 * automatically satisfies the exact same "every mask starts at NotGenerated on a fresh Working Mesh"
+	 * invariant the pre-split design already had, just expressed through a fresh GeneratorState instead
+	 * of a fresh WorkingMesh.
+	 */
+	FVertexMaskForgeGeneratorState GeneratorState;
 
 	/**
 	 * True iff this entry's Static Mesh has Nanite enabled (Mesh->IsNaniteEnabled()) -- see
@@ -1330,6 +1357,13 @@ struct FVertexMaskForgeSelectedMesh
 	 * source (Actors and directly-selected Components in the level; Content Browser asset selection
 	 * is never consulted anywhere in this panel), so this is never empty for an entry that exists at
 	 * all (every entry comes from at least one real, placed UStaticMeshComponent).
+	 *
+	 * M16-J.0B: one FVertexMaskForgeWorkingStateOwner per component (owns that component's own
+	 * BaselineColors/CommittedColors/WorkingColors/authority lifecycle -- see that class's own module
+	 * comment), held by TUniquePtr for a stable heap address regardless of this array's own reallocation
+	 * (StateOwnerId uses that address; also required since FVertexMaskForgeWorkingStateOwner is itself
+	 * non-copyable/non-movable). Every StateOwner in this array is attached (AttachToMeshOwner) to THIS
+	 * entry's own MeshOwner above -- never a different entry's.
 	 */
-	TArray<FVertexMaskForgePreviewComponentState> PreviewComponents;
+	TArray<TUniquePtr<FVertexMaskForgeWorkingStateOwner>> PreviewComponents;
 };
