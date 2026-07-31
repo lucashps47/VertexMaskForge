@@ -156,6 +156,40 @@ public:
 	 *  contract). Only an unknown LayerId can fail. */
 	bool SetLayerChannelFilter(const FGuid& LayerId, bool bAffectRed, bool bAffectGreen, bool bAffectBlue);
 
+	/**
+	 * M16-K.5B: assigns or replaces the layer's procedural mask generator instance -- the ONLY way this
+	 * stack ever creates or replaces a FVertexMaskForgeGeneratorMaskInstance (mirrors every other
+	 * SetLayer* mutator's "sole controlled entry point" contract).
+	 *   - LayerId unknown: returns false, stack completely unmodified.
+	 *   - Layer has no mask yet: creates one -- fresh FGuid::NewGuid() MaskInstanceId, GeneratorType, and
+	 *     MakeVertexMaskForgeGeneratorParams(GeneratorType) defaults. Returns true.
+	 *   - Layer already has a mask with GeneratorType == the requested type: a NO-OP -- MaskInstanceId and
+	 *     Params are left completely untouched (not just value-equal, but not even re-assigned), the
+	 *     instance is not recreated. Returns true (the request's postcondition -- "this layer has a mask
+	 *     of this type" -- already held).
+	 *   - Layer already has a mask with a DIFFERENT GeneratorType: replaced outright -- a fresh
+	 *     MaskInstanceId, the new GeneratorType, and that type's own default Params, discarding the old
+	 *     instance's Params entirely (never a partial/merged carry-over). Returns true.
+	 */
+	bool SetLayerMaskGeneratorType(const FGuid& LayerId, EVertexMaskForgeGeneratorType GeneratorType);
+
+	/**
+	 * Clears the layer's mask, if any -- the layer itself, its LayerId, and every other field are
+	 * completely unaffected. Idempotent: calling this on a layer that already has no mask is a harmless
+	 * no-op that still returns true (the postcondition -- "this layer has no mask" -- already held).
+	 * Returns false only for an unknown LayerId, leaving the stack completely unmodified.
+	 */
+	bool ClearLayerMask(const FGuid& LayerId);
+
+	/**
+	 * Const-only lookup of the layer's mask instance. Returns nullptr for BOTH an unknown LayerId and a
+	 * known layer with no mask set -- callers that must distinguish "layer doesn't exist" from "layer
+	 * exists but has no mask" should resolve the layer itself first (e.g. via FindLayerById) rather than
+	 * rely on this function to disambiguate; no such need exists in this checkpoint. Same lifetime caveat
+	 * as FindLayerById -- the returned pointer is only valid until the next mutating call on this stack.
+	 */
+	const FVertexMaskForgeGeneratorMaskInstance* GetLayerMask(const FGuid& LayerId) const;
+
 	/** Read-only view of the current layers, in composition order (index 0 first). */
 	const TArray<FVertexMaskForgeLayer>& GetLayers() const { return Layers; }
 

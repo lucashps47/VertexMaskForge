@@ -234,6 +234,58 @@ bool FVertexMaskForgeDynamicLayerStack::SetLayerChannelFilter(const FGuid& Layer
 	return true;
 }
 
+bool FVertexMaskForgeDynamicLayerStack::SetLayerMaskGeneratorType(const FGuid& LayerId, const EVertexMaskForgeGeneratorType GeneratorType)
+{
+	FVertexMaskForgeLayer* Layer = FindLayerByIdMutable(LayerId);
+	if (!Layer)
+	{
+		return false;
+	}
+
+	// AUDITED (M16-K.5B): requesting the SAME type the layer already has is a true no-op -- MaskInstanceId
+	// and Params are left completely untouched, never recreated, even though the values would end up
+	// equal either way. This is what makes SetLayerMaskGeneratorType safe to call repeatedly/idempotently
+	// from a future UI without silently discarding in-progress parameter edits (deferred to K.5C).
+	if (Layer->Mask.IsSet() && Layer->Mask->GeneratorType == GeneratorType)
+	{
+		return true;
+	}
+
+	// Either no mask yet, or an existing mask of a DIFFERENT type -- both cases assign a wholly fresh
+	// instance: new MaskInstanceId, the requested GeneratorType, and that type's own default Params. Any
+	// previous instance's Params are discarded outright, never merged/carried over.
+	FVertexMaskForgeGeneratorMaskInstance NewInstance;
+	NewInstance.MaskInstanceId = FGuid::NewGuid();
+	NewInstance.GeneratorType = GeneratorType;
+	NewInstance.Params = MakeVertexMaskForgeGeneratorParams(GeneratorType);
+	Layer->Mask = MoveTemp(NewInstance);
+	return true;
+}
+
+bool FVertexMaskForgeDynamicLayerStack::ClearLayerMask(const FGuid& LayerId)
+{
+	FVertexMaskForgeLayer* Layer = FindLayerByIdMutable(LayerId);
+	if (!Layer)
+	{
+		return false;
+	}
+
+	// Idempotent -- clearing an already-unset Mask is a harmless no-op, still a success (the postcondition
+	// "this layer has no mask" already held).
+	Layer->Mask.Reset();
+	return true;
+}
+
+const FVertexMaskForgeGeneratorMaskInstance* FVertexMaskForgeDynamicLayerStack::GetLayerMask(const FGuid& LayerId) const
+{
+	const FVertexMaskForgeLayer* Layer = FindLayerById(LayerId);
+	if (!Layer || !Layer->Mask.IsSet())
+	{
+		return nullptr;
+	}
+	return &Layer->Mask.GetValue();
+}
+
 bool FVertexMaskForgeDynamicLayerStack::IsValid() const
 {
 	TSet<FGuid> SeenIds;
