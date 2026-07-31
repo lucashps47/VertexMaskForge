@@ -431,6 +431,29 @@ bool FVertexMaskForgeDynamicLayerStack::IsValid() const
 		{
 			return false;
 		}
+
+		// M16-K.5C-C: structural invariant for an assigned Mask -- a layer with no Mask (TOptional unset,
+		// including the Base Layer) is skipped entirely, preserving the exact prior behavior for that case.
+		// MaskInstanceId validity and GeneratorType/Params coherence are not enforceable-invalid through
+		// the stack's own public API (SetLayerMaskGeneratorType/SetLayerMaskParams both already guard
+		// this), but this is the same "explicit, testable proof of an invariant already held by
+		// construction" role this method plays for LayerId/Opacity/Fill/BlendMode above -- not a defense
+		// against a reachable corruption path. Reuses DoGeneratorTypeAndParamsMatch verbatim (its own
+		// default:false already covers an unrecognized GeneratorType, so no separate IsValidGeneratorType
+		// call is needed). MaskInstanceId uniqueness across layers is deliberately NOT checked -- no such
+		// contract exists anywhere in this model (unlike LayerId's own documented uniqueness above).
+		if (Layer.Mask.IsSet())
+		{
+			if (!Layer.Mask->MaskInstanceId.IsValid())
+			{
+				return false;
+			}
+
+			if (!DoGeneratorTypeAndParamsMatch(Layer.Mask->GeneratorType, Layer.Mask->Params))
+			{
+				return false;
+			}
+		}
 	}
 
 	return true;

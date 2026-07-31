@@ -1084,4 +1084,39 @@ bool FVertexMaskForgeGeneratorMaskInstanceSetParamsSiblingCopyTest::RunTest(cons
 	return true;
 }
 
+// 32. IsValidAcceptsMaskedBaseAndLayersForAllSevenGeneratorTypes (M16-K.5C-C) -- positive coverage for
+// FVertexMaskForgeDynamicLayerStack::IsValid()'s new Mask structural check: a Base Layer plus six ordinary
+// layers, one Mask per real GeneratorType (all seven types covered, table-driven, not seven separate
+// tests), must all leave the stack IsValid(). No negative case is included here -- an invalid MaskInstanceId
+// or an incoherent GeneratorType/Params pairing is not constructible through this stack's public API (see
+// this checkpoint's own audit), so only this positive proof is honest.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeGeneratorMaskInstanceIsValidAcceptsMaskedLayersTest, "VertexMaskForge.GeneratorMaskInstance.IsValidAcceptsMaskedBaseAndLayersForAllSevenGeneratorTypes", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeGeneratorMaskInstanceIsValidAcceptsMaskedLayersTest::RunTest(const FString& Parameters)
+{
+	FVertexMaskForgeDynamicLayerStack Stack = FVertexMaskForgeDynamicLayerStack::MakeInitialStack();
+	const FGuid BaseLayerId = Stack.GetLayers()[0].LayerId;
+
+	TestTrue(TEXT("Base Layer receives a mask (BoundingBox)"), Stack.SetLayerMaskGeneratorType(BaseLayerId, EVertexMaskForgeGeneratorType::BoundingBox));
+
+	const EVertexMaskForgeGeneratorType RemainingTypes[] = {
+		EVertexMaskForgeGeneratorType::AmbientOcclusion,
+		EVertexMaskForgeGeneratorType::Curvature,
+		EVertexMaskForgeGeneratorType::Noise,
+		EVertexMaskForgeGeneratorType::DirectionalNormal,
+		EVertexMaskForgeGeneratorType::Thickness,
+		EVertexMaskForgeGeneratorType::MaterialSlot,
+	};
+
+	for (const EVertexMaskForgeGeneratorType Type : RemainingTypes)
+	{
+		const FGuid Id = Stack.AddLayer(TEXT("Layer"));
+		TestTrue(TEXT("Ordinary layer receives a mask"), Stack.SetLayerMaskGeneratorType(Id, Type));
+	}
+
+	TestEqual(TEXT("Base Layer plus six ordinary layers"), Stack.Num(), 7);
+	TestTrue(TEXT("Stack remains valid with all seven GeneratorTypes masked, including the Base Layer"), Stack.IsValid());
+
+	return true;
+}
+
 #endif // WITH_DEV_AUTOMATION_TESTS

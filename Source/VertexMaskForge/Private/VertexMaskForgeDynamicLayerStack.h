@@ -230,6 +230,14 @@ public:
 	 *   - BlendMode is one of EVertexMaskForgeBlendMode's seven real enumerators (Copy/Add/Subtract/
 	 *     Multiply/Overlay/Screen/Linear) -- validated by explicit switch, never a numeric range check,
 	 *     since that enum carries no Count/Max sentinel and no documented contiguity contract.
+	 *   - M16-K.5C-C: IF the layer has a Mask (TOptional set -- an unset Mask, including on the Base
+	 *     Layer, imposes no further requirement), then MaskInstanceId is valid (non-default FGuid) AND
+	 *     GeneratorType/Params are coherent (GeneratorType is one of the seven real generators AND Params'
+	 *     active alternative matches it) -- the same structural check SetLayerMaskParams itself performs
+	 *     via DoGeneratorTypeAndParamsMatch. MaskInstanceId uniqueness ACROSS layers is deliberately NOT
+	 *     required -- no such contract exists anywhere in this model, unlike LayerId's own uniqueness
+	 *     above. Semantic validity of a Params struct's own field values (ranges, NaN, artistic bounds) is
+	 *     explicitly out of scope -- this method only checks the Type/Params PAIRING, never field content.
 	 * An empty stack is valid (there is nothing to violate). Pure observation -- never mutates,
 	 * normalizes, clamps, or repairs anything; an out-of-contract value is reported, never corrected.
 	 *
