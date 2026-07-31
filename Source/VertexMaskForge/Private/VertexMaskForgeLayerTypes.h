@@ -180,3 +180,79 @@ inline FLinearColor GetDynamicLayerChannelTintColor(const EVertexMaskForgeDynami
 		return FLinearColor(0.0f, 0.0f, 0.0f, 0.0f);
 	}
 }
+
+/** M16-K.4C: identifies which of a Dynamic Layer's three RGB Channel Filter checkboxes was clicked --
+ *  used only to parameterize ResolveDynamicLayerChannelToggle below, never stored, never a substitute for
+ *  LayerId/FGuid identity. */
+enum class EVertexMaskForgeDynamicLayerChannel : uint8
+{
+	Red,
+	Green,
+	Blue,
+};
+
+/** Pure output of ResolveDynamicLayerChannelToggle -- the final RGB Channel Filter state to apply via
+ *  FVertexMaskForgeDynamicLayerStack::SetLayerChannelFilter (a single, already-atomic call.) */
+struct FVertexMaskForgeDynamicLayerChannelToggleResult
+{
+	bool bAffectRed = true;
+	bool bAffectGreen = true;
+	bool bAffectBlue = true;
+};
+
+/**
+ * M16-K.4C: pure, Slate-free Channel Solo decision -- Substance-Painter-style Alt-click behavior for a
+ * Dynamic Layer's R/G/B Channel Filter checkboxes. Deliberately separate from both Slate (no widget/
+ * modifier-key type appears here -- bAltDown is a plain bool the caller already resolved) and from
+ * FVertexMaskForgeDynamicLayerStack (this function never touches a layer or a stack; it only computes
+ * what SHOULD be applied, via the existing SetLayerChannelFilter call, at the one real call site in
+ * SVertexMaskForgePanel::BuildDynamicLayerRow).
+ *
+ * Contract:
+ *   - bAltDown == false (normal click): ClickedChannel is set to bRequestedChecked (the checkbox's own
+ *     new state); the other two channels are returned UNCHANGED from bCurrentRed/Green/Blue. Identical
+ *     to the pre-M16-K.4C behavior -- multiple channels, or zero channels, remain fully reachable.
+ *   - bAltDown == true (Alt-click, "solo"): ClickedChannel is forced to true; the other two are forced to
+ *     false -- REGARDLESS of bRequestedChecked. This is the specific rule that makes Alt-clicking an
+ *     already-solo channel a no-op rather than a toggle-off: since SCheckBox always requests the OPPOSITE
+ *     of its current checked state on click, Alt-clicking a channel that is already the sole active one
+ *     would otherwise request bRequestedChecked=false for it -- this function ignores that request
+ *     entirely under Alt and forces ClickedChannel to true unconditionally, so the row can never end up
+ *     with zero active channels from an Alt-click.
+ * Always returns exactly one of the three following shapes: normal-click's "one channel changed, two
+ * preserved", or Alt-click's "exactly the clicked channel true, the other two false" -- never a partial
+ * or ambiguous state.
+ */
+inline FVertexMaskForgeDynamicLayerChannelToggleResult ResolveDynamicLayerChannelToggle(
+	const bool bCurrentRed, const bool bCurrentGreen, const bool bCurrentBlue,
+	const EVertexMaskForgeDynamicLayerChannel ClickedChannel,
+	const bool bRequestedChecked,
+	const bool bAltDown)
+{
+	FVertexMaskForgeDynamicLayerChannelToggleResult Result;
+
+	if (bAltDown)
+	{
+		Result.bAffectRed = (ClickedChannel == EVertexMaskForgeDynamicLayerChannel::Red);
+		Result.bAffectGreen = (ClickedChannel == EVertexMaskForgeDynamicLayerChannel::Green);
+		Result.bAffectBlue = (ClickedChannel == EVertexMaskForgeDynamicLayerChannel::Blue);
+		return Result;
+	}
+
+	Result.bAffectRed = bCurrentRed;
+	Result.bAffectGreen = bCurrentGreen;
+	Result.bAffectBlue = bCurrentBlue;
+	switch (ClickedChannel)
+	{
+	case EVertexMaskForgeDynamicLayerChannel::Red:
+		Result.bAffectRed = bRequestedChecked;
+		break;
+	case EVertexMaskForgeDynamicLayerChannel::Green:
+		Result.bAffectGreen = bRequestedChecked;
+		break;
+	case EVertexMaskForgeDynamicLayerChannel::Blue:
+		Result.bAffectBlue = bRequestedChecked;
+		break;
+	}
+	return Result;
+}

@@ -12,6 +12,7 @@
 #include "Editor.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/World.h"
+#include "Framework/Application/SlateApplication.h"
 #include "GameFramework/Actor.h"
 #include "HAL/PlatformTime.h"
 #include "HAL/ThreadSafeCounter.h"
@@ -3737,7 +3738,7 @@ TSharedRef<SWidget> SVertexMaskForgePanel::BuildDynamicLayerRow(const FGuid Laye
 			.Padding(FMargin(0.f, 0.f, 2.f, 0.f))
 			[
 				SNew(SCheckBox)
-				.ToolTipText(LOCTEXT("DynamicLayerAffectRedTooltip", "Affect Red Channel"))
+				.ToolTipText(LOCTEXT("DynamicLayerAffectRedTooltip", "Affect Red Channel\nAlt-click to solo channel"))
 				.IsChecked_Lambda([this, LayerId]()
 				{
 					const FVertexMaskForgeLayer* Layer = DynamicLayerStack.FindLayerById(LayerId);
@@ -3750,7 +3751,16 @@ TSharedRef<SWidget> SVertexMaskForgePanel::BuildDynamicLayerRow(const FGuid Laye
 					{
 						return;
 					}
-					DynamicLayerStack.SetLayerChannelFilter(LayerId, NewState == ECheckBoxState::Checked, Layer->bAffectGreen, Layer->bAffectBlue);
+					// AUDITED (M16-K.4C): Alt detection is UI-only (FSlateApplication's own modifier-key
+					// state, queried synchronously inside this click callback) -- never stored on the
+					// layer/stack. The pure decision (ResolveDynamicLayerChannelToggle) computes the final
+					// RGB shape; SetLayerChannelFilter applies it as the single atomic mutation it already
+					// was, unchanged from M16-K.4A/K.4B.
+					const bool bAltDown = FSlateApplication::Get().GetModifierKeys().IsAltDown();
+					const FVertexMaskForgeDynamicLayerChannelToggleResult Result = ResolveDynamicLayerChannelToggle(
+						Layer->bAffectRed, Layer->bAffectGreen, Layer->bAffectBlue,
+						EVertexMaskForgeDynamicLayerChannel::Red, NewState == ECheckBoxState::Checked, bAltDown);
+					DynamicLayerStack.SetLayerChannelFilter(LayerId, Result.bAffectRed, Result.bAffectGreen, Result.bAffectBlue);
 				})
 				.Content()
 				[
@@ -3764,7 +3774,7 @@ TSharedRef<SWidget> SVertexMaskForgePanel::BuildDynamicLayerRow(const FGuid Laye
 			.Padding(FMargin(0.f, 0.f, 2.f, 0.f))
 			[
 				SNew(SCheckBox)
-				.ToolTipText(LOCTEXT("DynamicLayerAffectGreenTooltip", "Affect Green Channel"))
+				.ToolTipText(LOCTEXT("DynamicLayerAffectGreenTooltip", "Affect Green Channel\nAlt-click to solo channel"))
 				.IsChecked_Lambda([this, LayerId]()
 				{
 					const FVertexMaskForgeLayer* Layer = DynamicLayerStack.FindLayerById(LayerId);
@@ -3777,7 +3787,11 @@ TSharedRef<SWidget> SVertexMaskForgePanel::BuildDynamicLayerRow(const FGuid Laye
 					{
 						return;
 					}
-					DynamicLayerStack.SetLayerChannelFilter(LayerId, Layer->bAffectRed, NewState == ECheckBoxState::Checked, Layer->bAffectBlue);
+					const bool bAltDown = FSlateApplication::Get().GetModifierKeys().IsAltDown();
+					const FVertexMaskForgeDynamicLayerChannelToggleResult Result = ResolveDynamicLayerChannelToggle(
+						Layer->bAffectRed, Layer->bAffectGreen, Layer->bAffectBlue,
+						EVertexMaskForgeDynamicLayerChannel::Green, NewState == ECheckBoxState::Checked, bAltDown);
+					DynamicLayerStack.SetLayerChannelFilter(LayerId, Result.bAffectRed, Result.bAffectGreen, Result.bAffectBlue);
 				})
 				.Content()
 				[
@@ -3790,7 +3804,7 @@ TSharedRef<SWidget> SVertexMaskForgePanel::BuildDynamicLayerRow(const FGuid Laye
 			.VAlign(VAlign_Center)
 			[
 				SNew(SCheckBox)
-				.ToolTipText(LOCTEXT("DynamicLayerAffectBlueTooltip", "Affect Blue Channel"))
+				.ToolTipText(LOCTEXT("DynamicLayerAffectBlueTooltip", "Affect Blue Channel\nAlt-click to solo channel"))
 				.IsChecked_Lambda([this, LayerId]()
 				{
 					const FVertexMaskForgeLayer* Layer = DynamicLayerStack.FindLayerById(LayerId);
@@ -3803,7 +3817,11 @@ TSharedRef<SWidget> SVertexMaskForgePanel::BuildDynamicLayerRow(const FGuid Laye
 					{
 						return;
 					}
-					DynamicLayerStack.SetLayerChannelFilter(LayerId, Layer->bAffectRed, Layer->bAffectGreen, NewState == ECheckBoxState::Checked);
+					const bool bAltDown = FSlateApplication::Get().GetModifierKeys().IsAltDown();
+					const FVertexMaskForgeDynamicLayerChannelToggleResult Result = ResolveDynamicLayerChannelToggle(
+						Layer->bAffectRed, Layer->bAffectGreen, Layer->bAffectBlue,
+						EVertexMaskForgeDynamicLayerChannel::Blue, NewState == ECheckBoxState::Checked, bAltDown);
+					DynamicLayerStack.SetLayerChannelFilter(LayerId, Result.bAffectRed, Result.bAffectGreen, Result.bAffectBlue);
 				})
 				.Content()
 				[
