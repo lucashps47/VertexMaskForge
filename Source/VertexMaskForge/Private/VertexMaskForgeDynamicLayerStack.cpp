@@ -66,6 +66,36 @@ namespace
 			return false;
 		}
 	}
+
+	// M16-K.5C-B: the Type<->Params correspondence check used by SetLayerMaskParams, both to validate the
+	// ALREADY-STORED pairing (defense-in-depth against an instance that somehow became structurally
+	// inconsistent -- see SetLayerMaskParams' own doc comment for why this checkpoint never repairs such
+	// an instance, only rejects mutating it) and to validate the NEW payload a caller submits. Same
+	// discipline as the validators above: explicit switch over the seven real named enumerators, no range
+	// check, no variant index, no cast -- an unrecognized GeneratorType falls to `default: false` and is
+	// never treated as MaterialSlot (MaterialSlot has its own explicit case, not the default one).
+	bool DoGeneratorTypeAndParamsMatch(const EVertexMaskForgeGeneratorType GeneratorType, const FVertexMaskForgeGeneratorParams& Params)
+	{
+		switch (GeneratorType)
+		{
+		case EVertexMaskForgeGeneratorType::BoundingBox:
+			return Params.IsType<FVertexMaskForgeBoundingBoxParams>();
+		case EVertexMaskForgeGeneratorType::AmbientOcclusion:
+			return Params.IsType<FVertexMaskForgeAmbientOcclusionParams>();
+		case EVertexMaskForgeGeneratorType::Curvature:
+			return Params.IsType<FVertexMaskForgeCurvatureParams>();
+		case EVertexMaskForgeGeneratorType::Noise:
+			return Params.IsType<FVertexMaskForgeNoiseParams>();
+		case EVertexMaskForgeGeneratorType::DirectionalNormal:
+			return Params.IsType<FVertexMaskForgeDirectionalNormalParams>();
+		case EVertexMaskForgeGeneratorType::Thickness:
+			return Params.IsType<FVertexMaskForgeThicknessParams>();
+		case EVertexMaskForgeGeneratorType::MaterialSlot:
+			return Params.IsType<FVertexMaskForgeMaterialSlotParams>();
+		default:
+			return false;
+		}
+	}
 }
 
 FVertexMaskForgeDynamicLayerStack FVertexMaskForgeDynamicLayerStack::MakeInitialStack()
@@ -295,6 +325,52 @@ bool FVertexMaskForgeDynamicLayerStack::SetLayerMaskGeneratorType(const FGuid& L
 	NewInstance.GeneratorType = GeneratorType;
 	NewInstance.Params = MakeVertexMaskForgeGeneratorParams(GeneratorType);
 	Layer->Mask = MoveTemp(NewInstance);
+	return true;
+}
+
+bool FVertexMaskForgeDynamicLayerStack::SetLayerMaskParams(const FGuid& LayerId, const FGuid& ExpectedMaskInstanceId, FVertexMaskForgeGeneratorParams Params)
+{
+	// Rejected BEFORE the lookup -- an invalid ExpectedMaskInstanceId is invalid regardless of which
+	// layer/instance (if any) LayerId resolves to, same reasoning as SetLayerMaskGeneratorType's own
+	// GeneratorType guard (M16-K.5B.1).
+	if (!ExpectedMaskInstanceId.IsValid())
+	{
+		return false;
+	}
+
+	FVertexMaskForgeLayer* Layer = FindLayerByIdMutable(LayerId);
+	if (!Layer)
+	{
+		return false;
+	}
+
+	if (!Layer->Mask.IsSet())
+	{
+		return false;
+	}
+
+	if (Layer->Mask->MaskInstanceId != ExpectedMaskInstanceId)
+	{
+		return false;
+	}
+
+	// M16-K.5C-A2 corrected policy: an already-inconsistent instance is never silently repaired by this
+	// operation -- it must be replaced or cleared via SetLayerMaskGeneratorType/ClearLayerMask instead.
+	// Checked BEFORE the new payload, so a coherent new Params value can never be used to paper over an
+	// existing inconsistency.
+	if (!DoGeneratorTypeAndParamsMatch(Layer->Mask->GeneratorType, Layer->Mask->Params))
+	{
+		return false;
+	}
+
+	if (!DoGeneratorTypeAndParamsMatch(Layer->Mask->GeneratorType, Params))
+	{
+		return false;
+	}
+
+	// The only write in this entire method -- MaskInstanceId, GeneratorType, LayerId, position, and every
+	// other field are left completely untouched.
+	Layer->Mask->Params = MoveTemp(Params);
 	return true;
 }
 

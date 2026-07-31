@@ -182,6 +182,31 @@ public:
 	bool ClearLayerMask(const FGuid& LayerId);
 
 	/**
+	 * M16-K.5C-B: replaces ONLY the Params payload of the layer's existing generator mask instance --
+	 * never its GeneratorType, MaskInstanceId, or any other field of the layer or instance. This is the
+	 * sole controlled entry point for editing an already-assigned mask's parameters (mirrors every other
+	 * SetLayer.../SetLayerMask... mutator's "sole controlled entry point" contract).
+	 *
+	 * ExpectedMaskInstanceId guards against a stale caller (e.g. a future parameter UI that captured a
+	 * MaskInstanceId before SetLayerMaskGeneratorType replaced it with a different instance) silently
+	 * editing the WRONG instance -- LayerId alone cannot distinguish "still the instance I opened" from
+	 * "this layer now holds a different instance that happens to share the same LayerId".
+	 *
+	 * Fails (returns false, stack completely unmodified) if:
+	 *   - ExpectedMaskInstanceId is not a valid FGuid (checked before any lookup);
+	 *   - LayerId does not resolve to a layer;
+	 *   - the layer currently has no mask;
+	 *   - the mask's current MaskInstanceId does not equal ExpectedMaskInstanceId;
+	 *   - the mask's currently stored GeneratorType/Params pairing is not itself coherent (this
+	 *     checkpoint never repairs an already-inconsistent instance -- such an instance must be replaced
+	 *     or cleared via SetLayerMaskGeneratorType/ClearLayerMask instead);
+	 *   - the new Params' active alternative does not match the mask's GeneratorType.
+	 * On success, only Mask->Params is assigned (via MoveTemp) -- MaskInstanceId, GeneratorType, LayerId,
+	 * position, and every other field are left completely untouched.
+	 */
+	bool SetLayerMaskParams(const FGuid& LayerId, const FGuid& ExpectedMaskInstanceId, FVertexMaskForgeGeneratorParams Params);
+
+	/**
 	 * Const-only lookup of the layer's mask instance. Returns nullptr for BOTH an unknown LayerId and a
 	 * known layer with no mask set -- callers that must distinguish "layer doesn't exist" from "layer
 	 * exists but has no mask" should resolve the layer itself first (e.g. via FindLayerById) rather than

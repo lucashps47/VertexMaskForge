@@ -583,4 +583,505 @@ bool FVertexMaskForgeGeneratorMaskInstanceAllValidTypesStillWorkTest::RunTest(co
 	return true;
 }
 
+// --- M16-K.5C-B: SetLayerMaskParams -- controlled mutation of an existing mask instance's Params only ---
+// Proves success/persistence for all 7 generator types, every documented failure mode (unknown layer,
+// maskless layer including the Base Layer, invalid/mismatched ExpectedMaskInstanceId, incompatible Params
+// alternative), identical-value no-op, the ABA/stale-callback scenario, and cross-layer/cross-copy
+// isolation -- exclusively via public APIs and observable state (GetLayerMask/FindLayerById/IsType<T>()/
+// Get<T>()), never via friend/private access/casts/memcmp/instrumentation. GeneratorType-invalid and
+// stored-Type/Params-incompatible states are NOT tested here -- both are confirmed unreachable through the
+// stack's public API after M16-K.5B.1 (see this checkpoint's own audit); the corresponding guards
+// (DoGeneratorTypeAndParamsMatch's default:false, checked against the STORED pairing before the new
+// payload) are verified by direct diff/code review instead of by fabricated test state.
+
+// 23. SetParamsSucceedsForAllSevenTypesAndPreservesIdentity (also proves value semantics, in the
+// MaterialSlot case, rather than as a separate 10th test).
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeGeneratorMaskInstanceSetParamsAllTypesTest, "VertexMaskForge.GeneratorMaskInstance.SetParamsSucceedsForAllSevenTypesAndPreservesIdentity", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeGeneratorMaskInstanceSetParamsAllTypesTest::RunTest(const FString& Parameters)
+{
+	FVertexMaskForgeDynamicLayerStack Stack;
+
+	// BoundingBox.
+	{
+		const FGuid Id = Stack.AddLayer(TEXT("BoundingBox"));
+		Stack.SetLayerMaskGeneratorType(Id, EVertexMaskForgeGeneratorType::BoundingBox);
+		const FGuid OriginalInstanceId = Stack.GetLayerMask(Id)->MaskInstanceId;
+
+		FVertexMaskForgeGeneratorParams NewParams = MakeVertexMaskForgeGeneratorParams(EVertexMaskForgeGeneratorType::BoundingBox);
+		NewParams.Get<FVertexMaskForgeBoundingBoxParams>().bUseUnifiedBounds = true;
+
+		TestTrue(TEXT("BoundingBox: SetLayerMaskParams succeeds"), Stack.SetLayerMaskParams(Id, OriginalInstanceId, NewParams));
+
+		const FVertexMaskForgeGeneratorMaskInstance* Mask = Stack.GetLayerMask(Id);
+		TestNotNull(TEXT("BoundingBox: mask present"), Mask);
+		if (Mask)
+		{
+			TestEqual(TEXT("BoundingBox: LayerId preserved"), Stack.FindLayerById(Id)->LayerId, Id);
+			TestEqual(TEXT("BoundingBox: MaskInstanceId preserved"), Mask->MaskInstanceId, OriginalInstanceId);
+			TestTrue(TEXT("BoundingBox: GeneratorType preserved"), Mask->GeneratorType == EVertexMaskForgeGeneratorType::BoundingBox);
+			TestTrue(TEXT("BoundingBox: Params alternative is BoundingBox"), Mask->Params.IsType<FVertexMaskForgeBoundingBoxParams>());
+			TestTrue(TEXT("BoundingBox: bUseUnifiedBounds stored as true"), Mask->Params.Get<FVertexMaskForgeBoundingBoxParams>().bUseUnifiedBounds);
+		}
+	}
+
+	// AmbientOcclusion.
+	{
+		const FGuid Id = Stack.AddLayer(TEXT("AmbientOcclusion"));
+		Stack.SetLayerMaskGeneratorType(Id, EVertexMaskForgeGeneratorType::AmbientOcclusion);
+		const FGuid OriginalInstanceId = Stack.GetLayerMask(Id)->MaskInstanceId;
+
+		FVertexMaskForgeGeneratorParams NewParams = MakeVertexMaskForgeGeneratorParams(EVertexMaskForgeGeneratorType::AmbientOcclusion);
+		NewParams.Get<FVertexMaskForgeAmbientOcclusionParams>().Samples = 32;
+
+		TestTrue(TEXT("AmbientOcclusion: SetLayerMaskParams succeeds"), Stack.SetLayerMaskParams(Id, OriginalInstanceId, NewParams));
+
+		const FVertexMaskForgeGeneratorMaskInstance* Mask = Stack.GetLayerMask(Id);
+		TestNotNull(TEXT("AmbientOcclusion: mask present"), Mask);
+		if (Mask)
+		{
+			TestEqual(TEXT("AmbientOcclusion: LayerId preserved"), Stack.FindLayerById(Id)->LayerId, Id);
+			TestEqual(TEXT("AmbientOcclusion: MaskInstanceId preserved"), Mask->MaskInstanceId, OriginalInstanceId);
+			TestTrue(TEXT("AmbientOcclusion: GeneratorType preserved"), Mask->GeneratorType == EVertexMaskForgeGeneratorType::AmbientOcclusion);
+			TestTrue(TEXT("AmbientOcclusion: Params alternative is AmbientOcclusion"), Mask->Params.IsType<FVertexMaskForgeAmbientOcclusionParams>());
+			TestEqual(TEXT("AmbientOcclusion: Samples stored as 32"), Mask->Params.Get<FVertexMaskForgeAmbientOcclusionParams>().Samples, 32);
+		}
+	}
+
+	// Curvature.
+	{
+		const FGuid Id = Stack.AddLayer(TEXT("Curvature"));
+		Stack.SetLayerMaskGeneratorType(Id, EVertexMaskForgeGeneratorType::Curvature);
+		const FGuid OriginalInstanceId = Stack.GetLayerMask(Id)->MaskInstanceId;
+
+		FVertexMaskForgeGeneratorParams NewParams = MakeVertexMaskForgeGeneratorParams(EVertexMaskForgeGeneratorType::Curvature);
+		NewParams.Get<FVertexMaskForgeCurvatureParams>().Multiplier = 2.5f;
+
+		TestTrue(TEXT("Curvature: SetLayerMaskParams succeeds"), Stack.SetLayerMaskParams(Id, OriginalInstanceId, NewParams));
+
+		const FVertexMaskForgeGeneratorMaskInstance* Mask = Stack.GetLayerMask(Id);
+		TestNotNull(TEXT("Curvature: mask present"), Mask);
+		if (Mask)
+		{
+			TestEqual(TEXT("Curvature: LayerId preserved"), Stack.FindLayerById(Id)->LayerId, Id);
+			TestEqual(TEXT("Curvature: MaskInstanceId preserved"), Mask->MaskInstanceId, OriginalInstanceId);
+			TestTrue(TEXT("Curvature: GeneratorType preserved"), Mask->GeneratorType == EVertexMaskForgeGeneratorType::Curvature);
+			TestTrue(TEXT("Curvature: Params alternative is Curvature"), Mask->Params.IsType<FVertexMaskForgeCurvatureParams>());
+			TestEqual(TEXT("Curvature: Multiplier stored as 2.5"), Mask->Params.Get<FVertexMaskForgeCurvatureParams>().Multiplier, 2.5f);
+		}
+	}
+
+	// Noise.
+	{
+		const FGuid Id = Stack.AddLayer(TEXT("Noise"));
+		Stack.SetLayerMaskGeneratorType(Id, EVertexMaskForgeGeneratorType::Noise);
+		const FGuid OriginalInstanceId = Stack.GetLayerMask(Id)->MaskInstanceId;
+
+		FVertexMaskForgeGeneratorParams NewParams = MakeVertexMaskForgeGeneratorParams(EVertexMaskForgeGeneratorType::Noise);
+		NewParams.Get<FVertexMaskForgeNoiseParams>().Seed = 42;
+
+		TestTrue(TEXT("Noise: SetLayerMaskParams succeeds"), Stack.SetLayerMaskParams(Id, OriginalInstanceId, NewParams));
+
+		const FVertexMaskForgeGeneratorMaskInstance* Mask = Stack.GetLayerMask(Id);
+		TestNotNull(TEXT("Noise: mask present"), Mask);
+		if (Mask)
+		{
+			TestEqual(TEXT("Noise: LayerId preserved"), Stack.FindLayerById(Id)->LayerId, Id);
+			TestEqual(TEXT("Noise: MaskInstanceId preserved"), Mask->MaskInstanceId, OriginalInstanceId);
+			TestTrue(TEXT("Noise: GeneratorType preserved"), Mask->GeneratorType == EVertexMaskForgeGeneratorType::Noise);
+			TestTrue(TEXT("Noise: Params alternative is Noise"), Mask->Params.IsType<FVertexMaskForgeNoiseParams>());
+			TestEqual(TEXT("Noise: Seed stored as 42"), Mask->Params.Get<FVertexMaskForgeNoiseParams>().Seed, 42);
+		}
+	}
+
+	// DirectionalNormal.
+	{
+		const FGuid Id = Stack.AddLayer(TEXT("DirectionalNormal"));
+		Stack.SetLayerMaskGeneratorType(Id, EVertexMaskForgeGeneratorType::DirectionalNormal);
+		const FGuid OriginalInstanceId = Stack.GetLayerMask(Id)->MaskInstanceId;
+
+		FVertexMaskForgeGeneratorParams NewParams = MakeVertexMaskForgeGeneratorParams(EVertexMaskForgeGeneratorType::DirectionalNormal);
+		NewParams.Get<FVertexMaskForgeDirectionalNormalParams>().Angle = 45.0f;
+
+		TestTrue(TEXT("DirectionalNormal: SetLayerMaskParams succeeds"), Stack.SetLayerMaskParams(Id, OriginalInstanceId, NewParams));
+
+		const FVertexMaskForgeGeneratorMaskInstance* Mask = Stack.GetLayerMask(Id);
+		TestNotNull(TEXT("DirectionalNormal: mask present"), Mask);
+		if (Mask)
+		{
+			TestEqual(TEXT("DirectionalNormal: LayerId preserved"), Stack.FindLayerById(Id)->LayerId, Id);
+			TestEqual(TEXT("DirectionalNormal: MaskInstanceId preserved"), Mask->MaskInstanceId, OriginalInstanceId);
+			TestTrue(TEXT("DirectionalNormal: GeneratorType preserved"), Mask->GeneratorType == EVertexMaskForgeGeneratorType::DirectionalNormal);
+			TestTrue(TEXT("DirectionalNormal: Params alternative is DirectionalNormal"), Mask->Params.IsType<FVertexMaskForgeDirectionalNormalParams>());
+			TestEqual(TEXT("DirectionalNormal: Angle stored as 45"), Mask->Params.Get<FVertexMaskForgeDirectionalNormalParams>().Angle, 45.0f);
+		}
+	}
+
+	// Thickness.
+	{
+		const FGuid Id = Stack.AddLayer(TEXT("Thickness"));
+		Stack.SetLayerMaskGeneratorType(Id, EVertexMaskForgeGeneratorType::Thickness);
+		const FGuid OriginalInstanceId = Stack.GetLayerMask(Id)->MaskInstanceId;
+
+		FVertexMaskForgeGeneratorParams NewParams = MakeVertexMaskForgeGeneratorParams(EVertexMaskForgeGeneratorType::Thickness);
+		NewParams.Get<FVertexMaskForgeThicknessParams>().MinThickness = 5.0f;
+
+		TestTrue(TEXT("Thickness: SetLayerMaskParams succeeds"), Stack.SetLayerMaskParams(Id, OriginalInstanceId, NewParams));
+
+		const FVertexMaskForgeGeneratorMaskInstance* Mask = Stack.GetLayerMask(Id);
+		TestNotNull(TEXT("Thickness: mask present"), Mask);
+		if (Mask)
+		{
+			TestEqual(TEXT("Thickness: LayerId preserved"), Stack.FindLayerById(Id)->LayerId, Id);
+			TestEqual(TEXT("Thickness: MaskInstanceId preserved"), Mask->MaskInstanceId, OriginalInstanceId);
+			TestTrue(TEXT("Thickness: GeneratorType preserved"), Mask->GeneratorType == EVertexMaskForgeGeneratorType::Thickness);
+			TestTrue(TEXT("Thickness: Params alternative is Thickness"), Mask->Params.IsType<FVertexMaskForgeThicknessParams>());
+			TestEqual(TEXT("Thickness: MinThickness stored as 5"), Mask->Params.Get<FVertexMaskForgeThicknessParams>().MinThickness, 5.0f);
+		}
+	}
+
+	// MaterialSlot -- also proves value semantics: the caller's own Params variable is mutated AFTER the
+	// call returns; the stack's stored value (already copied at the call boundary) must be unaffected.
+	{
+		const FGuid Id = Stack.AddLayer(TEXT("MaterialSlot"));
+		Stack.SetLayerMaskGeneratorType(Id, EVertexMaskForgeGeneratorType::MaterialSlot);
+		const FGuid OriginalInstanceId = Stack.GetLayerMask(Id)->MaskInstanceId;
+
+		FVertexMaskForgeGeneratorParams CallerParams = MakeVertexMaskForgeGeneratorParams(EVertexMaskForgeGeneratorType::MaterialSlot);
+		CallerParams.Get<FVertexMaskForgeMaterialSlotParams>().SelectedSlotIndex = 3;
+
+		TestTrue(TEXT("MaterialSlot: SetLayerMaskParams succeeds"), Stack.SetLayerMaskParams(Id, OriginalInstanceId, CallerParams));
+
+		CallerParams.Get<FVertexMaskForgeMaterialSlotParams>().SelectedSlotIndex = 99;
+
+		const FVertexMaskForgeGeneratorMaskInstance* Mask = Stack.GetLayerMask(Id);
+		TestNotNull(TEXT("MaterialSlot: mask present"), Mask);
+		if (Mask)
+		{
+			TestEqual(TEXT("MaterialSlot: LayerId preserved"), Stack.FindLayerById(Id)->LayerId, Id);
+			TestEqual(TEXT("MaterialSlot: MaskInstanceId preserved"), Mask->MaskInstanceId, OriginalInstanceId);
+			TestTrue(TEXT("MaterialSlot: GeneratorType preserved"), Mask->GeneratorType == EVertexMaskForgeGeneratorType::MaterialSlot);
+			TestTrue(TEXT("MaterialSlot: Params alternative is MaterialSlot"), Mask->Params.IsType<FVertexMaskForgeMaterialSlotParams>());
+			TestEqual(TEXT("MaterialSlot: SelectedSlotIndex stored as 3, unaffected by caller's later mutation to 99"), Mask->Params.Get<FVertexMaskForgeMaterialSlotParams>().SelectedSlotIndex, 3);
+		}
+	}
+
+	TestEqual(TEXT("Seven independent layers created"), Stack.Num(), 7);
+
+	return true;
+}
+
+// 24. SetParamsFailsForUnknownLayerId.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeGeneratorMaskInstanceSetParamsUnknownLayerTest, "VertexMaskForge.GeneratorMaskInstance.SetParamsFailsForUnknownLayerId", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeGeneratorMaskInstanceSetParamsUnknownLayerTest::RunTest(const FString& Parameters)
+{
+	FVertexMaskForgeDynamicLayerStack Stack;
+	const FGuid Real = Stack.AddLayer(TEXT("Real"));
+	Stack.SetLayerMaskGeneratorType(Real, EVertexMaskForgeGeneratorType::Curvature);
+	const FGuid RealInstanceId = Stack.GetLayerMask(Real)->MaskInstanceId;
+
+	const FGuid Unknown = FGuid::NewGuid();
+	const FVertexMaskForgeGeneratorParams NewParams = MakeVertexMaskForgeGeneratorParams(EVertexMaskForgeGeneratorType::Curvature);
+
+	TestFalse(TEXT("Unknown LayerId is rejected"), Stack.SetLayerMaskParams(Unknown, FGuid::NewGuid(), NewParams));
+
+	TestEqual(TEXT("Stack size unchanged"), Stack.Num(), 1);
+	const FVertexMaskForgeGeneratorMaskInstance* Mask = Stack.GetLayerMask(Real);
+	TestNotNull(TEXT("Real layer's mask still present"), Mask);
+	if (Mask)
+	{
+		TestEqual(TEXT("Real layer's MaskInstanceId unaffected"), Mask->MaskInstanceId, RealInstanceId);
+	}
+
+	return true;
+}
+
+// 25. SetParamsFailsWhenLayerHasNoMaskIncludingBaseLayer.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeGeneratorMaskInstanceSetParamsNoMaskTest, "VertexMaskForge.GeneratorMaskInstance.SetParamsFailsWhenLayerHasNoMaskIncludingBaseLayer", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeGeneratorMaskInstanceSetParamsNoMaskTest::RunTest(const FString& Parameters)
+{
+	const FVertexMaskForgeGeneratorParams NewParams = MakeVertexMaskForgeGeneratorParams(EVertexMaskForgeGeneratorType::Curvature);
+	const FGuid SomeValidGuid = FGuid::NewGuid();
+
+	// A. Ordinary layer, no mask.
+	{
+		FVertexMaskForgeDynamicLayerStack Stack;
+		const FGuid Id = Stack.AddLayer(TEXT("Layer"));
+		TestNull(TEXT("A: layer starts with no mask"), Stack.GetLayerMask(Id));
+
+		TestFalse(TEXT("A: SetLayerMaskParams fails on a maskless layer"), Stack.SetLayerMaskParams(Id, SomeValidGuid, NewParams));
+
+		TestNull(TEXT("A: layer still has no mask"), Stack.GetLayerMask(Id));
+		TestNotNull(TEXT("A: layer itself still exists"), Stack.FindLayerById(Id));
+		TestTrue(TEXT("A: stack remains valid"), Stack.IsValid());
+	}
+
+	// B. Base Layer, no mask.
+	{
+		FVertexMaskForgeDynamicLayerStack Stack = FVertexMaskForgeDynamicLayerStack::MakeInitialStack();
+		const FGuid BaseLayerId = Stack.GetLayers()[0].LayerId;
+		TestNull(TEXT("B: Base Layer starts with no mask"), Stack.GetLayerMask(BaseLayerId));
+
+		TestFalse(TEXT("B: SetLayerMaskParams fails on the maskless Base Layer"), Stack.SetLayerMaskParams(BaseLayerId, SomeValidGuid, NewParams));
+
+		TestNull(TEXT("B: Base Layer still has no mask"), Stack.GetLayerMask(BaseLayerId));
+		TestNotNull(TEXT("B: Base Layer itself still exists"), Stack.FindLayerById(BaseLayerId));
+		TestEqual(TEXT("B: still exactly one layer"), Stack.Num(), 1);
+		TestTrue(TEXT("B: stack remains valid"), Stack.IsValid());
+	}
+
+	return true;
+}
+
+// 26. SetParamsFailsOnInvalidOrMismatchedExpectedMaskInstanceId.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeGeneratorMaskInstanceSetParamsBadExpectedIdTest, "VertexMaskForge.GeneratorMaskInstance.SetParamsFailsOnInvalidOrMismatchedExpectedMaskInstanceId", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeGeneratorMaskInstanceSetParamsBadExpectedIdTest::RunTest(const FString& Parameters)
+{
+	FVertexMaskForgeDynamicLayerStack Stack;
+	const FGuid Id = Stack.AddLayer(TEXT("Layer"));
+	Stack.SetLayerMaskGeneratorType(Id, EVertexMaskForgeGeneratorType::Curvature);
+
+	const FVertexMaskForgeGeneratorMaskInstance* Before = Stack.GetLayerMask(Id);
+	TestNotNull(TEXT("Mask present before"), Before);
+	if (!Before)
+	{
+		return false;
+	}
+	const FGuid RealInstanceId = Before->MaskInstanceId;
+	const float OriginalMultiplier = Before->Params.Get<FVertexMaskForgeCurvatureParams>().Multiplier;
+
+	FVertexMaskForgeGeneratorParams NewParams = MakeVertexMaskForgeGeneratorParams(EVertexMaskForgeGeneratorType::Curvature);
+	NewParams.Get<FVertexMaskForgeCurvatureParams>().Multiplier = 9.0f;
+
+	// A. Default/invalid FGuid.
+	TestFalse(TEXT("A: default FGuid is rejected"), Stack.SetLayerMaskParams(Id, FGuid(), NewParams));
+
+	const FVertexMaskForgeGeneratorMaskInstance* AfterA = Stack.GetLayerMask(Id);
+	TestNotNull(TEXT("A: mask still present"), AfterA);
+	if (AfterA)
+	{
+		TestEqual(TEXT("A: MaskInstanceId unchanged"), AfterA->MaskInstanceId, RealInstanceId);
+		TestTrue(TEXT("A: GeneratorType unchanged"), AfterA->GeneratorType == EVertexMaskForgeGeneratorType::Curvature);
+		TestTrue(TEXT("A: Params alternative unchanged"), AfterA->Params.IsType<FVertexMaskForgeCurvatureParams>());
+		TestEqual(TEXT("A: Multiplier unchanged"), AfterA->Params.Get<FVertexMaskForgeCurvatureParams>().Multiplier, OriginalMultiplier);
+	}
+
+	// B. Valid but wrong FGuid.
+	const FGuid WrongButValid = FGuid::NewGuid();
+	TestFalse(TEXT("B: valid-but-wrong FGuid is rejected"), Stack.SetLayerMaskParams(Id, WrongButValid, NewParams));
+
+	const FVertexMaskForgeGeneratorMaskInstance* AfterB = Stack.GetLayerMask(Id);
+	TestNotNull(TEXT("B: mask still present"), AfterB);
+	if (AfterB)
+	{
+		TestEqual(TEXT("B: MaskInstanceId unchanged"), AfterB->MaskInstanceId, RealInstanceId);
+		TestTrue(TEXT("B: GeneratorType unchanged"), AfterB->GeneratorType == EVertexMaskForgeGeneratorType::Curvature);
+		TestTrue(TEXT("B: Params alternative unchanged"), AfterB->Params.IsType<FVertexMaskForgeCurvatureParams>());
+		TestEqual(TEXT("B: Multiplier unchanged"), AfterB->Params.Get<FVertexMaskForgeCurvatureParams>().Multiplier, OriginalMultiplier);
+	}
+
+	return true;
+}
+
+// 27. SetParamsFailsOnParamsTypeMismatch.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeGeneratorMaskInstanceSetParamsTypeMismatchTest, "VertexMaskForge.GeneratorMaskInstance.SetParamsFailsOnParamsTypeMismatch", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeGeneratorMaskInstanceSetParamsTypeMismatchTest::RunTest(const FString& Parameters)
+{
+	FVertexMaskForgeDynamicLayerStack Stack;
+	const FGuid Id = Stack.AddLayer(TEXT("Layer"));
+	Stack.SetLayerMaskGeneratorType(Id, EVertexMaskForgeGeneratorType::Curvature);
+
+	const FVertexMaskForgeGeneratorMaskInstance* Before = Stack.GetLayerMask(Id);
+	TestNotNull(TEXT("Mask present before"), Before);
+	if (!Before)
+	{
+		return false;
+	}
+	const FGuid InstanceId = Before->MaskInstanceId;
+	const float OriginalMultiplier = Before->Params.Get<FVertexMaskForgeCurvatureParams>().Multiplier;
+
+	const FVertexMaskForgeGeneratorParams MismatchedParams = MakeVertexMaskForgeGeneratorParams(EVertexMaskForgeGeneratorType::MaterialSlot);
+
+	TestFalse(TEXT("Mismatched Params alternative is rejected"), Stack.SetLayerMaskParams(Id, InstanceId, MismatchedParams));
+
+	const FVertexMaskForgeGeneratorMaskInstance* After = Stack.GetLayerMask(Id);
+	TestNotNull(TEXT("Mask still present"), After);
+	if (After)
+	{
+		TestEqual(TEXT("MaskInstanceId unchanged"), After->MaskInstanceId, InstanceId);
+		TestTrue(TEXT("GeneratorType still Curvature"), After->GeneratorType == EVertexMaskForgeGeneratorType::Curvature);
+		TestTrue(TEXT("Params still the Curvature alternative"), After->Params.IsType<FVertexMaskForgeCurvatureParams>());
+		TestEqual(TEXT("Curvature values unchanged"), After->Params.Get<FVertexMaskForgeCurvatureParams>().Multiplier, OriginalMultiplier);
+	}
+
+	return true;
+}
+
+// 28. SetParamsOnBaseLayerBehavesLikeAnyOtherLayer.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeGeneratorMaskInstanceSetParamsBaseLayerTest, "VertexMaskForge.GeneratorMaskInstance.SetParamsOnBaseLayerBehavesLikeAnyOtherLayer", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeGeneratorMaskInstanceSetParamsBaseLayerTest::RunTest(const FString& Parameters)
+{
+	FVertexMaskForgeDynamicLayerStack Stack = FVertexMaskForgeDynamicLayerStack::MakeInitialStack();
+	const FGuid BaseLayerId = Stack.GetLayers()[0].LayerId;
+
+	TestTrue(TEXT("Base Layer can receive a mask"), Stack.SetLayerMaskGeneratorType(BaseLayerId, EVertexMaskForgeGeneratorType::Thickness));
+	const FGuid InstanceId = Stack.GetLayerMask(BaseLayerId)->MaskInstanceId;
+
+	FVertexMaskForgeGeneratorParams NewParams = MakeVertexMaskForgeGeneratorParams(EVertexMaskForgeGeneratorType::Thickness);
+	NewParams.Get<FVertexMaskForgeThicknessParams>().MinThickness = 7.5f;
+
+	TestTrue(TEXT("SetLayerMaskParams succeeds on the Base Layer"), Stack.SetLayerMaskParams(BaseLayerId, InstanceId, NewParams));
+
+	const FVertexMaskForgeGeneratorMaskInstance* Mask = Stack.GetLayerMask(BaseLayerId);
+	TestNotNull(TEXT("Base Layer mask present"), Mask);
+	if (Mask)
+	{
+		TestEqual(TEXT("MaskInstanceId preserved"), Mask->MaskInstanceId, InstanceId);
+		TestTrue(TEXT("GeneratorType preserved"), Mask->GeneratorType == EVertexMaskForgeGeneratorType::Thickness);
+		TestEqual(TEXT("MinThickness stored as 7.5"), Mask->Params.Get<FVertexMaskForgeThicknessParams>().MinThickness, 7.5f);
+	}
+
+	TestEqual(TEXT("Still exactly one layer"), Stack.Num(), 1);
+	TestEqual(TEXT("Base Layer is still the same layer"), Stack.GetLayers()[0].LayerId, BaseLayerId);
+
+	return true;
+}
+
+// 29. SetParamsWithIdenticalValueIsHarmlessSuccess.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeGeneratorMaskInstanceSetParamsIdenticalTest, "VertexMaskForge.GeneratorMaskInstance.SetParamsWithIdenticalValueIsHarmlessSuccess", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeGeneratorMaskInstanceSetParamsIdenticalTest::RunTest(const FString& Parameters)
+{
+	FVertexMaskForgeDynamicLayerStack Stack;
+	const FGuid Id = Stack.AddLayer(TEXT("Layer"));
+	Stack.SetLayerMaskGeneratorType(Id, EVertexMaskForgeGeneratorType::Noise);
+
+	const FVertexMaskForgeGeneratorMaskInstance* Before = Stack.GetLayerMask(Id);
+	TestNotNull(TEXT("Mask present before"), Before);
+	if (!Before)
+	{
+		return false;
+	}
+	const FGuid InstanceId = Before->MaskInstanceId;
+	const FVertexMaskForgeGeneratorParams IdenticalCopy = Before->Params; // Copy-by-value of the currently stored Params.
+	const int32 OriginalSeed = Before->Params.Get<FVertexMaskForgeNoiseParams>().Seed;
+
+	TestTrue(TEXT("Submitting an identical copy still succeeds"), Stack.SetLayerMaskParams(Id, InstanceId, IdenticalCopy));
+
+	const FVertexMaskForgeGeneratorMaskInstance* After = Stack.GetLayerMask(Id);
+	TestNotNull(TEXT("Mask still present"), After);
+	if (After)
+	{
+		TestEqual(TEXT("MaskInstanceId preserved"), After->MaskInstanceId, InstanceId);
+		TestTrue(TEXT("GeneratorType preserved"), After->GeneratorType == EVertexMaskForgeGeneratorType::Noise);
+		TestTrue(TEXT("Params alternative preserved"), After->Params.IsType<FVertexMaskForgeNoiseParams>());
+		TestEqual(TEXT("Seed value unchanged"), After->Params.Get<FVertexMaskForgeNoiseParams>().Seed, OriginalSeed);
+	}
+
+	return true;
+}
+
+// 30. StaleExpectedMaskInstanceIdAfterReplacementFailsWithoutMutatingNewInstance -- the ABA/stale-callback
+// hazard SetLayerMaskParams' own doc comment describes.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeGeneratorMaskInstanceSetParamsStaleAbaTest, "VertexMaskForge.GeneratorMaskInstance.StaleExpectedMaskInstanceIdAfterReplacementFailsWithoutMutatingNewInstance", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeGeneratorMaskInstanceSetParamsStaleAbaTest::RunTest(const FString& Parameters)
+{
+	FVertexMaskForgeDynamicLayerStack Stack;
+	const FGuid Id = Stack.AddLayer(TEXT("Layer"));
+
+	// 1-2. Create instance A, capture its MaskInstanceId.
+	Stack.SetLayerMaskGeneratorType(Id, EVertexMaskForgeGeneratorType::Curvature);
+	const FGuid StaleInstanceIdOfA = Stack.GetLayerMask(Id)->MaskInstanceId;
+
+	// 3. Replace A with B, a different GeneratorType.
+	TestTrue(TEXT("Replace with a different type"), Stack.SetLayerMaskGeneratorType(Id, EVertexMaskForgeGeneratorType::Thickness));
+
+	// 4. Capture B's full observable state.
+	const FVertexMaskForgeGeneratorMaskInstance* BBefore = Stack.GetLayerMask(Id);
+	TestNotNull(TEXT("B present"), BBefore);
+	if (!BBefore)
+	{
+		return false;
+	}
+	const FGuid InstanceIdOfB = BBefore->MaskInstanceId;
+	const float OriginalMinThicknessOfB = BBefore->Params.Get<FVertexMaskForgeThicknessParams>().MinThickness;
+	TestNotEqual(TEXT("A and B have distinct identities"), InstanceIdOfB, StaleInstanceIdOfA);
+
+	// 5. Attempt to apply Params using A's stale MaskInstanceId.
+	FVertexMaskForgeGeneratorParams StaleParams = MakeVertexMaskForgeGeneratorParams(EVertexMaskForgeGeneratorType::Thickness);
+	StaleParams.Get<FVertexMaskForgeThicknessParams>().MinThickness = 123.0f;
+
+	TestFalse(TEXT("Stale ExpectedMaskInstanceId (A's) is rejected against B"), Stack.SetLayerMaskParams(Id, StaleInstanceIdOfA, StaleParams));
+
+	const FVertexMaskForgeGeneratorMaskInstance* BAfter = Stack.GetLayerMask(Id);
+	TestNotNull(TEXT("B still present"), BAfter);
+	if (BAfter)
+	{
+		TestEqual(TEXT("B's MaskInstanceId preserved"), BAfter->MaskInstanceId, InstanceIdOfB);
+		TestTrue(TEXT("B's GeneratorType preserved"), BAfter->GeneratorType == EVertexMaskForgeGeneratorType::Thickness);
+		TestTrue(TEXT("B's Params alternative preserved"), BAfter->Params.IsType<FVertexMaskForgeThicknessParams>());
+		TestEqual(TEXT("B's Params values preserved"), BAfter->Params.Get<FVertexMaskForgeThicknessParams>().MinThickness, OriginalMinThicknessOfB);
+	}
+	TestEqual(TEXT("LayerId unchanged throughout"), Stack.FindLayerById(Id)->LayerId, Id);
+
+	return true;
+}
+
+// 31. SetParamsOnOneLayerDoesNotAffectSiblingOrCopiedStack.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeGeneratorMaskInstanceSetParamsSiblingCopyTest, "VertexMaskForge.GeneratorMaskInstance.SetParamsOnOneLayerDoesNotAffectSiblingOrCopiedStack", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeGeneratorMaskInstanceSetParamsSiblingCopyTest::RunTest(const FString& Parameters)
+{
+	FVertexMaskForgeDynamicLayerStack Stack;
+	const FGuid A = Stack.AddLayer(TEXT("A"));
+	const FGuid B = Stack.AddLayer(TEXT("B"));
+	Stack.SetLayerMaskGeneratorType(A, EVertexMaskForgeGeneratorType::Curvature);
+	Stack.SetLayerMaskGeneratorType(B, EVertexMaskForgeGeneratorType::Noise);
+
+	const FGuid InstanceIdA = Stack.GetLayerMask(A)->MaskInstanceId;
+	const FGuid InstanceIdB = Stack.GetLayerMask(B)->MaskInstanceId;
+	const int32 OriginalSeedB = Stack.GetLayerMask(B)->Params.Get<FVertexMaskForgeNoiseParams>().Seed;
+
+	// Copy the stack by value BEFORE the mutation.
+	const FVertexMaskForgeDynamicLayerStack StackCopy = Stack;
+
+	FVertexMaskForgeGeneratorParams NewParamsA = MakeVertexMaskForgeGeneratorParams(EVertexMaskForgeGeneratorType::Curvature);
+	NewParamsA.Get<FVertexMaskForgeCurvatureParams>().Multiplier = 8.0f;
+
+	TestTrue(TEXT("Mutate A's Params in the original stack"), Stack.SetLayerMaskParams(A, InstanceIdA, NewParamsA));
+
+	// A changed only in Params.
+	const FVertexMaskForgeGeneratorMaskInstance* MaskA = Stack.GetLayerMask(A);
+	TestNotNull(TEXT("A's mask present"), MaskA);
+	if (MaskA)
+	{
+		TestEqual(TEXT("A's MaskInstanceId preserved"), MaskA->MaskInstanceId, InstanceIdA);
+		TestTrue(TEXT("A's GeneratorType preserved"), MaskA->GeneratorType == EVertexMaskForgeGeneratorType::Curvature);
+		TestEqual(TEXT("A's Multiplier updated"), MaskA->Params.Get<FVertexMaskForgeCurvatureParams>().Multiplier, 8.0f);
+	}
+
+	// Sibling B fully unaffected.
+	const FVertexMaskForgeGeneratorMaskInstance* MaskB = Stack.GetLayerMask(B);
+	TestNotNull(TEXT("B's mask present"), MaskB);
+	if (MaskB)
+	{
+		TestEqual(TEXT("B's MaskInstanceId unaffected"), MaskB->MaskInstanceId, InstanceIdB);
+		TestTrue(TEXT("B's GeneratorType unaffected"), MaskB->GeneratorType == EVertexMaskForgeGeneratorType::Noise);
+		TestEqual(TEXT("B's Seed unaffected"), MaskB->Params.Get<FVertexMaskForgeNoiseParams>().Seed, OriginalSeedB);
+	}
+
+	// Order and count unaffected.
+	TestEqual(TEXT("Still two layers"), Stack.Num(), 2);
+	TestEqual(TEXT("A still first"), Stack.GetLayers()[0].LayerId, A);
+	TestEqual(TEXT("B still second"), Stack.GetLayers()[1].LayerId, B);
+
+	// The earlier copy of the whole stack remains fully isolated from the mutation.
+	const FVertexMaskForgeGeneratorMaskInstance* CopyMaskA = StackCopy.GetLayerMask(A);
+	TestNotNull(TEXT("Copy: A's mask present"), CopyMaskA);
+	if (CopyMaskA)
+	{
+		TestEqual(TEXT("Copy: A's MaskInstanceId matches original pre-mutation id"), CopyMaskA->MaskInstanceId, InstanceIdA);
+		TestNotEqual(TEXT("Copy: A's Multiplier did NOT receive the later mutation"), CopyMaskA->Params.Get<FVertexMaskForgeCurvatureParams>().Multiplier, 8.0f);
+	}
+
+	return true;
+}
+
 #endif // WITH_DEV_AUTOMATION_TESTS
