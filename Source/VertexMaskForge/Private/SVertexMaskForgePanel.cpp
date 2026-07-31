@@ -51,6 +51,7 @@
 #include "VertexMaskForgeWorkingStateOwner.h"
 #include "SPrimaryButton.h"
 #include "Styling/CoreStyle.h"
+#include "Styling/StyleColors.h"
 #include "Widgets/Input/SButton.h"
 #include "Widgets/Input/SCheckBox.h"
 #include "Widgets/Input/SComboBox.h"
@@ -1013,6 +1014,27 @@ namespace VertexMaskForgePanel
 		}
 	}
 
+	/**
+	 * M16-K.4: human-readable label for one EVertexMaskForgeLayerFill value, used only by the Dynamic
+	 * Layers list's own Fill combo (see SVertexMaskForgePanel::BuildDynamicLayerRow). Mirrors
+	 * GetBlendModeLabel's own shape -- explicit switch, no numeric/contiguity assumption. None/Black/
+	 * White are the only three real enumerators; there is no procedural/textured Fill in this checkpoint.
+	 */
+	static FText GetDynamicLayerFillLabel(const EVertexMaskForgeLayerFill Fill)
+	{
+		switch (Fill)
+		{
+		case EVertexMaskForgeLayerFill::None:
+			return LOCTEXT("DynamicLayerFillNone", "None");
+		case EVertexMaskForgeLayerFill::Black:
+			return LOCTEXT("DynamicLayerFillBlack", "Black");
+		case EVertexMaskForgeLayerFill::White:
+			return LOCTEXT("DynamicLayerFillWhite", "White");
+		default:
+			return FText::GetEmpty();
+		}
+	}
+
 	static FText GetCurvatureTypeLabel(const EVertexMaskForgeCurvatureType Type)
 	{
 		switch (Type)
@@ -1025,6 +1047,43 @@ namespace VertexMaskForgePanel
 			return LOCTEXT("CurvatureTypeBoth", "Both");
 		default:
 			return FText::GetEmpty();
+		}
+	}
+
+	/**
+	 * M16-K.3: stable, human-readable name for one generator layer identity, used only by the Layers
+	 * list's own rows (see SVertexMaskForgePanel::BuildGeneratorLayerRow). Explicit mapping, one case
+	 * per generator -- never derived from the enum's own numeric value or declaration order. Matches
+	 * each generator's own existing section title verbatim (BBoxMaskSectionTitle/AOSectionTitle/
+	 * CurvatureSectionTitle/NoiseSectionTitle/MaterialSlotMaskSectionTitle/
+	 * DirectionalNormalMaskSectionTitle/ThicknessMaskSectionTitle) so the same generator is never named
+	 * two different ways in the same panel. ConstantWhite/ConstantBlack (Fill overrides, not generators)
+	 * and any unknown/cast-invalid value fall to the diagnosed default -- never a silent empty row (see
+	 * VertexMaskForgeLayerOrder::IsGeneratorLayer's own allowlist, which this switch mirrors).
+	 */
+	static FText GetGeneratorLayerDisplayName(const EVertexMaskForgeScalarMaskSource Source)
+	{
+		switch (Source)
+		{
+		case EVertexMaskForgeScalarMaskSource::BoundingBox:
+			return LOCTEXT("LayerRowBoundingBox", "Bounding Box");
+		case EVertexMaskForgeScalarMaskSource::AmbientOcclusion:
+			return LOCTEXT("LayerRowAmbientOcclusion", "Ambient Occlusion");
+		case EVertexMaskForgeScalarMaskSource::Curvature:
+			return LOCTEXT("LayerRowCurvature", "Curvature");
+		case EVertexMaskForgeScalarMaskSource::Noise:
+			return LOCTEXT("LayerRowNoise", "Noise");
+		case EVertexMaskForgeScalarMaskSource::MaterialSlot:
+			return LOCTEXT("LayerRowMaterialSlot", "Material Slot");
+		case EVertexMaskForgeScalarMaskSource::DirectionalNormal:
+			return LOCTEXT("LayerRowDirectionalNormal", "Directional Normal");
+		case EVertexMaskForgeScalarMaskSource::Thickness:
+			return LOCTEXT("LayerRowThickness", "Thickness");
+		default:
+			UE_LOG(LogVertexMaskForge, Warning,
+				TEXT("Vertex Mask Forge: GetGeneratorLayerDisplayName received a non-generator Source (%d) -- this should never happen for a row built from GeneratorLayerOrder."),
+				static_cast<int32>(Source));
+			return LOCTEXT("LayerRowUnknown", "<Unknown Layer>");
 		}
 	}
 
@@ -2223,6 +2282,15 @@ TSharedRef<SWidget> SVertexMaskForgePanel::OnGenerateBlendModeRow(TSharedPtr<EVe
 		.Text(InOption.IsValid() ? VertexMaskForgePanel::GetBlendModeLabel(*InOption) : FText::GetEmpty());
 }
 
+// AUDITED (M16-K.4): shared dropdown-row generator for every Dynamic Layer's Fill combo -- generic over
+// TSharedPtr<EVertexMaskForgeLayerFill> only, no per-row state, exactly mirroring OnGenerateBlendModeRow's
+// own shape (which the seven existing generator BlendMode combos already all share as a single method).
+TSharedRef<SWidget> SVertexMaskForgePanel::OnGenerateDynamicLayerFillRow(TSharedPtr<EVertexMaskForgeLayerFill> InOption) const
+{
+	return SNew(STextBlock)
+		.Text(InOption.IsValid() ? VertexMaskForgePanel::GetDynamicLayerFillLabel(*InOption) : FText::GetEmpty());
+}
+
 void SVertexMaskForgePanel::OnBlendModeSelectionChanged(TSharedPtr<EVertexMaskForgeBlendMode> NewSelection, ESelectInfo::Type SelectInfo)
 {
 	if (!NewSelection.IsValid())
@@ -3289,6 +3357,559 @@ FText SVertexMaskForgePanel::GetActiveMaskSourceText() const
 		FText::FromString(FString::Join(LayerStrings, TEXT(" + "))));
 }
 
+void SVertexMaskForgePanel::RebuildGeneratorLayerList()
+{
+	if (!GeneratorLayerListContainer.IsValid())
+	{
+		return;
+	}
+
+	// AUDITED (M16-K.3): view refresh only -- clears and re-adds ROW WIDGETS, never touches
+	// GeneratorLayerOrder itself (read here, never written). Walking GeneratorLayerOrder directly (not
+	// any cached/parallel copy) is what guarantees the visible list can never drift from the one real
+	// order the production composition path also reads.
+	GeneratorLayerListContainer->ClearChildren();
+	for (const EVertexMaskForgeScalarMaskSource Source : GeneratorLayerOrder)
+	{
+		GeneratorLayerListContainer->AddSlot()
+			.AutoHeight()
+			.Padding(FMargin(0.f, 1.f))
+			[
+				BuildGeneratorLayerRow(Source)
+			];
+	}
+}
+
+TSharedRef<SWidget> SVertexMaskForgePanel::BuildGeneratorLayerRow(const EVertexMaskForgeScalarMaskSource Source)
+{
+	// AUDITED (M16-K.3): this row shows identity + reorder controls ONLY -- Enabled/Blend Mode/Opacity/
+	// Invert/generator-specific parameters remain exclusively in this generator's own existing section
+	// further down the panel (unchanged by this checkpoint). Source is captured by value in both
+	// lambdas below; CanMoveGeneratorLayerUp/Down and OnMoveGeneratorLayerUp/Down each resolve Source's
+	// CURRENT position fresh, every call -- never a position/index captured once here at row-build time,
+	// which would go stale the moment any reorder happens.
+	return SNew(SHorizontalBox)
+
+	+ SHorizontalBox::Slot()
+	.FillWidth(1.f)
+	.VAlign(VAlign_Center)
+	[
+		SNew(STextBlock)
+		.Text(VertexMaskForgePanel::GetGeneratorLayerDisplayName(Source))
+	]
+
+	+ SHorizontalBox::Slot()
+	.AutoWidth()
+	.VAlign(VAlign_Center)
+	.Padding(FMargin(4.f, 0.f, 0.f, 0.f))
+	[
+		SNew(SButton)
+		.ContentPadding(FMargin(8.f, 1.f))
+		.ToolTipText(LOCTEXT("MoveLayerUpTooltip", "Move this layer one position earlier in the composition order."))
+		.Text(LOCTEXT("MoveLayerUp", "Up"))
+		.IsEnabled_Lambda([this, Source]() { return CanMoveGeneratorLayerUp(Source); })
+		.OnClicked(FOnClicked::CreateLambda([this, Source]() { return OnMoveGeneratorLayerUp(Source); }))
+	]
+
+	+ SHorizontalBox::Slot()
+	.AutoWidth()
+	.VAlign(VAlign_Center)
+	.Padding(FMargin(2.f, 0.f, 0.f, 0.f))
+	[
+		SNew(SButton)
+		.ContentPadding(FMargin(8.f, 1.f))
+		.ToolTipText(LOCTEXT("MoveLayerDownTooltip", "Move this layer one position later in the composition order."))
+		.Text(LOCTEXT("MoveLayerDown", "Down"))
+		.IsEnabled_Lambda([this, Source]() { return CanMoveGeneratorLayerDown(Source); })
+		.OnClicked(FOnClicked::CreateLambda([this, Source]() { return OnMoveGeneratorLayerDown(Source); }))
+	];
+}
+
+bool SVertexMaskForgePanel::CanMoveGeneratorLayerUp(const EVertexMaskForgeScalarMaskSource Source) const
+{
+	if (!VertexMaskForgeLayerOrder::IsGeneratorLayer(Source))
+	{
+		return false;
+	}
+	const int32 CurrentIndex = GeneratorLayerOrder.IndexOfByKey(Source);
+	return CurrentIndex != INDEX_NONE && CurrentIndex > 0;
+}
+
+bool SVertexMaskForgePanel::CanMoveGeneratorLayerDown(const EVertexMaskForgeScalarMaskSource Source) const
+{
+	if (!VertexMaskForgeLayerOrder::IsGeneratorLayer(Source))
+	{
+		return false;
+	}
+	const int32 CurrentIndex = GeneratorLayerOrder.IndexOfByKey(Source);
+	return CurrentIndex != INDEX_NONE && CurrentIndex < GeneratorLayerOrder.Num() - 1;
+}
+
+FReply SVertexMaskForgePanel::OnMoveGeneratorLayerUp(const EVertexMaskForgeScalarMaskSource Source)
+{
+	// AUDITED (M16-K.3): the K.1 domain (VertexMaskForgeLayerOrder::MoveUp) is authoritative for the
+	// actual movement -- no Swap/RemoveAt/Insert/Sort/enum arithmetic here. On a boundary/invalid no-op
+	// (returns false), GeneratorLayerOrder is guaranteed untouched by MoveUp's own contract, so this
+	// function does nothing further -- no rebuild, no recomposition -- matching a click that had no
+	// real effect.
+	if (!VertexMaskForgeLayerOrder::MoveUp(GeneratorLayerOrder, Source))
+	{
+		return FReply::Handled();
+	}
+
+	// AUDITED (M16-K.3): exactly one visual rebuild and one recomposition request per successful move --
+	// RecomposeWorkingColors() is pure composition (UpdateAllPreviews(false)), never invalidates a raw
+	// mask, never rebuilds Working Mesh, never calls RefreshSelection.
+	RebuildGeneratorLayerList();
+	RecomposeWorkingColors();
+	return FReply::Handled();
+}
+
+FReply SVertexMaskForgePanel::OnMoveGeneratorLayerDown(const EVertexMaskForgeScalarMaskSource Source)
+{
+	if (!VertexMaskForgeLayerOrder::MoveDown(GeneratorLayerOrder, Source))
+	{
+		return FReply::Handled();
+	}
+
+	RebuildGeneratorLayerList();
+	RecomposeWorkingColors();
+	return FReply::Handled();
+}
+
+// ==================================================================================================
+// M16-K.4: Dynamic Layers UI Prototype -- domain-only, deliberately disconnected from composition/
+// preview. Every function below reads/writes ONLY DynamicLayerStack (via its own controlled, GUID-based
+// mutation API); none of them call RecomposeWorkingColors, UpdateAllPreviews, invalidate any generator
+// mask/cache, touch GeneratorLayerOrder, or call VertexMaskForgeDynamicLayerEvaluator. Structural changes
+// (Add/Remove/Move) rebuild the row list; property changes (Enabled/Fill/BlendMode/Opacity/Channel
+// Filter/Rename) mutate the stack only -- each control's own displayed value is bound live to the stack
+// via a _Lambda accessor, so no rebuild is needed and no widget holds a duplicate copy of the data.
+// ==================================================================================================
+
+void SVertexMaskForgePanel::RebuildDynamicLayersList()
+{
+	if (!DynamicLayersListContainer.IsValid())
+	{
+		return;
+	}
+
+	// View refresh only -- clears and re-adds ROW WIDGETS, never touches DynamicLayerStack itself (read
+	// here, never written). Walking DynamicLayerStack.GetLayers() directly (never a cached/parallel copy)
+	// is what guarantees the visible list can never drift from the stack's own real order.
+	DynamicLayersListContainer->ClearChildren();
+
+	if (DynamicLayerStack.IsEmpty())
+	{
+		DynamicLayersListContainer->AddSlot()
+			.AutoHeight()
+			.Padding(FMargin(2.f))
+			[
+				SNew(STextBlock)
+				.Text(LOCTEXT("NoDynamicLayers", "No dynamic layers"))
+				.ColorAndOpacity(FSlateColor::UseSubduedForeground())
+			];
+		return;
+	}
+
+	for (const FVertexMaskForgeLayer& Layer : DynamicLayerStack.GetLayers())
+	{
+		// AUDITED: LayerId captured BY VALUE into BuildDynamicLayerRow's own row-building lambdas below --
+		// never a pointer/reference into this Layer (which may be relocated or destroyed by any later
+		// Add/Remove/Move, all of which may reallocate DynamicLayerStack's internal TArray).
+		DynamicLayersListContainer->AddSlot()
+			.AutoHeight()
+			.Padding(FMargin(0.f, 2.f))
+			[
+				BuildDynamicLayerRow(Layer.LayerId)
+			];
+	}
+}
+
+TSharedRef<SWidget> SVertexMaskForgePanel::BuildDynamicLayerRow(const FGuid LayerId)
+{
+	// AUDITED: every accessor below resolves LayerId fresh via DynamicLayerStack.FindLayerById on every
+	// call -- never a captured pointer/reference/index. A defensive nullptr guard is used throughout even
+	// though a row is only ever built for a LayerId RebuildDynamicLayersList just confirmed present --
+	// this is what makes a hypothetical late-firing callback for an already-removed layer safe (the
+	// stack's own SetLayer*/RenameLayer already return false/no-op for an unknown id; these UI-side
+	// guards additionally prevent dereferencing a null Find result when reading, not just when writing).
+	return SNew(SBorder)
+	.Padding(FMargin(4.f))
+	// AUDITED (M16-K.4B root-cause fix): SBorder's DEFAULT BorderImage (used when none is specified,
+	// which is what M16-K.4A shipped) is FCoreStyle's "Border" brush -- FSlateColorBrush(FStyleColors::
+	// Panel), a brush whose OWN internal tint is already the dark panel color. BorderBackgroundColor is
+	// MULTIPLIED against that brush's own tint at paint time, so (1,0,0,0.15) against an already
+	// near-black Panel color zeroes the G/B channels of an already-dark value and barely nudges R --
+	// visually indistinguishable from the untinted row (exactly the reported "row stayed gray" bug).
+	// Fix: use "WhiteBrush" (FSlateColorBrush(FLinearColor::White), i.e. TintColor == pure white) as the
+	// BorderImage instead, so BorderBackgroundColor's own RGBA is what actually renders (White * Color ==
+	// Color), un-crushed. The neutral/default case (see GetDynamicLayerChannelTint) now explicitly
+	// returns FStyleColors::Panel at full alpha -- White * Panel == Panel, reproducing the EXACT original
+	// "Border" brush appearance byte-for-byte, so a multi-channel/no-channel row is visually identical to
+	// the pre-K.4A baseline, never solid white.
+	.BorderImage(FCoreStyle::Get().GetBrush(TEXT("WhiteBrush")))
+	// AUDITED (M16-K.4A): channel-aware tint -- BorderBackgroundColor is a plain SLATE_ATTRIBUTE, so this
+	// TAttribute re-evaluates GetDynamicLayerChannelTint(LayerId) fresh every paint; no explicit
+	// invalidation/rebuild is needed when a channel checkbox changes (the checkbox's own
+	// OnCheckStateChanged_Lambda mutates DynamicLayerStack only -- see GetDynamicLayerChannelTint's own
+	// doc comment for why this is presentation-only, never domain data).
+	.BorderBackgroundColor_Lambda([this, LayerId]() { return GetDynamicLayerChannelTint(LayerId); })
+	[
+		SNew(SVerticalBox)
+
+		// --- Structural row: Enabled, Name, Up, Down, Remove -------------------------------------
+		+ SVerticalBox::Slot()
+		.AutoHeight()
+		.Padding(FMargin(0.f, 0.f, 0.f, 2.f))
+		[
+			SNew(SHorizontalBox)
+
+			+ SHorizontalBox::Slot()
+			.AutoWidth()
+			.VAlign(VAlign_Center)
+			.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
+			[
+				SNew(SCheckBox)
+				.ToolTipText(LOCTEXT("DynamicLayerEnabledTooltip", "Whether this layer currently contributes to composition (prototype -- not yet evaluated)."))
+				.IsChecked_Lambda([this, LayerId]()
+				{
+					const FVertexMaskForgeLayer* Layer = DynamicLayerStack.FindLayerById(LayerId);
+					return (Layer && Layer->bEnabled) ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
+				})
+				.OnCheckStateChanged_Lambda([this, LayerId](const ECheckBoxState NewState)
+				{
+					DynamicLayerStack.SetLayerEnabled(LayerId, NewState == ECheckBoxState::Checked);
+				})
+			]
+
+			+ SHorizontalBox::Slot()
+			.FillWidth(1.f)
+			.VAlign(VAlign_Center)
+			.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
+			[
+				SNew(SEditableTextBox)
+				.ToolTipText(LOCTEXT("DynamicLayerNameTooltip", "Layer name. Duplicate names are allowed -- identity is internal, not the name."))
+				.Text_Lambda([this, LayerId]()
+				{
+					const FVertexMaskForgeLayer* Layer = DynamicLayerStack.FindLayerById(LayerId);
+					return Layer ? FText::FromString(Layer->Name) : FText::GetEmpty();
+				})
+				.OnTextCommitted(FOnTextCommitted::CreateLambda([this, LayerId](const FText& NewText, ETextCommit::Type)
+				{
+					// AUDITED: RenameLayer has no non-empty/uniqueness policy -- whatever the domain
+					// accepts or rejects, the UI never invents its own divergent validation. On rejection
+					// (only possible for an unknown LayerId), the widget's own Text_Lambda above already
+					// re-reads the stack on next paint, so it naturally reverts to the source of truth --
+					// no separate revert logic is needed here.
+					DynamicLayerStack.RenameLayer(LayerId, NewText.ToString());
+				}))
+			]
+
+			+ SHorizontalBox::Slot()
+			.AutoWidth()
+			.VAlign(VAlign_Center)
+			.Padding(FMargin(0.f, 0.f, 2.f, 0.f))
+			[
+				SNew(SButton)
+				.ContentPadding(FMargin(8.f, 1.f))
+				.ToolTipText(LOCTEXT("MoveDynamicLayerUpTooltip", "Move this layer one position earlier."))
+				.Text(LOCTEXT("MoveLayerUp", "Up"))
+				.IsEnabled_Lambda([this, LayerId]() { return CanMoveDynamicLayerUp(LayerId); })
+				.OnClicked(FOnClicked::CreateLambda([this, LayerId]() { return OnMoveDynamicLayerUpClicked(LayerId); }))
+			]
+
+			+ SHorizontalBox::Slot()
+			.AutoWidth()
+			.VAlign(VAlign_Center)
+			.Padding(FMargin(0.f, 0.f, 2.f, 0.f))
+			[
+				SNew(SButton)
+				.ContentPadding(FMargin(8.f, 1.f))
+				.ToolTipText(LOCTEXT("MoveDynamicLayerDownTooltip", "Move this layer one position later."))
+				.Text(LOCTEXT("MoveLayerDown", "Down"))
+				.IsEnabled_Lambda([this, LayerId]() { return CanMoveDynamicLayerDown(LayerId); })
+				.OnClicked(FOnClicked::CreateLambda([this, LayerId]() { return OnMoveDynamicLayerDownClicked(LayerId); }))
+			]
+
+			+ SHorizontalBox::Slot()
+			.AutoWidth()
+			.VAlign(VAlign_Center)
+			[
+				SNew(SButton)
+				.ContentPadding(FMargin(8.f, 1.f))
+				.ToolTipText(LOCTEXT("RemoveDynamicLayerTooltip", "Remove this layer."))
+				.Text(LOCTEXT("RemoveDynamicLayerButton", "Remove"))
+				.OnClicked(FOnClicked::CreateLambda([this, LayerId]() { return OnRemoveDynamicLayerClicked(LayerId); }))
+			]
+		]
+
+		// --- Properties row: Fill, Blend Mode, Opacity, R, G, B ----------------------------------
+		+ SVerticalBox::Slot()
+		.AutoHeight()
+		[
+			SNew(SHorizontalBox)
+
+			+ SHorizontalBox::Slot()
+			.AutoWidth()
+			.VAlign(VAlign_Center)
+			.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
+			[
+				SNew(SComboBox<TSharedPtr<EVertexMaskForgeLayerFill>>)
+				.OptionsSource(&DynamicLayerFillOptions)
+				.InitiallySelectedItem(DynamicLayerFillOptions.IsValidIndex(0) ? DynamicLayerFillOptions[0] : nullptr)
+				.OnGenerateWidget(this, &SVertexMaskForgePanel::OnGenerateDynamicLayerFillRow)
+				.OnSelectionChanged(SComboBox<TSharedPtr<EVertexMaskForgeLayerFill>>::FOnSelectionChanged::CreateLambda(
+					[this, LayerId](TSharedPtr<EVertexMaskForgeLayerFill> NewSelection, ESelectInfo::Type)
+					{
+						if (NewSelection.IsValid())
+						{
+							DynamicLayerStack.SetLayerFill(LayerId, *NewSelection);
+						}
+					}))
+				[
+					SNew(STextBlock)
+					.Text_Lambda([this, LayerId]()
+					{
+						const FVertexMaskForgeLayer* Layer = DynamicLayerStack.FindLayerById(LayerId);
+						return Layer ? VertexMaskForgePanel::GetDynamicLayerFillLabel(Layer->Fill) : FText::GetEmpty();
+					})
+				]
+			]
+
+			+ SHorizontalBox::Slot()
+			.AutoWidth()
+			.VAlign(VAlign_Center)
+			.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
+			[
+				SNew(SComboBox<TSharedPtr<EVertexMaskForgeBlendMode>>)
+				.OptionsSource(&BlendModeOptions)
+				.InitiallySelectedItem(BlendModeOptions.IsValidIndex(0) ? BlendModeOptions[0] : nullptr)
+				.OnGenerateWidget(this, &SVertexMaskForgePanel::OnGenerateBlendModeRow)
+				.OnSelectionChanged(SComboBox<TSharedPtr<EVertexMaskForgeBlendMode>>::FOnSelectionChanged::CreateLambda(
+					[this, LayerId](TSharedPtr<EVertexMaskForgeBlendMode> NewSelection, ESelectInfo::Type)
+					{
+						if (NewSelection.IsValid())
+						{
+							DynamicLayerStack.SetLayerBlendMode(LayerId, *NewSelection);
+						}
+					}))
+				[
+					SNew(STextBlock)
+					.Text_Lambda([this, LayerId]()
+					{
+						const FVertexMaskForgeLayer* Layer = DynamicLayerStack.FindLayerById(LayerId);
+						return Layer ? VertexMaskForgePanel::GetBlendModeLabel(Layer->BlendMode) : FText::GetEmpty();
+					})
+				]
+			]
+
+			+ SHorizontalBox::Slot()
+			.AutoWidth()
+			.VAlign(VAlign_Center)
+			.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
+			[
+				SNew(SSpinBox<float>)
+				.MinDesiredWidth(52.f)
+				.MinValue(0.0f)
+				.MaxValue(1.0f)
+				.Delta(0.01f)
+				.MinFractionalDigits(2)
+				.MaxFractionalDigits(2)
+				.ToolTipText(LOCTEXT("DynamicLayerOpacityTooltip", "Opacity, [0,1]."))
+				.Value_Lambda([this, LayerId]()
+				{
+					const FVertexMaskForgeLayer* Layer = DynamicLayerStack.FindLayerById(LayerId);
+					return Layer ? Layer->Opacity : 1.0f;
+				})
+				.OnValueChanged_Lambda([this, LayerId](const float NewValue)
+				{
+					// AUDITED: SSpinBox's own Min/MaxValue already constrain NewValue to [0,1]; no manual
+					// clamp is applied here -- SetLayerOpacity performs its own finite+range validation
+					// and rejects (no-op) anything it would not accept, never silently normalizing.
+					DynamicLayerStack.SetLayerOpacity(LayerId, NewValue);
+				})
+			]
+
+			+ SHorizontalBox::Slot()
+			.AutoWidth()
+			.VAlign(VAlign_Center)
+			.Padding(FMargin(0.f, 0.f, 2.f, 0.f))
+			[
+				SNew(SCheckBox)
+				.ToolTipText(LOCTEXT("DynamicLayerAffectRedTooltip", "Affect Red Channel"))
+				.IsChecked_Lambda([this, LayerId]()
+				{
+					const FVertexMaskForgeLayer* Layer = DynamicLayerStack.FindLayerById(LayerId);
+					return (Layer && Layer->bAffectRed) ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
+				})
+				.OnCheckStateChanged_Lambda([this, LayerId](const ECheckBoxState NewState)
+				{
+					const FVertexMaskForgeLayer* Layer = DynamicLayerStack.FindLayerById(LayerId);
+					if (!Layer)
+					{
+						return;
+					}
+					DynamicLayerStack.SetLayerChannelFilter(LayerId, NewState == ECheckBoxState::Checked, Layer->bAffectGreen, Layer->bAffectBlue);
+				})
+				.Content()
+				[
+					SNew(STextBlock).Text(LOCTEXT("DynamicLayerAffectRedLabel", "R"))
+				]
+			]
+
+			+ SHorizontalBox::Slot()
+			.AutoWidth()
+			.VAlign(VAlign_Center)
+			.Padding(FMargin(0.f, 0.f, 2.f, 0.f))
+			[
+				SNew(SCheckBox)
+				.ToolTipText(LOCTEXT("DynamicLayerAffectGreenTooltip", "Affect Green Channel"))
+				.IsChecked_Lambda([this, LayerId]()
+				{
+					const FVertexMaskForgeLayer* Layer = DynamicLayerStack.FindLayerById(LayerId);
+					return (Layer && Layer->bAffectGreen) ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
+				})
+				.OnCheckStateChanged_Lambda([this, LayerId](const ECheckBoxState NewState)
+				{
+					const FVertexMaskForgeLayer* Layer = DynamicLayerStack.FindLayerById(LayerId);
+					if (!Layer)
+					{
+						return;
+					}
+					DynamicLayerStack.SetLayerChannelFilter(LayerId, Layer->bAffectRed, NewState == ECheckBoxState::Checked, Layer->bAffectBlue);
+				})
+				.Content()
+				[
+					SNew(STextBlock).Text(LOCTEXT("DynamicLayerAffectGreenLabel", "G"))
+				]
+			]
+
+			+ SHorizontalBox::Slot()
+			.AutoWidth()
+			.VAlign(VAlign_Center)
+			[
+				SNew(SCheckBox)
+				.ToolTipText(LOCTEXT("DynamicLayerAffectBlueTooltip", "Affect Blue Channel"))
+				.IsChecked_Lambda([this, LayerId]()
+				{
+					const FVertexMaskForgeLayer* Layer = DynamicLayerStack.FindLayerById(LayerId);
+					return (Layer && Layer->bAffectBlue) ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
+				})
+				.OnCheckStateChanged_Lambda([this, LayerId](const ECheckBoxState NewState)
+				{
+					const FVertexMaskForgeLayer* Layer = DynamicLayerStack.FindLayerById(LayerId);
+					if (!Layer)
+					{
+						return;
+					}
+					DynamicLayerStack.SetLayerChannelFilter(LayerId, Layer->bAffectRed, Layer->bAffectGreen, NewState == ECheckBoxState::Checked);
+				})
+				.Content()
+				[
+					SNew(STextBlock).Text(LOCTEXT("DynamicLayerAffectBlueLabel", "B"))
+				]
+			]
+		]
+	];
+}
+
+bool SVertexMaskForgePanel::CanMoveDynamicLayerUp(const FGuid LayerId) const
+{
+	const int32 CurrentIndex = DynamicLayerStack.FindLayerIndexById(LayerId);
+	return CurrentIndex != INDEX_NONE && CurrentIndex > 0;
+}
+
+bool SVertexMaskForgePanel::CanMoveDynamicLayerDown(const FGuid LayerId) const
+{
+	const int32 CurrentIndex = DynamicLayerStack.FindLayerIndexById(LayerId);
+	return CurrentIndex != INDEX_NONE && CurrentIndex < DynamicLayerStack.Num() - 1;
+}
+
+FReply SVertexMaskForgePanel::OnMoveDynamicLayerUpClicked(const FGuid LayerId)
+{
+	// AUDITED: DynamicLayerStack::MoveLayerUp is authoritative for the actual movement -- no Swap/
+	// RemoveAt/Insert here. On a boundary/invalid no-op (returns false), the stack is guaranteed untouched
+	// by MoveLayerUp's own contract, so this function does nothing further -- no rebuild -- matching a
+	// click that had no real effect. On success: exactly one rebuild, no production call whatsoever.
+	if (!DynamicLayerStack.MoveLayerUp(LayerId))
+	{
+		return FReply::Handled();
+	}
+
+	RebuildDynamicLayersList();
+	return FReply::Handled();
+}
+
+FReply SVertexMaskForgePanel::OnMoveDynamicLayerDownClicked(const FGuid LayerId)
+{
+	if (!DynamicLayerStack.MoveLayerDown(LayerId))
+	{
+		return FReply::Handled();
+	}
+
+	RebuildDynamicLayersList();
+	return FReply::Handled();
+}
+
+FReply SVertexMaskForgePanel::OnAddDynamicLayerClicked()
+{
+	// AUDITED: display name only -- "Layer N" from the CURRENT count, not a persistent counter. Not
+	// guaranteed unique (e.g. removing "Layer 2" then adding again can produce another "Layer 2") --
+	// deliberately fine, since identity is LayerId, never Name (see DuplicateNamesDoNotConfuseRows).
+	const FString NewLayerName = FString::Printf(TEXT("Layer %d"), DynamicLayerStack.Num() + 1);
+	DynamicLayerStack.AddLayer(NewLayerName);
+
+	RebuildDynamicLayersList();
+	return FReply::Handled();
+}
+
+FReply SVertexMaskForgePanel::OnRemoveDynamicLayerClicked(const FGuid LayerId)
+{
+	// AUDITED: RemoveLayer is a safe no-op for an unknown LayerId (already-removed/stale callback) --
+	// nothing else needs to guard against that case here. Removing the stack's only/last layer is
+	// explicitly supported and safe (IsEmpty() stack is a valid stack) -- RebuildDynamicLayersList's own
+	// empty-state branch handles the resulting empty list.
+	DynamicLayerStack.RemoveLayer(LayerId);
+
+	RebuildDynamicLayersList();
+	return FReply::Handled();
+}
+
+FSlateColor SVertexMaskForgePanel::GetDynamicLayerChannelTint(const FGuid LayerId) const
+{
+	// AUDITED (M16-K.4B root-cause fix): default appearance is FStyleColors::Panel at full alpha -- NOT
+	// FLinearColor::White. BuildDynamicLayerRow's SBorder now uses "WhiteBrush" (pure white TintColor) as
+	// its BorderImage, so BorderBackgroundColor's own RGBA renders directly (White * Color == Color).
+	// Returning White here would multiply to opaque White * White == solid WHITE, replacing the row's
+	// entire background -- wrong. Returning FStyleColors::Panel instead reproduces White * Panel == Panel,
+	// which is exactly the color SBorder's OLD default "Border" brush (FSlateColorBrush(FStyleColors::
+	// Panel)) rendered before M16-K.4A -- i.e. byte-for-byte the pre-tint baseline appearance, for an
+	// unknown/removed LayerId, zero active channels, or two-or-more active channels. The actual channel-
+	// exclusivity decision is delegated to ResolveDynamicLayerChannelTint (VertexMaskForgeLayerTypes.h) --
+	// a pure, Slate-free function of the three channel bools only, kept directly unit-testable without
+	// constructing this (or any) Slate widget. This function's only job is resolving LayerId to a layer
+	// and mapping that pure decision to an actual presentation color/alpha.
+	const FSlateColor DefaultAppearance = FStyleColors::Panel;
+
+	const FVertexMaskForgeLayer* Layer = DynamicLayerStack.FindLayerById(LayerId);
+	if (!Layer)
+	{
+		return DefaultAppearance;
+	}
+
+	// Discreet identification, not a highlight -- low alpha over the panel's existing dark background.
+	// Diagnostic starting point per this checkpoint's own instruction (0.15); raise moderately (~0.18-0.30)
+	// only after manual visual confirmation that the WhiteBrush fix above is proven correct.
+	constexpr float TintAlpha = 0.15f;
+	const EVertexMaskForgeDynamicLayerChannelTint Tint = ResolveDynamicLayerChannelTint(Layer->bAffectRed, Layer->bAffectGreen, Layer->bAffectBlue);
+	if (Tint == EVertexMaskForgeDynamicLayerChannelTint::Default)
+	{
+		return DefaultAppearance;
+	}
+	return FSlateColor(GetDynamicLayerChannelTintColor(Tint, TintAlpha));
+}
+
 TSharedRef<SWidget> SVertexMaskForgePanel::BuildBoundingBoxAxisRow(const EVertexMaskForgeBoundsAxis Axis, const FText& Title)
 {
 	const int32 AxisIndex = static_cast<int32>(Axis);
@@ -3494,6 +4115,13 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 	BlendModeOptions.Add(MakeShared<EVertexMaskForgeBlendMode>(EVertexMaskForgeBlendMode::Screen));
 	BlendModeOptions.Add(MakeShared<EVertexMaskForgeBlendMode>(EVertexMaskForgeBlendMode::Linear));
 
+	// M16-K.4: Dynamic Layers' own Fill options -- None/Black/White, the only three real
+	// EVertexMaskForgeLayerFill enumerators. Shared read-only across every Dynamic Layer row's Fill combo,
+	// same pattern as BlendModeOptions above.
+	DynamicLayerFillOptions.Add(MakeShared<EVertexMaskForgeLayerFill>(EVertexMaskForgeLayerFill::None));
+	DynamicLayerFillOptions.Add(MakeShared<EVertexMaskForgeLayerFill>(EVertexMaskForgeLayerFill::Black));
+	DynamicLayerFillOptions.Add(MakeShared<EVertexMaskForgeLayerFill>(EVertexMaskForgeLayerFill::White));
+
 	CurvatureTypeOptions.Add(MakeShared<EVertexMaskForgeCurvatureType>(EVertexMaskForgeCurvatureType::Convex));
 	CurvatureTypeOptions.Add(MakeShared<EVertexMaskForgeCurvatureType>(EVertexMaskForgeCurvatureType::Concave));
 	CurvatureTypeOptions.Add(MakeShared<EVertexMaskForgeCurvatureType>(EVertexMaskForgeCurvatureType::Both));
@@ -3593,6 +4221,99 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 				SNew(STextBlock)
 				.Text(this, &SVertexMaskForgePanel::GetActiveMaskSourceText)
 				.ColorAndOpacity(FSlateColor::UseSubduedForeground())
+			]
+
+			// AUDITED (M16-K.3): the first visual representation of the generator layer composition
+			// order -- a minimal, non-expandable list (identity + Move Up/Move Down only, see
+			// BuildGeneratorLayerRow's own doc comment) placed BEFORE the seven individual generator
+			// sections below, since it reports/controls the ORDER those sections compose in. Rows are
+			// (re)built by RebuildGeneratorLayerList() directly from GeneratorLayerOrder -- this
+			// SVerticalBox::Slot() only ever assigns the empty container once; it is never itself
+			// re-entered by Construct().
+			+ SVerticalBox::Slot()
+			.AutoHeight()
+			.Padding(FMargin(0.f, 0.f, 0.f, 12.f))
+			[
+				SNew(SBorder)
+				.Padding(FMargin(8.f))
+				[
+					SNew(SVerticalBox)
+
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(FMargin(0.f, 0.f, 0.f, 4.f))
+					[
+						SNew(STextBlock)
+						.Text(LOCTEXT("GeneratorLayersSectionTitle", "Layers"))
+						.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
+					]
+
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					[
+						SAssignNew(GeneratorLayerListContainer, SVerticalBox)
+					]
+				]
+			]
+
+			// AUDITED (M16-K.4): "Dynamic Layers" -- a SEPARATE section from "Layers" above (the K.3
+			// prototype, still GeneratorLayerOrder-backed). This one is backed entirely by
+			// DynamicLayerStack, the M16-K.3A/K.3B domain -- explicitly disconnected from composition/
+			// preview (see the "Prototype" caption below and DynamicLayerStack's own doc comment). No
+			// production call (RecomposeWorkingColors, UpdateAllPreviews, generator invalidation, etc.)
+			// is ever made from any control in this section.
+			+ SVerticalBox::Slot()
+			.AutoHeight()
+			.Padding(FMargin(0.f, 0.f, 0.f, 12.f))
+			[
+				SNew(SBorder)
+				.Padding(FMargin(8.f))
+				[
+					SNew(SVerticalBox)
+
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(FMargin(0.f, 0.f, 0.f, 2.f))
+					[
+						SNew(SHorizontalBox)
+
+						+ SHorizontalBox::Slot()
+						.FillWidth(1.f)
+						.VAlign(VAlign_Center)
+						[
+							SNew(STextBlock)
+							.Text(LOCTEXT("DynamicLayersSectionTitle", "Dynamic Layers"))
+							.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						[
+							SNew(SButton)
+							.ContentPadding(FMargin(8.f, 1.f))
+							.ToolTipText(LOCTEXT("AddDynamicLayerTooltip", "Add a new, empty (Fill=None) dynamic layer at the end of the list."))
+							.Text(LOCTEXT("AddDynamicLayerButton", "+ Add Layer"))
+							.OnClicked(FOnClicked::CreateLambda([this]() { return OnAddDynamicLayerClicked(); }))
+						]
+					]
+
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(FMargin(0.f, 0.f, 0.f, 4.f))
+					[
+						SNew(STextBlock)
+						.Text(LOCTEXT("DynamicLayersPrototypeNotice", "Prototype -- not applied to preview yet"))
+						.Font(FCoreStyle::GetDefaultFontStyle("Italic", 8))
+						.ColorAndOpacity(FSlateColor::UseSubduedForeground())
+					]
+
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					[
+						SAssignNew(DynamicLayersListContainer, SVerticalBox)
+					]
+				]
 			]
 
 			+ SVerticalBox::Slot()
@@ -6174,6 +6895,21 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 			] // closes SScrollBox::Slot content
 		]
 	];
+
+	// AUDITED (M16-K.3): GeneratorLayerListContainer now exists (assigned via SAssignNew above, inside
+	// the ChildSlot expression just completed) -- populate its rows from GeneratorLayerOrder's own
+	// member-initializer default (VertexMaskForgeLayerOrder::MakeDefault(), set once when this panel
+	// instance's fields were constructed, BEFORE this function body even started running). This is a
+	// single, one-time initial population -- never a second default derivation.
+	RebuildGeneratorLayerList();
+
+	// AUDITED (M16-K.4): DynamicLayersListContainer now exists (assigned via SAssignNew above) --
+	// populate its rows from DynamicLayerStack's own member-initializer default
+	// (FVertexMaskForgeDynamicLayerStack::MakeInitialStack(), set once when this panel instance's
+	// fields were constructed) -- a single, one-time initial population, mirroring
+	// RebuildGeneratorLayerList's own call just above. DynamicLayerStack itself is never
+	// re-initialized here or anywhere else in Construct().
+	RebuildDynamicLayersList();
 
 	// AUDITED (UX1, explicit Edit Vertex Mask session entry): Construct() must never itself start an
 	// editing session (previously called RefreshSelection() here unconditionally, which meant simply

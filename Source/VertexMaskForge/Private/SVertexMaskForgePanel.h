@@ -11,6 +11,7 @@
 #include "UObject/SoftObjectPtr.h"
 #include "UObject/StrongObjectPtr.h"
 #include "UObject/WeakObjectPtr.h"
+#include "VertexMaskForgeDynamicLayerStack.h"
 #include "VertexMaskForgeLayerOrder.h"
 #include "VertexMaskForgeMaskTypes.h"
 #include "VertexMaskForgeWorkingMeshTypes.h"
@@ -24,6 +25,7 @@ class UStaticMesh;
 class UStaticMeshComponent;
 class UDynamicMeshComponent;
 template <typename OptionType> class SComboBox;
+class SVerticalBox;
 enum class ECheckBoxState : uint8;
 namespace ESelectInfo { enum Type : int; }
 enum class EVertexMaskForgeWorkingColorsPublicationValidationStatus : uint8;
@@ -254,6 +256,148 @@ private:
 	 * mesh and its computed statistics are kept on the entry.
 	 */
 	void BuildWorkingMeshes(TArray<TSharedPtr<FVertexMaskForgeSelectedMesh>>& InOutMeshes) const;
+
+	// --- M16-K.3: Layers (minimal generator layer order UI) ---------------------------------
+
+	/**
+	 * Rebuilds ONLY the visual rows of the Layers list, from GeneratorLayerOrder's own current
+	 * sequence -- clears GeneratorLayerListContainer's slots and re-adds exactly one row per entry, in
+	 * order. Purely a view refresh: never mutates GeneratorLayerOrder, never invalidates any raw mask,
+	 * never rebuilds Working Mesh, never calls RefreshSelection, never recomposes (the caller decides
+	 * whether recomposition is also needed -- see OnMoveGeneratorLayerUp/Down's own doc comment). Safe
+	 * to call before GeneratorLayerListContainer exists (no-op) or any number of times.
+	 */
+	void RebuildGeneratorLayerList();
+
+	/** Builds ONE Layers row for Source: display name (left) + Move Up/Move Down buttons (right). Never
+	 *  displays or edits Enabled/Blend Mode/Opacity/Invert -- those remain exclusively in this
+	 *  generator's own existing section below. */
+	TSharedRef<SWidget> BuildGeneratorLayerRow(EVertexMaskForgeScalarMaskSource Source);
+
+	/**
+	 * AUDITED (M16-K.3): the ONLY two functions that mutate GeneratorLayerOrder. Both delegate the
+	 * actual movement to VertexMaskForgeLayerOrder::MoveUp/MoveDown (the K.1 domain) -- never a manual
+	 * Swap/RemoveAt/Insert/Sort here. On success: rebuilds the visual list and requests exactly one
+	 * recomposition (RecomposeWorkingColors -- pure composition, never invalidates a raw mask, never
+	 * rebuilds Working Mesh). On failure (boundary no-op, invalid Source, or Source absent): the UI is
+	 * left completely untouched and no recomposition is requested.
+	 */
+	FReply OnMoveGeneratorLayerUp(EVertexMaskForgeScalarMaskSource Source);
+	FReply OnMoveGeneratorLayerDown(EVertexMaskForgeScalarMaskSource Source);
+
+	/**
+	 * Read-only: True iff Source currently occupies a position in GeneratorLayerOrder from which the
+	 * corresponding move is possible (not already first/last, not absent, not a non-generator Source).
+	 * Always resolves Source's CURRENT index by looking it up fresh in GeneratorLayerOrder -- never a
+	 * position captured once at row-construction time, which would go stale after any reorder.
+	 */
+	bool CanMoveGeneratorLayerUp(EVertexMaskForgeScalarMaskSource Source) const;
+	bool CanMoveGeneratorLayerDown(EVertexMaskForgeScalarMaskSource Source) const;
+
+	/**
+	 * UI-only reference to the Layers list's row container -- never a second source of order (that
+	 * remains GeneratorLayerOrder exclusively), never holds generator data/masks/caches, never
+	 * serialized. Populated by RebuildGeneratorLayerList(); assigned once in Construct().
+	 */
+	TSharedPtr<SVerticalBox> GeneratorLayerListContainer;
+
+	// --- M16-K.4: Dynamic Layers UI Prototype (domain-only, disconnected from composition/preview) ------
+	//
+	// DynamicLayerStack is a SEPARATE, isolated owner from GeneratorLayerOrder above -- GeneratorLayerOrder
+	// remains the sole owner of the order the active production composition path (ComputeComposedColorsRGB/
+	// ComputeComposedColorsRGBSourceTopology) reads; DynamicLayerStack is not read by any production call
+	// site and has no bridge/adapter to one yet. Every function below mutates ONLY DynamicLayerStack, via
+	// its own controlled, GUID-based API (SetLayerFill/SetLayerBlendMode/SetLayerOpacity/SetLayerEnabled/
+	// SetLayerChannelFilter/RenameLayer/AddLayer/RemoveLayer/MoveLayerUp/MoveLayerDown) -- never a manual
+	// mutation, never a second parallel "UI layer" struct duplicating the stack's own data. None of them
+	// call RecomposeWorkingColors, UpdateAllPreviews, VertexMaskForgeDynamicLayerEvaluator, or touch any
+	// generator/cache/GeneratorLayerOrder/Working-Baseline-Committed Colors.
+
+	/**
+	 * Rebuilds ONLY the visual rows of the Dynamic Layers list, from DynamicLayerStack's own current
+	 * TArray order -- clears DynamicLayersListContainer's slots and re-adds exactly one row per layer, in
+	 * order (or a single "No dynamic layers" text if the stack is empty). Purely a view refresh: never
+	 * mutates DynamicLayerStack, never calls any production function. Safe to call before
+	 * DynamicLayersListContainer exists (no-op) or any number of times.
+	 */
+	void RebuildDynamicLayersList();
+
+	/**
+	 * Builds ONE Dynamic Layers row for LayerId: a structural line (Enabled checkbox, editable Name, Move
+	 * Up/Down, Remove) and a properties line (Fill combo, Blend Mode combo, Opacity spin box, R/G/B
+	 * channel checkboxes). Every control's displayed value is bound live to DynamicLayerStack via a
+	 * _Lambda accessor that resolves LayerId fresh on every call (DynamicLayerStack.FindLayerById) -- no
+	 * widget captures a pointer/reference into the stack's own TArray, and no widget holds a duplicate
+	 * copy of any field.
+	 */
+	TSharedRef<SWidget> BuildDynamicLayerRow(FGuid LayerId);
+
+	/** Shared dropdown-row generator for every Dynamic Layer's Fill combo -- mirrors
+	 *  OnGenerateBlendModeRow's own shape/reuse pattern (generic over the option type only). */
+	TSharedRef<SWidget> OnGenerateDynamicLayerFillRow(TSharedPtr<EVertexMaskForgeLayerFill> InOption) const;
+
+	/**
+	 * Reorder: the ONLY two functions that mutate DynamicLayerStack's order. Both delegate the actual
+	 * movement to FVertexMaskForgeDynamicLayerStack::MoveLayerUp/MoveLayerDown -- never a manual Swap/
+	 * RemoveAt/Insert here. On success: rebuilds the visual list only -- no recomposition, no production
+	 * call of any kind. On failure (boundary no-op or unknown LayerId): the UI is left completely
+	 * untouched, no rebuild.
+	 */
+	FReply OnMoveDynamicLayerUpClicked(FGuid LayerId);
+	FReply OnMoveDynamicLayerDownClicked(FGuid LayerId);
+
+	/**
+	 * Read-only: True iff LayerId currently occupies a position in DynamicLayerStack from which the
+	 * corresponding move is possible (not already first/last, not absent). Always resolves LayerId's
+	 * CURRENT index fresh via DynamicLayerStack.FindLayerIndexById -- never a position captured once at
+	 * row-construction time.
+	 */
+	bool CanMoveDynamicLayerUp(FGuid LayerId) const;
+	bool CanMoveDynamicLayerDown(FGuid LayerId) const;
+
+	/** Add/Remove: the ONLY two functions that change DynamicLayerStack's membership. Both rebuild the
+	 *  visual list on completion (Remove rebuilds even on a no-op unknown-id call -- harmless/idempotent).
+	 *  Neither selects a viewport component, executes a generator, or calls any production function. */
+	FReply OnAddDynamicLayerClicked();
+	FReply OnRemoveDynamicLayerClicked(FGuid LayerId);
+
+	/**
+	 * M16-K.4A: pure, presentation-only channel-exclusivity tint for one Dynamic Layer row's outer
+	 * SBorder (BorderBackgroundColor). Resolves LayerId fresh via DynamicLayerStack.FindLayerById (no
+	 * captured pointer/reference/index); returns a low-opacity Red/Green/Blue SlateColor iff EXACTLY one
+	 * of bAffectRed/bAffectGreen/bAffectBlue is true, and the default (opaque white -- i.e. the brush's
+	 * own unmodified appearance) for zero, two, or three active channels, or for an unknown/removed
+	 * LayerId. Never combines channel colors (RG/RB/GB/RGB all resolve to the default, never a mixed
+	 * hue). This value is NOT stored anywhere -- not on FVertexMaskForgeLayer, not on the stack, not
+	 * cached -- it is recomputed from the layer's current channel flags every time Slate repaints the
+	 * row, which is what lets a channel checkbox toggle update the tint with no explicit widget
+	 * invalidation or list rebuild. Alpha-channel support does not exist in this checkpoint's domain (see
+	 * this class's own M16-K.4A doc note); when it is introduced, an Alpha-only layer is expected to
+	 * resolve to a low-opacity white tint here, analogous to the R/G/B cases -- not implemented yet.
+	 */
+	FSlateColor GetDynamicLayerChannelTint(FGuid LayerId) const;
+
+	/**
+	 * UI-only reference to the Dynamic Layers list's row container -- never a second source of order or
+	 * data (that remains DynamicLayerStack exclusively), never serialized. Populated by
+	 * RebuildDynamicLayersList(); assigned once in Construct().
+	 */
+	TSharedPtr<SVerticalBox> DynamicLayersListContainer;
+
+	/** Shared, read-only Fill options for every Dynamic Layer row's Fill combo -- None/Black/White, the
+	 *  three real EVertexMaskForgeLayerFill enumerators. Populated once in Construct(), mirroring
+	 *  BlendModeOptions' own pattern below. */
+	TArray<TSharedPtr<EVertexMaskForgeLayerFill>> DynamicLayerFillOptions;
+
+	/**
+	 * The M16-K.3A/K.3B domain instance this UI edits -- initialized exactly once, via the member
+	 * initializer below (FVertexMaskForgeDynamicLayerStack::MakeInitialStack()), BEFORE Construct() body
+	 * even runs. Never re-initialized by Construct, RefreshSelection, RebuildDynamicLayersList, Accept, or
+	 * Cancel -- this panel instance's own single DynamicLayerStack persists for the lifetime of the panel,
+	 * exactly like GeneratorLayerOrder does today. Not read by ApplyPreviewToEntry, UpdateAllPreviews,
+	 * ComputeComposedColorsRGB[SourceTopology], or any other production function.
+	 */
+	FVertexMaskForgeDynamicLayerStack DynamicLayerStack = FVertexMaskForgeDynamicLayerStack::MakeInitialStack();
 
 	// --- Bounding Box Mask (Local X / Local Y / Local Z, each with independent Local/World Space) --
 

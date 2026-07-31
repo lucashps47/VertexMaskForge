@@ -540,4 +540,219 @@ bool FVertexMaskForgePanelCompositionHomogeneousModesTest::RunTest(const FString
 	return true;
 }
 
+// =================================================================================================
+// M16-K.3: end-to-end proof that VertexMaskForgeLayerOrder::MoveUp/MoveDown (the K.1 domain -- the
+// SAME functions SVertexMaskForgePanel::OnMoveGeneratorLayerUp/Down call, never a reimplementation)
+// produce an order that, once handed to the REAL production seam, changes composition exactly as
+// expected -- proving the UI's own move handlers are not merely cosmetic. Fixture: Curvature=0.5
+// Multiply, Noise=0.3 Add, Base=0.2 -- a genuinely non-commutative pair (Multiply-then-Add=0.4=~102,
+// Add-then-Multiply=0.25=~64), matching the same divergent fixture already characterized in tests A/C
+// above (not replicated blend math -- these values were already independently derived there).
+// =================================================================================================
+
+// A. MoveUp: default order has Curvature (index 2) before Noise (index 3, its own predecessor is
+// AmbientOcclusion, but moving NOISE up swaps it with Curvature specifically, its own immediate
+// predecessor) -- MoveUp(GeneratorLayerOrder, Noise) yields [..., Noise, Curvature, ...], the OPPOSITE
+// relative order from default. Feeding that resulting order to ComputeComposedColorsRGB must now
+// resolve Add(Noise) before Multiply(Curvature): Base=0.2 -> Add(0.3)=0.5 -> Multiply(0.5)=0.25 -> ~64.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgePanelCompositionMoveUpTest, "VertexMaskForge.PanelCompositionIntegration.MoveUpThenProductionUsesNewOrder", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgePanelCompositionMoveUpTest::RunTest(const FString& Parameters)
+{
+	TArray<EVertexMaskForgeScalarMaskSource> Order = VertexMaskForgeLayerOrder::MakeDefault();
+	const bool bMoved = VertexMaskForgeLayerOrder::MoveUp(Order, EVertexMaskForgeScalarMaskSource::Noise);
+	TestTrue(TEXT("MoveUp(Noise) succeeds from the default order"), bMoved);
+	TestTrue(TEXT("Result is still a valid, complete order"), VertexMaskForgeLayerOrder::IsValid(Order));
+
+	const int32 CurvatureIndex = Order.IndexOfByKey(EVertexMaskForgeScalarMaskSource::Curvature);
+	const int32 NoiseIndex = Order.IndexOfByKey(EVertexMaskForgeScalarMaskSource::Noise);
+	TestTrue(TEXT("Noise now sits immediately BEFORE Curvature (was immediately after)"), NoiseIndex == CurvatureIndex - 1);
+
+	const FVertexMaskForgeScalarMask CurvatureMask = MakeIntegrationMask(0.5f, EVertexMaskForgeScalarMaskSource::Curvature);
+	const FVertexMaskForgeScalarMask NoiseMask = MakeIntegrationMask(0.3f, EVertexMaskForgeScalarMaskSource::Noise);
+	TArray<VertexMaskForgePanel::FVertexMaskForgeMaskLayerParams> Layers;
+	Layers.Add({ &CurvatureMask, EVertexMaskForgeBlendMode::Multiply, 1.0f, -1 });
+	Layers.Add({ &NoiseMask, EVertexMaskForgeBlendMode::Add, 1.0f, -1 });
+
+	const TArray<FColor> Baseline = { FColor(51, 51, 51, 255) };
+	TArray<FColor> OutFinalColors;
+	int32 OutNumComposed = 0;
+	VertexMaskForgePanel::ComputeComposedColorsRGB(Baseline, Baseline, Layers, Order, true, true, true, OutFinalColors, OutNumComposed);
+
+	TestEqual(TEXT("One vertex composed"), OutNumComposed, 1);
+	if (TestEqual(TEXT("OutFinalColors sized"), OutFinalColors.Num(), 1))
+	{
+		TestTrue(TEXT("Production respects the MoveUp-derived order: Add-then-Multiply -> ~64, not the default's ~102"),
+			ByteNear(OutFinalColors[0].R, 64.0f));
+	}
+
+	return true;
+}
+
+// B. MoveDown: default order has Curvature before Noise -- MoveDown(GeneratorLayerOrder, Curvature)
+// swaps Curvature with its own immediate successor (Noise), reaching the SAME resulting relative order
+// as test A (Noise before Curvature) via the opposite operation, proving the change reaches production
+// regardless of which direction produced it.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgePanelCompositionMoveDownTest, "VertexMaskForge.PanelCompositionIntegration.MoveDownThenProductionUsesNewOrder", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgePanelCompositionMoveDownTest::RunTest(const FString& Parameters)
+{
+	TArray<EVertexMaskForgeScalarMaskSource> Order = VertexMaskForgeLayerOrder::MakeDefault();
+	const bool bMoved = VertexMaskForgeLayerOrder::MoveDown(Order, EVertexMaskForgeScalarMaskSource::Curvature);
+	TestTrue(TEXT("MoveDown(Curvature) succeeds from the default order"), bMoved);
+	TestTrue(TEXT("Result is still a valid, complete order"), VertexMaskForgeLayerOrder::IsValid(Order));
+
+	const int32 CurvatureIndex = Order.IndexOfByKey(EVertexMaskForgeScalarMaskSource::Curvature);
+	const int32 NoiseIndex = Order.IndexOfByKey(EVertexMaskForgeScalarMaskSource::Noise);
+	TestTrue(TEXT("Noise now sits immediately BEFORE Curvature"), NoiseIndex == CurvatureIndex - 1);
+
+	const FVertexMaskForgeScalarMask CurvatureMask = MakeIntegrationMask(0.5f, EVertexMaskForgeScalarMaskSource::Curvature);
+	const FVertexMaskForgeScalarMask NoiseMask = MakeIntegrationMask(0.3f, EVertexMaskForgeScalarMaskSource::Noise);
+	TArray<VertexMaskForgePanel::FVertexMaskForgeMaskLayerParams> Layers;
+	Layers.Add({ &CurvatureMask, EVertexMaskForgeBlendMode::Multiply, 1.0f, -1 });
+	Layers.Add({ &NoiseMask, EVertexMaskForgeBlendMode::Add, 1.0f, -1 });
+
+	const TArray<FColor> Baseline = { FColor(51, 51, 51, 255) };
+	TArray<FColor> OutFinalColors;
+	int32 OutNumComposed = 0;
+	VertexMaskForgePanel::ComputeComposedColorsRGB(Baseline, Baseline, Layers, Order, true, true, true, OutFinalColors, OutNumComposed);
+
+	TestEqual(TEXT("One vertex composed"), OutNumComposed, 1);
+	if (TestEqual(TEXT("OutFinalColors sized"), OutFinalColors.Num(), 1))
+	{
+		TestTrue(TEXT("Production respects the MoveDown-derived order: Add-then-Multiply -> ~64, not the default's ~102"),
+			ByteNear(OutFinalColors[0].R, 64.0f));
+	}
+
+	return true;
+}
+
+// C. Boundary move is a no-op: MoveUp on the first element and MoveDown on the last element both
+// return false and leave the order byte/element-wise identical -- feeding that UNCHANGED order to
+// production reproduces the exact default-order result (~102), never the reordered ~64 -- proving a
+// rejected click never silently reaches production as if it had succeeded.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgePanelCompositionBoundaryNoOpTest, "VertexMaskForge.PanelCompositionIntegration.BoundaryMoveIsNoOp", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgePanelCompositionBoundaryNoOpTest::RunTest(const FString& Parameters)
+{
+	TArray<EVertexMaskForgeScalarMaskSource> Order = VertexMaskForgeLayerOrder::MakeDefault();
+	const TArray<EVertexMaskForgeScalarMaskSource> Before = Order;
+
+	TestFalse(TEXT("MoveUp on the first element (BoundingBox) returns false"),
+		VertexMaskForgeLayerOrder::MoveUp(Order, EVertexMaskForgeScalarMaskSource::BoundingBox));
+	TestFalse(TEXT("MoveDown on the last element (Thickness) returns false"),
+		VertexMaskForgeLayerOrder::MoveDown(Order, EVertexMaskForgeScalarMaskSource::Thickness));
+
+	TestEqual(TEXT("Order element count unchanged"), Order.Num(), Before.Num());
+	bool bOrderUnchanged = true;
+	for (int32 i = 0; i < Order.Num(); ++i)
+	{
+		if (Order[i] != Before[i]) { bOrderUnchanged = false; break; }
+	}
+	TestTrue(TEXT("Order is byte/element-wise identical to before the rejected moves"), bOrderUnchanged);
+
+	const FVertexMaskForgeScalarMask CurvatureMask = MakeIntegrationMask(0.5f, EVertexMaskForgeScalarMaskSource::Curvature);
+	const FVertexMaskForgeScalarMask NoiseMask = MakeIntegrationMask(0.3f, EVertexMaskForgeScalarMaskSource::Noise);
+	TArray<VertexMaskForgePanel::FVertexMaskForgeMaskLayerParams> Layers;
+	Layers.Add({ &CurvatureMask, EVertexMaskForgeBlendMode::Multiply, 1.0f, -1 });
+	Layers.Add({ &NoiseMask, EVertexMaskForgeBlendMode::Add, 1.0f, -1 });
+
+	const TArray<FColor> Baseline = { FColor(51, 51, 51, 255) };
+	TArray<FColor> OutFinalColors;
+	int32 OutNumComposed = 0;
+	VertexMaskForgePanel::ComputeComposedColorsRGB(Baseline, Baseline, Layers, Order, true, true, true, OutFinalColors, OutNumComposed);
+
+	if (TestEqual(TEXT("OutFinalColors sized"), OutFinalColors.Num(), 1))
+	{
+		TestTrue(TEXT("Production still reflects the default order (~102) -- the rejected boundary moves changed nothing"),
+			ByteNear(OutFinalColors[0].R, 102.0f));
+	}
+
+	return true;
+}
+
+// D. A generator absent from Layers (disabled) can still be reordered by its own identity -- moving it
+// changes ITS OWN position in GeneratorLayerOrder without disturbing the RELATIVE order of the layers
+// that ARE active. AmbientOcclusion(Multiply,0.5) and MaterialSlot(Add,0.3) are the only active layers;
+// Curvature (disabled -- absent from Layers) sits between them in the default order and is moved DOWN
+// (swapping with its own successor, Noise -- neither of which is active either) -- this must not affect
+// AmbientOcclusion's position relative to MaterialSlot at all. Base=0.2 -> AO Multiply(0.5)=0.1 ->
+// MaterialSlot Add(0.3)=0.4 -> ~102, UNCHANGED by Curvature's own move.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgePanelCompositionDisabledReorderTest, "VertexMaskForge.PanelCompositionIntegration.DisabledGeneratorCanBeReordered", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgePanelCompositionDisabledReorderTest::RunTest(const FString& Parameters)
+{
+	TArray<EVertexMaskForgeScalarMaskSource> Order = VertexMaskForgeLayerOrder::MakeDefault();
+	const bool bMoved = VertexMaskForgeLayerOrder::MoveDown(Order, EVertexMaskForgeScalarMaskSource::Curvature);
+	TestTrue(TEXT("MoveDown succeeds on Curvature's own identity even though it is disabled/absent from Layers"), bMoved);
+	TestTrue(TEXT("Curvature is still present in the full order (disabled generators are never removed)"),
+		Order.Contains(EVertexMaskForgeScalarMaskSource::Curvature));
+
+	const int32 AOIndex = Order.IndexOfByKey(EVertexMaskForgeScalarMaskSource::AmbientOcclusion);
+	const int32 MaterialSlotIndex = Order.IndexOfByKey(EVertexMaskForgeScalarMaskSource::MaterialSlot);
+	TestTrue(TEXT("AmbientOcclusion still sits before MaterialSlot -- unaffected by Curvature's own move"), AOIndex < MaterialSlotIndex);
+
+	const FVertexMaskForgeScalarMask AOMask = MakeIntegrationMask(0.5f, EVertexMaskForgeScalarMaskSource::AmbientOcclusion);
+	const FVertexMaskForgeScalarMask MaterialSlotMask = MakeIntegrationMask(0.3f, EVertexMaskForgeScalarMaskSource::MaterialSlot);
+	// Curvature/Noise are deliberately NOT added to Layers -- both disabled, one of them just moved.
+	TArray<VertexMaskForgePanel::FVertexMaskForgeMaskLayerParams> Layers;
+	Layers.Add({ &AOMask, EVertexMaskForgeBlendMode::Multiply, 1.0f, -1 });
+	Layers.Add({ &MaterialSlotMask, EVertexMaskForgeBlendMode::Add, 1.0f, -1 });
+
+	const TArray<FColor> Baseline = { FColor(51, 51, 51, 255) };
+	TArray<FColor> OutFinalColors;
+	int32 OutNumComposed = 0;
+	VertexMaskForgePanel::ComputeComposedColorsRGB(Baseline, Baseline, Layers, Order, true, true, true, OutFinalColors, OutNumComposed);
+
+	TestEqual(TEXT("One vertex composed"), OutNumComposed, 1);
+	if (TestEqual(TEXT("OutFinalColors sized"), OutFinalColors.Num(), 1))
+	{
+		TestTrue(TEXT("Active-layer composition is unaffected by the disabled generator's own reorder (~102)"),
+			ByteNear(OutFinalColors[0].R, 102.0f));
+	}
+
+	return true;
+}
+
+// E. A short sequence of real moves preserves a valid, complete permutation at every step, and the
+// final order is accepted by production without incident (no crash, no rejection, a determinate result).
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgePanelCompositionRepeatedMovesTest, "VertexMaskForge.PanelCompositionIntegration.RepeatedMovesPreserveValidPermutation", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgePanelCompositionRepeatedMovesTest::RunTest(const FString& Parameters)
+{
+	TArray<EVertexMaskForgeScalarMaskSource> Order = VertexMaskForgeLayerOrder::MakeDefault();
+
+	TestTrue(TEXT("Move 1: MoveDown(BoundingBox)"), VertexMaskForgeLayerOrder::MoveDown(Order, EVertexMaskForgeScalarMaskSource::BoundingBox));
+	TestTrue(TEXT("Valid after move 1"), VertexMaskForgeLayerOrder::IsValid(Order));
+
+	TestTrue(TEXT("Move 2: MoveUp(Thickness)"), VertexMaskForgeLayerOrder::MoveUp(Order, EVertexMaskForgeScalarMaskSource::Thickness));
+	TestTrue(TEXT("Valid after move 2"), VertexMaskForgeLayerOrder::IsValid(Order));
+
+	TestTrue(TEXT("Move 3: MoveDown(AmbientOcclusion)"), VertexMaskForgeLayerOrder::MoveDown(Order, EVertexMaskForgeScalarMaskSource::AmbientOcclusion));
+	TestTrue(TEXT("Valid after move 3"), VertexMaskForgeLayerOrder::IsValid(Order));
+
+	const EVertexMaskForgeScalarMaskSource AllSeven[] = {
+		EVertexMaskForgeScalarMaskSource::BoundingBox, EVertexMaskForgeScalarMaskSource::AmbientOcclusion,
+		EVertexMaskForgeScalarMaskSource::Curvature, EVertexMaskForgeScalarMaskSource::Noise,
+		EVertexMaskForgeScalarMaskSource::MaterialSlot, EVertexMaskForgeScalarMaskSource::DirectionalNormal,
+		EVertexMaskForgeScalarMaskSource::Thickness
+	};
+	for (const EVertexMaskForgeScalarMaskSource Source : AllSeven)
+	{
+		TestEqual(FString::Printf(TEXT("Source=%d still present exactly once"), (int32)Source), Order.FilterByPredicate([Source](const EVertexMaskForgeScalarMaskSource S) { return S == Source; }).Num(), 1);
+	}
+
+	const FVertexMaskForgeScalarMask BBoxMask = MakeIntegrationMask(0.6f, EVertexMaskForgeScalarMaskSource::BoundingBox);
+	TArray<VertexMaskForgePanel::FVertexMaskForgeMaskLayerParams> Layers;
+	Layers.Add({ &BBoxMask, EVertexMaskForgeBlendMode::Copy, 1.0f, -1 });
+
+	const TArray<FColor> Baseline = { FColor(51, 51, 51, 255) };
+	TArray<FColor> OutFinalColors;
+	int32 OutNumComposed = 0;
+	VertexMaskForgePanel::ComputeComposedColorsRGB(Baseline, Baseline, Layers, Order, true, true, true, OutFinalColors, OutNumComposed);
+
+	TestEqual(TEXT("Production accepts the final order without incident: one vertex composed"), OutNumComposed, 1);
+	if (TestEqual(TEXT("OutFinalColors sized"), OutFinalColors.Num(), 1))
+	{
+		TestTrue(TEXT("Determinate result (Copy(0.6) at full opacity -> ~153)"), ByteNear(OutFinalColors[0].R, 153.0f));
+	}
+
+	return true;
+}
+
 #endif // WITH_DEV_AUTOMATION_TESTS
