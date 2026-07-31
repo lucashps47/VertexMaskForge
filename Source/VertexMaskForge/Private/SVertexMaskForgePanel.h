@@ -11,6 +11,7 @@
 #include "UObject/SoftObjectPtr.h"
 #include "UObject/StrongObjectPtr.h"
 #include "UObject/WeakObjectPtr.h"
+#include "VertexMaskForgeLayerOrder.h"
 #include "VertexMaskForgeMaskTypes.h"
 #include "VertexMaskForgeWorkingMeshTypes.h"
 #include "Widgets/SCompoundWidget.h"
@@ -1203,6 +1204,21 @@ private:
 	TMap<TWeakObjectPtr<AActor>, FVertexMaskForgeActorHideState> ActorHideStates;
 
 	TArray<TSharedPtr<FVertexMaskForgeSelectedMesh>> SelectedMeshes;
+
+	/**
+	 * M16-K.2: this panel's own persistent order of the seven generator layers -- a single sequence
+	 * shared by the whole current operation, applied coherently to every selected component (never
+	 * per-component, never per-entry, never stored on Working Mesh/GeneratorState/any cache). Owner is
+	 * this panel; lifecycle is exactly this panel instance's own -- initialized once, here, via
+	 * VertexMaskForgeLayerOrder::MakeDefault() (never derived from EVertexMaskForgeScalarMaskSource's
+	 * own numeric/declaration order), and survives RefreshSelection/rebuild/recomposition/Preview Mode/
+	 * Channel Filter/Accept for as long as this panel instance is alive -- reset to default only when a
+	 * new panel instance is constructed (see VertexMaskForgeLayerOrder.h's own module comment). No
+	 * mutator exists yet (Move Up/Move Down is M16-K.3's own scope); Enabled/BlendMode/Opacity/Invert/
+	 * generator-specific parameters and every raw mask/cache remain exactly where they already were --
+	 * this member is the single source of truth for ORDER only.
+	 */
+	TArray<EVertexMaskForgeScalarMaskSource> GeneratorLayerOrder = VertexMaskForgeLayerOrder::MakeDefault();
 
 	// Preview Mode / Channel Filter are panel/session-transient: never saved on the asset, never
 	// invalidate or regenerate BoundingBoxMask, and are fully independent of one another.

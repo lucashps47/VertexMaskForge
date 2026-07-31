@@ -201,11 +201,20 @@ namespace VertexMaskForgePanel
 	 * VertexMaskForgeMaskStackComposer::ComposeStack. Defined in SVertexMaskForgePanel.cpp, unchanged
 	 * from their own non-test call sites (ApplyPreviewToEntry) -- this is not a reimplementation or a
 	 * test-only shim, it is the exact function the panel itself calls every preview update.
+	 *
+	 * M16-K.2: LayerOrder is the panel's own persistent generator layer order (see
+	 * SVertexMaskForgePanel::GeneratorLayerOrder's own doc comment) -- Layers is resolved into
+	 * composition order by walking LayerOrder and picking each generator's own entry out of Layers
+	 * (never a Sort() by Mask->Source anymore); a non-generator entry (a Fill/Constant override, which
+	 * never depends on LayerOrder) is preserved verbatim. LayerOrder is expected to be
+	 * VertexMaskForgeLayerOrder::IsValid() by construction -- see this function's own .cpp-side doc
+	 * comment on the explicit, diagnosed fallback for the defensive case where it is not.
 	 */
 	void ComputeComposedColorsRGB(
 		TConstArrayView<FColor> BaselineColors,
 		TConstArrayView<FColor> CommittedColors,
 		TArrayView<const FVertexMaskForgeMaskLayerParams> Layers,
+		TConstArrayView<EVertexMaskForgeScalarMaskSource> LayerOrder,
 		bool bFilterR, bool bFilterG, bool bFilterB,
 		TArray<FColor>& OutFinalColors,
 		int32& OutNumComposed);
@@ -215,6 +224,7 @@ namespace VertexMaskForgePanel
 		TConstArrayView<FColor> BaselineColors,
 		TConstArrayView<FColor> CommittedColors,
 		TArrayView<const FVertexMaskForgeMaskLayerParams> Layers,
+		TConstArrayView<EVertexMaskForgeScalarMaskSource> LayerOrder,
 		const UE::Geometry::FDynamicMesh3& Mesh,
 		bool bFilterR, bool bFilterG, bool bFilterB,
 		TArray<FColor>& OutFinalColors,

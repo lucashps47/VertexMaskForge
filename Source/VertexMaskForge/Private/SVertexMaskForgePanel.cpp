@@ -42,6 +42,7 @@
 #include "VertexMaskForgeDisplayColorDerivation.h"
 #include "VertexMaskForgeGeneratorLayerBridge.h"
 #include "VertexMaskForgeGeneratorUtils.h"
+#include "VertexMaskForgeLayerOrder.h"
 #include "VertexMaskForgeMaterialSlotGenerator.h"
 #include "VertexMaskForgeNoiseGenerator.h"
 #include "VertexMaskForgeRecipeTypes.h"
@@ -1207,28 +1208,94 @@ namespace VertexMaskForgePanel
 	 *
 	 * AUDITED (peer-mask composition checkpoint): Layers is an UNORDERED set of every enabled+Ready mask
 	 * generator for this component, resolved entirely by the caller (ApplyPreviewToEntry) BEFORE this
-	 * call. This function sorts Layers ONCE by Mask->Source before the per-vertex loop, then hands the
-	 * same sorted view to ComposeMaskStack for every vertex.
+	 * call. AUDITED (M16-K.2): this function no longer sorts Layers by Mask->Source -- it resolves
+	 * composition order ONCE, via ResolveLayersInPersistentOrder (the panel's own persistent
+	 * GeneratorLayerOrder), before the per-vertex loop, then hands that same resolved view to
+	 * VertexMaskForgeGeneratorLayerBridge::ComposeGeneratorLayersSequential for every vertex.
 	 */
+	/**
+	 * M16-K.2: resolves Layers (an unordered set of every enabled+Ready generator's own
+	 * FVertexMaskForgeMaskLayerParams, built by the caller) into composition order, walking LayerOrder
+	 * (the panel's own persistent generator layer order) and picking out each generator's own entry from
+	 * Layers by identity (Mask->Source) -- replaces the legacy Sort()-by-Mask->Source used by both
+	 * ComputeComposedColorsRGB/ComputeComposedColorsRGBSourceTopology before this checkpoint. A generator
+	 * with no matching entry in Layers (disabled, or not Ready) is simply absent from the result -- same
+	 * "not contributing" outcome the old Sort() already produced for it, just never present at all now
+	 * rather than sorted-but-skipped downstream. Every field of a matched Layer (Mask/BlendMode/Opacity/
+	 * IndexOverride) is copied verbatim -- no generator state, cache, or heavy payload is touched, only
+	 * these small per-call descriptors.
+	 *
+	 * A non-generator entry (Fill/Constant override -- VertexMaskForgeLayerOrder::IsGeneratorLayer()==
+	 * false for its own Mask->Source) never depends on LayerOrder at all -- it is preserved verbatim, in
+	 * Layers' own original relative order, appended after any resolved generator layers. In every real
+	 * call site today Layers contains EITHER exactly one Fill override OR up to seven generators, never
+	 * both at once (see ApplyPreviewToEntry's own Fill/generator branch) -- this function does not assume
+	 * that mutual exclusivity, it simply handles both shapes correctly either way.
+	 *
+	 * AUDITED (M16-K.2 defensive boundary): LayerOrder is expected to be VertexMaskForgeLayerOrder::
+	 * IsValid() by construction -- the panel's own GeneratorLayerOrder member is initialized once via
+	 * MakeDefault() and (until M16-K.3 introduces a mutator) never changes at all. If an invalid
+	 * LayerOrder is ever passed here regardless (e.g. directly from a test), this function does not
+	 * attempt a partial/best-effort reorder or silently repair it -- no generator layer is resolved at
+	 * all for that call (an explicit, diagnosed, safe "empty" outcome, logged once via UE_LOG), while
+	 * any non-generator (Fill) entry still passes through unaffected, since Fill never depended on
+	 * LayerOrder in the first place.
+	 */
+	static TArray<FVertexMaskForgeMaskLayerParams, TInlineAllocator<8>> ResolveLayersInPersistentOrder(
+		const TArrayView<const FVertexMaskForgeMaskLayerParams> Layers,
+		const TConstArrayView<EVertexMaskForgeScalarMaskSource> LayerOrder)
+	{
+		TArray<FVertexMaskForgeMaskLayerParams, TInlineAllocator<8>> Resolved;
+
+		if (VertexMaskForgeLayerOrder::IsValid(LayerOrder))
+		{
+			for (const EVertexMaskForgeScalarMaskSource Source : LayerOrder)
+			{
+				for (const FVertexMaskForgeMaskLayerParams& Layer : Layers)
+				{
+					if (Layer.Mask && Layer.Mask->Source == Source)
+					{
+						Resolved.Add(Layer);
+						break;
+					}
+				}
+			}
+		}
+		else
+		{
+			UE_LOG(LogVertexMaskForge, Warning,
+				TEXT("Vertex Mask Forge: ResolveLayersInPersistentOrder received an invalid LayerOrder (Num=%d) -- no generator layer will be composed this call."),
+				LayerOrder.Num());
+		}
+
+		for (const FVertexMaskForgeMaskLayerParams& Layer : Layers)
+		{
+			const bool bIsGeneratorLayer = Layer.Mask && VertexMaskForgeLayerOrder::IsGeneratorLayer(Layer.Mask->Source);
+			if (!bIsGeneratorLayer)
+			{
+				Resolved.Add(Layer);
+			}
+		}
+
+		return Resolved;
+	}
+
 	// AUDITED (M16-J final): no longer `static` -- declared in VertexMaskForgeMaskTypes.h so automation
 	// tests can call this exact production function directly (see that header's own doc comment on why).
 	void ComputeComposedColorsRGB(
 		TConstArrayView<FColor> BaselineColors,
 		TConstArrayView<FColor> CommittedColors,
 		TArrayView<const FVertexMaskForgeMaskLayerParams> Layers,
+		const TConstArrayView<EVertexMaskForgeScalarMaskSource> LayerOrder,
 		const bool bFilterR, const bool bFilterG, const bool bFilterB,
 		TArray<FColor>& OutFinalColors,
 		int32& OutNumComposed)
 	{
 		OutNumComposed = 0;
 
-		TArray<FVertexMaskForgeMaskLayerParams, TInlineAllocator<8>> SortedLayers(Layers.GetData(), Layers.Num());
-		SortedLayers.Sort([](const FVertexMaskForgeMaskLayerParams& A, const FVertexMaskForgeMaskLayerParams& B)
-		{
-			const uint8 SourceA = A.Mask ? static_cast<uint8>(A.Mask->Source) : 0;
-			const uint8 SourceB = B.Mask ? static_cast<uint8>(B.Mask->Source) : 0;
-			return SourceA < SourceB;
-		});
+		// AUDITED (M16-K.2): resolved via the panel's own persistent LayerOrder -- no Sort()-by-
+		// Mask->Source anymore. See ResolveLayersInPersistentOrder's own doc comment for the full contract.
+		const TArray<FVertexMaskForgeMaskLayerParams, TInlineAllocator<8>> SortedLayers = ResolveLayersInPersistentOrder(Layers, LayerOrder);
 
 		const int32 NumRenderVerts = BaselineColors.Num();
 
@@ -1325,6 +1392,7 @@ namespace VertexMaskForgePanel
 		TConstArrayView<FColor> BaselineColors,
 		TConstArrayView<FColor> CommittedColors,
 		TArrayView<const FVertexMaskForgeMaskLayerParams> Layers,
+		const TConstArrayView<EVertexMaskForgeScalarMaskSource> LayerOrder,
 		const UE::Geometry::FDynamicMesh3& Mesh,
 		const bool bFilterR, const bool bFilterG, const bool bFilterB,
 		TArray<FColor>& OutFinalColors,
@@ -1334,13 +1402,11 @@ namespace VertexMaskForgePanel
 
 		OutNumComposed = 0;
 
-		TArray<FVertexMaskForgeMaskLayerParams, TInlineAllocator<8>> SortedLayers(Layers.GetData(), Layers.Num());
-		SortedLayers.Sort([](const FVertexMaskForgeMaskLayerParams& A, const FVertexMaskForgeMaskLayerParams& B)
-		{
-			const uint8 SourceA = A.Mask ? static_cast<uint8>(A.Mask->Source) : 0;
-			const uint8 SourceB = B.Mask ? static_cast<uint8>(B.Mask->Source) : 0;
-			return SourceA < SourceB;
-		});
+		// AUDITED (M16-K.2): same LayerOrder-driven resolution as ComputeComposedColorsRGB's own -- see
+		// ResolveLayersInPersistentOrder's own doc comment. Stays mutable here (unlike the render-vertex
+		// sibling): the per-corner loop below rewrites each entry's own IndexOverride in place, every
+		// corner, exactly as it already did before this checkpoint.
+		TArray<FVertexMaskForgeMaskLayerParams, TInlineAllocator<8>> SortedLayers = ResolveLayersInPersistentOrder(Layers, LayerOrder);
 
 		const FDynamicMeshNormalOverlay* NormalOverlay = Mesh.HasAttributes() ? Mesh.Attributes()->PrimaryNormals() : nullptr;
 
@@ -8026,7 +8092,7 @@ void SVertexMaskForgePanel::ApplyPreviewToEntry(
 			int32 NumComposed = 0;
 			VertexMaskForgePanel::ComputeComposedColorsRGBSourceTopology(
 				StateOwner->GetBaselineColors(), StateOwner->GetCommittedColors(),
-				Layers, *WorkingMesh.Mesh,
+				Layers, GeneratorLayerOrder, *WorkingMesh.Mesh,
 				bChannelFilterR, bChannelFilterG, bChannelFilterB,
 				FinalColors, NumComposed);
 
@@ -8257,7 +8323,7 @@ void SVertexMaskForgePanel::ApplyPreviewToEntry(
 		TArray<FColor> FinalColors;
 		int32 NumComposed = 0;
 		VertexMaskForgePanel::ComputeComposedColorsRGB(
-			StateOwner->GetBaselineColors(), StateOwner->GetCommittedColors(), Layers,
+			StateOwner->GetBaselineColors(), StateOwner->GetCommittedColors(), Layers, GeneratorLayerOrder,
 			bChannelFilterR, bChannelFilterG, bChannelFilterB,
 			FinalColors, NumComposed);
 
