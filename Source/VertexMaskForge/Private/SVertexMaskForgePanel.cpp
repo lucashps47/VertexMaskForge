@@ -40,8 +40,8 @@
 #include "VertexMaskForgeCurvatureGenerator.h"
 #include "VertexMaskForgeDirectionalNormalGenerator.h"
 #include "VertexMaskForgeDisplayColorDerivation.h"
+#include "VertexMaskForgeGeneratorLayerBridge.h"
 #include "VertexMaskForgeGeneratorUtils.h"
-#include "VertexMaskForgeMaskStackComposer.h"
 #include "VertexMaskForgeMaterialSlotGenerator.h"
 #include "VertexMaskForgeNoiseGenerator.h"
 #include "VertexMaskForgeRecipeTypes.h"
@@ -1028,48 +1028,17 @@ namespace VertexMaskForgePanel
 	}
 
 	// --- Blend Mode math (see EVertexMaskForgeBlendMode) -------------------------------------
-	// AUDITED (M2 extraction): the actual fold/formula math (ApplyMaskBlendMode,
-	// BlendMaskValueUnclamped, and the fixed-stage composition previously implemented directly here)
-	// moved verbatim to VertexMaskForgeMaskStackComposer::ComposeStack (VertexMaskForgeMaskStackComposer.cpp)
-	// -- a generic, stateless composer that knows nothing about FVertexMaskForgeScalarMask, Mask->Source,
-	// IndexOverride, render vertices, triangle corners, or Nanite/Source-Topology domains. This function
-	// is now a thin WRAPPER, kept at its ORIGINAL name/signature so both existing call sites (inside
-	// UpdateWorkingColors/UpdateWorkingColorsSourceTopology below) need zero changes: it still resolves
-	// each layer's LookupIndex (IndexOverride >= 0 ? IndexOverride : VertexIndex), still calls
-	// Layer.Mask->TryGetValue() exactly as before, still skips a layer under the exact same conditions
-	// (null Mask or a failed TryGetValue) -- only building a VertexMaskForgeMaskStackComposer::
-	// FResolvedMaskLayer (BlendMode/Opacity/MaskValue only, no Mask pointer, no Source) per successfully
-	// resolved layer, in the SAME order SortedLayers was received in (never re-sorted here), before
-	// delegating the actual per-channel fold/clamp/Channel-Filter/Alpha math to ComposeStack.
-	static FVector4f ComposeMaskStack(
-		const FVector4f& BaselineColor,
-		const FVector4f& CommittedColor,
-		const int32 VertexIndex,
-		TArrayView<const FVertexMaskForgeMaskLayerParams> SortedLayers,
-		const bool bFilterR, const bool bFilterG, const bool bFilterB,
-		bool& bOutAnyLayerContributed)
-	{
-		// Resolved ONCE per vertex -- MaskValue does not vary per channel, so every channel the
-		// composer computes below reuses the exact same set of (MaskValue, BlendMode, Opacity)
-		// samples. SortedLayers is already ordered by Mask->Source (the caller sorts once, outside the
-		// per-vertex loop, in UpdateWorkingColors/UpdateWorkingColorsSourceTopology) -- that order is
-		// preserved verbatim into ResolvedLayers, which is what gives the Copy/Overlay/Linear stages
-		// their deterministic, generator-ID tie-break order inside the composer.
-		TArray<VertexMaskForgeMaskStackComposer::FResolvedMaskLayer, TInlineAllocator<8>> ResolvedLayers;
-		for (const FVertexMaskForgeMaskLayerParams& Layer : SortedLayers)
-		{
-			float MaskValue = 0.f;
-			const int32 LookupIndex = (Layer.IndexOverride >= 0) ? Layer.IndexOverride : VertexIndex;
-			if (!Layer.Mask || !Layer.Mask->TryGetValue(LookupIndex, MaskValue))
-			{
-				continue;
-			}
-			ResolvedLayers.Add({ Layer.BlendMode, Layer.Opacity, MaskValue });
-		}
-
-		return VertexMaskForgeMaskStackComposer::ComposeStack(
-			BaselineColor, CommittedColor, ResolvedLayers, bFilterR, bFilterG, bFilterB, bOutAnyLayerContributed);
-	}
+	// AUDITED (M16-J final): the panel-level ComposeMaskStack wrapper (which called
+	// VertexMaskForgeMaskStackComposer::ComposeStack, the legacy fixed-stage/Blend-Mode-grouped
+	// compositor) was REMOVED from this file -- both of its real call sites (ComputeComposedColorsRGB /
+	// ComputeComposedColorsRGBSourceTopology below) now call
+	// VertexMaskForgeGeneratorLayerBridge::ComposeGeneratorLayersSequential instead, which threads the
+	// SAME already-sorted Layers array through the new strictly-sequential fold
+	// (VertexMaskForgeSequentialEvaluator::EvaluateFillLayers) rather than ComposeStack's fixed stages.
+	// VertexMaskForgeMaskStackComposer::ComposeStack itself is NOT deleted -- it remains, unmodified, as
+	// the legacy algorithm characterized/protected by
+	// VertexMaskForge.SequentialEvaluator.Legacy.ComposeStackCharacterization
+	// (VertexMaskForgeSequentialEvaluatorTests.cpp); this panel simply no longer calls it.
 
 	// ApplyPreviewModeDisplay moved to VertexMaskForgeDisplayColorDerivation.cpp (M3 extraction, private
 	// helper there) -- see DeriveDisplayColors' own call site below for the only place this panel still
@@ -1241,7 +1210,9 @@ namespace VertexMaskForgePanel
 	 * call. This function sorts Layers ONCE by Mask->Source before the per-vertex loop, then hands the
 	 * same sorted view to ComposeMaskStack for every vertex.
 	 */
-	static void ComputeComposedColorsRGB(
+	// AUDITED (M16-J final): no longer `static` -- declared in VertexMaskForgeMaskTypes.h so automation
+	// tests can call this exact production function directly (see that header's own doc comment on why).
+	void ComputeComposedColorsRGB(
 		TConstArrayView<FColor> BaselineColors,
 		TConstArrayView<FColor> CommittedColors,
 		TArrayView<const FVertexMaskForgeMaskLayerParams> Layers,
@@ -1285,7 +1256,13 @@ namespace VertexMaskForgePanel
 				CommittedRenderColor.B / 255.f, CommittedRenderColor.A / 255.f);
 
 			bool bAnyLayerContributed = false;
-			const FVector4f Composite = ComposeMaskStack(
+			// AUDITED (M16-J final): the panel's real composition call site -- replaces the legacy
+			// ComposeMaskStack/ComposeStack (fixed-stage, Blend-Mode-grouped) with the strictly
+			// sequential (array-order) fold, via VertexMaskForgeGeneratorLayerBridge. SortedLayers is
+			// unchanged (still sorted once by Mask->Source outside this loop); the bridge threads each
+			// generator's own resolved scalar through VertexMaskForgeSequentialEvaluator::EvaluateFillLayers
+			// as an implicit-white Fill Layer -- see that module's own doc comment.
+			const FVector4f Composite = VertexMaskForgeGeneratorLayerBridge::ComposeGeneratorLayersSequential(
 				BaselineColorF, CommittedColorF, i, SortedLayers,
 				bFilterR, bFilterG, bFilterB, bAnyLayerContributed);
 			if (!bAnyLayerContributed)
@@ -1343,7 +1320,8 @@ namespace VertexMaskForgePanel
 	 * Box/Curvature/Noise -> Dynamic Mesh Vertex ID, Ambient Occlusion -> Normal Overlay Element ID,
 	 * Material Slot/Directional Normal/Fill -> corner-exact).
 	 */
-	static void ComputeComposedColorsRGBSourceTopology(
+	// AUDITED (M16-J final): no longer `static` -- see ComputeComposedColorsRGB's own comment above.
+	void ComputeComposedColorsRGBSourceTopology(
 		TConstArrayView<FColor> BaselineColors,
 		TConstArrayView<FColor> CommittedColors,
 		TArrayView<const FVertexMaskForgeMaskLayerParams> Layers,
@@ -1425,7 +1403,9 @@ namespace VertexMaskForgePanel
 					CommittedRenderColor.B / 255.f, CommittedRenderColor.A / 255.f);
 
 				bool bAnyLayerContributed = false;
-				const FVector4f Composite = ComposeMaskStack(
+				// AUDITED (M16-J final): same bridge/sequential-fold replacement as the render-vertex
+				// branch above -- see ComputeComposedColorsRGB's own call site comment.
+				const FVector4f Composite = VertexMaskForgeGeneratorLayerBridge::ComposeGeneratorLayersSequential(
 					BaselineColorF, CommittedColorF, CornerIndex, SortedLayers,
 					bFilterR, bFilterG, bFilterB, bAnyLayerContributed);
 				if (!bAnyLayerContributed)

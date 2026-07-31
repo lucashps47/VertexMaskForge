@@ -49,7 +49,14 @@ namespace
 		return Instance;
 	}
 
-	/** White fill, Copy blend, full layer opacity -- Composite[i] = Lerp(Base[i], White, Coverage[i]). */
+	/** White fill, Copy blend, full layer opacity -- AUDITED (M16-J final formula update): PaintValue[i] =
+	 *  White * EffectiveMask[i] = broadcast(EffectiveMask[i]) exactly (White is the multiplicative
+	 *  identity per-channel). At Opacity=1, Copy's own LayerOutput = Lerp(CompositeBelow, PaintValue, 1)
+	 *  = PaintValue verbatim -- CompositeBelow (and therefore Base[i]) is COMPLETELY IGNORED. So
+	 *  Composite[i] = broadcast(EffectiveMask[i]), independent of Base[i]. This is a genuine behavioral
+	 *  change from the OLD Coverage-based contract (Composite[i] = Lerp(Base[i], White, Coverage[i]),
+	 *  which DID depend on Base[i] for Coverage[i] < 1) -- see VertexMaskForgeSequentialEvaluator.h's own
+	 *  EvaluateFillLayers doc comment for the authoritative derivation. */
 	FVertexMaskForgeFillLayer MakeWhiteFillCopyLayer()
 	{
 		FVertexMaskForgeFillLayer Layer = FVertexMaskForgeFillLayer::Make();
@@ -60,9 +67,14 @@ namespace
 		return Layer;
 	}
 
-	/** 0.5 fill, Multiply blend, full layer opacity -- with an empty Mask Stack (Coverage=1 always),
-	 *  Composite[i] = Base[i] * 0.5 exactly, making the result a direct, unambiguous function of
-	 *  Base[i] alone (no Coverage/mask term to obscure whether Base was actually read per-sample). */
+	/** 0.5 fill, Multiply blend, full layer opacity -- with an empty Mask Stack (EffectiveMask=1 always,
+	 *  M16-B's own empty-stack contract), PaintValue[i] = FillValue[i] * 1 = 0.5 exactly. AUDITED (M16-J
+	 *  final): when EffectiveMask=1, the OLD Coverage=Opacity*EffectiveMask=Opacity and the NEW
+	 *  PaintValue=FillValue*1=FillValue formulas produce IDENTICAL LayerOutput for any Blend Mode (Coverage
+	 *  and LayerOpacity coincide, and FillValue and PaintValue coincide) -- so this helper's own contract,
+	 *  Composite[i] = Base[i] * 0.5 exactly, is UNCHANGED by the M16-J final semantic update. Still a
+	 *  direct, unambiguous function of Base[i] alone (no mask term to obscure whether Base was actually
+	 *  read per-sample). */
 	FVertexMaskForgeFillLayer MakeHalfMultiplyLayer()
 	{
 		FVertexMaskForgeFillLayer Layer = FVertexMaskForgeFillLayer::Make();
@@ -120,7 +132,7 @@ bool FVertexMaskForgeFillLayerResolutionVaryingBaseTest::RunTest(const FString& 
 {
 	FVertexMaskForgeInstanceResultStore Store;
 	const FVertexMaskForgeMaskInstance A = MakeFillLayerTestInstance(EVertexMaskForgeBlendMode::Copy, 1.0f);
-	Store.StoreOrReplace(A.InstanceId, MakeFillLayerTestResult({ 0.3f, 0.6f, 0.9f })); // Coverage == these values (Copy, Opacity=1).
+	Store.StoreOrReplace(A.InstanceId, MakeFillLayerTestResult({ 0.3f, 0.6f, 0.9f })); // EffectiveMask == these values (Copy, Opacity=1).
 
 	FVertexMaskForgeFillLayer Layer = MakeWhiteFillCopyLayer();
 	Layer.MaskStack.Add(A);
@@ -137,9 +149,17 @@ bool FVertexMaskForgeFillLayerResolutionVaryingBaseTest::RunTest(const FString& 
 	TestTrue(TEXT("Evaluation succeeds"), bSuccess);
 	if (bSuccess)
 	{
-		// Composite[i] = Lerp(Base[i], White, Coverage[i]) = Base[i] + Coverage[i]*(1-Base[i]).
-		ExpectVector(*this, TEXT("Composite[0]"), Output.Composite[0], FVector3f(0.44f, 0.58f, 0.72f));
-		ExpectVector(*this, TEXT("Composite[1]"), Output.Composite[1], FVector3f(1.0f, 1.0f, 1.0f));
+		// AUDITED (M16-J final -- recomputed): Composite[i] = PaintValue[i] = White*EffectiveMask[i]
+		// (broadcast), INDEPENDENT of Base[i] -- Copy at Opacity=1 ignores CompositeBelow entirely (see
+		// MakeWhiteFillCopyLayer's own updated doc comment). EffectiveMask itself is unchanged by this
+		// checkpoint (a single Copy(Op=1) mask step, values already in [0,1], no clamp-policy divergence):
+		// EffectiveMask = {0.3, 0.6, 0.9}, so Composite[i] = broadcast(EffectiveMask[i]) for every i.
+		// OLD (pre-M16-J-final) values, which DID depend on Base[i] via Lerp(Base[i], White, Coverage[i]):
+		// Composite[0] = (0.44,0.58,0.72), Composite[1] = (1,1,1), Composite[2] = (0.9,0.9,0.9) -- no
+		// longer reproducible under the new contract; this is the exact "invalidated by white-fill Copy
+		// at Opacity=1" consequence flagged in the checkpoint's own scope.
+		ExpectVector(*this, TEXT("Composite[0]"), Output.Composite[0], FVector3f(0.3f, 0.3f, 0.3f));
+		ExpectVector(*this, TEXT("Composite[1]"), Output.Composite[1], FVector3f(0.6f, 0.6f, 0.6f));
 		ExpectVector(*this, TEXT("Composite[2]"), Output.Composite[2], FVector3f(0.9f, 0.9f, 0.9f));
 	}
 
@@ -148,14 +168,37 @@ bool FVertexMaskForgeFillLayerResolutionVaryingBaseTest::RunTest(const FString& 
 
 // B. Index correspondence: distinguishable per-index colors prove Base[i] is paired with the evaluator
 // output at that SAME index i -- no spatial reorder, shift, or broadcast from index 0.
+//
+// AUDITED (M16-J final closing audit -- minimal fixture redesign, not a formula fix): this test
+// originally used MakeWhiteFillCopyLayer() (Copy, Opacity=1). Under the new PaintValue contract, white
+// Copy@1 makes LayerOutput == broadcast(EffectiveMask), which DISCARDS CompositeBelow (and therefore
+// Base[i]) entirely -- see MakeWhiteFillCopyLayer's own doc comment. With a uniform mask (0.5 at every
+// index, chosen by the original test specifically to isolate Base's own contribution), that means all
+// three indices now produce the IDENTICAL Composite regardless of Base[i] -- the test would pass even if
+// PerSampleBase[i] were silently broadcast from index 0 or read out of order, which is exactly the bug
+// this test's own name and doc comment claim to catch. VaryingBasePerSample (test A, above) still proves
+// index correspondence for the MASK side (EffectiveMask[i] varies per index and is correctly threaded to
+// Composite[i]), but nothing in this file any longer proves the BASE side of that same contract with a
+// Copy-based fixture -- a real, mandatory-matrix gap, not just a stale comment.
+//
+// Fix: swap the Fill Layer's own Blend Mode from Copy to Add (keeping FillValue white and the mask
+// uniform at 0.5, unchanged) -- Add's own formula (LayerOutput = Base + PaintValue, then Clamp01) does
+// NOT discard CompositeBelow, so Base[i] is restored as the only source of per-index variation, which is
+// precisely what this test's name promises to isolate. This is a fixture change, not a re-derivation of
+// the authoritative PaintValue/clamp formula itself (already covered/re-verified by every other test in
+// this file and in VertexMaskForgeSequentialEvaluatorTests.cpp).
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeFillLayerResolutionIndexCorrespondenceTest, "VertexMaskForge.FillLayerResolution.IndexCorrespondence", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
 bool FVertexMaskForgeFillLayerResolutionIndexCorrespondenceTest::RunTest(const FString& Parameters)
 {
 	FVertexMaskForgeInstanceResultStore Store;
 	const FVertexMaskForgeMaskInstance A = MakeFillLayerTestInstance(EVertexMaskForgeBlendMode::Copy, 1.0f);
-	Store.StoreOrReplace(A.InstanceId, MakeFillLayerTestResult({ 0.5f, 0.5f, 0.5f })); // Uniform Coverage=0.5 isolates the base's own contribution.
+	Store.StoreOrReplace(A.InstanceId, MakeFillLayerTestResult({ 0.5f, 0.5f, 0.5f })); // Uniform EffectiveMask=0.5 -- isolates Base's own contribution (restored by the Add fixture below).
 
-	FVertexMaskForgeFillLayer Layer = MakeWhiteFillCopyLayer();
+	FVertexMaskForgeFillLayer Layer = FVertexMaskForgeFillLayer::Make();
+	Layer.FillValue = FVector3f(1.0f, 1.0f, 1.0f);
+	Layer.BlendMode = EVertexMaskForgeBlendMode::Add; // AUDITED (M16-J final): Add, not Copy -- see this test's own updated doc comment above for why.
+	Layer.Opacity = 1.0f;
+	Layer.bEnabled = true;
 	Layer.MaskStack.Add(A);
 
 	const TArray<FVector3f> Base = {
@@ -170,7 +213,11 @@ bool FVertexMaskForgeFillLayerResolutionIndexCorrespondenceTest::RunTest(const F
 	TestTrue(TEXT("Evaluation succeeds"), bSuccess);
 	if (bSuccess)
 	{
-		// Composite[i] = 0.5*Base[i] + 0.5.
+		// PaintValue = White*0.5 = (0.5,0.5,0.5) uniformly (same EffectiveMask as before). Add:
+		// LayerOutput[i] = Clamp01(Base[i] + PaintValue) -- restores per-index/per-base-color
+		// discrimination: red(1,0,0)+0.5 -> Clamp01(1.5,0.5,0.5) = (1,0.5,0.5); green(0,1,0)+0.5 ->
+		// (0.5,1,0.5); blue(0,0,1)+0.5 -> (0.5,0.5,1). A broadcast-from-index-0 or shifted-index bug in
+		// PerSampleBase reading would now produce a visibly wrong (non-matching) result at some index.
 		ExpectVector(*this, TEXT("Composite[0] (from red base)"), Output.Composite[0], FVector3f(1.0f, 0.5f, 0.5f));
 		ExpectVector(*this, TEXT("Composite[1] (from green base)"), Output.Composite[1], FVector3f(0.5f, 1.0f, 0.5f));
 		ExpectVector(*this, TEXT("Composite[2] (from blue base)"), Output.Composite[2], FVector3f(0.5f, 0.5f, 1.0f));
@@ -204,7 +251,11 @@ bool FVertexMaskForgeFillLayerResolutionEmptyStackVaryingBaseTest::RunTest(const
 		{
 			TestNearlyEqual(FString::Printf(TEXT("EffectiveMask[%d] == 1.0"), i), Output.EffectiveMask[i], 1.0f, FLR_Tolerance);
 		}
-		// Multiply, Coverage=1 always -> Composite[i] = Base[i] * 0.5, individually.
+		// AUDITED (M16-J final -- verified unaffected): empty Mask Stack -> EffectiveMask=1 always ->
+		// PaintValue[i] = FillValue[i]*1 = 0.5, and since EffectiveMask=1 the OLD Coverage=Opacity*1=1 and
+		// NEW LayerOpacity=1 coincide (see MakeHalfMultiplyLayer's own updated doc comment for the general
+		// proof this holds for any Blend Mode) -- so Composite[i] = Base[i] * 0.5, individually, UNCHANGED
+		// by this checkpoint.
 		ExpectVector(*this, TEXT("Composite[0]"), Output.Composite[0], FVector3f(0.1f, 0.2f, 0.3f));
 		ExpectVector(*this, TEXT("Composite[1]"), Output.Composite[1], FVector3f(0.5f, 0.5f, 0.5f));
 		ExpectVector(*this, TEXT("Composite[2]"), Output.Composite[2], FVector3f(0.0f, 0.0f, 0.0f));
@@ -304,7 +355,11 @@ bool FVertexMaskForgeFillLayerResolutionOrderTest::RunTest(const FString& Parame
 		TestNearlyEqual(TEXT("Order [A,B] index 0 == 0.2"), OutputAB.EffectiveMask[0], 0.2f, FLR_Tolerance);
 		TestNearlyEqual(TEXT("Order [B,A] index 0 == 0.35"), OutputBA.EffectiveMask[0], 0.35f, FLR_Tolerance);
 		TestTrue(TEXT("Orders produce different results at index 0"), !FMath::IsNearlyEqual(OutputAB.EffectiveMask[0], OutputBA.EffectiveMask[0], FLR_Tolerance));
-		// Base[0]=(0,0,0), Coverage=EffectiveMask[0] -> Composite[0] = White*Coverage.
+		// AUDITED (M16-J final -- verified unaffected): Composite[0] = PaintValue[0] = White*EffectiveMask[0]
+		// (Copy at Opacity=1 ignores CompositeBelow entirely -- see MakeWhiteFillCopyLayer's own updated
+		// doc comment). Base[0]=(0,0,0) happens to make the OLD Lerp(Base[0], White, EffectiveMask[0]) =
+		// EffectiveMask[0]*(1-0)+0 = EffectiveMask[0] numerically identical to the NEW broadcast formula, so
+		// the expected values below are UNCHANGED by this checkpoint (verified by hand, not assumed).
 		ExpectVector(*this, TEXT("Composite[0] order AB"), OutputAB.Composite[0], FVector3f(0.2f, 0.2f, 0.2f));
 		ExpectVector(*this, TEXT("Composite[0] order BA"), OutputBA.Composite[0], FVector3f(0.35f, 0.35f, 0.35f));
 	}
@@ -602,12 +657,20 @@ bool FVertexMaskForgeFillLayerResolutionOutputAsNextBaseTest::RunTest(const FStr
 	TestTrue(TEXT("First evaluation succeeds"), bSuccess1);
 	if (!bSuccess1) { return true; }
 
-	// Coverage=0.5 both indices -> Composite1 = Lerp(Base1, White, 0.5).
+	// AUDITED (M16-J final -- recomputed): EffectiveMask=0.5 both indices (unaffected mask math) ->
+	// Composite1[i] = PaintValue[i] = White*0.5 = (0.5,0.5,0.5) broadcast, INDEPENDENT of Base1[i] -- Copy
+	// at Opacity=1 ignores CompositeBelow entirely (see MakeWhiteFillCopyLayer's own updated doc comment).
+	// Base1[0]=(0,0,0) happens to make the OLD Lerp(0,White,0.5)=0.5 numerically coincide with the new
+	// broadcast value, so Composite1[0] is UNCHANGED. Base1[1]=(1,1,1) does NOT coincide: OLD
+	// Lerp((1,1,1),White,0.5)=(1,1,1), but NEW is the same broadcast 0.5 as every other index -- Composite1[1]
+	// changes from (1,1,1) to (0.5,0.5,0.5).
 	ExpectVector(*this, TEXT("Composite1[0]"), Output1.Composite[0], FVector3f(0.5f, 0.5f, 0.5f));
-	ExpectVector(*this, TEXT("Composite1[1]"), Output1.Composite[1], FVector3f(1.0f, 1.0f, 1.0f));
+	ExpectVector(*this, TEXT("Composite1[1]"), Output1.Composite[1], FVector3f(0.5f, 0.5f, 0.5f));
 
 	// Second, independent call: Output1.Composite becomes PerSampleBase for a different Fill Layer,
-	// empty Mask Stack, Multiply-half -- Composite2[i] = Composite1[i] * 0.5.
+	// empty Mask Stack, Multiply-half. EffectiveMask=1 here, so this layer's own formula is UNCHANGED by
+	// M16-J final (see MakeHalfMultiplyLayer's own updated doc comment) -- Composite2[i] = Composite1[i] * 0.5,
+	// using the RECOMPUTED Composite1 above (0.5 uniformly) rather than the old, Base-dependent Composite1.
 	FVertexMaskForgeFillLayer Layer2 = MakeHalfMultiplyLayer();
 
 	FVertexMaskForgeFillLayerEvaluationOutput Output2;
@@ -616,8 +679,10 @@ bool FVertexMaskForgeFillLayerResolutionOutputAsNextBaseTest::RunTest(const FStr
 	TestTrue(TEXT("Second evaluation succeeds"), bSuccess2);
 	if (bSuccess2)
 	{
+		// Composite2[0] = 0.5*0.5 = 0.25 -- UNCHANGED (Composite1[0] itself was unchanged).
+		// Composite2[1] = 0.5*0.5 = 0.25 -- CHANGED from 0.5 (Composite1[1] dropped from 1.0 to 0.5).
 		ExpectVector(*this, TEXT("Composite2[0]"), Output2.Composite[0], FVector3f(0.25f, 0.25f, 0.25f));
-		ExpectVector(*this, TEXT("Composite2[1]"), Output2.Composite[1], FVector3f(0.5f, 0.5f, 0.5f));
+		ExpectVector(*this, TEXT("Composite2[1]"), Output2.Composite[1], FVector3f(0.25f, 0.25f, 0.25f));
 	}
 
 	return true;

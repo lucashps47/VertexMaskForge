@@ -1,6 +1,8 @@
 #pragma once
 
+#include "Containers/ArrayView.h"
 #include "CoreMinimal.h"
+#include "Math/Color.h"
 
 /** Result of attempting to generate a scalar mask on a working mesh. */
 enum class EVertexMaskForgeScalarMaskState : uint8
@@ -155,6 +157,10 @@ enum class EVertexMaskForgeBlendMode : uint8
  *  checkpoint) is not required here. */
 struct FVertexMaskForgeScalarMask;
 
+/** Forward declaration only -- ComputeComposedColorsRGBSourceTopology below takes it by const&; the
+ *  full definition is not required here. */
+namespace UE::Geometry { class FDynamicMesh3; }
+
 namespace VertexMaskForgePanel
 {
 	/**
@@ -186,6 +192,33 @@ namespace VertexMaskForgePanel
 		 */
 		int32 IndexOverride = -1;
 	};
+
+	/**
+	 * M16-J final: declared here (a shared header), not just defined `static` in SVertexMaskForgePanel.cpp,
+	 * so automation tests can call the REAL, unmodified panel composition functions directly -- proving
+	 * the panel's own production path reaches VertexMaskForgeGeneratorLayerBridge::
+	 * ComposeGeneratorLayersSequential (and therefore VertexMaskForgeSequentialEvaluator), never
+	 * VertexMaskForgeMaskStackComposer::ComposeStack. Defined in SVertexMaskForgePanel.cpp, unchanged
+	 * from their own non-test call sites (ApplyPreviewToEntry) -- this is not a reimplementation or a
+	 * test-only shim, it is the exact function the panel itself calls every preview update.
+	 */
+	void ComputeComposedColorsRGB(
+		TConstArrayView<FColor> BaselineColors,
+		TConstArrayView<FColor> CommittedColors,
+		TArrayView<const FVertexMaskForgeMaskLayerParams> Layers,
+		bool bFilterR, bool bFilterG, bool bFilterB,
+		TArray<FColor>& OutFinalColors,
+		int32& OutNumComposed);
+
+	/** Source-Topology sibling of ComputeComposedColorsRGB above -- see that function's own doc comment. */
+	void ComputeComposedColorsRGBSourceTopology(
+		TConstArrayView<FColor> BaselineColors,
+		TConstArrayView<FColor> CommittedColors,
+		TArrayView<const FVertexMaskForgeMaskLayerParams> Layers,
+		const UE::Geometry::FDynamicMesh3& Mesh,
+		bool bFilterR, bool bFilterG, bool bFilterB,
+		TArray<FColor>& OutFinalColors,
+		int32& OutNumComposed);
 }
 
 /**
