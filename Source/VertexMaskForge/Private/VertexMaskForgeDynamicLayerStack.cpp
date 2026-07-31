@@ -41,6 +41,31 @@ namespace
 	{
 		return FMath::IsFinite(Opacity) && Opacity >= 0.0f && Opacity <= 1.0f;
 	}
+
+	// AUDITED (M16-K.5B.1 corrective): same discipline as the three validators above -- explicit switch
+	// over the seven real named enumerators, no range check (EVertexMaskForgeGeneratorType carries no
+	// Count/Max sentinel), default: false. This is the fix for a confirmed gap: MakeVertexMaskForgeGenerat
+	// orParams (VertexMaskForgeRecipeTypes.h) is NOT a validator -- its own switch groups an unrecognized
+	// value into the same `default:` case as MaterialSlot, silently producing a MaterialSlot Params
+	// alternative for ANY invalid input, with no failure signal. SetLayerMaskGeneratorType must reject an
+	// invalid GeneratorType itself, before ever reaching that factory -- see this function's own call site
+	// below for exactly where.
+	bool IsValidGeneratorType(const EVertexMaskForgeGeneratorType GeneratorType)
+	{
+		switch (GeneratorType)
+		{
+		case EVertexMaskForgeGeneratorType::BoundingBox:
+		case EVertexMaskForgeGeneratorType::AmbientOcclusion:
+		case EVertexMaskForgeGeneratorType::Curvature:
+		case EVertexMaskForgeGeneratorType::Noise:
+		case EVertexMaskForgeGeneratorType::DirectionalNormal:
+		case EVertexMaskForgeGeneratorType::Thickness:
+		case EVertexMaskForgeGeneratorType::MaterialSlot:
+			return true;
+		default:
+			return false;
+		}
+	}
 }
 
 FVertexMaskForgeDynamicLayerStack FVertexMaskForgeDynamicLayerStack::MakeInitialStack()
@@ -236,6 +261,17 @@ bool FVertexMaskForgeDynamicLayerStack::SetLayerChannelFilter(const FGuid& Layer
 
 bool FVertexMaskForgeDynamicLayerStack::SetLayerMaskGeneratorType(const FGuid& LayerId, const EVertexMaskForgeGeneratorType GeneratorType)
 {
+	// AUDITED (M16-K.5B.1 corrective): rejected BEFORE the lookup -- an invalid GeneratorType is invalid
+	// regardless of which layer (if any) LayerId resolves to, so there is no reason to spend a lookup on
+	// it. This is what guarantees NOTHING observable happens for an invalid value: no layer is found or
+	// touched, no FGuid is minted, no existing Mask is read or replaced, and MakeVertexMaskForgeGeneratorPa
+	// rams (whose own `default:` case would otherwise silently produce a MaterialSlot Params alternative
+	// for the invalid value) is never called.
+	if (!IsValidGeneratorType(GeneratorType))
+	{
+		return false;
+	}
+
 	FVertexMaskForgeLayer* Layer = FindLayerByIdMutable(LayerId);
 	if (!Layer)
 	{

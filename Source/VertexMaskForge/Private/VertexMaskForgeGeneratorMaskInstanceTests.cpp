@@ -466,4 +466,121 @@ bool FVertexMaskForgeGeneratorMaskInstanceEvaluatorInertTest::RunTest(const FStr
 	return true;
 }
 
+// --- M16-K.5B.1 corrective: SetLayerMaskGeneratorType must reject an unrecognized GeneratorType ---------
+// Confirmed gap: MakeVertexMaskForgeGeneratorParams (VertexMaskForgeRecipeTypes.h) is NOT a validator --
+// its own switch's `default:` case is shared with MaterialSlot, so an out-of-range GeneratorType value
+// used to silently produce a MaterialSlot Params alternative with no failure signal, while GeneratorType
+// itself was stored verbatim as the invalid value -- a real, publicly-reachable inconsistency (GeneratorType
+// not equal to any real enumerator, yet Params looking like MaterialSlot's). The four tests below prove the
+// fix via observable state only (GetLayerMask/FindLayerById/Params.IsType<T>()) -- no instrumentation, no
+// GUID hooking, no padding/memcmp comparison.
+
+// 19. InvalidGeneratorTypeOnEmptyMaskFailsWithoutMutation.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeGeneratorMaskInstanceInvalidTypeEmptyMaskTest, "VertexMaskForge.GeneratorMaskInstance.InvalidGeneratorTypeOnEmptyMaskFailsWithoutMutation", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeGeneratorMaskInstanceInvalidTypeEmptyMaskTest::RunTest(const FString& Parameters)
+{
+	FVertexMaskForgeDynamicLayerStack Stack;
+	const FGuid Id = Stack.AddLayer(TEXT("Layer"));
+	TestNull(TEXT("Starts with no mask"), Stack.GetLayerMask(Id));
+
+	const bool bResult = Stack.SetLayerMaskGeneratorType(Id, static_cast<EVertexMaskForgeGeneratorType>(255));
+	TestFalse(TEXT("Invalid GeneratorType is rejected"), bResult);
+
+	// Observable proof that no Mask Instance (and therefore no MaskInstanceId) was ever created.
+	TestNull(TEXT("Still no mask after the rejected call"), Stack.GetLayerMask(Id));
+	TestNotNull(TEXT("The layer itself still exists, untouched"), Stack.FindLayerById(Id));
+
+	return true;
+}
+
+// 20. InvalidGeneratorTypeDoesNotReplaceExistingMask.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeGeneratorMaskInstanceInvalidTypeExistingMaskTest, "VertexMaskForge.GeneratorMaskInstance.InvalidGeneratorTypeDoesNotReplaceExistingMask", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeGeneratorMaskInstanceInvalidTypeExistingMaskTest::RunTest(const FString& Parameters)
+{
+	FVertexMaskForgeDynamicLayerStack Stack;
+	const FGuid Id = Stack.AddLayer(TEXT("Layer"));
+	TestTrue(TEXT("Assign a valid Curvature mask"), Stack.SetLayerMaskGeneratorType(Id, EVertexMaskForgeGeneratorType::Curvature));
+
+	// Capture observable state before the rejected call.
+	const FVertexMaskForgeGeneratorMaskInstance* Before = Stack.GetLayerMask(Id);
+	TestNotNull(TEXT("Mask present before"), Before);
+	if (!Before)
+	{
+		return false;
+	}
+	const FGuid OriginalInstanceId = Before->MaskInstanceId;
+	const bool bOriginalIsCurvature = Before->Params.IsType<FVertexMaskForgeCurvatureParams>();
+	TestTrue(TEXT("Original Params alternative is Curvature"), bOriginalIsCurvature);
+
+	const bool bResult = Stack.SetLayerMaskGeneratorType(Id, static_cast<EVertexMaskForgeGeneratorType>(255));
+	TestFalse(TEXT("Invalid GeneratorType is rejected"), bResult);
+
+	// Observable proof the existing instance was left completely alone -- same id, same type, same
+	// Params alternative.
+	const FVertexMaskForgeGeneratorMaskInstance* After = Stack.GetLayerMask(Id);
+	TestNotNull(TEXT("Mask still present after the rejected call"), After);
+	if (After)
+	{
+		TestEqual(TEXT("MaskInstanceId unchanged"), After->MaskInstanceId, OriginalInstanceId);
+		TestTrue(TEXT("GeneratorType still Curvature"), After->GeneratorType == EVertexMaskForgeGeneratorType::Curvature);
+		TestTrue(TEXT("Params alternative still Curvature"), After->Params.IsType<FVertexMaskForgeCurvatureParams>());
+	}
+
+	return true;
+}
+
+// 21. InvalidGeneratorTypeOnBaseLayerFailsWithoutMutation.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeGeneratorMaskInstanceInvalidTypeBaseLayerTest, "VertexMaskForge.GeneratorMaskInstance.InvalidGeneratorTypeOnBaseLayerFailsWithoutMutation", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeGeneratorMaskInstanceInvalidTypeBaseLayerTest::RunTest(const FString& Parameters)
+{
+	FVertexMaskForgeDynamicLayerStack Stack = FVertexMaskForgeDynamicLayerStack::MakeInitialStack();
+	const FGuid BaseLayerId = Stack.GetLayers()[0].LayerId;
+	TestNull(TEXT("Base Layer starts with no mask"), Stack.GetLayerMask(BaseLayerId));
+
+	const bool bResult = Stack.SetLayerMaskGeneratorType(BaseLayerId, static_cast<EVertexMaskForgeGeneratorType>(255));
+	TestFalse(TEXT("Invalid GeneratorType is rejected on the Base Layer, same as any other layer"), bResult);
+
+	TestNull(TEXT("Base Layer still has no mask"), Stack.GetLayerMask(BaseLayerId));
+	TestNotNull(TEXT("Base Layer itself still exists"), Stack.FindLayerById(BaseLayerId));
+	TestEqual(TEXT("Still exactly one layer"), Stack.Num(), 1);
+
+	return true;
+}
+
+// 22. ValidGeneratorTypesStillCreateMatchingPayloadAlternatives -- regression proof that the new guard
+// does not affect any of the 7 real generator types.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeGeneratorMaskInstanceAllValidTypesStillWorkTest, "VertexMaskForge.GeneratorMaskInstance.ValidGeneratorTypesStillCreateMatchingPayloadAlternatives", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeGeneratorMaskInstanceAllValidTypesStillWorkTest::RunTest(const FString& Parameters)
+{
+	FVertexMaskForgeDynamicLayerStack Stack;
+
+	auto CheckType = [this, &Stack](const EVertexMaskForgeGeneratorType Type, const TCHAR* Label, TFunctionRef<bool(const FVertexMaskForgeGeneratorParams&)> IsExpectedAlternative)
+	{
+		const FGuid Id = Stack.AddLayer(Label);
+		const bool bResult = Stack.SetLayerMaskGeneratorType(Id, Type);
+		TestTrue(FString::Printf(TEXT("%s: SetLayerMaskGeneratorType returns true"), Label), bResult);
+
+		const FVertexMaskForgeGeneratorMaskInstance* Mask = Stack.GetLayerMask(Id);
+		TestNotNull(FString::Printf(TEXT("%s: mask instance is non-null"), Label), Mask);
+		if (Mask)
+		{
+			TestTrue(FString::Printf(TEXT("%s: MaskInstanceId is valid"), Label), Mask->MaskInstanceId.IsValid());
+			TestTrue(FString::Printf(TEXT("%s: GeneratorType is exactly the requested type"), Label), Mask->GeneratorType == Type);
+			TestTrue(FString::Printf(TEXT("%s: Params holds the expected alternative"), Label), IsExpectedAlternative(Mask->Params));
+		}
+	};
+
+	CheckType(EVertexMaskForgeGeneratorType::BoundingBox, TEXT("BoundingBox"), [](const FVertexMaskForgeGeneratorParams& P) { return P.IsType<FVertexMaskForgeBoundingBoxParams>(); });
+	CheckType(EVertexMaskForgeGeneratorType::AmbientOcclusion, TEXT("AmbientOcclusion"), [](const FVertexMaskForgeGeneratorParams& P) { return P.IsType<FVertexMaskForgeAmbientOcclusionParams>(); });
+	CheckType(EVertexMaskForgeGeneratorType::Curvature, TEXT("Curvature"), [](const FVertexMaskForgeGeneratorParams& P) { return P.IsType<FVertexMaskForgeCurvatureParams>(); });
+	CheckType(EVertexMaskForgeGeneratorType::Noise, TEXT("Noise"), [](const FVertexMaskForgeGeneratorParams& P) { return P.IsType<FVertexMaskForgeNoiseParams>(); });
+	CheckType(EVertexMaskForgeGeneratorType::DirectionalNormal, TEXT("DirectionalNormal"), [](const FVertexMaskForgeGeneratorParams& P) { return P.IsType<FVertexMaskForgeDirectionalNormalParams>(); });
+	CheckType(EVertexMaskForgeGeneratorType::Thickness, TEXT("Thickness"), [](const FVertexMaskForgeGeneratorParams& P) { return P.IsType<FVertexMaskForgeThicknessParams>(); });
+	CheckType(EVertexMaskForgeGeneratorType::MaterialSlot, TEXT("MaterialSlot"), [](const FVertexMaskForgeGeneratorParams& P) { return P.IsType<FVertexMaskForgeMaterialSlotParams>(); });
+
+	TestEqual(TEXT("Seven independent layers created"), Stack.Num(), 7);
+
+	return true;
+}
+
 #endif // WITH_DEV_AUTOMATION_TESTS
