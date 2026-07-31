@@ -11,6 +11,7 @@
 
 #include "Misc/AutomationTest.h"
 #include "VertexMaskForgeDynamicLayerEvaluator.h"
+#include "VertexMaskForgeInstanceResultStore.h"
 
 namespace
 {
@@ -618,6 +619,186 @@ bool FVertexMaskForgeDynamicLayerEvaluatorDoesNotMutateStackTest::RunTest(const 
 			After[i].bAffectRed == Before[i].bAffectRed && After[i].bAffectGreen == Before[i].bAffectGreen && After[i].bAffectBlue == Before[i].bAffectBlue);
 	}
 	TestTrue(TEXT("Stack still valid"), Stack.IsValid());
+
+	return true;
+}
+
+// --- M16-K.5D: the new three-argument EvaluateColor overload resolving EffectiveMask from a real
+// FVertexMaskForgeInstanceResultStore -----------------------------------------------------------------
+// The legacy two-argument overload's own unchanged behavior (Mask always ignored) is already proven by
+// VertexMaskForge.GeneratorMaskInstance.EvaluatorIgnoresMaskInstance -- not duplicated here.
+
+// 25. MaskedBaseLayerUsesStoredResultValue: the Base Layer, with a Mask and a real stored value, must use
+// that stored value -- proven via Fill=White/BlendMode=Copy/Opacity=1 (Result == PaintValue exactly), with
+// a StoredValue distinct from 0.0 (zero coverage), 1.0 (full coverage), and BaseColor (leak-through).
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynamicLayerEvaluatorMaskedBaseLayerStoredValueTest, "VertexMaskForge.DynamicLayerEvaluator.MaskedBaseLayerUsesStoredResultValue", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynamicLayerEvaluatorMaskedBaseLayerStoredValueTest::RunTest(const FString& Parameters)
+{
+	FVertexMaskForgeDynamicLayerStack Stack = FVertexMaskForgeDynamicLayerStack::MakeInitialStack();
+	const FGuid BaseLayerId = Stack.GetLayers()[0].LayerId;
+	Stack.SetLayerFill(BaseLayerId, EVertexMaskForgeLayerFill::White);
+	Stack.SetLayerBlendMode(BaseLayerId, EVertexMaskForgeBlendMode::Copy);
+	Stack.SetLayerOpacity(BaseLayerId, 1.0f);
+	TestTrue(TEXT("Base Layer receives a Mask"), Stack.SetLayerMaskGeneratorType(BaseLayerId, EVertexMaskForgeGeneratorType::Curvature));
+	const FGuid MaskInstanceId = Stack.GetLayerMask(BaseLayerId)->MaskInstanceId;
+
+	const int32 VertexIndex = 0;
+	FVertexMaskForgeInstanceMaskResult Result;
+	Result.Values.SetNum(1);
+	Result.bHasValue.Init(false, 1);
+	Result.Values[VertexIndex] = 0.35f;
+	Result.bHasValue[VertexIndex] = true;
+
+	FVertexMaskForgeInstanceResultStore Store;
+	TestTrue(TEXT("Store the real result"), Store.StoreOrReplace(MaskInstanceId, MoveTemp(Result)));
+
+	const FVector4f Base(0.9f, 0.9f, 0.9f, 1.0f);
+	const FVector4f Composed = VertexMaskForgeDynamicLayerEvaluator::EvaluateColor(Base, Stack, Store, VertexIndex);
+	// White Copy@1: PaintValue = FillValue(1) * StoredValue(0.35) = 0.35, and Copy@1 == PaintValue exactly.
+	TestTrue(TEXT("Base Layer's PaintValue uses the real stored value (0.35), not 0.0, 1.0, or BaseColor"), ColorsNearlyEqual(Composed, FVector4f(0.35f, 0.35f, 0.35f, 1.0f)));
+
+	return true;
+}
+
+// 26. MaskedOrdinaryLayerUsesStoredResultValue: same proof, but for a non-Base layer, with a different
+// StoredValue and VertexIndex, isolating the layer's own contribution.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynamicLayerEvaluatorMaskedOrdinaryLayerStoredValueTest, "VertexMaskForge.DynamicLayerEvaluator.MaskedOrdinaryLayerUsesStoredResultValue", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynamicLayerEvaluatorMaskedOrdinaryLayerStoredValueTest::RunTest(const FString& Parameters)
+{
+	FVertexMaskForgeDynamicLayerStack Stack;
+	const FGuid Id = Stack.AddLayer(TEXT("Ordinary"));
+	Stack.SetLayerFill(Id, EVertexMaskForgeLayerFill::White);
+	Stack.SetLayerBlendMode(Id, EVertexMaskForgeBlendMode::Copy);
+	Stack.SetLayerOpacity(Id, 1.0f);
+	TestTrue(TEXT("Ordinary layer receives a Mask"), Stack.SetLayerMaskGeneratorType(Id, EVertexMaskForgeGeneratorType::Noise));
+	const FGuid MaskInstanceId = Stack.GetLayerMask(Id)->MaskInstanceId;
+
+	const int32 VertexIndex = 3;
+	FVertexMaskForgeInstanceMaskResult Result;
+	Result.Values.SetNum(4);
+	Result.bHasValue.Init(false, 4);
+	Result.Values[VertexIndex] = 0.7f;
+	Result.bHasValue[VertexIndex] = true;
+
+	FVertexMaskForgeInstanceResultStore Store;
+	TestTrue(TEXT("Store the real result"), Store.StoreOrReplace(MaskInstanceId, MoveTemp(Result)));
+
+	const FVector4f Base(0.1f, 0.1f, 0.1f, 1.0f);
+	const FVector4f Composed = VertexMaskForgeDynamicLayerEvaluator::EvaluateColor(Base, Stack, Store, VertexIndex);
+	// White Copy@1: PaintValue = FillValue(1) * StoredValue(0.7) = 0.7, exactly.
+	TestTrue(TEXT("Ordinary layer's PaintValue uses the real stored value (0.7)"), ColorsNearlyEqual(Composed, FVector4f(0.7f, 0.7f, 0.7f, 1.0f)));
+
+	return true;
+}
+
+// 27. MissingMaskInstanceIdInStoreProducesZeroCoverage: an EMPTY store (the MaskInstanceId is not present
+// at all) must resolve to zero coverage. Proven via a two-layer composition -- an unmasked White Copy@1
+// layer first (drives the composite to a known, non-Base value of 1.0), then the masked White Multiply@1
+// layer under test: Multiply with EffectiveMask=0 gives BlendResult = CompositeBelow * 0 = 0 (a value
+// distinguishable from both BaseColor and from what a WRONG "missing == full coverage" policy would
+// produce -- Multiply with EffectiveMask=1 would instead leave the composite at 1.0, unchanged).
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynamicLayerEvaluatorMissingInstanceIdZeroCoverageTest, "VertexMaskForge.DynamicLayerEvaluator.MissingMaskInstanceIdInStoreProducesZeroCoverage", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynamicLayerEvaluatorMissingInstanceIdZeroCoverageTest::RunTest(const FString& Parameters)
+{
+	FVertexMaskForgeDynamicLayerStack Stack;
+
+	const FGuid UnmaskedId = Stack.AddLayer(TEXT("DrivesCompositeTo1"));
+	Stack.SetLayerFill(UnmaskedId, EVertexMaskForgeLayerFill::White);
+	Stack.SetLayerBlendMode(UnmaskedId, EVertexMaskForgeBlendMode::Copy);
+	Stack.SetLayerOpacity(UnmaskedId, 1.0f);
+
+	const FGuid MaskedId = Stack.AddLayer(TEXT("MaskedMultiply"));
+	Stack.SetLayerFill(MaskedId, EVertexMaskForgeLayerFill::White);
+	Stack.SetLayerBlendMode(MaskedId, EVertexMaskForgeBlendMode::Multiply);
+	Stack.SetLayerOpacity(MaskedId, 1.0f);
+	TestTrue(TEXT("Masked layer receives a Mask"), Stack.SetLayerMaskGeneratorType(MaskedId, EVertexMaskForgeGeneratorType::AmbientOcclusion));
+
+	// The store is real but has NO entry for this (or any) MaskInstanceId.
+	const FVertexMaskForgeInstanceResultStore EmptyStore;
+
+	const FVector4f Base(0.3f, 0.3f, 0.3f, 0.77f);
+	const FVector4f Composed = VertexMaskForgeDynamicLayerEvaluator::EvaluateColor(Base, Stack, EmptyStore, 0);
+	// Composite after layer 1 = 1.0 (White Copy@1, BaseColor irrelevant). Layer 2: EffectiveMask must be
+	// 0.0 (missing MaskInstanceId), so PaintValue = 0, and Multiply gives 1.0 * 0 = 0 -- NOT 1.0 (which is
+	// what a wrong "missing == full coverage" policy would have produced instead).
+	TestTrue(TEXT("Missing MaskInstanceId resolves to zero coverage, not full coverage"), ColorsNearlyEqual(Composed, FVector4f(0.0f, 0.0f, 0.0f, 0.77f)));
+
+	return true;
+}
+
+// 28. PresentInstanceWithoutValueAtVertexIndexProducesZeroCoverage: the MaskInstanceId IS present in the
+// store, but has no value stored at the queried VertexIndex -- must resolve identically to the fully-
+// absent case (zero coverage), distinguishing this from test 27's "ID absent entirely" via an actual
+// StoreOrReplace call for the correct MaskInstanceId.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynamicLayerEvaluatorPresentInstanceNoValueZeroCoverageTest, "VertexMaskForge.DynamicLayerEvaluator.PresentInstanceWithoutValueAtVertexIndexProducesZeroCoverage", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynamicLayerEvaluatorPresentInstanceNoValueZeroCoverageTest::RunTest(const FString& Parameters)
+{
+	FVertexMaskForgeDynamicLayerStack Stack;
+
+	const FGuid UnmaskedId = Stack.AddLayer(TEXT("DrivesCompositeTo1"));
+	Stack.SetLayerFill(UnmaskedId, EVertexMaskForgeLayerFill::White);
+	Stack.SetLayerBlendMode(UnmaskedId, EVertexMaskForgeBlendMode::Copy);
+	Stack.SetLayerOpacity(UnmaskedId, 1.0f);
+
+	const FGuid MaskedId = Stack.AddLayer(TEXT("MaskedMultiply"));
+	Stack.SetLayerFill(MaskedId, EVertexMaskForgeLayerFill::White);
+	Stack.SetLayerBlendMode(MaskedId, EVertexMaskForgeBlendMode::Multiply);
+	Stack.SetLayerOpacity(MaskedId, 1.0f);
+	TestTrue(TEXT("Masked layer receives a Mask"), Stack.SetLayerMaskGeneratorType(MaskedId, EVertexMaskForgeGeneratorType::Thickness));
+	const FGuid MaskInstanceId = Stack.GetLayerMask(MaskedId)->MaskInstanceId;
+
+	const int32 QueriedVertexIndex = 0;
+	// A real entry exists for MaskInstanceId, but only index 2 has a value -- index 0 (queried below)
+	// was never written, so TryGetValue must fail for it specifically.
+	FVertexMaskForgeInstanceMaskResult Result;
+	Result.Values.SetNum(3);
+	Result.bHasValue.Init(false, 3);
+	Result.Values[2] = 0.9f;
+	Result.bHasValue[2] = true;
+
+	FVertexMaskForgeInstanceResultStore Store;
+	TestTrue(TEXT("Store a real (but partial) result for this MaskInstanceId"), Store.StoreOrReplace(MaskInstanceId, MoveTemp(Result)));
+
+	const FVector4f Base(0.3f, 0.3f, 0.3f, 1.0f);
+	const FVector4f Composed = VertexMaskForgeDynamicLayerEvaluator::EvaluateColor(Base, Stack, Store, QueriedVertexIndex);
+	// Same math as test 27: Composite after layer 1 = 1.0; layer 2 Multiply with EffectiveMask=0 (no
+	// value at index 0, despite the instance itself being present) gives 1.0 * 0 = 0.
+	TestTrue(TEXT("Present instance without a value at this VertexIndex resolves to zero coverage"), ColorsNearlyEqual(Composed, FVector4f(0.0f, 0.0f, 0.0f, 1.0f)));
+
+	return true;
+}
+
+// 29. UnmaskedLayerIgnoresResultStoreContents: a layer with NO Mask must never consult ResultStore, even
+// when it is real, populated, and non-empty -- proven by comparing against the plain unmasked result, and
+// additionally against the legacy two-argument overload (which never even receives a store).
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynamicLayerEvaluatorUnmaskedIgnoresStoreTest, "VertexMaskForge.DynamicLayerEvaluator.UnmaskedLayerIgnoresResultStoreContents", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynamicLayerEvaluatorUnmaskedIgnoresStoreTest::RunTest(const FString& Parameters)
+{
+	FVertexMaskForgeDynamicLayerStack Stack;
+	const FGuid Id = Stack.AddLayer(TEXT("Unmasked"));
+	Stack.SetLayerFill(Id, EVertexMaskForgeLayerFill::White);
+	Stack.SetLayerBlendMode(Id, EVertexMaskForgeBlendMode::Copy);
+	Stack.SetLayerOpacity(Id, 1.0f);
+	// Deliberately no Stack.SetLayerMaskGeneratorType call -- this layer has no Mask.
+
+	const int32 VertexIndex = 0;
+	FVertexMaskForgeInstanceMaskResult UnrelatedResult;
+	UnrelatedResult.Values.SetNum(1);
+	UnrelatedResult.bHasValue.Init(false, 1);
+	UnrelatedResult.Values[VertexIndex] = 0.9f;
+	UnrelatedResult.bHasValue[VertexIndex] = true;
+
+	FVertexMaskForgeInstanceResultStore PopulatedStore;
+	// Populated for an unrelated identity -- this layer has no Mask, so it could never even ask for it.
+	TestTrue(TEXT("Store populated for an unrelated identity"), PopulatedStore.StoreOrReplace(FGuid::NewGuid(), MoveTemp(UnrelatedResult)));
+
+	const FVector4f Base(0.4f, 0.4f, 0.4f, 1.0f);
+	const FVector4f ComposedWithStore = VertexMaskForgeDynamicLayerEvaluator::EvaluateColor(Base, Stack, PopulatedStore, VertexIndex);
+	const FVector4f ComposedLegacy = VertexMaskForgeDynamicLayerEvaluator::EvaluateColor(Base, Stack);
+
+	// White Copy@1 == 1.0 regardless -- the populated-but-irrelevant store must not change anything.
+	TestTrue(TEXT("Unmasked layer's result is unaffected by a real, populated store"), ColorsNearlyEqual(ComposedWithStore, FVector4f(1.0f, 1.0f, 1.0f, 1.0f)));
+	TestTrue(TEXT("Three-argument and two-argument overloads agree for an unmasked layer"), ColorsNearlyEqual(ComposedWithStore, ComposedLegacy));
 
 	return true;
 }

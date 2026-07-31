@@ -5,6 +5,8 @@
 #include "VertexMaskForgeDynamicLayerStack.h"
 #include "VertexMaskForgeLayerTypes.h"
 
+class FVertexMaskForgeInstanceResultStore;
+
 /**
  * M16-K.3B: pure, stateless composition core for FVertexMaskForgeDynamicLayerStack -- deliberately a
  * SEPARATE component from the stack itself (the stack is domain/identity; this is evaluation -- see this
@@ -96,4 +98,32 @@ namespace VertexMaskForgeDynamicLayerEvaluator
 	 * stack if they need the documented semantics above.
 	 */
 	FVector4f EvaluateColor(const FVector4f& BaseColor, const FVertexMaskForgeDynamicLayerStack& Stack);
+
+	/**
+	 * M16-K.5D: sibling overload that additionally resolves each layer's EffectiveMask from a real
+	 * FVertexMaskForgeInstanceResultStore, by the layer's own Mask->MaskInstanceId, at VertexIndex --
+	 * still pure and read-only (never executes a generator, never writes to ResultStore, never
+	 * fabricates/repairs/normalizes a result). This is the ONLY overload that ever resolves
+	 * MaskInstanceId; the two-argument overload above continues to ignore Mask entirely (unchanged),
+	 * exactly preserving its own pre-K.5D observable behavior and semantics.
+	 *
+	 * Per layer (bEnabled/Fill resolution identical to the two-argument overload -- see EvaluateColor's
+	 * own doc comment above for those):
+	 *   - Layer.Mask unset: PaintValue = FillValue (broadcast) -- ResultStore is NEVER consulted for such
+	 *     a layer, regardless of what it may or may not contain.
+	 *   - Layer.Mask set: PaintValue = FillValue * EffectiveMask, where EffectiveMask is:
+	 *       - the real stored scalar, IF ResultStore.Find(Layer.Mask->MaskInstanceId) succeeds AND the
+	 *         found result's TryGetValue(VertexIndex, ...) succeeds;
+	 *       - 0.0f otherwise -- covers BOTH "MaskInstanceId not present in ResultStore" and "present but
+	 *         no value stored at VertexIndex" identically (a Mask configured but without a resolved
+	 *         result represents explicit filtering with no coverage yet, never full coverage -- see this
+	 *         checkpoint's own architectural decision; "empty stack = full coverage" remains scoped to
+	 *         Fill/layer-presence only, never extended to an existing-but-unresolved Mask Instance).
+	 * The Base Layer receives no special-casing anywhere in this resolution -- it is governed by exactly
+	 * the same two rules above as any other layer.
+	 * BlendMode, Opacity, Channel Filter, fold order, the single final Clamp01, and Alpha passthrough are
+	 * all identical to the two-argument overload -- this overload only changes how PaintValue is derived,
+	 * nothing else in the fold.
+	 */
+	FVector4f EvaluateColor(const FVector4f& BaseColor, const FVertexMaskForgeDynamicLayerStack& Stack, const FVertexMaskForgeInstanceResultStore& ResultStore, int32 VertexIndex);
 }
