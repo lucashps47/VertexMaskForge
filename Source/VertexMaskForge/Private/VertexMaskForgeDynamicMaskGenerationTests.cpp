@@ -134,4 +134,128 @@ bool FVertexMaskForgeDynamicMaskGenerationCrossModuleTest::RunTest(const FString
 	return true;
 }
 
+// 2. FailedRegenerationPreservesPreviousReadyResult (M16-K.5G): locks the FailurePreservesPrevious
+// contract already established and tested for the Recipe model (VertexMaskForgeMaterialSlotGeneratorTests
+// .cpp's own FailurePreservesPrevious) for the Dynamic model too -- a real Ready result generated for a
+// real, stack-minted MaskInstanceId survives a SECOND, genuinely-failing call to
+// GenerateStoredResultForMaterialSlotInstance for the exact same MaskInstanceId (no StoreOrReplace ever
+// runs on failure -- see that function's own doc comment), and VertexMaskForgeDynamicLayerEvaluator::
+// EvaluateColor consumes that preserved Ready result afterward, NOT zero coverage. No production code is
+// touched by this checkpoint -- this test only proves an already-existing, already-documented contract.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynamicMaskGenerationFailedAfterReadyTest, "VertexMaskForge.DynamicMaskGeneration.FailedRegenerationPreservesPreviousReadyResult", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynamicMaskGenerationFailedAfterReadyTest::RunTest(const FString& Parameters)
+{
+	// Real Dynamic Layer stack: one layer, White Copy@1 -- same isolating rationale as the sibling
+	// GeneratedMaterialSlotResultDrivesEvaluatedColorAtBothCorners test above.
+	FVertexMaskForgeDynamicLayerStack Stack;
+	const FGuid LayerId = Stack.AddLayer(TEXT("Layer"));
+	TestTrue(TEXT("SetLayerFill(White) succeeds"), Stack.SetLayerFill(LayerId, EVertexMaskForgeLayerFill::White));
+	TestTrue(TEXT("SetLayerBlendMode(Copy) succeeds"), Stack.SetLayerBlendMode(LayerId, EVertexMaskForgeBlendMode::Copy));
+	TestTrue(TEXT("SetLayerOpacity(1.0) succeeds"), Stack.SetLayerOpacity(LayerId, 1.0f));
+	TestTrue(TEXT("SetLayerMaskGeneratorType(MaterialSlot) succeeds"), Stack.SetLayerMaskGeneratorType(LayerId, EVertexMaskForgeGeneratorType::MaterialSlot));
+
+	// MaskInstanceId is the real GUID the stack itself minted -- never fabricated, never disconnected
+	// from the layer.
+	const FGuid MaskInstanceId = Stack.GetLayerMask(LayerId)->MaskInstanceId;
+	FVertexMaskForgeGeneratorParams NewParams = MakeVertexMaskForgeGeneratorParams(EVertexMaskForgeGeneratorType::MaterialSlot);
+	FVertexMaskForgeMaterialSlotParams& SlotParams = NewParams.Get<FVertexMaskForgeMaterialSlotParams>();
+	SlotParams.SelectedSlotIndex = 0;
+	SlotParams.bInvert = false;
+	TestTrue(TEXT("SetLayerMaskParams succeeds"), Stack.SetLayerMaskParams(LayerId, MaskInstanceId, NewParams));
+
+	const FVertexMaskForgeGeneratorMaskInstance* GeneratorMaskInstance = Stack.GetLayerMask(LayerId);
+	TestNotNull(TEXT("GeneratorMaskInstance present"), GeneratorMaskInstance);
+	if (!GeneratorMaskInstance)
+	{
+		return false;
+	}
+
+	// Same synthetic WorkingMesh fixture as the sibling test: two triangles, Tri0 -> Slot 0 (selected),
+	// Tri1 -> Slot 1 (not selected), Source-Topology (triangle-corner) domain.
+	FVertexMaskForgeWorkingMesh WorkingMesh;
+	WorkingMesh.Mesh = MakeUnique<UE::Geometry::FDynamicMesh3>();
+	const int32 V0 = WorkingMesh.Mesh->AppendVertex(FVector3d(0.0, 0.0, 0.0));
+	const int32 V1 = WorkingMesh.Mesh->AppendVertex(FVector3d(1.0, 0.0, 0.0));
+	const int32 V2 = WorkingMesh.Mesh->AppendVertex(FVector3d(1.0, 1.0, 0.0));
+	const int32 V3 = WorkingMesh.Mesh->AppendVertex(FVector3d(0.0, 1.0, 0.0));
+	const int32 Tri0 = WorkingMesh.Mesh->AppendTriangle(V0, V1, V2);
+	const int32 Tri1 = WorkingMesh.Mesh->AppendTriangle(V0, V2, V3);
+
+	WorkingMesh.bMaterialSlotResolutionValid = true;
+	WorkingMesh.bRenderVertexMaterialSlotAmbiguous = false;
+	WorkingMesh.MaterialSlotOptions.SetNum(2);
+	WorkingMesh.DynamicTriangleToMaterialSlot.Init(INDEX_NONE, WorkingMesh.Mesh->MaxTriangleID());
+	WorkingMesh.DynamicTriangleToMaterialSlot[Tri0] = 0;
+	WorkingMesh.DynamicTriangleToMaterialSlot[Tri1] = 1;
+
+	// --- First generation: real, Ready. ---
+	const bool bFirstGenerated = VertexMaskForgeDynamicMaskGeneration::GenerateStoredResultForMaterialSlotInstance(
+		*GeneratorMaskInstance, WorkingMesh, /*bUseSourceTopology=*/true, /*LOD0=*/nullptr);
+	TestTrue(TEXT("First generation returns true"), bFirstGenerated);
+
+	const FVertexMaskForgeInstanceMaskResult* FirstResult = WorkingMesh.InstanceResults.Find(MaskInstanceId);
+	TestNotNull(TEXT("A result exists under MaskInstanceId after the first generation"), FirstResult);
+	if (!FirstResult)
+	{
+		return false;
+	}
+	TestEqual(TEXT("Values.Num() == 6 after first generation"), FirstResult->Values.Num(), 6);
+	TestEqual(TEXT("bHasValue.Num() == 6 after first generation"), FirstResult->bHasValue.Num(), 6);
+	for (int32 Index = 0; Index < 6; ++Index)
+	{
+		TestTrue(FString::Printf(TEXT("bHasValue[%d] is true after first generation"), Index), FirstResult->bHasValue[Index]);
+	}
+	TestEqual(TEXT("Values[0] == 1.0f (Tri0, selected slot)"), FirstResult->Values[0], 1.0f);
+	TestEqual(TEXT("Values[1] == 1.0f (Tri0, selected slot)"), FirstResult->Values[1], 1.0f);
+	TestEqual(TEXT("Values[2] == 1.0f (Tri0, selected slot)"), FirstResult->Values[2], 1.0f);
+	TestEqual(TEXT("Values[3] == 0.0f (Tri1, unselected slot)"), FirstResult->Values[3], 0.0f);
+	TestEqual(TEXT("Values[4] == 0.0f (Tri1, unselected slot)"), FirstResult->Values[4], 0.0f);
+	TestEqual(TEXT("Values[5] == 0.0f (Tri1, unselected slot)"), FirstResult->Values[5], 0.0f);
+
+	// Snapshot BY VALUE (real copies, not the pointer itself) everything that characterizes the Ready
+	// result, to compare against after the forced failure below.
+	const TArray<float> ValuesSnapshot = FirstResult->Values;
+	const TBitArray<> HasValueSnapshot = FirstResult->bHasValue;
+	const int32 ValuesCountSnapshot = FirstResult->Values.Num();
+	const int32 HasValueCountSnapshot = FirstResult->bHasValue.Num();
+
+	// --- Force a REAL failure in the generator for the SECOND call, same MaskInstanceId. ---
+	WorkingMesh.bMaterialSlotResolutionValid = false;
+
+	const bool bSecondGenerated = VertexMaskForgeDynamicMaskGeneration::GenerateStoredResultForMaterialSlotInstance(
+		*GeneratorMaskInstance, WorkingMesh, /*bUseSourceTopology=*/true, /*LOD0=*/nullptr);
+	TestFalse(TEXT("Second generation (forced failure) returns false"), bSecondGenerated);
+
+	// --- Prove full preservation: not just two spot-checked indices, the ENTIRE stored result. ---
+	const FVertexMaskForgeInstanceMaskResult* ResultAfterFailure = WorkingMesh.InstanceResults.Find(MaskInstanceId);
+	TestNotNull(TEXT("A result still exists under MaskInstanceId after the failed second generation"), ResultAfterFailure);
+	if (!ResultAfterFailure)
+	{
+		return false;
+	}
+	TestEqual(TEXT("Values.Num() unchanged after failure"), ResultAfterFailure->Values.Num(), ValuesCountSnapshot);
+	TestEqual(TEXT("bHasValue.Num() unchanged after failure"), ResultAfterFailure->bHasValue.Num(), HasValueCountSnapshot);
+	TestTrue(TEXT("Values array is entirely unchanged after failure (full-array comparison)"), ResultAfterFailure->Values == ValuesSnapshot);
+	TestTrue(TEXT("bHasValue array is entirely unchanged after failure (full-array comparison)"), ResultAfterFailure->bHasValue == HasValueSnapshot);
+
+	// --- Prove via the evaluator: the preserved Ready result is consumed, NOT zero coverage. ---
+	const FVector4f Base(0.2f, 0.2f, 0.2f, 1.0f);
+	const FVector4f ResultAtCorner0 = VertexMaskForgeDynamicLayerEvaluator::EvaluateColor(Base, Stack, WorkingMesh.InstanceResults, 0);
+	const FVector4f ResultAtCorner3 = VertexMaskForgeDynamicLayerEvaluator::EvaluateColor(Base, Stack, WorkingMesh.InstanceResults, 3);
+
+	// Corner 0 (selected slot, preserved coverage 1.0): PaintValue = White(1) * 1.0 = 1.0 -> Copy@1 ->
+	// (1,1,1) -- proves the corner that HAD real coverage still has it, not zero (FailedAfterReady is
+	// NOT treated as Missing).
+	TestTrue(TEXT("Corner 0 RGBA == (1,1,1,1) after failure -- preserved Ready coverage, not zero"), DynamicMaskGenerationColorsNearlyEqual(ResultAtCorner0, FVector4f(1.0f, 1.0f, 1.0f, 1.0f)));
+	// Corner 3 (unselected slot, preserved coverage 0.0): PaintValue = White(1) * 0.0 = 0.0 -> Copy@1 ->
+	// (0,0,0) -- still distinct from corner 0, proving the preserved result is the REAL prior array, not
+	// a uniform fallback value.
+	TestTrue(TEXT("Corner 3 RGBA == (0,0,0,1) after failure -- preserved Ready coverage, not a uniform fallback"), DynamicMaskGenerationColorsNearlyEqual(ResultAtCorner3, FVector4f(0.0f, 0.0f, 0.0f, 1.0f)));
+	// Alpha explicitly re-confirmed equal to BaseColor.W in both, independent of the RGB comparison above.
+	TestEqual(TEXT("Corner 0 Alpha == BaseColor.W"), ResultAtCorner0.W, Base.W);
+	TestEqual(TEXT("Corner 3 Alpha == BaseColor.W"), ResultAtCorner3.W, Base.W);
+
+	return true;
+}
+
 #endif // WITH_DEV_AUTOMATION_TESTS
