@@ -2313,6 +2313,33 @@ TSharedRef<SWidget> SVertexMaskForgePanel::OnGenerateDynamicLayerGeneratorTypeRo
 		.Text(VertexMaskForgePanel::GetDynamicLayerGeneratorTypeLabel(InOption.IsValid() ? InOption.Get() : nullptr));
 }
 
+// M16-K.6C-2 / ADR-010: the exact single-asset gate -- SelectedMeshes.Num() == 1, identical to
+// IsMaterialSlotMaskAvailableForSelection's own condition. Never picks an arbitrary entry from a
+// multi-asset selection, never computes a union/intersection. Returns nullptr for zero or multiple
+// assets, or if the one entry/its MeshOwner is somehow invalid. Does NOT check MaterialSlotOptions --
+// callers distinguish "no eligible asset" from "eligible asset with zero slots" themselves.
+const FVertexMaskForgeWorkingMesh* SVertexMaskForgePanel::GetSingleAssetWorkingMeshForDynamicMaterialSlot() const
+{
+	if (SelectedMeshes.Num() != 1)
+	{
+		return nullptr;
+	}
+	const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry = SelectedMeshes[0];
+	if (!Entry.IsValid() || !Entry->MeshOwner.IsValid())
+	{
+		return nullptr;
+	}
+	return &Entry->MeshOwner->GetWorkingMesh();
+}
+
+// M16-K.6C-2: shared dropdown-row generator for the Dynamic Material Slot picker -- mirrors
+// OnGenerateDynamicLayerFillRow's own shape, reusing the legacy picker's own label format verbatim.
+TSharedRef<SWidget> SVertexMaskForgePanel::OnGenerateDynamicMaterialSlotPickerRow(TSharedPtr<FVertexMaskForgeMaterialSlotInfo> InOption) const
+{
+	return SNew(STextBlock)
+		.Text(InOption.IsValid() ? VertexMaskForgePanel::GetMaterialSlotLabel(*InOption) : FText::GetEmpty());
+}
+
 void SVertexMaskForgePanel::OnBlendModeSelectionChanged(TSharedPtr<EVertexMaskForgeBlendMode> NewSelection, ESelectInfo::Type SelectInfo)
 {
 	if (!NewSelection.IsValid())
@@ -3556,6 +3583,29 @@ TSharedRef<SWidget> SVertexMaskForgePanel::BuildDynamicLayerRow(const FGuid Laye
 	// this is what makes a hypothetical late-firing callback for an already-removed layer safe (the
 	// stack's own SetLayer*/RenameLayer already return false/no-op for an unknown id; these UI-side
 	// guards additionally prevent dereferencing a null Find result when reading, not just when writing).
+
+	// M16-K.6C-2-FIX: captured ONCE, here, at the moment this specific row is built for LayerId's then-
+	// current mask -- this is the widget's own fixed "identity contract" for the rest of its lifetime.
+	// Never re-read inside a callback and substituted for this value: a stale-firing callback from an
+	// earlier-built widget must compare against the id it was built for, not whatever id happens to be
+	// current when it fires (that would be tautological and provide no protection at all -- see the
+	// Material Slot section's OnSelectionChanged/OnCheckStateChanged below for the actual identity check).
+	// This row -- and therefore this captured value -- is rebuilt from scratch by RebuildDynamicLayersList
+	// whenever the Generator Type combo above changes what LayerId's mask actually is (see its
+	// OnSelectionChanged), so a live row's captured value never goes stale while that row is the one
+	// currently displayed for LayerId.
+	const FVertexMaskForgeGeneratorMaskInstance* MaterialSlotMaskAtConstruction = DynamicLayerStack.GetLayerMask(LayerId);
+	const FGuid MaterialSlotExpectedMaskInstanceId = MaterialSlotMaskAtConstruction ? MaterialSlotMaskAtConstruction->MaskInstanceId : FGuid();
+
+	// M16-K.6C-2-FIX: per-row-exclusive, stable-address, refcounted options container -- replaces the
+	// removed panel-wide DynamicMaterialSlotPickerOptions member. Each call to BuildDynamicLayerRow (i.e.
+	// each row/widget instance) gets its OWN TArray via its own TSharedRef, captured by value into this
+	// row's OnComboBoxOpening/OnGenerateWidget closures below, so refreshing one Dynamic layer's Material
+	// Slot dropdown can never repopulate, alias, or invalidate another layer's (or another instance's)
+	// options array or the TSharedPtr<FVertexMaskForgeMaterialSlotInfo> elements it holds.
+	const TSharedRef<TArray<TSharedPtr<FVertexMaskForgeMaterialSlotInfo>>> MaterialSlotPickerOptions =
+		MakeShared<TArray<TSharedPtr<FVertexMaskForgeMaterialSlotInfo>>>();
+
 	return SNew(SBorder)
 	.Padding(FMargin(4.f))
 	// AUDITED (M16-K.4B root-cause fix): SBorder's DEFAULT BorderImage (used when none is specified,
@@ -3725,6 +3775,17 @@ TSharedRef<SWidget> SVertexMaskForgePanel::BuildDynamicLayerRow(const FGuid Laye
 						{
 							DynamicLayerStack.ClearLayerMask(LayerId);
 						}
+						// M16-K.6C-2-FIX: rebuilds the row list so every per-generator configurational
+						// section (e.g. the Material Slot editor below) is reconstructed against whatever
+						// MaskInstanceId now actually exists -- without this, a Material Slot editor built
+						// for an earlier instance would keep referring to that stale instance forever after
+						// a Clear/reassignment, since nothing else in this row rebuilds on a Params-only or
+						// generator-type change. Safe to call from within this very callback -- mirrors
+						// OnAddDynamicLayerClicked/OnRemoveDynamicLayerClicked's own established pattern of
+						// rebuilding the list (destroying the row this callback itself belongs to) from
+						// inside their own handlers; Slate defers the actual widget destruction until after
+						// this event finishes processing.
+						RebuildDynamicLayersList();
 					}))
 				[
 					SNew(STextBlock)
@@ -3886,6 +3947,234 @@ TSharedRef<SWidget> SVertexMaskForgePanel::BuildDynamicLayerRow(const FGuid Laye
 				[
 					SNew(STextBlock).Text(LOCTEXT("DynamicLayerAffectBlueLabel", "B"))
 				]
+			]
+		]
+
+		// M16-K.6C-2 / ADR-010: Material Slot configurational editor -- visible ONLY when this layer's
+		// assigned generator is MaterialSlot. Editing is gated to exactly one selected Static Mesh asset
+		// (SelectedMeshes.Num()==1, identical to the legacy IsMaterialSlotMaskAvailableForSelection gate)
+		// with at least one real material slot on that asset's own WorkingMesh.MaterialSlotOptions -- see
+		// GetSingleAssetWorkingMeshForDynamicMaterialSlot. Zero, multiple, or slot-less assets leave this
+		// section visible but non-editable, with an explicit inline message -- never a silent clamp,
+		// fallback to index 0, arbitrary mesh pick, or intersection/union across assets. A stale/out-of-
+		// range stored SelectedSlotIndex is preserved verbatim and surfaced explicitly, never clamped or
+		// silently reselected -- the user repairs it by picking a valid option themselves.
+		//
+		// M16-K.6C-2-FIX: the picker's and Invert's write callbacks below validate identity against
+		// MaterialSlotExpectedMaskInstanceId -- the id captured ONCE when this row was built (see above) --
+		// never against a freshly re-read Mask->MaskInstanceId. A freshly re-read id is always trivially
+		// equal to itself and therefore proves nothing about whether THIS widget instance still corresponds
+		// to the mask instance currently in the stack; only comparing against the construction-time capture
+		// can detect a stale-firing callback from a widget built for an instance that was since cleared or
+		// replaced (see the six-step check inside each callback below). Only SetLayerMaskParams is ever
+		// called, and only from real user-driven selection events (SelectType != ESelectInfo::Direct guards
+		// against a programmatic/reconstruction-driven event, e.g. from this row's own OptionsSource being
+		// refreshed on dropdown-open).
+		+ SVerticalBox::Slot()
+		.AutoHeight()
+		.Padding(FMargin(0.f, 2.f, 0.f, 0.f))
+		[
+			SNew(SVerticalBox)
+			.Visibility_Lambda([this, LayerId]()
+			{
+				const FVertexMaskForgeGeneratorMaskInstance* Mask = DynamicLayerStack.GetLayerMask(LayerId);
+				return (Mask && Mask->GeneratorType == EVertexMaskForgeGeneratorType::MaterialSlot) ? EVisibility::Visible : EVisibility::Collapsed;
+			})
+
+			+ SVerticalBox::Slot()
+			.AutoHeight()
+			[
+				SNew(SHorizontalBox)
+
+				+ SHorizontalBox::Slot()
+				.AutoWidth()
+				.VAlign(VAlign_Center)
+				.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
+				[
+					SNew(STextBlock).Text(LOCTEXT("DynamicLayerMaterialSlotPickerLabel", "Material Slot:"))
+				]
+
+				+ SHorizontalBox::Slot()
+				.AutoWidth()
+				.VAlign(VAlign_Center)
+				.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
+				[
+					SNew(SComboBox<TSharedPtr<FVertexMaskForgeMaterialSlotInfo>>)
+					.OptionsSource(&(*MaterialSlotPickerOptions))
+					.IsEnabled_Lambda([this]()
+					{
+						const FVertexMaskForgeWorkingMesh* WorkingMesh = GetSingleAssetWorkingMeshForDynamicMaterialSlot();
+						return WorkingMesh && !WorkingMesh->MaterialSlotOptions.IsEmpty();
+					})
+					.OnComboBoxOpening_Lambda([this, MaterialSlotPickerOptions]()
+					{
+						// AUDITED: rebuilt fresh right before the dropdown opens, never on every paint --
+						// this ONLY repopulates THIS row's own exclusive, per-widget options array (captured
+						// by value above -- never the removed panel-wide member); it never reads or writes
+						// any layer's own persisted Params, and cannot affect any other row's options.
+						MaterialSlotPickerOptions->Reset();
+						if (const FVertexMaskForgeWorkingMesh* WorkingMesh = GetSingleAssetWorkingMeshForDynamicMaterialSlot())
+						{
+							MaterialSlotPickerOptions->Reserve(WorkingMesh->MaterialSlotOptions.Num());
+							for (const FVertexMaskForgeMaterialSlotInfo& Info : WorkingMesh->MaterialSlotOptions)
+							{
+								MaterialSlotPickerOptions->Add(MakeShared<FVertexMaskForgeMaterialSlotInfo>(Info));
+							}
+						}
+					})
+					.OnGenerateWidget(this, &SVertexMaskForgePanel::OnGenerateDynamicMaterialSlotPickerRow)
+					.OnSelectionChanged(SComboBox<TSharedPtr<FVertexMaskForgeMaterialSlotInfo>>::FOnSelectionChanged::CreateLambda(
+						[this, LayerId, MaterialSlotExpectedMaskInstanceId](TSharedPtr<FVertexMaskForgeMaterialSlotInfo> NewSelection, ESelectInfo::Type SelectType)
+						{
+							// AUDITED: ignores a null selection (nothing chosen) and any non-user-driven
+							// SelectInfo (Direct -- fired when the combo's own internal selection is
+							// reconciled against a freshly-rebuilt OptionsSource, not from a real click/key)
+							// -- only a genuine mouse-click/keyboard-driven pick ever writes.
+							if (!NewSelection.IsValid() || SelectType == ESelectInfo::Type::Direct)
+							{
+								return;
+							}
+							// M16-K.6C-2-FIX six-step identity-validated write path: (1) resolve the layer's
+							// current mask fresh by LayerId; (2)-(3) confirm it exists; (4) confirm the
+							// CURRENT generator is still Material Slot; (5) confirm the CURRENT Params variant
+							// is still the Material Slot payload type; (6) confirm the CURRENT MaskInstanceId
+							// equals the id THIS widget was built for (MaterialSlotExpectedMaskInstanceId,
+							// captured by value at construction, never re-derived here) -- only if all six
+							// hold do we (7) copy the current payload, (8) mutate only SelectedSlotIndex, and
+							// (9) call SetLayerMaskParams with the CAPTURED expected id, not a freshly re-read
+							// one. Any mismatch (cleared, reassigned to a different generator, or replaced by
+							// a newer Material Slot instance with a different MaskInstanceId) makes this a
+							// silent no-op, exactly as required.
+							const FVertexMaskForgeGeneratorMaskInstance* Mask = DynamicLayerStack.GetLayerMask(LayerId);
+							if (!Mask
+								|| Mask->GeneratorType != EVertexMaskForgeGeneratorType::MaterialSlot
+								|| !Mask->Params.IsType<FVertexMaskForgeMaterialSlotParams>()
+								|| Mask->MaskInstanceId != MaterialSlotExpectedMaskInstanceId)
+							{
+								return;
+							}
+							// AUDITED: records only NewSelection->SlotIndex (the option's own real index
+							// field, never the array position it happened to occupy) -- never the name.
+							FVertexMaskForgeGeneratorParams NewParams = Mask->Params;
+							NewParams.Get<FVertexMaskForgeMaterialSlotParams>().SelectedSlotIndex = NewSelection->SlotIndex;
+							DynamicLayerStack.SetLayerMaskParams(LayerId, MaterialSlotExpectedMaskInstanceId, NewParams);
+						}))
+					[
+						SNew(STextBlock)
+						.ToolTipText(LOCTEXT("DynamicLayerMaterialSlotPickerTooltip", "Which material slot this layer's Material Slot mask selects (prototype -- assignment only; not yet generated, composed, or previewed)."))
+						.Text_Lambda([this, LayerId]() -> FText
+						{
+							const FVertexMaskForgeGeneratorMaskInstance* Mask = DynamicLayerStack.GetLayerMask(LayerId);
+							if (!Mask || !Mask->Params.IsType<FVertexMaskForgeMaterialSlotParams>())
+							{
+								return FText::GetEmpty();
+							}
+							const int32 StoredIndex = Mask->Params.Get<FVertexMaskForgeMaterialSlotParams>().SelectedSlotIndex;
+							// AUDITED: this lookup NEVER writes StoredIndex back -- it only decides which
+							// text to display. A match is found by the option's own SlotIndex field, never
+							// by array position.
+							if (const FVertexMaskForgeWorkingMesh* WorkingMesh = GetSingleAssetWorkingMeshForDynamicMaterialSlot())
+							{
+								for (const FVertexMaskForgeMaterialSlotInfo& Info : WorkingMesh->MaterialSlotOptions)
+								{
+									if (Info.SlotIndex == StoredIndex)
+									{
+										return VertexMaskForgePanel::GetMaterialSlotLabel(Info);
+									}
+								}
+							}
+							return FText::Format(
+								LOCTEXT("DynamicLayerMaterialSlotStaleFormat", "Slot {0} (not available for the current asset)"),
+								FText::AsNumber(StoredIndex));
+						})
+					]
+				]
+
+				+ SHorizontalBox::Slot()
+				.AutoWidth()
+				.VAlign(VAlign_Center)
+				[
+					SNew(SCheckBox)
+					.ToolTipText(LOCTEXT("DynamicLayerMaterialSlotInvertTooltip", "Invert coverage (prototype -- assignment only; not yet generated, composed, or previewed)."))
+					.IsEnabled_Lambda([this]()
+					{
+						const FVertexMaskForgeWorkingMesh* WorkingMesh = GetSingleAssetWorkingMeshForDynamicMaterialSlot();
+						return WorkingMesh && !WorkingMesh->MaterialSlotOptions.IsEmpty();
+					})
+					.IsChecked_Lambda([this, LayerId]()
+					{
+						const FVertexMaskForgeGeneratorMaskInstance* Mask = DynamicLayerStack.GetLayerMask(LayerId);
+						return (Mask && Mask->Params.IsType<FVertexMaskForgeMaterialSlotParams>() && Mask->Params.Get<FVertexMaskForgeMaterialSlotParams>().bInvert)
+							? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
+					})
+					.OnCheckStateChanged_Lambda([this, LayerId, MaterialSlotExpectedMaskInstanceId](const ECheckBoxState NewState)
+					{
+						// M16-K.6C-2-FIX: identical six-step identity-validated write path as the picker's
+						// OnSelectionChanged above -- see its comment for the full rationale. Compares the
+						// CURRENT mask's MaskInstanceId against MaterialSlotExpectedMaskInstanceId (captured
+						// by value when this row was built), never a freshly re-read id, and no-ops on any
+						// mismatch (cleared, reassigned to a different generator, or replaced by a newer
+						// Material Slot instance).
+						const FVertexMaskForgeGeneratorMaskInstance* Mask = DynamicLayerStack.GetLayerMask(LayerId);
+						if (!Mask
+							|| Mask->GeneratorType != EVertexMaskForgeGeneratorType::MaterialSlot
+							|| !Mask->Params.IsType<FVertexMaskForgeMaterialSlotParams>()
+							|| Mask->MaskInstanceId != MaterialSlotExpectedMaskInstanceId)
+						{
+							return;
+						}
+						// AUDITED: preserves SelectedSlotIndex exactly as stored, even if currently stale --
+						// only bInvert is mutated.
+						FVertexMaskForgeGeneratorParams NewParams = Mask->Params;
+						NewParams.Get<FVertexMaskForgeMaterialSlotParams>().bInvert = (NewState == ECheckBoxState::Checked);
+						DynamicLayerStack.SetLayerMaskParams(LayerId, MaterialSlotExpectedMaskInstanceId, NewParams);
+					})
+					.Content()
+					[
+						SNew(STextBlock).Text(LOCTEXT("DynamicLayerMaterialSlotInvertLabel", "Invert"))
+					]
+				]
+			]
+
+			// Inline feedback for the two gate-failure cases that are independent of the picker/checkbox
+			// above (which stay visible but disabled in both). Exactly one message is visible at a time;
+			// neither is visible when exactly one asset with at least one slot is selected.
+			+ SVerticalBox::Slot()
+			.AutoHeight()
+			.Padding(FMargin(0.f, 2.f, 0.f, 0.f))
+			[
+				SNew(STextBlock)
+				.AutoWrapText(true)
+				.ColorAndOpacity(FSlateColor::UseSubduedForeground())
+				.Visibility_Lambda([this]()
+				{
+					return SelectedMeshes.Num() == 1 ? EVisibility::Collapsed : EVisibility::Visible;
+				})
+				.Text_Lambda([this]() -> FText
+				{
+					if (SelectedMeshes.Num() == 0)
+					{
+						return LOCTEXT("DynamicLayerMaterialSlotZeroAssets", "Select exactly one Static Mesh asset to edit Material Slot parameters.");
+					}
+					return FText::Format(
+						LOCTEXT("DynamicLayerMaterialSlotMultipleAssetsFormat", "Material Slot editing requires exactly one selected Static Mesh asset ({0} are currently selected)."),
+						FText::AsNumber(SelectedMeshes.Num()));
+				})
+			]
+
+			+ SVerticalBox::Slot()
+			.AutoHeight()
+			.Padding(FMargin(0.f, 2.f, 0.f, 0.f))
+			[
+				SNew(STextBlock)
+				.AutoWrapText(true)
+				.ColorAndOpacity(FSlateColor::UseSubduedForeground())
+				.Visibility_Lambda([this]()
+				{
+					const FVertexMaskForgeWorkingMesh* WorkingMesh = GetSingleAssetWorkingMeshForDynamicMaterialSlot();
+					return (WorkingMesh && WorkingMesh->MaterialSlotOptions.IsEmpty()) ? EVisibility::Visible : EVisibility::Collapsed;
+				})
+				.Text(LOCTEXT("DynamicLayerMaterialSlotNoSlots", "The selected Static Mesh asset has no material slots."))
 			]
 		]
 	];

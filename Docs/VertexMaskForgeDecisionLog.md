@@ -143,4 +143,3 @@ The following are open questions this project has identified but not yet decided
 - Whether/how Recipes/Layers should be serialized for reuse across sessions or assets.
 - Final removal (or permanent retention) of the legacy fixed `GeneratorState` composition path.
 - Definitive Accept/Cancel behavior once/if the Dynamic path gains a real caller (today's Accept/Cancel contracts are defined only in terms of the legacy path's `WorkingColors`).
-- Implementation of the single-mesh Material Slot editing UI/gate itself (ADR-010 decides the addressing policy only; the actual eligibility check, slot-list UI, and invalid/unavailable-state presentation remain unimplemented).

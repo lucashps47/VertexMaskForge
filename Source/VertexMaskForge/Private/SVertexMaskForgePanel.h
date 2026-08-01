@@ -346,6 +346,24 @@ private:
 	TSharedRef<SWidget> OnGenerateDynamicLayerGeneratorTypeRow(TSharedPtr<EVertexMaskForgeGeneratorType> InOption) const;
 
 	/**
+	 * M16-K.6C-2 / ADR-010: read-only gate check -- returns the single eligible Static Mesh asset entry's
+	 * WorkingMesh iff SelectedMeshes.Num() == 1 (the exact ADR-010 gate, identical to
+	 * IsMaterialSlotMaskAvailableForSelection's own condition), else nullptr. Never picks an arbitrary
+	 * entry, never computes an intersection/union across multiple entries. The returned WorkingMesh may
+	 * still have an empty MaterialSlotOptions (a mesh with no material slots) -- callers must check that
+	 * separately. Pure observation; never mutates DynamicLayerStack, SelectedMeshes, or any Params. */
+	const FVertexMaskForgeWorkingMesh* GetSingleAssetWorkingMeshForDynamicMaterialSlot() const;
+
+	/**
+	 * M16-K.6C-2: shared dropdown-row generator for the Dynamic Material Slot picker -- mirrors
+	 * OnGenerateDynamicLayerFillRow's own shape. Reuses VertexMaskForgePanel::GetMaterialSlotLabel (the
+	 * same "Slot {index}: {name} — {material}" format the legacy Material Slot picker already uses). Reads
+	 * only the InOption passed to it -- never touches any options-source array itself, so it remains
+	 * correct regardless of which per-row options container (see BuildDynamicLayerRow) supplied InOption.
+	 */
+	TSharedRef<SWidget> OnGenerateDynamicMaterialSlotPickerRow(TSharedPtr<FVertexMaskForgeMaterialSlotInfo> InOption) const;
+
+	/**
 	 * Reorder: the ONLY two functions that mutate DynamicLayerStack's order. Both delegate the actual
 	 * movement to FVertexMaskForgeDynamicLayerStack::MoveLayerUp/MoveLayerDown -- never a manual Swap/
 	 * RemoveAt/Insert here. On success: rebuilds the visual list only -- no recomposition, no production
