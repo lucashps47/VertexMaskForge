@@ -337,6 +337,15 @@ private:
 	TSharedRef<SWidget> OnGenerateDynamicLayerFillRow(TSharedPtr<EVertexMaskForgeLayerFill> InOption) const;
 
 	/**
+	 * M16-K.6B: shared dropdown-row generator for every Dynamic Layer's Generator Type combo. An invalid
+	 * (null) TSharedPtr represents "None/Unassigned" (the layer's Mask is unset); a valid pointer holds one
+	 * of the generator types this checkpoint's DynamicLayerGeneratorTypeOptions actually offers (today:
+	 * only MaterialSlot -- the sole Dynamic generator with real, test-proven generation). Mirrors
+	 * OnGenerateDynamicLayerFillRow's own shape.
+	 */
+	TSharedRef<SWidget> OnGenerateDynamicLayerGeneratorTypeRow(TSharedPtr<EVertexMaskForgeGeneratorType> InOption) const;
+
+	/**
 	 * Reorder: the ONLY two functions that mutate DynamicLayerStack's order. Both delegate the actual
 	 * movement to FVertexMaskForgeDynamicLayerStack::MoveLayerUp/MoveLayerDown -- never a manual Swap/
 	 * RemoveAt/Insert here. On success: rebuilds the visual list only -- no recomposition, no production
@@ -388,6 +397,20 @@ private:
 	 *  three real EVertexMaskForgeLayerFill enumerators. Populated once in Construct(), mirroring
 	 *  BlendModeOptions' own pattern below. */
 	TArray<TSharedPtr<EVertexMaskForgeLayerFill>> DynamicLayerFillOptions;
+
+	/**
+	 * M16-K.6B: shared, read-only Generator Type options for every Dynamic Layer row's Generator Type
+	 * combo. Element 0 is a deliberately invalid (null) TSharedPtr, representing "None/Unassigned" --
+	 * EVertexMaskForgeGeneratorType itself has no None enumerator (VertexMaskForgeRecipeTypes.h), so
+	 * "no generator" is represented here exactly as the domain represents it: the layer's own Mask
+	 * (TOptional<FVertexMaskForgeGeneratorMaskInstance>) being unset. Every subsequent element is a real
+	 * EVertexMaskForgeGeneratorType this checkpoint chooses to expose -- today only MaterialSlot, the
+	 * only Dynamic generator with real, test-proven generation (VertexMaskForgeDynamicMaskGeneration::
+	 * GenerateStoredResultForMaterialSlotInstance). AO/Curvature/Noise/BoundingBox/DirectionalNormal/
+	 * Thickness are deliberately NOT listed here -- they have no Dynamic generation contract yet (see
+	 * Docs/VertexMaskForgeArchitecture.md section 10). Populated once in Construct(), mirroring
+	 * DynamicLayerFillOptions' own pattern above. */
+	TArray<TSharedPtr<EVertexMaskForgeGeneratorType>> DynamicLayerGeneratorTypeOptions;
 
 	/**
 	 * The M16-K.3A/K.3B domain instance this UI edits -- initialized exactly once, via the member

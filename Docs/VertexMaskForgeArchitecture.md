@@ -304,7 +304,7 @@ Generator parameters that only affect the final scalar mapping (e.g. blur, level
 
 ### Implemented and Test-Proven but Not Yet Connected
 
-- `FVertexMaskForgeDynamicLayerStack` — has a real, editable UI section, but no production composition call site reads it.
+- `FVertexMaskForgeDynamicLayerStack` — has a real, editable UI section. As of M16-K.6B this includes generator-type assignment per layer (`None`/`Material Slot`, via `SetLayerMaskGeneratorType`/`ClearLayerMask`) — `Material Slot` is the only generator type exposed, matching the only generator with real Dynamic generation (see the table above). Parameter editing (`SetLayerMaskParams`) is still not exposed by any UI control. No production composition call site reads the stack, generates anything, or feeds `WorkingColors`/preview — assignment is configuration-only.
 - `VertexMaskForgeDynamicLayerEvaluator` / `VertexMaskForgeDynamicLayerBatchCompositor`.
 - `VertexMaskForgeDynamicMaskGeneration::GenerateStoredResultForMaterialSlotInstance` (Material Slot only, source-topology domain proven).
 - `FVertexMaskForgeInstanceResultStore` as a general mechanism (only exercised by the Material Slot Dynamic path above).

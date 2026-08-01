@@ -1037,6 +1037,29 @@ namespace VertexMaskForgePanel
 		}
 	}
 
+	/**
+	 * M16-K.6B: human-readable label for one Dynamic Layer row's Generator Type combo option/current
+	 * value. A null InOption represents "None/Unassigned" (mirrors DynamicLayerGeneratorTypeOptions' own
+	 * element-0-is-null convention). A non-null InOption is expected to only ever be MaterialSlot in this
+	 * checkpoint (the only value DynamicLayerGeneratorTypeOptions offers) -- the default case covers any
+	 * other EVertexMaskForgeGeneratorType defensively (e.g. if a layer's Mask was assigned by something
+	 * other than this combo), without claiming Dynamic support for it.
+	 */
+	static FText GetDynamicLayerGeneratorTypeLabel(const EVertexMaskForgeGeneratorType* InOption)
+	{
+		if (!InOption)
+		{
+			return LOCTEXT("DynamicLayerGeneratorNone", "None");
+		}
+		switch (*InOption)
+		{
+		case EVertexMaskForgeGeneratorType::MaterialSlot:
+			return LOCTEXT("DynamicLayerGeneratorMaterialSlot", "Material Slot");
+		default:
+			return LOCTEXT("DynamicLayerGeneratorUnsupported", "Unsupported");
+		}
+	}
+
 	static FText GetCurvatureTypeLabel(const EVertexMaskForgeCurvatureType Type)
 	{
 		switch (Type)
@@ -2279,6 +2302,15 @@ TSharedRef<SWidget> SVertexMaskForgePanel::OnGenerateDynamicLayerFillRow(TShared
 {
 	return SNew(STextBlock)
 		.Text(InOption.IsValid() ? VertexMaskForgePanel::GetDynamicLayerFillLabel(*InOption) : FText::GetEmpty());
+}
+
+// M16-K.6B: shared dropdown-row generator for every Dynamic Layer's Generator Type combo -- generic over
+// TSharedPtr<EVertexMaskForgeGeneratorType> only, mirroring OnGenerateDynamicLayerFillRow's own shape. An
+// invalid InOption (element 0 of DynamicLayerGeneratorTypeOptions) renders the "None" row.
+TSharedRef<SWidget> SVertexMaskForgePanel::OnGenerateDynamicLayerGeneratorTypeRow(TSharedPtr<EVertexMaskForgeGeneratorType> InOption) const
+{
+	return SNew(STextBlock)
+		.Text(VertexMaskForgePanel::GetDynamicLayerGeneratorTypeLabel(InOption.IsValid() ? InOption.Get() : nullptr));
 }
 
 void SVertexMaskForgePanel::OnBlendModeSelectionChanged(TSharedPtr<EVertexMaskForgeBlendMode> NewSelection, ESelectInfo::Type SelectInfo)
@@ -3667,6 +3699,44 @@ TSharedRef<SWidget> SVertexMaskForgePanel::BuildDynamicLayerRow(const FGuid Laye
 				]
 			]
 
+			// M16-K.6B: Generator Type assignment -- the ONLY control this checkpoint adds. Selecting
+			// "None" calls ClearLayerMask; selecting "Material Slot" calls SetLayerMaskGeneratorType.
+			// Neither branch touches any result store, generates anything, calls ComposeColors/
+			// ApplyComposedColorsRGB/UpdateAllPreviews, or mutates WorkingColors/CommittedColors/
+			// BaselineColors in any way -- this control edits DynamicLayerStack's own configuration only,
+			// exactly like every other control in this row (Fill/BlendMode/Opacity/Channel Filter above).
+			+ SHorizontalBox::Slot()
+			.AutoWidth()
+			.VAlign(VAlign_Center)
+			.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
+			[
+				SNew(SComboBox<TSharedPtr<EVertexMaskForgeGeneratorType>>)
+				.OptionsSource(&DynamicLayerGeneratorTypeOptions)
+				.InitiallySelectedItem(DynamicLayerGeneratorTypeOptions.IsValidIndex(0) ? DynamicLayerGeneratorTypeOptions[0] : nullptr)
+				.OnGenerateWidget(this, &SVertexMaskForgePanel::OnGenerateDynamicLayerGeneratorTypeRow)
+				.OnSelectionChanged(SComboBox<TSharedPtr<EVertexMaskForgeGeneratorType>>::FOnSelectionChanged::CreateLambda(
+					[this, LayerId](TSharedPtr<EVertexMaskForgeGeneratorType> NewSelection, ESelectInfo::Type)
+					{
+						if (NewSelection.IsValid())
+						{
+							DynamicLayerStack.SetLayerMaskGeneratorType(LayerId, *NewSelection);
+						}
+						else
+						{
+							DynamicLayerStack.ClearLayerMask(LayerId);
+						}
+					}))
+				[
+					SNew(STextBlock)
+					.ToolTipText(LOCTEXT("DynamicLayerGeneratorTypeTooltip", "Which generator produces this layer's mask (assignment only, prototype -- not yet generated, composed, or previewed)."))
+					.Text_Lambda([this, LayerId]()
+					{
+						const FVertexMaskForgeGeneratorMaskInstance* Mask = DynamicLayerStack.GetLayerMask(LayerId);
+						return VertexMaskForgePanel::GetDynamicLayerGeneratorTypeLabel(Mask ? &Mask->GeneratorType : nullptr);
+					})
+				]
+			]
+
 			+ SHorizontalBox::Slot()
 			.AutoWidth()
 			.VAlign(VAlign_Center)
@@ -4128,6 +4198,13 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 	DynamicLayerFillOptions.Add(MakeShared<EVertexMaskForgeLayerFill>(EVertexMaskForgeLayerFill::None));
 	DynamicLayerFillOptions.Add(MakeShared<EVertexMaskForgeLayerFill>(EVertexMaskForgeLayerFill::Black));
 	DynamicLayerFillOptions.Add(MakeShared<EVertexMaskForgeLayerFill>(EVertexMaskForgeLayerFill::White));
+
+	// M16-K.6B: Generator Type options -- element 0 is deliberately an invalid TSharedPtr (None/
+	// Unassigned; see this array's own doc comment in SVertexMaskForgePanel.h). Only MaterialSlot follows
+	// it -- the only Dynamic generator with real, test-proven generation. The other six
+	// EVertexMaskForgeGeneratorType values are deliberately NOT added here.
+	DynamicLayerGeneratorTypeOptions.Add(TSharedPtr<EVertexMaskForgeGeneratorType>());
+	DynamicLayerGeneratorTypeOptions.Add(MakeShared<EVertexMaskForgeGeneratorType>(EVertexMaskForgeGeneratorType::MaterialSlot));
 
 	CurvatureTypeOptions.Add(MakeShared<EVertexMaskForgeCurvatureType>(EVertexMaskForgeCurvatureType::Convex));
 	CurvatureTypeOptions.Add(MakeShared<EVertexMaskForgeCurvatureType>(EVertexMaskForgeCurvatureType::Concave));
