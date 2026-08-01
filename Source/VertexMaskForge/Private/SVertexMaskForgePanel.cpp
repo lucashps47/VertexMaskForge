@@ -38,6 +38,7 @@
 #include "VertexMaskForgeAcceptWriter.h"
 #include "VertexMaskForgeAmbientOcclusionGenerator.h"
 #include "VertexMaskForgeBoundingBoxGenerator.h"
+#include "VertexMaskForgeColorConversion.h"
 #include "VertexMaskForgeCurvatureGenerator.h"
 #include "VertexMaskForgeDirectionalNormalGenerator.h"
 #include "VertexMaskForgeDisplayColorDerivation.h"
@@ -1105,15 +1106,11 @@ namespace VertexMaskForgePanel
 	// helper there) -- see DeriveDisplayColors' own call site below for the only place this panel still
 	// needs Preview Mode display reduction.
 	//
-	// AUDITED: ToDisplayFColor stays here, unchanged -- UpdateWorkingColors/UpdateWorkingColorsSourceTopology
-	// below use it to build the real WorkingColors buffer itself (not just for display), so it could not
-	// move without altering those two functions (out of scope for M3). VertexMaskForgeDisplayColorDerivation.cpp
-	// has its own private, identical copy for its own (display-only) use.
-	static FColor ToDisplayFColor(const FVector4f& Color)
-	{
-		auto ClampChannel = [](const float V) { return static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(V * 255.f), 0, 255)); };
-		return FColor(ClampChannel(Color.X), ClampChannel(Color.Y), ClampChannel(Color.Z), ClampChannel(Color.W));
-	}
+	// AUDITED (M16-K.5F): the local ToDisplayFColor duplicate that used to live here was removed --
+	// UpdateWorkingColors/UpdateWorkingColorsSourceTopology below now call
+	// VertexMaskForgeColorConversion::ToDisplayFColor, the single shared implementation (same formula,
+	// verified byte-identical). VertexMaskForgeDisplayColorDerivation.cpp's own former copy was removed
+	// the same way -- see that file's own diff.
 
 	// --- Render-vertex <-> Dynamic-Mesh-vertex position correspondence -----------------------
 	// AUDITED: no longer used by the Bounding Box Z mask (see GenerateBoundingBoxMask and
@@ -1374,13 +1371,9 @@ namespace VertexMaskForgePanel
 			// handed over, so this assignment is defense-in-depth, not the sole guarantee.
 			OutFinalColors[i].A = BaselineRenderColor.A;
 
-			const FVector4f BaselineColorF(
-				BaselineRenderColor.R / 255.f, BaselineRenderColor.G / 255.f,
-				BaselineRenderColor.B / 255.f, BaselineRenderColor.A / 255.f);
+			const FVector4f BaselineColorF = VertexMaskForgeColorConversion::ToLinearColorF(BaselineRenderColor);
 			const FColor& CommittedRenderColor = CommittedColors[i];
-			const FVector4f CommittedColorF(
-				CommittedRenderColor.R / 255.f, CommittedRenderColor.G / 255.f,
-				CommittedRenderColor.B / 255.f, CommittedRenderColor.A / 255.f);
+			const FVector4f CommittedColorF = VertexMaskForgeColorConversion::ToLinearColorF(CommittedRenderColor);
 
 			bool bAnyLayerContributed = false;
 			// AUDITED (M16-J final): the panel's real composition call site -- replaces the legacy
@@ -1397,7 +1390,7 @@ namespace VertexMaskForgePanel
 				continue;
 			}
 			++OutNumComposed;
-			OutFinalColors[i] = ToDisplayFColor(Composite);
+			OutFinalColors[i] = VertexMaskForgeColorConversion::ToDisplayFColor(Composite);
 		}
 	}
 
@@ -1427,7 +1420,7 @@ namespace VertexMaskForgePanel
 				const int32 ElementID = ColorTri[Corner];
 				if (ColorOverlay && ElementID != INDEX_NONE && ColorOverlay->IsElement(ElementID))
 				{
-					Color = ToDisplayFColor(ColorOverlay->GetElement(ElementID));
+					Color = VertexMaskForgeColorConversion::ToDisplayFColor(ColorOverlay->GetElement(ElementID));
 				}
 				Captured[SeedCornerIndex] = Color;
 				++SeedCornerIndex;
@@ -1520,13 +1513,9 @@ namespace VertexMaskForgePanel
 				const FColor& BaselineRenderColor = BaselineColors[CornerIndex];
 				OutFinalColors[CornerIndex].A = BaselineRenderColor.A;
 
-				const FVector4f BaselineColorF(
-					BaselineRenderColor.R / 255.f, BaselineRenderColor.G / 255.f,
-					BaselineRenderColor.B / 255.f, BaselineRenderColor.A / 255.f);
+				const FVector4f BaselineColorF = VertexMaskForgeColorConversion::ToLinearColorF(BaselineRenderColor);
 				const FColor& CommittedRenderColor = CommittedColors[CornerIndex];
-				const FVector4f CommittedColorF(
-					CommittedRenderColor.R / 255.f, CommittedRenderColor.G / 255.f,
-					CommittedRenderColor.B / 255.f, CommittedRenderColor.A / 255.f);
+				const FVector4f CommittedColorF = VertexMaskForgeColorConversion::ToLinearColorF(CommittedRenderColor);
 
 				bool bAnyLayerContributed = false;
 				// AUDITED (M16-J final): same bridge/sequential-fold replacement as the render-vertex
@@ -1539,7 +1528,7 @@ namespace VertexMaskForgePanel
 					continue;
 				}
 				++OutNumComposed;
-				OutFinalColors[CornerIndex] = ToDisplayFColor(Composite);
+				OutFinalColors[CornerIndex] = VertexMaskForgeColorConversion::ToDisplayFColor(Composite);
 			}
 		}
 	}
@@ -1832,7 +1821,7 @@ namespace VertexMaskForgePanel
 				for (int32 Corner = 0; Corner < 3; ++Corner, ++CornerIndex)
 				{
 					const FColor& Color = WorkingColors.IsValidIndex(CornerIndex) ? WorkingColors[CornerIndex] : FColor::White;
-					const FVector4f ColorF(Color.R / 255.f, Color.G / 255.f, Color.B / 255.f, Color.A / 255.f);
+					const FVector4f ColorF = VertexMaskForgeColorConversion::ToLinearColorF(Color);
 					ElementTri[Corner] = ColorOverlay->AppendElement(ColorF);
 				}
 				ColorOverlay->SetTriangle(TriangleID, ElementTri);

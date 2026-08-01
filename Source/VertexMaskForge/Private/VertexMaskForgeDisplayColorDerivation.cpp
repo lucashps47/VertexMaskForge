@@ -1,16 +1,17 @@
 #include "VertexMaskForgeDisplayColorDerivation.h"
 
+#include "VertexMaskForgeColorConversion.h"
+
 namespace
 {
-	// AUDITED (M3 extraction): moved verbatim from VertexMaskForgePanel::ApplyPreviewModeDisplay /
-	// ToDisplayFColor in SVertexMaskForgePanel.cpp -- no formula, clamp, or rounding change. Private
-	// to this .cpp: neither is part of VertexMaskForgeDisplayColorDerivation's public API.
+	// AUDITED (M3 extraction): moved verbatim from VertexMaskForgePanel::ApplyPreviewModeDisplay in
+	// SVertexMaskForgePanel.cpp -- no formula/behavior change. Private to this .cpp: not part of
+	// VertexMaskForgeDisplayColorDerivation's public API.
 	//
-	// AUDITED: ToDisplayFColor also still exists, unchanged, as its own private helper directly inside
-	// SVertexMaskForgePanel.cpp -- it is used there by UpdateWorkingColors/UpdateWorkingColorsSourceTopology
-	// to build the real (persisted-adjacent) WorkingColors buffer itself, not just for display, so it could
-	// not be removed from the panel without altering those two functions (out of scope for M3). This copy
-	// and that one are intentionally identical, small (5-line), pure conversions -- not a functional split.
+	// AUDITED (M16-K.5F): the local ToDisplayFColor duplicate that used to live here (and the
+	// SVertexMaskForgePanel.cpp copy this comment used to describe as "intentionally identical") were
+	// both removed -- both real callers now consume VertexMaskForgeColorConversion::ToDisplayFColor,
+	// the single shared implementation.
 
 	/**
 	 * Reduces a composed RGBA color to what the given Preview Mode should actually display.
@@ -40,12 +41,6 @@ namespace
 			return Composite;
 		}
 	}
-
-	FColor ToDisplayFColor(const FVector4f& Color)
-	{
-		auto ClampChannel = [](const float V) { return static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(V * 255.f), 0, 255)); };
-		return FColor(ClampChannel(Color.X), ClampChannel(Color.Y), ClampChannel(Color.Z), ClampChannel(Color.W));
-	}
 }
 
 namespace VertexMaskForgeDisplayColorDerivation
@@ -70,8 +65,8 @@ namespace VertexMaskForgeDisplayColorDerivation
 		for (int32 i = 0; i < WorkingColors.Num(); ++i)
 		{
 			const FColor& Working = WorkingColors[i];
-			const FVector4f WorkingF(Working.R / 255.f, Working.G / 255.f, Working.B / 255.f, Working.A / 255.f);
-			Result[i] = ToDisplayFColor(ApplyPreviewModeDisplay(WorkingF, PreviewMode));
+			const FVector4f WorkingF = VertexMaskForgeColorConversion::ToLinearColorF(Working);
+			Result[i] = VertexMaskForgeColorConversion::ToDisplayFColor(ApplyPreviewModeDisplay(WorkingF, PreviewMode));
 		}
 
 		return Result;
