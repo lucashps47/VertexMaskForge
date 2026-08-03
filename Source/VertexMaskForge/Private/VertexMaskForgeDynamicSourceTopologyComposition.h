@@ -63,15 +63,27 @@ namespace VertexMaskForgeDynamicSourceTopologyComposition
 	 *   - BaseColors.Num() must equal EXACTLY WorkingMesh.Mesh->TriangleCount() * 3 (the Source-Topology
 	 *     corner count); any mismatch fails outright -- no resize, no partial composition.
 	 *   - Every ENABLED layer that carries a Mask (TOptional set) must have
-	 *     Mask->GeneratorType == EVertexMaskForgeGeneratorType::MaterialSlot -- this checkpoint's own
-	 *     explicit, minimal, Material-Slot-only vertical slice (see the .cpp for why any other generator
-	 *     type fails the WHOLE call rather than being silently skipped or treated as Fill-only).
-	 *   - For every such masked layer, VertexMaskForgeMaterialSlotGenerator::GenerateMaterialSlotMaskFromDynamicMesh
-	 *     is called directly (never GenerateMaterialSlotMaskInstanceResult, never
+	 *     Mask->GeneratorType == EVertexMaskForgeGeneratorType::MaterialSlot or
+	 *     EVertexMaskForgeGeneratorType::BoundingBox (M16-K.6D-8B; any other generator type still fails
+	 *     the WHOLE call rather than being silently skipped or treated as Fill-only).
+	 *   - Material Slot: VertexMaskForgeMaterialSlotGenerator::GenerateMaterialSlotMaskFromDynamicMesh is
+	 *     called directly (never GenerateMaterialSlotMaskInstanceResult, never
 	 *     GenerateStoredResultForMaterialSlotInstance, never any stored wrapper) with that layer's own
 	 *     FVertexMaskForgeMaterialSlotParams (SelectedSlotIndex/bInvert); the result must be
 	 *     EVertexMaskForgeScalarMaskState::Ready with exactly the expected corner cardinality, or the
-	 *     WHOLE call fails.
+	 *     WHOLE call fails. This mask is already corner-domain.
+	 *   - Bounding Box (M16-K.6D-8B, Local-space only): VertexMaskForgeBoundingBoxGenerator::
+	 *     GenerateBoundingBoxMaskFromDynamicMesh is called directly with that layer's own
+	 *     FVertexMaskForgeBoundingBoxParams::Axes, ONLY after confirming bUseUnifiedBounds is false AND
+	 *     no enabled axis has bWorldSpace true -- either one fails the WHOLE call (World Space and
+	 *     Unified Bounds are explicitly unsupported in this checkpoint: World Space needs a per-component
+	 *     transform this orchestrator does not receive, Unified Bounds needs full-selection context this
+	 *     orchestrator does not receive; neither is silently reinterpreted as something else). The
+	 *     resulting mask is indexed by Dynamic Mesh VertexID, NOT corner -- resolved per corner via that
+	 *     corner's own triangle (Mesh.GetTriangle(TriangleID)[Corner]) and read only through
+	 *     FVertexMaskForgeScalarMask::TryGetValue (never a direct Values[] index), mirroring the same
+	 *     per-generator domain distinction Legacy's own Source-Topology composition already establishes
+	 *     for this generator -- see the .cpp for the exact resolution.
 	 * A disabled layer (bEnabled == false) contributes nothing and is never validated for its Mask's
 	 * GeneratorType, exactly mirroring EvaluateColor's own "bEnabled==false -> complete no-op" contract.
 	 *

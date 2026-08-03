@@ -9,6 +9,7 @@
 
 #include "DynamicMesh/DynamicMesh3.h"
 #include "Misc/AutomationTest.h"
+#include "VertexMaskForgeBoundingBoxGenerator.h"
 #include "VertexMaskForgeDynamicLayerStack.h"
 #include "VertexMaskForgeDynamicSourceTopologyComposition.h"
 #include "VertexMaskForgeLayerTypes.h"
@@ -83,6 +84,65 @@ namespace
 		Stack.SetLayerBlendMode(LayerId, BlendMode);
 		Stack.SetLayerOpacity(LayerId, Opacity);
 		return LayerId;
+	}
+
+	// M16-K.6D-8B: adds a layer with a Bounding Box mask, configured via the stack's own controlled
+	// mutators -- mirrors AddMaterialSlotLayer's own setup sequence exactly.
+	FGuid AddBoundingBoxLayer(
+		FVertexMaskForgeDynamicLayerStack& Stack, const FString& Name,
+		EVertexMaskForgeLayerFill Fill, EVertexMaskForgeBlendMode BlendMode, float Opacity,
+		const TStaticArray<FVertexMaskForgeAxisMaskParams, 3>& Axes, bool bUseUnifiedBounds = false)
+	{
+		const FGuid LayerId = Stack.AddLayer(Name);
+		Stack.SetLayerFill(LayerId, Fill);
+		Stack.SetLayerBlendMode(LayerId, BlendMode);
+		Stack.SetLayerOpacity(LayerId, Opacity);
+		Stack.SetLayerMaskGeneratorType(LayerId, EVertexMaskForgeGeneratorType::BoundingBox);
+
+		const FVertexMaskForgeGeneratorMaskInstance* MaskInstance = Stack.GetLayerMask(LayerId);
+		check(MaskInstance);
+		FVertexMaskForgeGeneratorParams NewParams = MakeVertexMaskForgeGeneratorParams(EVertexMaskForgeGeneratorType::BoundingBox);
+		FVertexMaskForgeBoundingBoxParams& BBoxParams = NewParams.Get<FVertexMaskForgeBoundingBoxParams>();
+		BBoxParams.Axes = Axes;
+		BBoxParams.bUseUnifiedBounds = bUseUnifiedBounds;
+		Stack.SetLayerMaskParams(LayerId, MaskInstance->MaskInstanceId, NewParams);
+
+		return LayerId;
+	}
+
+	// Same two-triangle quad shape as BuildOrchestratorFixtureWorkingMesh, but with distinct Z values
+	// (Z correlated with Y: V0/V1 at Z=0, V2/V3 at Z=1) so a Z-axis Bounding Box test has a genuine,
+	// non-degenerate Z extent -- BuildOrchestratorFixtureWorkingMesh's own flat (Z=0 everywhere) geometry
+	// is deliberately left untouched for every other test in this file.
+	FVertexMaskForgeWorkingMesh BuildZVaryingFixtureWorkingMesh()
+	{
+		FVertexMaskForgeWorkingMesh WorkingMesh;
+		WorkingMesh.Mesh = MakeUnique<UE::Geometry::FDynamicMesh3>();
+		WorkingMesh.Mesh->AppendVertex(FVector3d(0.0, 0.0, 0.0)); // V0
+		WorkingMesh.Mesh->AppendVertex(FVector3d(1.0, 0.0, 0.0)); // V1
+		WorkingMesh.Mesh->AppendVertex(FVector3d(1.0, 1.0, 1.0)); // V2
+		WorkingMesh.Mesh->AppendVertex(FVector3d(0.0, 1.0, 1.0)); // V3
+		WorkingMesh.Mesh->AppendTriangle(0, 1, 2);
+		WorkingMesh.Mesh->AppendTriangle(0, 2, 3);
+		return WorkingMesh;
+	}
+
+	// The fixed corner->VertexID mapping BOTH fixture meshes above share, by construction: Tri0=(V0,V1,V2),
+	// Tri1=(V0,V2,V3), appended in that order, so TriangleIndicesItr() yields Tri0 (ID 0) then Tri1 (ID 1)
+	// for this freshly-built, never-edited mesh. Corner 0/1/2 -> V0/V1/V2 (identity, by coincidence);
+	// corner 3/4/5 -> V0/V2/V3 (NOT identity -- proves a test cannot pass via accidental
+	// CornerIndex==VertexID equivalence, and V0/V2 being revisited proves the mapping is exercised on
+	// vertices SHARED by multiple triangles). Kept as an explicit, independent, test-side constant --
+	// never derived from or shared with the orchestrator's own internal corner->VertexID construction.
+	constexpr int32 FixtureCornerToVertexID[6] = { 0, 1, 2, 0, 2, 3 };
+
+	// Matches VertexMaskForgeColorConversion::ToDisplayFColor's own documented rounding contract
+	// (RoundToInt(Value*255), clamped to [0,255]) -- already independently proven exact for integer
+	// FColor round-trips elsewhere in this codebase (see the ColorConversion test suite); reused here as
+	// already-established knowledge, never re-derived as a new formula.
+	uint8 UnitFloatToByte(const float Value)
+	{
+		return static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(Value * 255.0f), 0, 255));
 	}
 }
 
@@ -181,7 +241,9 @@ bool FVertexMaskForgeDynSrcTopoCompFillOnlyLayerTest::RunTest(const FString& Par
 }
 
 // 4. A disabled layer contributes nothing AND is never validated for its Mask's GeneratorType -- an
-// unsupported generator type on a disabled layer must not fail the whole call.
+// unsupported generator type on a disabled layer must not fail the whole call. Uses AmbientOcclusion
+// (genuinely unsupported, unlike BoundingBox as of M16-K.6D-8B) so this test's own meaning survives
+// Bounding Box becoming a supported generator.
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompDisabledLayerTest, "VertexMaskForge.DynamicSourceTopologyComposition.DisabledLayerContributesNothingAndSkipsValidation", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
 bool FVertexMaskForgeDynSrcTopoCompDisabledLayerTest::RunTest(const FString& Parameters)
 {
@@ -191,8 +253,8 @@ bool FVertexMaskForgeDynSrcTopoCompDisabledLayerTest::RunTest(const FString& Par
 	Stack.SetLayerFill(LayerId, EVertexMaskForgeLayerFill::White);
 	Stack.SetLayerBlendMode(LayerId, EVertexMaskForgeBlendMode::Copy);
 	Stack.SetLayerOpacity(LayerId, 1.0f);
-	// BoundingBox is NOT MaterialSlot -- would fail the whole call if this layer were enabled.
-	Stack.SetLayerMaskGeneratorType(LayerId, EVertexMaskForgeGeneratorType::BoundingBox);
+	// AmbientOcclusion is genuinely unsupported -- would fail the whole call if this layer were enabled.
+	Stack.SetLayerMaskGeneratorType(LayerId, EVertexMaskForgeGeneratorType::AmbientOcclusion);
 	Stack.SetLayerEnabled(LayerId, false);
 
 	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
@@ -502,6 +564,436 @@ bool FVertexMaskForgeDynSrcTopoCompOpacityContinuityTest::RunTest(const FString&
 		}
 		PreviousR = Out[0].R;
 		bFirstSample = false;
+	}
+
+	return true;
+}
+
+// --- M16-K.6D-8B: Local-space Bounding Box support ------------------------------------------------
+
+// 15. A Local-space X-axis Bounding Box layer is accepted and produces a byte-exact result against the
+// REAL, authoritative generator (called directly, never reimplemented) combined with an explicit,
+// independent test-side corner->VertexID mapping. Reuses the already-established "White Fill / Copy /
+// Opacity 1.0 -> RGB == mask value" and "Alpha == BaseColors.Alpha" contracts (proven above by
+// SingleMaterialSlotLayerTest/AlphaPassthroughTest) rather than re-deriving the blend formula. The fixed
+// FixtureCornerToVertexID mapping ([0,1,2,0,2,3]) means corners 3-5 do NOT equal their own VertexID and
+// revisit vertices shared by both triangles -- a naive Values[CornerIndex] bug cannot pass this test.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompBBoxLocalXAxisTest, "VertexMaskForge.DynamicSourceTopologyComposition.BoundingBoxLocalSpaceXAxisByteExactAgainstGeneratorAndCornerMapping", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynSrcTopoCompBBoxLocalXAxisTest::RunTest(const FString& Parameters)
+{
+	const FVertexMaskForgeWorkingMesh WorkingMesh = BuildOrchestratorFixtureWorkingMesh(0, 1);
+
+	TStaticArray<FVertexMaskForgeAxisMaskParams, 3> Axes;
+	Axes[static_cast<int32>(EVertexMaskForgeBoundsAxis::X)].bEnabled = true;
+	Axes[static_cast<int32>(EVertexMaskForgeBoundsAxis::X)].Position = 0.5f;
+	Axes[static_cast<int32>(EVertexMaskForgeBoundsAxis::X)].TransitionWidth = 1.0f;
+
+	const FVertexMaskForgeScalarMask ReferenceMask = VertexMaskForgeBoundingBoxGenerator::GenerateBoundingBoxMaskFromDynamicMesh(
+		*WorkingMesh.Mesh, Axes, FTransform::Identity);
+	TestTrue(TEXT("Reference generator State == Ready"), ReferenceMask.State == EVertexMaskForgeScalarMaskState::Ready);
+
+	FVertexMaskForgeDynamicLayerStack Stack;
+	AddBoundingBoxLayer(Stack, TEXT("Layer"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f, Axes);
+
+	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
+	TArray<FColor> Out;
+	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, Out);
+
+	TestTrue(TEXT("Orchestrator accepts a Local-space Bounding Box layer"), bSucceeded);
+	TestEqual(TEXT("Out.Num() == 6"), Out.Num(), 6);
+	if (!bSucceeded || Out.Num() != 6)
+	{
+		return false;
+	}
+
+	for (int32 CornerIndex = 0; CornerIndex < 6; ++CornerIndex)
+	{
+		const int32 VertexID = FixtureCornerToVertexID[CornerIndex];
+		float ExpectedMaskValue = 0.0f;
+		const bool bHasValue = ReferenceMask.TryGetValue(VertexID, ExpectedMaskValue);
+		TestTrue(*FString::Printf(TEXT("Reference mask has a value at VertexID %d (corner %d)"), VertexID, CornerIndex), bHasValue);
+		if (!bHasValue)
+		{
+			continue;
+		}
+
+		const uint8 ExpectedByte = UnitFloatToByte(ExpectedMaskValue);
+		TestEqual(*FString::Printf(TEXT("Out[%d].R byte-exact vs reference generator + corner mapping"), CornerIndex), Out[CornerIndex].R, ExpectedByte);
+		TestEqual(*FString::Printf(TEXT("Out[%d].G byte-exact vs reference generator + corner mapping"), CornerIndex), Out[CornerIndex].G, ExpectedByte);
+		TestEqual(*FString::Printf(TEXT("Out[%d].B byte-exact vs reference generator + corner mapping"), CornerIndex), Out[CornerIndex].B, ExpectedByte);
+		TestEqual(*FString::Printf(TEXT("Out[%d].A == BaseColors[%d].A"), CornerIndex, CornerIndex), Out[CornerIndex].A, BaseColors[CornerIndex].A);
+	}
+
+	TestFalse(TEXT("Corner 3 does not map to VertexID 3 (proves non-identity mapping is exercised)"), FixtureCornerToVertexID[3] == 3);
+	TestFalse(TEXT("Corner 4 does not map to VertexID 4"), FixtureCornerToVertexID[4] == 4);
+	TestFalse(TEXT("Corner 5 does not map to VertexID 5"), FixtureCornerToVertexID[5] == 5);
+
+	return true;
+}
+
+// 16. Y-axis and Z-axis Local-space evaluation, on a mesh with genuine Z variation (the primary fixture
+// is flat in Z, so a real Z-axis test needs BuildZVaryingFixtureWorkingMesh) -- each byte-exact against
+// the real generator, same technique as the X-axis test above.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompBBoxLocalYZAxisTest, "VertexMaskForge.DynamicSourceTopologyComposition.BoundingBoxLocalSpaceYAndZAxisByteExactAgainstGenerator", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynSrcTopoCompBBoxLocalYZAxisTest::RunTest(const FString& Parameters)
+{
+	const FVertexMaskForgeWorkingMesh WorkingMesh = BuildZVaryingFixtureWorkingMesh();
+	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
+
+	for (const EVertexMaskForgeBoundsAxis Axis : { EVertexMaskForgeBoundsAxis::Y, EVertexMaskForgeBoundsAxis::Z })
+	{
+		TStaticArray<FVertexMaskForgeAxisMaskParams, 3> Axes;
+		Axes[static_cast<int32>(Axis)].bEnabled = true;
+		Axes[static_cast<int32>(Axis)].Position = 0.5f;
+		Axes[static_cast<int32>(Axis)].TransitionWidth = 1.0f;
+
+		const FVertexMaskForgeScalarMask ReferenceMask = VertexMaskForgeBoundingBoxGenerator::GenerateBoundingBoxMaskFromDynamicMesh(
+			*WorkingMesh.Mesh, Axes, FTransform::Identity);
+		TestTrue(*FString::Printf(TEXT("Axis %d reference generator State == Ready"), static_cast<int32>(Axis)), ReferenceMask.State == EVertexMaskForgeScalarMaskState::Ready);
+
+		FVertexMaskForgeDynamicLayerStack Stack;
+		AddBoundingBoxLayer(Stack, TEXT("Layer"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f, Axes);
+
+		TArray<FColor> Out;
+		const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, Out);
+		TestTrue(*FString::Printf(TEXT("Axis %d succeeds"), static_cast<int32>(Axis)), bSucceeded);
+		if (!bSucceeded || Out.Num() != 6)
+		{
+			continue;
+		}
+
+		for (int32 CornerIndex = 0; CornerIndex < 6; ++CornerIndex)
+		{
+			const int32 VertexID = FixtureCornerToVertexID[CornerIndex];
+			float ExpectedMaskValue = 0.0f;
+			if (!ReferenceMask.TryGetValue(VertexID, ExpectedMaskValue))
+			{
+				continue;
+			}
+			const uint8 ExpectedByte = UnitFloatToByte(ExpectedMaskValue);
+			TestEqual(*FString::Printf(TEXT("Axis %d: Out[%d].R byte-exact"), static_cast<int32>(Axis), CornerIndex), Out[CornerIndex].R, ExpectedByte);
+		}
+	}
+
+	return true;
+}
+
+// 17. Multiple enabled axes (X and Y together) preserve the generator's own combination semantics --
+// proven by byte-exact comparison against a direct generator call with the SAME two-axis params, never
+// by re-deriving the max() combination rule in this test.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompBBoxMultipleAxesTest, "VertexMaskForge.DynamicSourceTopologyComposition.BoundingBoxMultipleEnabledAxesByteExactAgainstGenerator", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynSrcTopoCompBBoxMultipleAxesTest::RunTest(const FString& Parameters)
+{
+	const FVertexMaskForgeWorkingMesh WorkingMesh = BuildZVaryingFixtureWorkingMesh();
+	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
+
+	TStaticArray<FVertexMaskForgeAxisMaskParams, 3> Axes;
+	Axes[static_cast<int32>(EVertexMaskForgeBoundsAxis::X)].bEnabled = true;
+	Axes[static_cast<int32>(EVertexMaskForgeBoundsAxis::X)].Position = 0.5f;
+	Axes[static_cast<int32>(EVertexMaskForgeBoundsAxis::X)].TransitionWidth = 1.0f;
+	Axes[static_cast<int32>(EVertexMaskForgeBoundsAxis::Y)].bEnabled = true;
+	Axes[static_cast<int32>(EVertexMaskForgeBoundsAxis::Y)].Position = 0.25f;
+	Axes[static_cast<int32>(EVertexMaskForgeBoundsAxis::Y)].TransitionWidth = 0.5f;
+
+	const FVertexMaskForgeScalarMask ReferenceMask = VertexMaskForgeBoundingBoxGenerator::GenerateBoundingBoxMaskFromDynamicMesh(
+		*WorkingMesh.Mesh, Axes, FTransform::Identity);
+	TestTrue(TEXT("Reference generator State == Ready"), ReferenceMask.State == EVertexMaskForgeScalarMaskState::Ready);
+
+	FVertexMaskForgeDynamicLayerStack Stack;
+	AddBoundingBoxLayer(Stack, TEXT("Layer"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f, Axes);
+
+	TArray<FColor> Out;
+	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, Out);
+	TestTrue(TEXT("Succeeds"), bSucceeded);
+	if (!bSucceeded || Out.Num() != 6)
+	{
+		return false;
+	}
+
+	for (int32 CornerIndex = 0; CornerIndex < 6; ++CornerIndex)
+	{
+		const int32 VertexID = FixtureCornerToVertexID[CornerIndex];
+		float ExpectedMaskValue = 0.0f;
+		if (!ReferenceMask.TryGetValue(VertexID, ExpectedMaskValue))
+		{
+			continue;
+		}
+		TestEqual(*FString::Printf(TEXT("Out[%d].R byte-exact for combined X+Y axes"), CornerIndex), Out[CornerIndex].R, UnitFloatToByte(ExpectedMaskValue));
+	}
+
+	return true;
+}
+
+// 18. Per-axis Invert and Mirror are honored -- each byte-exact against a direct generator call with the
+// matching flag set, never re-derived here.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompBBoxInvertMirrorTest, "VertexMaskForge.DynamicSourceTopologyComposition.BoundingBoxInvertAndMirrorByteExactAgainstGenerator", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynSrcTopoCompBBoxInvertMirrorTest::RunTest(const FString& Parameters)
+{
+	const FVertexMaskForgeWorkingMesh WorkingMesh = BuildOrchestratorFixtureWorkingMesh(0, 1);
+	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
+
+	auto RunOneConfig = [&](const bool bInvert, const bool bMirror, const TCHAR* Label)
+	{
+		TStaticArray<FVertexMaskForgeAxisMaskParams, 3> Axes;
+		Axes[static_cast<int32>(EVertexMaskForgeBoundsAxis::X)].bEnabled = true;
+		Axes[static_cast<int32>(EVertexMaskForgeBoundsAxis::X)].Position = 0.5f;
+		Axes[static_cast<int32>(EVertexMaskForgeBoundsAxis::X)].TransitionWidth = 1.0f;
+		Axes[static_cast<int32>(EVertexMaskForgeBoundsAxis::X)].bInvert = bInvert;
+		Axes[static_cast<int32>(EVertexMaskForgeBoundsAxis::X)].bMirror = bMirror;
+
+		const FVertexMaskForgeScalarMask ReferenceMask = VertexMaskForgeBoundingBoxGenerator::GenerateBoundingBoxMaskFromDynamicMesh(
+			*WorkingMesh.Mesh, Axes, FTransform::Identity);
+		TestTrue(*FString::Printf(TEXT("%s: reference generator State == Ready"), Label), ReferenceMask.State == EVertexMaskForgeScalarMaskState::Ready);
+
+		FVertexMaskForgeDynamicLayerStack Stack;
+		AddBoundingBoxLayer(Stack, TEXT("Layer"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f, Axes);
+
+		TArray<FColor> Out;
+		const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, Out);
+		TestTrue(*FString::Printf(TEXT("%s: succeeds"), Label), bSucceeded);
+		if (!bSucceeded || Out.Num() != 6)
+		{
+			return;
+		}
+		for (int32 CornerIndex = 0; CornerIndex < 6; ++CornerIndex)
+		{
+			const int32 VertexID = FixtureCornerToVertexID[CornerIndex];
+			float ExpectedMaskValue = 0.0f;
+			if (!ReferenceMask.TryGetValue(VertexID, ExpectedMaskValue))
+			{
+				continue;
+			}
+			TestEqual(*FString::Printf(TEXT("%s: Out[%d].R byte-exact"), Label, CornerIndex), Out[CornerIndex].R, UnitFloatToByte(ExpectedMaskValue));
+		}
+	};
+
+	RunOneConfig(/*bInvert=*/true, /*bMirror=*/false, TEXT("Invert"));
+	RunOneConfig(/*bInvert=*/false, /*bMirror=*/true, TEXT("Mirror"));
+
+	return true;
+}
+
+// 19. Falloff (TransitionWidth) and Position produce representative non-binary intermediate values --
+// byte-exact against a direct generator call with the same wide-falloff, off-center params, never
+// re-derived here. Proves the orchestrator does not silently clamp/binarize the generator's own gradient.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompBBoxFalloffTest, "VertexMaskForge.DynamicSourceTopologyComposition.BoundingBoxFalloffAndPositionByteExactAgainstGenerator", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynSrcTopoCompBBoxFalloffTest::RunTest(const FString& Parameters)
+{
+	const FVertexMaskForgeWorkingMesh WorkingMesh = BuildOrchestratorFixtureWorkingMesh(0, 1);
+	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
+
+	TStaticArray<FVertexMaskForgeAxisMaskParams, 3> Axes;
+	Axes[static_cast<int32>(EVertexMaskForgeBoundsAxis::X)].bEnabled = true;
+	Axes[static_cast<int32>(EVertexMaskForgeBoundsAxis::X)].Position = 0.25f;
+	Axes[static_cast<int32>(EVertexMaskForgeBoundsAxis::X)].TransitionWidth = 2.0f; // Wide falloff -- avoids a hard 0/1 binary result.
+
+	const FVertexMaskForgeScalarMask ReferenceMask = VertexMaskForgeBoundingBoxGenerator::GenerateBoundingBoxMaskFromDynamicMesh(
+		*WorkingMesh.Mesh, Axes, FTransform::Identity);
+	TestTrue(TEXT("Reference generator State == Ready"), ReferenceMask.State == EVertexMaskForgeScalarMaskState::Ready);
+
+	FVertexMaskForgeDynamicLayerStack Stack;
+	AddBoundingBoxLayer(Stack, TEXT("Layer"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f, Axes);
+
+	TArray<FColor> Out;
+	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, Out);
+	TestTrue(TEXT("Succeeds"), bSucceeded);
+	if (!bSucceeded || Out.Num() != 6)
+	{
+		return false;
+	}
+
+	bool bAnyNonBinary = false;
+	for (int32 CornerIndex = 0; CornerIndex < 6; ++CornerIndex)
+	{
+		const int32 VertexID = FixtureCornerToVertexID[CornerIndex];
+		float ExpectedMaskValue = 0.0f;
+		if (!ReferenceMask.TryGetValue(VertexID, ExpectedMaskValue))
+		{
+			continue;
+		}
+		if (ExpectedMaskValue > KINDA_SMALL_NUMBER && ExpectedMaskValue < 1.0f - KINDA_SMALL_NUMBER)
+		{
+			bAnyNonBinary = true;
+		}
+		TestEqual(*FString::Printf(TEXT("Out[%d].R byte-exact vs reference generator"), CornerIndex), Out[CornerIndex].R, UnitFloatToByte(ExpectedMaskValue));
+	}
+	TestTrue(TEXT("At least one corner produced a genuine non-binary (0<v<1) mask value"), bAnyNonBinary);
+
+	return true;
+}
+
+// 20. Blend/Opacity remain downstream composition concerns for a Bounding-Box-sourced mask, exactly as
+// for Material Slot: Opacity 0.0 leaves the composite at BaseColors regardless of the (real, Ready)
+// Bounding Box mask's own values, since PaintValue's contribution vanishes at the Copy formula's own
+// Opacity==0 case (already established, never re-derived here). A disabled-but-otherwise-valid Bounding
+// Box layer likewise contributes nothing -- distinct from the existing DisabledLayerTest, which uses a
+// genuinely UNSUPPORTED disabled generator to prove validation-skipping; this proves a SUPPORTED,
+// disabled generator still contributes nothing.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompBBoxOpacityAndDisabledTest, "VertexMaskForge.DynamicSourceTopologyComposition.BoundingBoxOpacityZeroAndDisabledLayerPreserveBaseColors", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynSrcTopoCompBBoxOpacityAndDisabledTest::RunTest(const FString& Parameters)
+{
+	const FVertexMaskForgeWorkingMesh WorkingMesh = BuildOrchestratorFixtureWorkingMesh(0, 1);
+	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
+
+	TStaticArray<FVertexMaskForgeAxisMaskParams, 3> Axes;
+	Axes[static_cast<int32>(EVertexMaskForgeBoundsAxis::X)].bEnabled = true;
+	Axes[static_cast<int32>(EVertexMaskForgeBoundsAxis::X)].Position = 0.5f;
+	Axes[static_cast<int32>(EVertexMaskForgeBoundsAxis::X)].TransitionWidth = 1.0f;
+
+	// --- Opacity 0.0, enabled, otherwise-valid layer -- must be a full passthrough. ---
+	{
+		FVertexMaskForgeDynamicLayerStack Stack;
+		AddBoundingBoxLayer(Stack, TEXT("Layer"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, /*Opacity=*/0.0f, Axes);
+
+		TArray<FColor> Out;
+		const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, Out);
+		TestTrue(TEXT("Opacity 0.0: succeeds"), bSucceeded);
+		if (bSucceeded && Out.Num() == 6)
+		{
+			for (int32 Index = 0; Index < 6; ++Index)
+			{
+				TestEqual(*FString::Printf(TEXT("Opacity 0.0: Out[%d] byte-exact passthrough"), Index), Out[Index], BaseColors[Index]);
+			}
+		}
+	}
+
+	// --- Disabled, otherwise-valid layer -- must also be a full passthrough. ---
+	{
+		FVertexMaskForgeDynamicLayerStack Stack;
+		const FGuid LayerId = AddBoundingBoxLayer(Stack, TEXT("Layer"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f, Axes);
+		Stack.SetLayerEnabled(LayerId, false);
+
+		TArray<FColor> Out;
+		const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, Out);
+		TestTrue(TEXT("Disabled: succeeds"), bSucceeded);
+		if (bSucceeded && Out.Num() == 6)
+		{
+			for (int32 Index = 0; Index < 6; ++Index)
+			{
+				TestEqual(*FString::Printf(TEXT("Disabled: Out[%d] byte-exact passthrough"), Index), Out[Index], BaseColors[Index]);
+			}
+		}
+	}
+
+	return true;
+}
+
+// 21. Two independently parameterized Bounding Box layers retain distinct masks and compose strictly in
+// Stack order (Copy always wins with the LAST enabled layer's own value, the same order contract
+// OrderMattersTest above already proves for Fill-only layers) -- and reordering them changes the final
+// result, proving this specific generator type is not special-cased around the authoritative orchestrator.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompBBoxTwoLayersOrderTest, "VertexMaskForge.DynamicSourceTopologyComposition.TwoBoundingBoxLayersRetainDistinctMasksAndReorderChangesResult", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynSrcTopoCompBBoxTwoLayersOrderTest::RunTest(const FString& Parameters)
+{
+	const FVertexMaskForgeWorkingMesh WorkingMesh = BuildOrchestratorFixtureWorkingMesh(0, 1);
+	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
+
+	TStaticArray<FVertexMaskForgeAxisMaskParams, 3> XAxes;
+	XAxes[static_cast<int32>(EVertexMaskForgeBoundsAxis::X)].bEnabled = true;
+	XAxes[static_cast<int32>(EVertexMaskForgeBoundsAxis::X)].Position = 0.5f;
+	XAxes[static_cast<int32>(EVertexMaskForgeBoundsAxis::X)].TransitionWidth = 1.0f;
+
+	TStaticArray<FVertexMaskForgeAxisMaskParams, 3> YAxes;
+	YAxes[static_cast<int32>(EVertexMaskForgeBoundsAxis::Y)].bEnabled = true;
+	YAxes[static_cast<int32>(EVertexMaskForgeBoundsAxis::Y)].Position = 0.5f;
+	YAxes[static_cast<int32>(EVertexMaskForgeBoundsAxis::Y)].TransitionWidth = 1.0f;
+
+	const FVertexMaskForgeScalarMask XReference = VertexMaskForgeBoundingBoxGenerator::GenerateBoundingBoxMaskFromDynamicMesh(*WorkingMesh.Mesh, XAxes, FTransform::Identity);
+	const FVertexMaskForgeScalarMask YReference = VertexMaskForgeBoundingBoxGenerator::GenerateBoundingBoxMaskFromDynamicMesh(*WorkingMesh.Mesh, YAxes, FTransform::Identity);
+	TestTrue(TEXT("X reference State == Ready"), XReference.State == EVertexMaskForgeScalarMaskState::Ready);
+	TestTrue(TEXT("Y reference State == Ready"), YReference.State == EVertexMaskForgeScalarMaskState::Ready);
+
+	// Forward: X-masked layer first, Y-masked layer last -- Y (folded last) determines the Copy result.
+	FVertexMaskForgeDynamicLayerStack ForwardStack;
+	AddBoundingBoxLayer(ForwardStack, TEXT("X"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f, XAxes);
+	AddBoundingBoxLayer(ForwardStack, TEXT("Y"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f, YAxes);
+
+	// Reverse: same two layers, opposite order -- X (folded last) determines the Copy result instead.
+	FVertexMaskForgeDynamicLayerStack ReverseStack;
+	AddBoundingBoxLayer(ReverseStack, TEXT("Y"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f, YAxes);
+	AddBoundingBoxLayer(ReverseStack, TEXT("X"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f, XAxes);
+
+	TArray<FColor> ForwardOut;
+	TArray<FColor> ReverseOut;
+	const bool bForwardSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, ForwardStack, BaseColors, ForwardOut);
+	const bool bReverseSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, ReverseStack, BaseColors, ReverseOut);
+	TestTrue(TEXT("Forward succeeds"), bForwardSucceeded);
+	TestTrue(TEXT("Reverse succeeds"), bReverseSucceeded);
+	if (!bForwardSucceeded || !bReverseSucceeded || ForwardOut.Num() != 6 || ReverseOut.Num() != 6)
+	{
+		return false;
+	}
+
+	for (int32 CornerIndex = 0; CornerIndex < 6; ++CornerIndex)
+	{
+		const int32 VertexID = FixtureCornerToVertexID[CornerIndex];
+		float ExpectedYValue = 0.0f;
+		float ExpectedXValue = 0.0f;
+		if (!YReference.TryGetValue(VertexID, ExpectedYValue) || !XReference.TryGetValue(VertexID, ExpectedXValue))
+		{
+			continue;
+		}
+		TestEqual(*FString::Printf(TEXT("Forward[%d].R matches Y (folded last)"), CornerIndex), ForwardOut[CornerIndex].R, UnitFloatToByte(ExpectedYValue));
+		TestEqual(*FString::Printf(TEXT("Reverse[%d].R matches X (folded last)"), CornerIndex), ReverseOut[CornerIndex].R, UnitFloatToByte(ExpectedXValue));
+	}
+
+	return true;
+}
+
+// 22. World Space is REJECTED (whole-call failure), never silently reinterpreted as Local Space -- Out is
+// left completely untouched on failure, matching this orchestrator's existing preserve-on-failure policy.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompBBoxWorldSpaceRejectedTest, "VertexMaskForge.DynamicSourceTopologyComposition.BoundingBoxWorldSpaceRejectedInThisCheckpoint", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynSrcTopoCompBBoxWorldSpaceRejectedTest::RunTest(const FString& Parameters)
+{
+	const FVertexMaskForgeWorkingMesh WorkingMesh = BuildOrchestratorFixtureWorkingMesh(0, 1);
+	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
+
+	TStaticArray<FVertexMaskForgeAxisMaskParams, 3> Axes;
+	Axes[static_cast<int32>(EVertexMaskForgeBoundsAxis::X)].bEnabled = true;
+	Axes[static_cast<int32>(EVertexMaskForgeBoundsAxis::X)].Position = 0.5f;
+	Axes[static_cast<int32>(EVertexMaskForgeBoundsAxis::X)].TransitionWidth = 1.0f;
+	Axes[static_cast<int32>(EVertexMaskForgeBoundsAxis::X)].bWorldSpace = true;
+
+	FVertexMaskForgeDynamicLayerStack Stack;
+	AddBoundingBoxLayer(Stack, TEXT("Layer"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f, Axes);
+
+	TArray<FColor> Out = { FColor(1, 2, 3, 4) }; // sentinel, wrong size on purpose
+	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, Out);
+
+	TestFalse(TEXT("World Space is rejected (fails the whole call)"), bSucceeded);
+	TestEqual(TEXT("Out left completely untouched on failure"), Out.Num(), 1);
+	if (Out.Num() == 1)
+	{
+		TestEqual(TEXT("Out[0] sentinel preserved"), Out[0], FColor(1, 2, 3, 4));
+	}
+
+	return true;
+}
+
+// 23. Unified Bounds is REJECTED (whole-call failure), never silently reinterpreted as per-mesh bounds --
+// Out is left completely untouched on failure, checked unconditionally regardless of axis enable state.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompBBoxUnifiedBoundsRejectedTest, "VertexMaskForge.DynamicSourceTopologyComposition.BoundingBoxUnifiedBoundsRejectedInThisCheckpoint", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynSrcTopoCompBBoxUnifiedBoundsRejectedTest::RunTest(const FString& Parameters)
+{
+	const FVertexMaskForgeWorkingMesh WorkingMesh = BuildOrchestratorFixtureWorkingMesh(0, 1);
+	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
+
+	TStaticArray<FVertexMaskForgeAxisMaskParams, 3> Axes;
+	Axes[static_cast<int32>(EVertexMaskForgeBoundsAxis::X)].bEnabled = true;
+	Axes[static_cast<int32>(EVertexMaskForgeBoundsAxis::X)].Position = 0.5f;
+	Axes[static_cast<int32>(EVertexMaskForgeBoundsAxis::X)].TransitionWidth = 1.0f;
+
+	FVertexMaskForgeDynamicLayerStack Stack;
+	AddBoundingBoxLayer(Stack, TEXT("Layer"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f, Axes, /*bUseUnifiedBounds=*/true);
+
+	TArray<FColor> Out = { FColor(5, 6, 7, 8) }; // sentinel, wrong size on purpose
+	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, Out);
+
+	TestFalse(TEXT("Unified Bounds is rejected (fails the whole call)"), bSucceeded);
+	TestEqual(TEXT("Out left completely untouched on failure"), Out.Num(), 1);
+	if (Out.Num() == 1)
+	{
+		TestEqual(TEXT("Out[0] sentinel preserved"), Out[0], FColor(5, 6, 7, 8));
 	}
 
 	return true;

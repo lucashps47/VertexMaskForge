@@ -19,6 +19,7 @@
 #include "VertexMaskForgeDynamicSourceTopologyComposition.h"
 
 #include "DynamicMesh/DynamicMesh3.h"
+#include "VertexMaskForgeBoundingBoxGenerator.h"
 #include "VertexMaskForgeColorConversion.h"
 #include "VertexMaskForgeDynamicLayerEvaluator.h"
 #include "VertexMaskForgeDynamicLayerStack.h"
@@ -28,6 +29,33 @@
 #include "VertexMaskForgeRecipeTypes.h"
 #include "VertexMaskForgeSequentialEvaluator.h"
 #include "VertexMaskForgeWorkingMeshTypes.h"
+
+namespace
+{
+	// M16-K.6D-8B: this orchestrator's masked layers are no longer all corner-domain -- Material Slot's
+	// own generator already produces one value per Source-Topology corner (see
+	// GenerateMaterialSlotMaskFromDynamicMesh), but Bounding Box's Source-Topology generator
+	// (GenerateBoundingBoxMaskFromDynamicMesh) is indexed by Dynamic Mesh VertexID instead (sparse-safe,
+	// TryGetValue-only -- see that function's own "INDEX SAFETY" doc note). Domain is tracked explicitly,
+	// per generated layer mask, never inferred from Values.Num() (which could coincidentally equal the
+	// corner count for a mesh where VertexCount()*something == TriangleCount()*3) -- this mirrors the
+	// same per-generator domain distinction Legacy's own UpdateWorkingColorsSourceTopology already makes
+	// (its IndexOverride switch: Material Slot by CornerIndex, Bounding Box/Curvature/Noise by Dynamic
+	// Mesh VertexID via Mesh.GetTriangle(TriangleID)[Corner]) -- reimplemented here structurally
+	// isolated from that Legacy code (no Legacy composition function is ever called), never copied from
+	// it.
+	enum class ELayerMaskDomain : uint8
+	{
+		Corner,
+		DynamicMeshVertex,
+	};
+
+	struct FLayerGeneratedMask
+	{
+		FVertexMaskForgeScalarMask Mask;
+		ELayerMaskDomain Domain = ELayerMaskDomain::Corner;
+	};
+}
 
 bool VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(
 	const FVertexMaskForgeWorkingMesh& WorkingMesh,
@@ -48,11 +76,20 @@ bool VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSo
 
 	const TArray<FVertexMaskForgeLayer>& Layers = Stack.GetLayers();
 
-	// --- Pass 1: resolve every ENABLED masked layer's Material Slot scalar array up front, all-or-
-	// nothing -- a structural failure (unsupported generator type, or the generator itself not Ready)
-	// fails the WHOLE call before any per-corner work begins; nothing is ever partially composed. ---
-	TArray<FVertexMaskForgeScalarMask> LayerMaterialSlotMasks;
-	LayerMaterialSlotMasks.SetNum(Layers.Num());
+	// --- Pass 1: resolve every ENABLED masked layer's scalar mask up front, all-or-nothing -- a
+	// structural failure (unsupported generator type, or the generator itself not Ready) fails the WHOLE
+	// call before any per-corner work begins; nothing is ever partially composed. ---
+	TArray<FLayerGeneratedMask> LayerMasks;
+	LayerMasks.SetNum(Layers.Num());
+
+	// Lazily built (only if at least one enabled layer actually requests Bounding Box) -- maps this
+	// call's own corner-domain index to the underlying Dynamic Mesh VertexID at that corner, walking
+	// WorkingMesh.Mesh->TriangleIndicesItr() in order (NEVER assuming TriangleID is dense/contiguous) so
+	// "CornerIndex N" means the identical physical corner GenerateMaterialSlotMaskFromDynamicMesh's own
+	// CornerIndex assignment already uses (see that function's own TriangleIndicesItr()-driven loop) --
+	// both domains agree on what a given CornerIndex physically is.
+	TArray<int32> CornerToVertexID;
+	bool bCornerToVertexIDBuilt = false;
 
 	for (int32 LayerIndex = 0; LayerIndex < Layers.Num(); ++LayerIndex)
 	{
@@ -62,30 +99,94 @@ bool VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSo
 			continue;
 		}
 
-		if (Layer.Mask->GeneratorType != EVertexMaskForgeGeneratorType::MaterialSlot)
+		if (Layer.Mask->GeneratorType == EVertexMaskForgeGeneratorType::MaterialSlot)
 		{
-			// Explicit, whole-call failure -- this checkpoint's own Material-Slot-only vertical slice
-			// never silently skips or treats an unsupported generator type as Fill-only.
+			const FVertexMaskForgeMaterialSlotParams* SlotParams = Layer.Mask->Params.TryGet<FVertexMaskForgeMaterialSlotParams>();
+			if (!SlotParams)
+			{
+				// Defensive -- should be unreachable given FVertexMaskForgeDynamicLayerStack's own
+				// GeneratorType/Params coherence invariant, but never assumed (mirrors every other
+				// Material Slot caller's own defensive check in this codebase).
+				return false;
+			}
+
+			FVertexMaskForgeScalarMask GeneratedMask = VertexMaskForgeMaterialSlotGenerator::GenerateMaterialSlotMaskFromDynamicMesh(
+				WorkingMesh, SlotParams->SelectedSlotIndex, SlotParams->bInvert);
+			if (GeneratedMask.State != EVertexMaskForgeScalarMaskState::Ready || GeneratedMask.Values.Num() != ExpectedCornerCount)
+			{
+				return false;
+			}
+
+			LayerMasks[LayerIndex].Mask = MoveTemp(GeneratedMask);
+			LayerMasks[LayerIndex].Domain = ELayerMaskDomain::Corner;
+		}
+		else if (Layer.Mask->GeneratorType == EVertexMaskForgeGeneratorType::BoundingBox)
+		{
+			const FVertexMaskForgeBoundingBoxParams* BBoxParams = Layer.Mask->Params.TryGet<FVertexMaskForgeBoundingBoxParams>();
+			if (!BBoxParams)
+			{
+				// Defensive -- mirrors the Material Slot coherence check above.
+				return false;
+			}
+
+			// M16-K.6D-8B scope: Local-space, per-mesh bounds ONLY. World Space and Unified Bounds are
+			// explicitly REJECTED here (whole-call failure), never silently reinterpreted as Local Space
+			// or per-mesh bounds -- both require inputs (a component transform; full-selection context)
+			// this orchestrator does not receive in this checkpoint. bUseUnifiedBounds is geometric/
+			// generator state (NOT a composition concern like Blend/Opacity), checked unconditionally
+			// regardless of which axes are enabled, since Unified Bounds changes what "the bounds" even
+			// are before any per-axis evaluation begins.
+			if (BBoxParams->bUseUnifiedBounds)
+			{
+				return false;
+			}
+			for (const FVertexMaskForgeAxisMaskParams& AxisParams : BBoxParams->Axes)
+			{
+				if (AxisParams.bEnabled && AxisParams.bWorldSpace)
+				{
+					return false;
+				}
+			}
+
+			// Every enabled axis has now been confirmed Local-space -- ResolveAxisCoordinate's own
+			// Local-space branch never reads ComponentTransform, so FTransform::Identity is safe here
+			// ONLY because that request was just proven, never supplied as a guess/placeholder ahead of
+			// validation.
+			FVertexMaskForgeScalarMask GeneratedMask = VertexMaskForgeBoundingBoxGenerator::GenerateBoundingBoxMaskFromDynamicMesh(
+				*WorkingMesh.Mesh, BBoxParams->Axes, FTransform::Identity);
+			if (GeneratedMask.State != EVertexMaskForgeScalarMaskState::Ready)
+			{
+				// Covers "no enabled axes" and "degenerate bounds" alike -- both leave the generator's
+				// own State at something other than Ready (Unavailable / DegenerateBounds respectively),
+				// exactly as GenerateBoundingBoxMaskFromDynamicMesh's own contract already establishes;
+				// no separate check is invented here.
+				return false;
+			}
+
+			LayerMasks[LayerIndex].Mask = MoveTemp(GeneratedMask);
+			LayerMasks[LayerIndex].Domain = ELayerMaskDomain::DynamicMeshVertex;
+
+			if (!bCornerToVertexIDBuilt)
+			{
+				CornerToVertexID.SetNumUninitialized(ExpectedCornerCount);
+				int32 RunningCornerIndex = 0;
+				for (const int32 TriangleID : WorkingMesh.Mesh->TriangleIndicesItr())
+				{
+					const UE::Geometry::FIndex3i Tri = WorkingMesh.Mesh->GetTriangle(TriangleID);
+					CornerToVertexID[RunningCornerIndex++] = Tri.A;
+					CornerToVertexID[RunningCornerIndex++] = Tri.B;
+					CornerToVertexID[RunningCornerIndex++] = Tri.C;
+				}
+				bCornerToVertexIDBuilt = true;
+			}
+		}
+		else
+		{
+			// Explicit, whole-call failure -- any generator type beyond this checkpoint's own supported
+			// set (Material Slot, Bounding Box Local-space) never silently skips or treats itself as
+			// Fill-only.
 			return false;
 		}
-
-		const FVertexMaskForgeMaterialSlotParams* SlotParams = Layer.Mask->Params.TryGet<FVertexMaskForgeMaterialSlotParams>();
-		if (!SlotParams)
-		{
-			// Defensive -- should be unreachable given FVertexMaskForgeDynamicLayerStack's own
-			// GeneratorType/Params coherence invariant, but never assumed (mirrors every other
-			// Material Slot caller's own defensive check in this codebase).
-			return false;
-		}
-
-		FVertexMaskForgeScalarMask GeneratedMask = VertexMaskForgeMaterialSlotGenerator::GenerateMaterialSlotMaskFromDynamicMesh(
-			WorkingMesh, SlotParams->SelectedSlotIndex, SlotParams->bInvert);
-		if (GeneratedMask.State != EVertexMaskForgeScalarMaskState::Ready || GeneratedMask.Values.Num() != ExpectedCornerCount)
-		{
-			return false;
-		}
-
-		LayerMaterialSlotMasks[LayerIndex] = MoveTemp(GeneratedMask);
 	}
 
 	// --- Pass 2: fold, per corner, strictly in Stack order, into a private local buffer -- OutComposedColors
@@ -113,10 +214,34 @@ bool VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSo
 			}
 
 			// Layer.Mask unset -> EffectiveMask implicitly 1.0, exactly mirroring EvaluateColor's own
-			// "ResultStore is NEVER consulted for such a layer" contract (here: the local Material Slot
-			// array is never consulted either). Layer.Mask set -> Pass 1 already guaranteed a Ready,
-			// exactly-sized LayerMaterialSlotMasks[LayerIndex] for every ENABLED masked layer.
-			const float EffectiveMask = Layer.Mask.IsSet() ? LayerMaterialSlotMasks[LayerIndex].Values[CornerIndex] : 1.0f;
+			// "ResultStore is NEVER consulted for such a layer" contract (here: neither generated mask
+			// array is ever consulted either). Layer.Mask set -> Pass 1 already guaranteed a Ready,
+			// domain-tagged LayerMasks[LayerIndex] for every ENABLED masked layer -- looked up according
+			// to that mask's own recorded domain, never inferred from array length.
+			float EffectiveMask = 1.0f;
+			if (Layer.Mask.IsSet())
+			{
+				const FLayerGeneratedMask& GeneratedLayerMask = LayerMasks[LayerIndex];
+				if (GeneratedLayerMask.Domain == ELayerMaskDomain::Corner)
+				{
+					EffectiveMask = GeneratedLayerMask.Mask.Values[CornerIndex];
+				}
+				else
+				{
+					// DynamicMeshVertex domain (Bounding Box) -- resolve this corner's own underlying
+					// Dynamic Mesh VertexID, then read the mask ONLY through TryGetValue (never a direct
+					// Values[VertexID] index), exactly per FVertexMaskForgeScalarMask's own sparse-domain
+					// contract. A miss here means the corner's VertexID was never written by the
+					// generator -- stale/invalid topology -- and fails the WHOLE call safely rather than
+					// substituting a guessed value; OutComposedColors is still untouched on this path
+					// (LocalOutput is never assigned to it before this point).
+					const int32 VertexID = CornerToVertexID[CornerIndex];
+					if (!GeneratedLayerMask.Mask.TryGetValue(VertexID, EffectiveMask))
+					{
+						return false;
+					}
+				}
+			}
 
 			const FVector3f PaintValue = FVector3f(FillValue, FillValue, FillValue) * EffectiveMask;
 			const FVector3f LayerOutput = VertexMaskForgeSequentialEvaluator::EvaluateFillLayerStep(Composite, PaintValue, Layer.BlendMode, Layer.Opacity);
