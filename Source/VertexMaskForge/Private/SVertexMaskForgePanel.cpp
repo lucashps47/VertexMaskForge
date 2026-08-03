@@ -4212,18 +4212,64 @@ TSharedRef<SWidget> SVertexMaskForgePanel::BuildDynamicLayerRow(const FGuid Laye
 					})
 					.OnComboBoxOpening_Lambda([this, MaterialSlotPickerOptions]()
 					{
-						// AUDITED: rebuilt fresh right before the dropdown opens, never on every paint --
-						// this ONLY repopulates THIS row's own exclusive, per-widget options array (captured
-						// by value above -- never the removed panel-wide member); it never reads or writes
-						// any layer's own persisted Params, and cannot affect any other row's options.
-						MaterialSlotPickerOptions->Reset();
-						if (const FVertexMaskForgeWorkingMesh* WorkingMesh = GetSingleAssetWorkingMeshForDynamicMaterialSlot())
+						// M16-K.6D-6 (Group E defect fix -- evidence-backed, see the checkpoint's own
+						// instrumentation): CONFIRMED root cause was recreating brand-new
+						// MakeShared<FVertexMaskForgeMaterialSlotInfo> option objects on EVERY open, even
+						// when the mesh's own MaterialSlotOptions had not changed at all. SComboBox's own
+						// internal SelectedItem (Widgets/Input/SComboBox.h) is a TSharedPtr captured at
+						// selection time; discarding and recreating the whole options array orphans that
+						// pointer's identity (it no longer matches ANYTHING in the new array), and the list
+						// view's own attempt to reconcile/restore it on the next open fires a spurious
+						// internal Direct+invalid OnSelectionChanged, which unconditionally calls
+						// this->SetIsOpen(false) inside SComboBox::OnSelectionChanged_Internal -- closing the
+						// popup that had JUST opened, in the same click. Direct evidence (temporary [MSDIAG]
+						// UE_LOG instrumentation, since removed): on the failing "reopen" click,
+						// OnComboBoxOpening fired normally (ruling out focus/capture/drag-swallow), followed
+						// 12ms later by OnSelectionChanged(Valid=0, SelectType=Direct) -- exactly this
+						// mechanism. The FOLLOWING click then succeeds because SelectedItem was ALREADY
+						// reset to invalid by that failed attempt, so there is nothing left to fail to
+						// reconcile.
+						//
+						// Fix: only Reset+repopulate when the live WorkingMesh->MaterialSlotOptions content
+						// has ACTUALLY changed since this array was last populated (compared by value, since
+						// FVertexMaskForgeMaterialSlotInfo has no operator==) -- if unchanged (the common
+						// case: reopening the same picker on the same mesh selection), the array, and
+						// therefore every existing TSharedPtr's identity including the currently selected
+						// one, is left completely untouched, so SelectedItem never gets orphaned in the
+						// first place. When the content genuinely changes (a real, if rare, case -- e.g. the
+						// underlying selection context changed while this row stayed alive), a real refresh
+						// still occurs, exactly as this control was designed to do.
+						const FVertexMaskForgeWorkingMesh* WorkingMesh = GetSingleAssetWorkingMeshForDynamicMaterialSlot();
+						const TArray<FVertexMaskForgeMaterialSlotInfo>& LiveOptions = WorkingMesh ? WorkingMesh->MaterialSlotOptions : TArray<FVertexMaskForgeMaterialSlotInfo>();
+
+						bool bContentUnchanged = MaterialSlotPickerOptions->Num() == LiveOptions.Num();
+						if (bContentUnchanged)
 						{
-							MaterialSlotPickerOptions->Reserve(WorkingMesh->MaterialSlotOptions.Num());
-							for (const FVertexMaskForgeMaterialSlotInfo& Info : WorkingMesh->MaterialSlotOptions)
+							for (int32 Index = 0; Index < LiveOptions.Num(); ++Index)
 							{
-								MaterialSlotPickerOptions->Add(MakeShared<FVertexMaskForgeMaterialSlotInfo>(Info));
+								const TSharedPtr<FVertexMaskForgeMaterialSlotInfo>& Existing = (*MaterialSlotPickerOptions)[Index];
+								const FVertexMaskForgeMaterialSlotInfo& Live = LiveOptions[Index];
+								if (!Existing.IsValid()
+									|| Existing->SlotIndex != Live.SlotIndex
+									|| Existing->MaterialSlotName != Live.MaterialSlotName
+									|| Existing->MaterialAssetName != Live.MaterialAssetName)
+								{
+									bContentUnchanged = false;
+									break;
+								}
 							}
+						}
+
+						if (bContentUnchanged)
+						{
+							return;
+						}
+
+						MaterialSlotPickerOptions->Reset();
+						MaterialSlotPickerOptions->Reserve(LiveOptions.Num());
+						for (const FVertexMaskForgeMaterialSlotInfo& Info : LiveOptions)
+						{
+							MaterialSlotPickerOptions->Add(MakeShared<FVertexMaskForgeMaterialSlotInfo>(Info));
 						}
 					})
 					.OnGenerateWidget(this, &SVertexMaskForgePanel::OnGenerateDynamicMaterialSlotPickerRow)
