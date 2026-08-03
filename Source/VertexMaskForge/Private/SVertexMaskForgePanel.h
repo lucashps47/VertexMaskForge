@@ -1389,12 +1389,14 @@ private:
 	 *  fresh message from this same pass is never clobbered). No-ops while Applying. */
 	void RecomputeOperationState();
 
-	/** M16-K.6D-5: Accept is unavailable while PreviewSource == Dynamic -- a UX-level safeguard, not the
-	 *  primary isolation barrier (the Dynamic buffer's own local/transitory ownership never reaches
-	 *  BuildAcceptTargets' inputs at all -- see PreviewSource's own doc comment). Accept's own internal
-	 *  behavior while Legacy is unaffected byte-for-byte. See AcceptPendingChanges() for the matching
-	 *  defensive early-out. */
-	bool CanAcceptChanges() const { return OperationState == EVertexMaskForgeOperationState::PendingChanges && PreviewSource == EVertexMaskForgePreviewSource::Legacy; }
+	/** M16-K.6D-7B: Accept is eligible under EITHER source now -- OperationState is itself already
+	 *  source-aware (see RecomputeOperationState()'s Dynamic branch: PendingChanges only when the Dynamic
+	 *  stack has at least one enabled layer AND a live selection), so no separate
+	 *  `PreviewSource == Legacy` gate is needed here anymore (M16-K.6D-5's original UX-level safeguard,
+	 *  superseded now that Dynamic has its own real, isolated Accept path -- see AcceptPendingChanges()'s
+	 *  source-aware branch and VertexMaskForgeDynamicAcceptTargetBuilder for the isolation this relies
+	 *  on). Legacy behavior is unaffected: OperationState's Legacy branch is byte-for-byte unchanged. */
+	bool CanAcceptChanges() const { return OperationState == EVertexMaskForgeOperationState::PendingChanges; }
 	FReply OnAcceptChangesClicked();
 
 	/**

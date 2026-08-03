@@ -535,4 +535,47 @@ bool FVertexMaskForgeDynamicLayerStackValidMutationsTest::RunTest(const FString&
 	return true;
 }
 
+// M16-K.6D-7B: HasAnyEnabledLayer() is the real decision primitive SVertexMaskForgePanel::
+// RecomputeOperationState()'s Dynamic branch calls to decide UI Accept-eligibility -- covered here
+// directly (a real, non-Slate production seam) rather than by any panel-level test, since exercising
+// RecomputeOperationState()/CanAcceptChanges()/AcceptPendingChanges() themselves requires a live
+// SVertexMaskForgePanel instance with real viewport selection, which has no automatable seam in this
+// codebase (see that checkpoint's own report for the manual-validation deferral).
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynamicLayerStackHasAnyEnabledLayerEmptyTest, "VertexMaskForge.DynamicLayerStack.HasAnyEnabledLayerFalseOnEmptyStack", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynamicLayerStackHasAnyEnabledLayerEmptyTest::RunTest(const FString& Parameters)
+{
+	FVertexMaskForgeDynamicLayerStack Stack;
+	TestTrue(TEXT("Stack starts empty"), Stack.IsEmpty());
+	TestFalse(TEXT("HasAnyEnabledLayer() false on an empty stack"), Stack.HasAnyEnabledLayer());
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynamicLayerStackHasAnyEnabledLayerAllDisabledTest, "VertexMaskForge.DynamicLayerStack.HasAnyEnabledLayerFalseWhenAllDisabled", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynamicLayerStackHasAnyEnabledLayerAllDisabledTest::RunTest(const FString& Parameters)
+{
+	FVertexMaskForgeDynamicLayerStack Stack;
+	const FGuid A = Stack.AddLayer(TEXT("A"));
+	const FGuid B = Stack.AddLayer(TEXT("B"));
+	TestTrue(TEXT("SetLayerEnabled(A, false)"), Stack.SetLayerEnabled(A, false));
+	TestTrue(TEXT("SetLayerEnabled(B, false)"), Stack.SetLayerEnabled(B, false));
+
+	TestFalse(TEXT("Stack is non-empty"), Stack.IsEmpty());
+	TestFalse(TEXT("HasAnyEnabledLayer() false when every layer is disabled -- deliberately NOT the same as !IsEmpty()"), Stack.HasAnyEnabledLayer());
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynamicLayerStackHasAnyEnabledLayerOneEnabledTest, "VertexMaskForge.DynamicLayerStack.HasAnyEnabledLayerTrueWithOneEnabled", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynamicLayerStackHasAnyEnabledLayerOneEnabledTest::RunTest(const FString& Parameters)
+{
+	FVertexMaskForgeDynamicLayerStack Stack;
+	const FGuid A = Stack.AddLayer(TEXT("A"));
+	const FGuid B = Stack.AddLayer(TEXT("B"));
+	TestTrue(TEXT("SetLayerEnabled(A, false)"), Stack.SetLayerEnabled(A, false));
+	// B is left at AddLayer's own default (bEnabled = true).
+	(void)B;
+
+	TestTrue(TEXT("HasAnyEnabledLayer() true with exactly one enabled layer"), Stack.HasAnyEnabledLayer());
+	return true;
+}
+
 #endif // WITH_DEV_AUTOMATION_TESTS

@@ -222,6 +222,28 @@ public:
 	bool IsEmpty() const { return Layers.IsEmpty(); }
 
 	/**
+	 * M16-K.6D-7B: true iff at least one layer has bEnabled == true. Deliberately distinct from
+	 * !IsEmpty() -- a non-empty stack with every layer disabled must be reported as having no enabled
+	 * layer. Used by the panel's Dynamic Accept eligibility check (see SVertexMaskForgePanel::
+	 * RecomputeOperationState) as a cheap, shallow UI-eligibility signal; it says nothing about whether
+	 * those enabled layer(s) will actually compose successfully (unsupported generator, stale topology,
+	 * etc.) -- that authoritative validation belongs solely to
+	 * VertexMaskForgeDynamicAcceptTargetBuilder::BuildSourceTopologyAcceptTargets, invoked only when
+	 * Accept is actually pressed.
+	 */
+	bool HasAnyEnabledLayer() const
+	{
+		for (const FVertexMaskForgeLayer& Layer : Layers)
+		{
+			if (Layer.bEnabled)
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
 	 * True iff, for every layer:
 	 *   - LayerId is valid (non-default-constructed FGuid);
 	 *   - LayerId is unique within the stack (no duplicates);

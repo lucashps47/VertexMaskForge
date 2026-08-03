@@ -41,6 +41,7 @@
 #include "VertexMaskForgeColorConversion.h"
 #include "VertexMaskForgeCurvatureGenerator.h"
 #include "VertexMaskForgeDirectionalNormalGenerator.h"
+#include "VertexMaskForgeDynamicAcceptTargetBuilder.h"
 #include "VertexMaskForgeDisplayColorDerivation.h"
 #include "VertexMaskForgeDynamicSourceTopologyComposition.h"
 #include "VertexMaskForgeGeneratorLayerBridge.h"
@@ -8933,19 +8934,46 @@ void SVertexMaskForgePanel::RecomputeOperationState()
 	// whether pending changes exist. bHasPending is therefore now computed identically regardless of
 	// CurrentPreviewMode.
 	bool bHasPending = false;
-	for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
+	if (PreviewSource == EVertexMaskForgePreviewSource::Dynamic)
 	{
-		if (Entry.IsValid() && !Entry->PreviewComponents.IsEmpty()
-			&& (Entry->GeneratorState.BoundingBoxMask.State == EVertexMaskForgeScalarMaskState::Ready
-				|| Entry->GeneratorState.AmbientOcclusionMask.State == EVertexMaskForgeScalarMaskState::Ready
-				|| Entry->GeneratorState.CurvatureMask.State == EVertexMaskForgeScalarMaskState::Ready
-				|| Entry->GeneratorState.NoiseMask.State == EVertexMaskForgeScalarMaskState::Ready
-				|| Entry->GeneratorState.MaterialSlotMask.State == EVertexMaskForgeScalarMaskState::Ready
-				|| Entry->GeneratorState.DirectionalNormalMask.State == EVertexMaskForgeScalarMaskState::Ready
-				|| Entry->GeneratorState.ThicknessMask.State == EVertexMaskForgeScalarMaskState::Ready))
+		// AUDITED (M16-K.6D-7B): the Legacy GeneratorState.*.Ready gate below is exclusively Legacy's own
+		// -- it must never be consulted while Dynamic is active (a mask generated earlier under Legacy
+		// must not spuriously mark a Dynamic session Pending, and vice versa). Dynamic pending-ness is a
+		// shallow UI-eligibility signal only: at least one selected entry has a live PreviewComponent (the
+		// same normal session/selection prerequisite every source shares) AND the Dynamic stack has at
+		// least one enabled layer (FVertexMaskForgeDynamicLayerStack::HasAnyEnabledLayer() -- deliberately
+		// NOT just !DynamicLayerStack.IsEmpty(), since a non-empty stack with every layer disabled must
+		// also read as non-pending). Authoritative validation (unsupported generator, stale topology, a
+		// masked layer that fails to compose) is never performed here -- that is solely
+		// VertexMaskForgeDynamicAcceptTargetBuilder::BuildSourceTopologyAcceptTargets' own responsibility,
+		// invoked only when Accept is actually pressed (see AcceptPendingChanges()'s Dynamic branch).
+		bool bHasSelection = false;
+		for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
 		{
-			bHasPending = true;
-			break;
+			if (Entry.IsValid() && !Entry->PreviewComponents.IsEmpty())
+			{
+				bHasSelection = true;
+				break;
+			}
+		}
+		bHasPending = bHasSelection && DynamicLayerStack.HasAnyEnabledLayer();
+	}
+	else
+	{
+		for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
+		{
+			if (Entry.IsValid() && !Entry->PreviewComponents.IsEmpty()
+				&& (Entry->GeneratorState.BoundingBoxMask.State == EVertexMaskForgeScalarMaskState::Ready
+					|| Entry->GeneratorState.AmbientOcclusionMask.State == EVertexMaskForgeScalarMaskState::Ready
+					|| Entry->GeneratorState.CurvatureMask.State == EVertexMaskForgeScalarMaskState::Ready
+					|| Entry->GeneratorState.NoiseMask.State == EVertexMaskForgeScalarMaskState::Ready
+					|| Entry->GeneratorState.MaterialSlotMask.State == EVertexMaskForgeScalarMaskState::Ready
+					|| Entry->GeneratorState.DirectionalNormalMask.State == EVertexMaskForgeScalarMaskState::Ready
+					|| Entry->GeneratorState.ThicknessMask.State == EVertexMaskForgeScalarMaskState::Ready))
+			{
+				bHasPending = true;
+				break;
+			}
 		}
 	}
 
@@ -9041,19 +9069,6 @@ bool SVertexMaskForgePanel::AcceptPendingChanges()
 		return false;
 	}
 
-	// AUDITED (M16-K.6D-5): defensive early-out, in addition to CanAcceptChanges()'s own declarative
-	// IsEnabled gate -- Dynamic Preview is presentation-only and must never become Accept-eligible.
-	// Placed before ANY other work in this function (no UpdateAllPreviews recompose, no
-	// BuildAcceptTargets, no FScopedTransaction) -- zero side effects, mirroring the OperationState
-	// guard immediately above.
-	if (PreviewSource == EVertexMaskForgePreviewSource::Dynamic)
-	{
-		LastOperationErrorText = LOCTEXT("AcceptUnavailableWhileDynamic",
-			"Accept is unavailable while Preview Source is Dynamic (presentation-only). Switch back to Legacy to Accept.");
-		UE_LOG(LogVertexMaskForge, Warning, TEXT("Vertex Mask Forge: Accept blocked: PreviewSource == Dynamic."));
-		return false;
-	}
-
 	LastOperationErrorText = FText::GetEmpty();
 	LastMaskActionStatusText = FText::GetEmpty();
 
@@ -9069,33 +9084,56 @@ bool SVertexMaskForgePanel::AcceptPendingChanges()
 	// audited machinery (ApplyPreviewToEntry recomputes Directional Normal Mask fresh per component in
 	// World Space every single call; Local Space and every other generator are entirely unaffected,
 	// since this never invalidates any raw cache, only recomposes from what is already cached).
-	if (bDirectionalNormalMaskEnabled && DirectionalNormalSpace == EVertexMaskForgeNormalSpace::World)
+	if (PreviewSource == EVertexMaskForgePreviewSource::Legacy
+		&& bDirectionalNormalMaskEnabled && DirectionalNormalSpace == EVertexMaskForgeNormalSpace::World)
 	{
 		UpdateAllPreviews(/*bCommit=*/false);
 	}
 
-	// AUDITED (Nanite source-topology support): preflight BOTH domains BEFORE writing either one --
-	// if EITHER fails, nothing is modified (the whole point of validating fully before the first
-	// Modify() call). BuildAcceptTargets/BuildSourceTopologyAcceptTargets never produce overlapping
-	// targets for the same asset (an entry is exclusively one domain or the other -- see
-	// FVertexMaskForgeSelectedMesh::bUseSourceTopology), so there is no cross-domain collision to
-	// reconcile, only a combined "nothing eligible at all" / "confirm N assets total" presentation.
+	// AUDITED (M16-K.6D-7B): source-aware target construction -- Targets (render-vertex) and Legacy's own
+	// two builders are reachable ONLY from the Legacy branch; Dynamic's ONLY accept-target source is
+	// VertexMaskForgeDynamicAcceptTargetBuilder::BuildSourceTopologyAcceptTargets (ADR-011 -- Dynamic's
+	// composed result must never reach VertexMaskForgeAcceptTargetBuilder's own two functions, which read
+	// Legacy's WorkingColors/SourceTopologyWorkingColors verbatim). Dynamic is Source-Topology only (see
+	// FVertexMaskForgeSelectedMesh::bUseSourceTopology's own doc comment), so Targets stays empty for a
+	// Dynamic Accept -- reusing the exact same combined "nothing eligible" / "confirm N assets" / write
+	// section below unmodified, since it already treats Targets/SourceTopologyTargets generically. Both
+	// branches fully validate (all-or-nothing) before any transaction opens or any write occurs.
 	TArray<VertexMaskForgeAcceptTargetBuilder::FAcceptTarget> Targets;
 	TArray<VertexMaskForgeAcceptTargetBuilder::FSourceTopologyAcceptTarget> SourceTopologyTargets;
 	FText ErrorText;
-	if (!VertexMaskForgeAcceptTargetBuilder::BuildAcceptTargets(SelectedMeshes, bDirectionalNormalMaskEnabled, DirectionalNormalSpace, Targets, ErrorText))
+	if (PreviewSource == EVertexMaskForgePreviewSource::Dynamic)
 	{
-		OperationState = EVertexMaskForgeOperationState::Failed;
-		LastOperationErrorText = ErrorText;
-		UE_LOG(LogVertexMaskForge, Warning, TEXT("Vertex Mask Forge: Accept blocked: %s"), *ErrorText.ToString());
-		return false;
+		if (!VertexMaskForgeDynamicAcceptTargetBuilder::BuildSourceTopologyAcceptTargets(SelectedMeshes, DynamicLayerStack, SourceTopologyTargets, ErrorText))
+		{
+			OperationState = EVertexMaskForgeOperationState::Failed;
+			LastOperationErrorText = ErrorText;
+			UE_LOG(LogVertexMaskForge, Warning, TEXT("Vertex Mask Forge: Accept (Dynamic) blocked: %s"), *ErrorText.ToString());
+			return false;
+		}
 	}
-	if (!VertexMaskForgeAcceptTargetBuilder::BuildSourceTopologyAcceptTargets(SelectedMeshes, bDirectionalNormalMaskEnabled, DirectionalNormalSpace, SourceTopologyTargets, ErrorText))
+	else
 	{
-		OperationState = EVertexMaskForgeOperationState::Failed;
-		LastOperationErrorText = ErrorText;
-		UE_LOG(LogVertexMaskForge, Warning, TEXT("Vertex Mask Forge: Accept blocked: %s"), *ErrorText.ToString());
-		return false;
+		// AUDITED (Nanite source-topology support): preflight BOTH domains BEFORE writing either one --
+		// if EITHER fails, nothing is modified (the whole point of validating fully before the first
+		// Modify() call). BuildAcceptTargets/BuildSourceTopologyAcceptTargets never produce overlapping
+		// targets for the same asset (an entry is exclusively one domain or the other -- see
+		// FVertexMaskForgeSelectedMesh::bUseSourceTopology), so there is no cross-domain collision to
+		// reconcile, only a combined "nothing eligible at all" / "confirm N assets total" presentation.
+		if (!VertexMaskForgeAcceptTargetBuilder::BuildAcceptTargets(SelectedMeshes, bDirectionalNormalMaskEnabled, DirectionalNormalSpace, Targets, ErrorText))
+		{
+			OperationState = EVertexMaskForgeOperationState::Failed;
+			LastOperationErrorText = ErrorText;
+			UE_LOG(LogVertexMaskForge, Warning, TEXT("Vertex Mask Forge: Accept blocked: %s"), *ErrorText.ToString());
+			return false;
+		}
+		if (!VertexMaskForgeAcceptTargetBuilder::BuildSourceTopologyAcceptTargets(SelectedMeshes, bDirectionalNormalMaskEnabled, DirectionalNormalSpace, SourceTopologyTargets, ErrorText))
+		{
+			OperationState = EVertexMaskForgeOperationState::Failed;
+			LastOperationErrorText = ErrorText;
+			UE_LOG(LogVertexMaskForge, Warning, TEXT("Vertex Mask Forge: Accept blocked: %s"), *ErrorText.ToString());
+			return false;
+		}
 	}
 	if (Targets.IsEmpty() && SourceTopologyTargets.IsEmpty())
 	{
