@@ -30,6 +30,30 @@ namespace VertexMaskForgeMaterialSlotGenerator
 	 * corners at the same position/VertexID on opposite sides of a material boundary correctly read
 	 * different values -- see UpdateWorkingColorsSourceTopology's own IndexOverride switch (CornerIndex
 	 * case) for how this is consumed.
+	 *
+	 * M16-K.6D-3: THIS is the caller-owned, Source-Topology Material Slot API a future Dynamic
+	 * orchestrator (M16-K.6D-4) is meant to call directly -- audited and confirmed to already satisfy
+	 * that role without any signature change:
+	 *   - inputs (WorkingMesh by const&, SelectedSlotIndex, bInvert) are read-only and sufficient on
+	 *     their own -- nothing here exists only because of Legacy storage;
+	 *   - the result is returned entirely by value (FVertexMaskForgeScalarMask) -- no
+	 *     FVertexMaskForgeInstanceResultStore parameter, no store of any kind, no WorkingColors/
+	 *     FVertexMaskForgeWorkingStateOwner dependency, no preview application, no Legacy/Dynamic
+	 *     decision;
+	 *   - success/failure is unambiguous via Mask.State: Ready (even an all-Values-0.0 result, e.g. a
+	 *     SelectedSlotIndex that legitimately matches no triangle -- see the corner loop's own
+	 *     comparison) versus Unavailable (invalid/absent Mesh, bMaterialSlotResolutionValid==false, an
+	 *     out-of-range SelectedSlotIndex, or zero triangles) -- a valid all-zero mask is never confused
+	 *     with a structural failure;
+	 *   - three existing call sites already treat this function as the single source of truth for
+	 *     Source-Topology Material Slot generation, each only writing to ITS OWN store after confirming
+	 *     Mask.State == Ready: SVertexMaskForgePanel's own legacy inline call (writes
+	 *     GeneratorState.MaterialSlotMask), GenerateMaterialSlotMaskInstanceResult below (writes
+	 *     WorkingMesh.InstanceResults, Recipe/M16-E identity), and
+	 *     VertexMaskForgeDynamicMaskGeneration::GenerateStoredResultForMaterialSlotInstance (writes
+	 *     WorkingMesh.InstanceResults, Dynamic Layer identity) -- this checkpoint adds no new wrapper
+	 *     and does not alter any of the three.
+	 * See Docs/VertexMaskForgeArchitecture.md §10 for the documented contract this doc comment codifies.
 	 */
 	FVertexMaskForgeScalarMask GenerateMaterialSlotMaskFromDynamicMesh(
 		const FVertexMaskForgeWorkingMesh& WorkingMesh,

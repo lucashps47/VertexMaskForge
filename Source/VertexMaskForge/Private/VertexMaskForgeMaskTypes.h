@@ -257,3 +257,25 @@ enum class EVertexMaskForgePreviewMode : uint8
 	 *  alters the real RGBA values held in the composed Preview/Accept data. */
 	AlphaChannel,
 };
+
+namespace VertexMaskForgePanel
+{
+	/**
+	 * M16-K.6D-2 (correction): the pure, directly-testable core of the Source-Topology preview seam
+	 * (ApplySuppliedSourceTopologyPreviewColors, SVertexMaskForgePanel.cpp) -- declared here (a shared
+	 * header), not just `static` in the .cpp, for the exact same reason ComputeComposedColorsRGB[
+	 * SourceTopology] above are: so automation tests can call the REAL, unmodified logic directly. Not a
+	 * reimplementation or a test-only shim -- ApplySuppliedSourceTopologyPreviewColors calls this exact
+	 * function for its own cardinality-gate-then-derive step.
+	 *
+	 * Validates SemanticComposedColors.Num() against ExpectedCornerCount completely BEFORE attempting any
+	 * derivation -- returns an unset TOptional (never a padded/truncated array) on any mismatch. Only on
+	 * an exact match does it call VertexMaskForgeDisplayColorDerivation::DeriveDisplayColors and return
+	 * its result. SemanticComposedColors itself is never mutated (taken by const&). Pure: no owner/panel
+	 * state read or written, no Slate/UObject dependency of any kind.
+	 */
+	TOptional<TArray<FColor>> DeriveValidatedSourceTopologyPreviewColors(
+		const TArray<FColor>& SemanticComposedColors,
+		int32 ExpectedCornerCount,
+		EVertexMaskForgePreviewMode PreviewMode);
+}

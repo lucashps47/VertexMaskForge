@@ -6,6 +6,7 @@
 #include "Delegates/IDelegateInstance.h"
 #include "EditorUndoClient.h"
 #include "Engine/TimerHandle.h"
+#include "Input/DragAndDrop.h"
 #include "Math/Vector4.h"
 #include "MeshTypes.h"
 #include "UObject/SoftObjectPtr.h"
@@ -15,6 +16,7 @@
 #include "VertexMaskForgeLayerOrder.h"
 #include "VertexMaskForgeMaskTypes.h"
 #include "VertexMaskForgeWorkingMeshTypes.h"
+#include "Widgets/SBoxPanel.h"
 #include "Widgets/SCompoundWidget.h"
 
 class UWorld;
@@ -51,6 +53,27 @@ enum class EVertexMaskForgeOperationState : uint8
 	/** The last Accept attempt was blocked or failed; the Preview that was attempted is preserved
 	 *  unchanged. Cleared by the next explicit user action (regenerate, Accept, Cancel). */
 	Failed,
+};
+
+/**
+ * M16-K.6D-1: which pipeline's semantically composed colors the preview currently shows -- Legacy
+ * (the fixed 7-generator `GeneratorState`/`GeneratorLayerOrder` path, feeding `WorkingColors`) or
+ * Dynamic (`FVertexMaskForgeDynamicLayerStack`'s composition, via the M16-K.6D-4 orchestrator, as of
+ * M16-K.6D-5). This answers exactly one question: which pipeline's output is shown. It is not
+ * Preview Mode (a display-only reduction of whichever pipeline's output is already selected -- see
+ * EVertexMaskForgePreviewMode), not Channel Filter, not an inference from Dynamic layer/assignment/
+ * result-store existence, not tab/section expansion state, and not the last-edited control. See
+ * ADR-011 (Docs/VertexMaskForgeDecisionLog.md) for the full contract this enum codifies.
+ */
+enum class EVertexMaskForgePreviewSource : uint8
+{
+	/** The fixed 7-generator pipeline. Default -- see SVertexMaskForgePanel::PreviewSource. */
+	Legacy,
+
+	/** FVertexMaskForgeDynamicLayerStack's composition, presentation-only (M16-K.6D-5) -- see
+	 *  SVertexMaskForgePanel::PreviewSource's own doc comment for the exact wiring and isolation
+	 *  contract. Selecting this value never makes the Dynamic result Accept-eligible. */
+	Dynamic,
 };
 
 // EVertexMaskForgeCurvatureType now defined in VertexMaskForgeWorkingMeshTypes.h (M13 extraction,
@@ -301,17 +324,23 @@ private:
 	 */
 	TSharedPtr<SVerticalBox> GeneratorLayerListContainer;
 
-	// --- M16-K.4: Dynamic Layers UI Prototype (domain-only, disconnected from composition/preview) ------
+	// --- M16-K.4: Dynamic Layers UI (M16-K.6D-5: live-connected to the Dynamic preview) ------------------
 	//
 	// DynamicLayerStack is a SEPARATE, isolated owner from GeneratorLayerOrder above -- GeneratorLayerOrder
-	// remains the sole owner of the order the active production composition path (ComputeComposedColorsRGB/
-	// ComputeComposedColorsRGBSourceTopology) reads; DynamicLayerStack is not read by any production call
-	// site and has no bridge/adapter to one yet. Every function below mutates ONLY DynamicLayerStack, via
-	// its own controlled, GUID-based API (SetLayerFill/SetLayerBlendMode/SetLayerOpacity/SetLayerEnabled/
-	// SetLayerChannelFilter/RenameLayer/AddLayer/RemoveLayer/MoveLayerUp/MoveLayerDown) -- never a manual
-	// mutation, never a second parallel "UI layer" struct duplicating the stack's own data. None of them
-	// call RecomposeWorkingColors, UpdateAllPreviews, VertexMaskForgeDynamicLayerEvaluator, or touch any
-	// generator/cache/GeneratorLayerOrder/Working-Baseline-Committed Colors.
+	// remains the sole owner of the order the Legacy production composition path (ComputeComposedColorsRGB/
+	// VertexMaskForgePanel::ComputeComposedColorsRGBSourceTopology) reads; DynamicLayerStack still has no
+	// bridge/adapter into that Legacy path. Every function below mutates ONLY DynamicLayerStack, via its
+	// own controlled, GUID-based API (SetLayerFill/SetLayerBlendMode/SetLayerOpacity/SetLayerEnabled/
+	// SetLayerChannelFilter/SetLayerMaskGeneratorType/SetLayerMaskParams/RenameLayer/AddLayer/RemoveLayer/
+	// MoveLayerUp/MoveLayerDown) -- never a manual mutation, never a second parallel "UI layer" struct
+	// duplicating the stack's own data. As of M16-K.6D-5, every mutator below additionally calls
+	// OnDynamicLayerStackMutated() once, after its own mutation -- a single choke point that requests a
+	// refresh (RecomposeWorkingColors()) ONLY when PreviewSource == Dynamic, so Legacy stays byte-for-byte
+	// unaffected. None of them call VertexMaskForgeDynamicLayerEvaluator directly, touch any legacy
+	// generator/cache/GeneratorLayerOrder/Working-Baseline-Committed Colors, or call ApplyComposedColorsRGB
+	// -- the live update path is exclusively DynamicLayerStack -> ApplyPreviewToEntry's Dynamic branch ->
+	// VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology -> the
+	// M16-K.6D-2 visual seam (see ApplyPreviewToEntry's own doc comment).
 
 	/**
 	 * Rebuilds ONLY the visual rows of the Dynamic Layers list, from DynamicLayerStack's own current
@@ -321,6 +350,17 @@ private:
 	 * DynamicLayersListContainer exists (no-op) or any number of times.
 	 */
 	void RebuildDynamicLayersList();
+
+	/**
+	 * M16-K.6D-5: the single choke point every DynamicLayerStack mutator below now calls after its own
+	 * mutation (one added line per existing call site -- no lambda body restructured). No-ops unless
+	 * PreviewSource == Dynamic (calls RecomposeWorkingColors() only then) -- editing the Dynamic stack
+	 * while Legacy is being previewed must not trigger a pointless Legacy recomposition, and Dynamic
+	 * Layer edits must keep updating the Dynamic presentation live, exactly like every existing Legacy
+	 * compositional control (Blend Mode/Opacity/Channel Filter/...) already does via the same
+	 * RecomposeWorkingColors() -> UpdateAllPreviews(false) -> ApplyPreviewToEntry path.
+	 */
+	void OnDynamicLayerStackMutated();
 
 	/**
 	 * Builds ONE Dynamic Layers row for LayerId: a structural line (Enabled checkbox, editable Name, Move
@@ -337,13 +377,17 @@ private:
 	TSharedRef<SWidget> OnGenerateDynamicLayerFillRow(TSharedPtr<EVertexMaskForgeLayerFill> InOption) const;
 
 	/**
-	 * M16-K.6B: shared dropdown-row generator for every Dynamic Layer's Generator Type combo. An invalid
-	 * (null) TSharedPtr represents "None/Unassigned" (the layer's Mask is unset); a valid pointer holds one
-	 * of the generator types this checkpoint's DynamicLayerGeneratorTypeOptions actually offers (today:
-	 * only MaterialSlot -- the sole Dynamic generator with real, test-proven generation). Mirrors
-	 * OnGenerateDynamicLayerFillRow's own shape.
+	 * M16-K.6B; option representation corrected M16-K.6D-6. "None/Unassigned" (the layer's Mask is unset)
+	 * is represented by a VALID TSharedPtr to an UNSET TOptional -- never a null TSharedPtr (see
+	 * DynamicLayerGeneratorTypeOptions' own doc comment for why: SListView, the real widget backing every
+	 * SComboBox dropdown, unconditionally skips generating a row for any item that fails
+	 * TListTypeTraits::IsPtrValid -- confirmed directly in Widgets/Views/SListView.h's own row-generation
+	 * loop, "Don't bother generating widgets for invalid items" -- so a null TSharedPtr option can NEVER
+	 * render as a selectable row in any SComboBox, regardless of OnGenerateWidget). A set TOptional holds
+	 * one of the generator types DynamicLayerGeneratorTypeOptions actually offers (today: only
+	 * MaterialSlot). Mirrors OnGenerateDynamicLayerFillRow's own shape otherwise.
 	 */
-	TSharedRef<SWidget> OnGenerateDynamicLayerGeneratorTypeRow(TSharedPtr<EVertexMaskForgeGeneratorType> InOption) const;
+	TSharedRef<SWidget> OnGenerateDynamicLayerGeneratorTypeRow(TSharedPtr<TOptional<EVertexMaskForgeGeneratorType>> InOption) const;
 
 	/**
 	 * M16-K.6C-2 / ADR-010: read-only gate check -- returns the single eligible Static Mesh asset entry's
@@ -364,23 +408,43 @@ private:
 	TSharedRef<SWidget> OnGenerateDynamicMaterialSlotPickerRow(TSharedPtr<FVertexMaskForgeMaterialSlotInfo> InOption) const;
 
 	/**
-	 * Reorder: the ONLY two functions that mutate DynamicLayerStack's order. Both delegate the actual
-	 * movement to FVertexMaskForgeDynamicLayerStack::MoveLayerUp/MoveLayerDown -- never a manual Swap/
-	 * RemoveAt/Insert here. On success: rebuilds the visual list only -- no recomposition, no production
-	 * call of any kind. On failure (boundary no-op or unknown LayerId): the UI is left completely
-	 * untouched, no rebuild.
+	 * M16-K.6D-6 (Correction 2): Reorder is now drag-and-drop only -- the Up/Down buttons and their
+	 * OnMoveDynamicLayerUpClicked/OnMoveDynamicLayerDownClicked/CanMoveDynamicLayerUp/
+	 * CanMoveDynamicLayerDown panel-UI-glue wrappers were removed (FVertexMaskForgeDynamicLayerStack::
+	 * MoveLayerUp/MoveLayerDown themselves are UNCHANGED and remain fully tested at the domain level --
+	 * only these panel-side wrappers, which had no remaining caller once the buttons were removed, were
+	 * deleted). Reordering now goes through FVertexMaskForgeDynamicLayerStack::MoveLayer (the general
+	 * "move to an arbitrary final index" seam, already established and tested) instead: a drag can move a
+	 * layer by more than one position in a single action, which MoveLayerUp/MoveLayerDown (single-step
+	 * adjacent swaps only) cannot express.
+	 *
+	 * OnDynamicLayerDragDetected: bound to DynamicLayersListContainer's low-level OnDragDetected --
+	 * begins the actual Slate drag operation. Resolves SlotIndexBeingDragged (a VISUAL slot index, top of
+	 * panel = 0) to the LayerId at that position via the SAME reversed mapping RebuildDynamicLayersList
+	 * uses, and captures that LayerId (a stable identifier, never a row/widget pointer) into the drag
+	 * operation's own payload -- safe across any rebuild that might occur before the drop completes.
+	 *
+	 * OnDynamicLayerCanAcceptDrop: bound to OnCanAcceptDropAdvanced -- rejects (returns unset) any drag
+	 * operation that is not this panel's own FDynamicLayerDragDropOp; otherwise accepts, echoing the
+	 * hovered zone back for the box's own drop-indicator rendering.
+	 *
+	 * OnDynamicLayerAcceptDrop: bound to OnAcceptDrop -- the actual domain mutation. Translates the
+	 * target VISUAL slot index (SlotIndex, matching exactly what SDragAndDropVerticalBox's own internal
+	 * Children.Move will use for the widget reorder right after this delegate returns -- see
+	 * Widgets/SBoxPanel.cpp's SDragAndDropVerticalBox::OnDrop) into the DynamicLayerStack array's own
+	 * "final index after the move" via the same reversed mapping, then calls
+	 * DynamicLayerStack.MoveLayer(DraggedLayerId, TargetArrayIndex) -- MoveLayer's own contract already
+	 * makes a same-position drop a safe no-op, and an unknown LayerId/out-of-range index a safe no-op
+	 * that leaves the stack completely unmodified (see MoveLayer's own doc comment). Never calls
+	 * RebuildDynamicLayersList() here -- the box's own internal Children.Move (which runs immediately
+	 * after this delegate returns a Handled FReply) already repositions the existing row widgets to match
+	 * the same target index, so a synchronous rebuild here would operate on a Children array the box is
+	 * about to move from underneath it. Calls OnDynamicLayerStackMutated() so a live Dynamic preview
+	 * recomposes immediately.
 	 */
-	FReply OnMoveDynamicLayerUpClicked(FGuid LayerId);
-	FReply OnMoveDynamicLayerDownClicked(FGuid LayerId);
-
-	/**
-	 * Read-only: True iff LayerId currently occupies a position in DynamicLayerStack from which the
-	 * corresponding move is possible (not already first/last, not absent). Always resolves LayerId's
-	 * CURRENT index fresh via DynamicLayerStack.FindLayerIndexById -- never a position captured once at
-	 * row-construction time.
-	 */
-	bool CanMoveDynamicLayerUp(FGuid LayerId) const;
-	bool CanMoveDynamicLayerDown(FGuid LayerId) const;
+	FReply OnDynamicLayerDragDetected(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent, int32 SlotIndexBeingDragged, SVerticalBox::FSlot* Slot);
+	TOptional<SDragAndDropVerticalBox::EItemDropZone> OnDynamicLayerCanAcceptDrop(const FDragDropEvent& DragDropEvent, SDragAndDropVerticalBox::EItemDropZone DropZone, int32 SlotIndex, SVerticalBox::FSlot* Slot);
+	FReply OnDynamicLayerAcceptDrop(const FDragDropEvent& DragDropEvent, SDragAndDropVerticalBox::EItemDropZone DropZone, int32 SlotIndex, SVerticalBox::FSlot* Slot);
 
 	/** Add/Remove: the ONLY two functions that change DynamicLayerStack's membership. Both rebuild the
 	 *  visual list on completion (Remove rebuilds even on a no-op unknown-id call -- harmless/idempotent).
@@ -407,9 +471,13 @@ private:
 	/**
 	 * UI-only reference to the Dynamic Layers list's row container -- never a second source of order or
 	 * data (that remains DynamicLayerStack exclusively), never serialized. Populated by
-	 * RebuildDynamicLayersList(); assigned once in Construct().
+	 * RebuildDynamicLayersList(); assigned once in Construct(). Type changed M16-K.6D-6 (Correction 2)
+	 * from SVerticalBox to SDragAndDropVerticalBox (SlateCore, Widgets/SBoxPanel.h) -- a drop-in subclass
+	 * that additionally supports drag-reordering its own slots; see OnDynamicLayerDragDetected/
+	 * OnDynamicLayerCanAcceptDrop/OnDynamicLayerAcceptDrop for the actual drag/drop handling this member
+	 * is wired to in Construct().
 	 */
-	TSharedPtr<SVerticalBox> DynamicLayersListContainer;
+	TSharedPtr<SDragAndDropVerticalBox> DynamicLayersListContainer;
 
 	/** Shared, read-only Fill options for every Dynamic Layer row's Fill combo -- None/Black/White, the
 	 *  three real EVertexMaskForgeLayerFill enumerators. Populated once in Construct(), mirroring
@@ -417,18 +485,22 @@ private:
 	TArray<TSharedPtr<EVertexMaskForgeLayerFill>> DynamicLayerFillOptions;
 
 	/**
-	 * M16-K.6B: shared, read-only Generator Type options for every Dynamic Layer row's Generator Type
-	 * combo. Element 0 is a deliberately invalid (null) TSharedPtr, representing "None/Unassigned" --
-	 * EVertexMaskForgeGeneratorType itself has no None enumerator (VertexMaskForgeRecipeTypes.h), so
-	 * "no generator" is represented here exactly as the domain represents it: the layer's own Mask
-	 * (TOptional<FVertexMaskForgeGeneratorMaskInstance>) being unset. Every subsequent element is a real
-	 * EVertexMaskForgeGeneratorType this checkpoint chooses to expose -- today only MaterialSlot, the
-	 * only Dynamic generator with real, test-proven generation (VertexMaskForgeDynamicMaskGeneration::
-	 * GenerateStoredResultForMaterialSlotInstance). AO/Curvature/Noise/BoundingBox/DirectionalNormal/
-	 * Thickness are deliberately NOT listed here -- they have no Dynamic generation contract yet (see
-	 * Docs/VertexMaskForgeArchitecture.md section 10). Populated once in Construct(), mirroring
-	 * DynamicLayerFillOptions' own pattern above. */
-	TArray<TSharedPtr<EVertexMaskForgeGeneratorType>> DynamicLayerGeneratorTypeOptions;
+	 * M16-K.6B; option representation corrected M16-K.6D-6 (manual-validation defect: the "None" row
+	 * never appeared in the dropdown -- see OnGenerateDynamicLayerGeneratorTypeRow's own doc comment for
+	 * the confirmed root cause and why a null TSharedPtr cannot be used as an option here). Element 0 is
+	 * now a VALID TSharedPtr to an UNSET TOptional<EVertexMaskForgeGeneratorType>, representing
+	 * "None/Unassigned" -- EVertexMaskForgeGeneratorType itself still has no None enumerator
+	 * (VertexMaskForgeRecipeTypes.h, unchanged), so "no generator" is still represented in the DOMAIN
+	 * exactly as before: the layer's own Mask (TOptional<FVertexMaskForgeGeneratorMaskInstance>) being
+	 * unset. This TOptional wrapper is purely a Slate-list-rendering concern local to this one combo's
+	 * options -- it never reaches FVertexMaskForgeDynamicLayerStack/FVertexMaskForgeLayer, which are both
+	 * unchanged. Every subsequent element holds a SET TOptional for a real EVertexMaskForgeGeneratorType
+	 * this checkpoint chooses to expose -- today only MaterialSlot, the only Dynamic generator with real,
+	 * test-proven generation (VertexMaskForgeDynamicMaskGeneration::GenerateStoredResultForMaterialSlotInstance).
+	 * AO/Curvature/Noise/BoundingBox/DirectionalNormal/Thickness are deliberately NOT listed here -- they
+	 * have no Dynamic generation contract yet (see Docs/VertexMaskForgeArchitecture.md section 10).
+	 * Populated once in Construct(), mirroring DynamicLayerFillOptions' own pattern above. */
+	TArray<TSharedPtr<TOptional<EVertexMaskForgeGeneratorType>>> DynamicLayerGeneratorTypeOptions;
 
 	/**
 	 * The M16-K.3A/K.3B domain instance this UI edits -- initialized exactly once, via the member
@@ -1218,6 +1290,17 @@ private:
 	void OnPreviewModeSelectionChanged(TSharedPtr<EVertexMaskForgePreviewMode> NewSelection, ESelectInfo::Type SelectInfo);
 	FText GetPreviewModeButtonText() const;
 
+	/**
+	 * M16-K.6D-5: the minimal Preview Source control -- Legacy/Dynamic, mirroring the Preview Mode
+	 * combo's own shape exactly (OnGenerateWidget/OnSelectionChanged/button-text triple). Selecting a
+	 * new value writes PreviewSource (the sole authority -- see its own doc comment) and immediately
+	 * requests a refresh via RecomposeWorkingColors(), exactly like every other compositional control
+	 * in this panel.
+	 */
+	TSharedRef<SWidget> OnGeneratePreviewSourceRow(TSharedPtr<EVertexMaskForgePreviewSource> InOption) const;
+	void OnPreviewSourceSelectionChanged(TSharedPtr<EVertexMaskForgePreviewSource> NewSelection, ESelectInfo::Type SelectInfo);
+	FText GetPreviewSourceButtonText() const;
+
 	ECheckBoxState GetChannelFilterRState() const { return bChannelFilterR ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; }
 	void OnChannelFilterRChanged(ECheckBoxState NewState);
 	ECheckBoxState GetChannelFilterGState() const { return bChannelFilterG ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; }
@@ -1306,7 +1389,12 @@ private:
 	 *  fresh message from this same pass is never clobbered). No-ops while Applying. */
 	void RecomputeOperationState();
 
-	bool CanAcceptChanges() const { return OperationState == EVertexMaskForgeOperationState::PendingChanges; }
+	/** M16-K.6D-5: Accept is unavailable while PreviewSource == Dynamic -- a UX-level safeguard, not the
+	 *  primary isolation barrier (the Dynamic buffer's own local/transitory ownership never reaches
+	 *  BuildAcceptTargets' inputs at all -- see PreviewSource's own doc comment). Accept's own internal
+	 *  behavior while Legacy is unaffected byte-for-byte. See AcceptPendingChanges() for the matching
+	 *  defensive early-out. */
+	bool CanAcceptChanges() const { return OperationState == EVertexMaskForgeOperationState::PendingChanges && PreviewSource == EVertexMaskForgePreviewSource::Legacy; }
 	FReply OnAcceptChangesClicked();
 
 	/**
@@ -1410,6 +1498,27 @@ private:
 	EVertexMaskForgePreviewMode CurrentPreviewMode = EVertexMaskForgePreviewMode::OriginalMaterial;
 	TArray<TSharedPtr<EVertexMaskForgePreviewMode>> PreviewModeOptions;
 	TSharedPtr<SComboBox<TSharedPtr<EVertexMaskForgePreviewMode>>> PreviewModeComboBox;
+
+	/** M16-K.6D-5: options/widget for the minimal Preview Source combo -- mirrors PreviewModeOptions/
+	 *  PreviewModeComboBox's own pattern exactly. Populated once in Construct(). */
+	TArray<TSharedPtr<EVertexMaskForgePreviewSource>> PreviewSourceOptions;
+	TSharedPtr<SComboBox<TSharedPtr<EVertexMaskForgePreviewSource>>> PreviewSourceComboBox;
+
+	/**
+	 * M16-K.6D-1/M16-K.6D-5: the sole authority for which pipeline's composed colors ApplyPreviewToEntry
+	 * shows -- see EVertexMaskForgePreviewSource's own doc comment and ADR-011 for the full contract.
+	 * Owner: this panel; lifetime: this panel instance's own, exactly like CurrentPreviewMode above.
+	 * Default Legacy. As of M16-K.6D-5, ApplyPreviewToEntry's Source-Topology branch reads this live,
+	 * every call, to select between the unchanged Legacy composition path and a Dynamic path that calls
+	 * VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology and feeds
+	 * its caller-owned, transitory output directly to the same M16-K.6D-2 visual-only seam -- never
+	 * ApplyComposedColorsRGB, never WorkingColors/SourceTopologyWorkingColors, never Accept-eligible
+	 * (see CanAcceptChanges()/AcceptPendingChanges(), both gated on PreviewSource == Legacy). Only the
+	 * Preview Source combo (OnPreviewSourceSelectionChanged) ever writes Dynamic; only an explicit user
+	 * action changes it. The Render Vertex domain and every Dynamic generator other than Material Slot
+	 * remain unconnected -- see Docs/VertexMaskForgeArchitecture.md for the full current contract.
+	 */
+	EVertexMaskForgePreviewSource PreviewSource = EVertexMaskForgePreviewSource::Legacy;
 
 	bool bChannelFilterR = true;
 	bool bChannelFilterG = true;
