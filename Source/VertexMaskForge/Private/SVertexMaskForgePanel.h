@@ -449,6 +449,30 @@ private:
 	void MutateDynamicDirectionalNormalParam(FGuid LayerId, FGuid ExpectedMaskInstanceId, TFunctionRef<void(FVertexMaskForgeDirectionalNormalParams&)> Mutator);
 
 	/**
+	 * M16-K.6D-8E-C: layer-owned Curvature editor -- Type/Multiplier/Blur/Levels Min/Levels Max/Invert,
+	 * mirroring BuildDynamicDirectionalNormalLayerParamsBlock's own structure and sibling placement inside
+	 * the "Generator Parameters" expander. Curvature has no Space/World-Local concept at all (confirmed by
+	 * M16-K.6D-8E-A/8E-B), so unlike Bounding Box/Directional Normal there is no incompatible-state warning
+	 * and no per-control IsEnabled_Lambda gate. ExpectedMaskInstanceId is the MaskInstanceId this row was
+	 * built for (captured once by BuildDynamicLayerRow, mirroring MaterialSlotExpectedMaskInstanceId's own
+	 * established role) -- every mutation below validates against it, never a freshly re-read id.
+	 */
+	TSharedRef<SWidget> BuildDynamicCurvatureLayerParamsBlock(FGuid LayerId, FGuid ExpectedMaskInstanceId);
+
+	/**
+	 * Shared mutation helper for one Dynamic layer's Curvature parameters: resolves LayerId's current mask
+	 * fresh, validates the same six-step identity/coherence contract every Material Slot/Bounding Box/
+	 * Directional Normal mutation callback already establishes (mask exists, GeneratorType == Curvature,
+	 * Params is the Curvature payload type, MaskInstanceId == ExpectedMaskInstanceId) -- on any mismatch, a
+	 * silent no-op. On success: copies the current FVertexMaskForgeCurvatureParams, invokes Mutator on the
+	 * copy (every other field preserved byte-for-byte, including the explicitly authorized Levels Min/Max
+	 * coupled-invariant maintenance performed BY the Mutator itself), calls SetLayerMaskParams with the
+	 * captured ExpectedMaskInstanceId, then OnDynamicLayerStackMutated(). Never retains Mutator or any
+	 * parameter reference beyond this single call.
+	 */
+	void MutateDynamicCurvatureParam(FGuid LayerId, FGuid ExpectedMaskInstanceId, TFunctionRef<void(FVertexMaskForgeCurvatureParams&)> Mutator);
+
+	/**
 	 * M16-K.6D-6 (Correction 2): Reorder is now drag-and-drop only -- the Up/Down buttons and their
 	 * OnMoveDynamicLayerUpClicked/OnMoveDynamicLayerDownClicked/CanMoveDynamicLayerUp/
 	 * CanMoveDynamicLayerDown panel-UI-glue wrappers were removed (FVertexMaskForgeDynamicLayerStack::

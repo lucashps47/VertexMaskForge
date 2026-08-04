@@ -11,6 +11,7 @@
 #include "DynamicMesh/DynamicMeshAttributeSet.h"
 #include "Misc/AutomationTest.h"
 #include "VertexMaskForgeBoundingBoxGenerator.h"
+#include "VertexMaskForgeCurvatureGenerator.h"
 #include "VertexMaskForgeDirectionalNormalGenerator.h"
 #include "VertexMaskForgeDynamicLayerStack.h"
 #include "VertexMaskForgeDynamicSourceTopologyComposition.h"
@@ -223,6 +224,58 @@ namespace
 		NormalParams.Falloff = Falloff;
 		NormalParams.Blur = Blur;
 		NormalParams.bInvert = bInvert;
+		Stack.SetLayerMaskParams(LayerId, MaskInstance->MaskInstanceId, NewParams);
+
+		return LayerId;
+	}
+
+	// M16-K.6D-8E-B: same two-triangle quad topology (vertex/triangle append order) as
+	// BuildOrchestratorFixtureWorkingMesh -- so FixtureCornerToVertexID ({0,1,2,0,2,3}) still applies
+	// unchanged -- but deliberately NON-PLANAR (V2 raised in Z), unlike that fixture (flat, Z=0
+	// everywhere -> zero curvature everywhere, useless for this generator) and unlike
+	// BuildZVaryingFixtureWorkingMesh (its own two triangles are, by construction, coplanar despite
+	// differing Z values -- verified by direct cross-product computation -- so it is ALSO unsuitable
+	// here). The shared diagonal edge (V0-V2) has a genuine dihedral fold between Tri0 and Tri1, so raw
+	// Curvature is nonzero at V0/V2 (both touched by that interior edge) and exactly zero at V1/V3 (only
+	// touched by boundary edges, which ComputeRawCurvatureMagnitudes never accumulates into) -- a
+	// genuinely non-constant, non-uniformly-zero result, never accidentally passing under a wrong domain.
+	FVertexMaskForgeWorkingMesh BuildCurvatureFixtureWorkingMesh()
+	{
+		FVertexMaskForgeWorkingMesh WorkingMesh;
+		WorkingMesh.Mesh = MakeUnique<UE::Geometry::FDynamicMesh3>();
+		WorkingMesh.Mesh->AppendVertex(FVector3d(0.0, 0.0, 0.0)); // V0
+		WorkingMesh.Mesh->AppendVertex(FVector3d(1.0, 0.0, 0.0)); // V1
+		WorkingMesh.Mesh->AppendVertex(FVector3d(1.0, 1.0, 0.7)); // V2 -- raised in Z, creates the fold
+		WorkingMesh.Mesh->AppendVertex(FVector3d(0.0, 1.0, 0.0)); // V3
+		WorkingMesh.Mesh->AppendTriangle(0, 1, 2);
+		WorkingMesh.Mesh->AppendTriangle(0, 2, 3);
+		return WorkingMesh;
+	}
+
+	// Adds a layer with a Curvature mask, configured via the stack's own controlled mutators -- mirrors
+	// AddDirectionalNormalLayer's own setup sequence exactly. Curvature has no Space field/concept at all
+	// (confirmed by M16-K.6D-8E-A), so unlike AddDirectionalNormalLayer there is no Space parameter here.
+	FGuid AddCurvatureLayer(
+		FVertexMaskForgeDynamicLayerStack& Stack, const FString& Name,
+		EVertexMaskForgeLayerFill Fill, EVertexMaskForgeBlendMode BlendMode, float Opacity,
+		EVertexMaskForgeCurvatureType Type, float Multiplier, float Blur, float LevelsMin, float LevelsMax, bool bInvert)
+	{
+		const FGuid LayerId = Stack.AddLayer(Name);
+		Stack.SetLayerFill(LayerId, Fill);
+		Stack.SetLayerBlendMode(LayerId, BlendMode);
+		Stack.SetLayerOpacity(LayerId, Opacity);
+		Stack.SetLayerMaskGeneratorType(LayerId, EVertexMaskForgeGeneratorType::Curvature);
+
+		const FVertexMaskForgeGeneratorMaskInstance* MaskInstance = Stack.GetLayerMask(LayerId);
+		check(MaskInstance);
+		FVertexMaskForgeGeneratorParams NewParams = MakeVertexMaskForgeGeneratorParams(EVertexMaskForgeGeneratorType::Curvature);
+		FVertexMaskForgeCurvatureParams& CurvatureParams = NewParams.Get<FVertexMaskForgeCurvatureParams>();
+		CurvatureParams.Type = Type;
+		CurvatureParams.Multiplier = Multiplier;
+		CurvatureParams.Blur = Blur;
+		CurvatureParams.LevelsMin = LevelsMin;
+		CurvatureParams.LevelsMax = LevelsMax;
+		CurvatureParams.bInvert = bInvert;
 		Stack.SetLayerMaskParams(LayerId, MaskInstance->MaskInstanceId, NewParams);
 
 		return LayerId;
@@ -1344,6 +1397,355 @@ bool FVertexMaskForgeDynSrcTopoCompDirNormalDisabledTest::RunTest(const FString&
 		for (int32 Index = 0; Index < 6; ++Index)
 		{
 			TestEqual(*FString::Printf(TEXT("Out[%d] byte-exact passthrough (disabled layer = no-op)"), Index), Out[Index], BaseColors[Index]);
+		}
+	}
+
+	return true;
+}
+
+// M16-K.6D-8E-B: A. Dispatch and exact generator parity -- proves the orchestrator's Curvature branch is
+// real dispatch (not merely non-empty output) by comparing byte-exact against a direct
+// GenerateCurvatureMaskFromDynamicMesh call (its own fresh, independent FVertexMaskForgeGeneratorState),
+// resolved through the SAME FixtureCornerToVertexID/TryGetValue correspondence the orchestrator's own
+// DynamicMeshVertex-domain Pass 2 path uses -- never a re-derivation of the curvature math itself.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompCurvatureDispatchTest, "VertexMaskForge.DynamicSourceTopologyComposition.CurvatureDispatchByteExactAgainstGeneratorAndVertexDomain", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynSrcTopoCompCurvatureDispatchTest::RunTest(const FString& Parameters)
+{
+	const FVertexMaskForgeWorkingMesh WorkingMesh = BuildCurvatureFixtureWorkingMesh();
+	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
+
+	const EVertexMaskForgeCurvatureType Type = EVertexMaskForgeCurvatureType::Both;
+	const float Multiplier = 1.0f;
+	const float Blur = 0.0f;
+	const float LevelsMin = 0.0f;
+	const float LevelsMax = 1.0f;
+	const bool bInvert = false;
+
+	// Authoritative, independent reference -- the REAL generator, called directly with its OWN fresh
+	// FVertexMaskForgeGeneratorState, never reimplemented.
+	FVertexMaskForgeGeneratorState ReferenceGeneratorState;
+	const FVertexMaskForgeScalarMask ReferenceMask = VertexMaskForgeCurvatureGenerator::GenerateCurvatureMaskFromDynamicMesh(
+		WorkingMesh, ReferenceGeneratorState, Type, Multiplier, Blur, LevelsMin, LevelsMax, bInvert);
+	TestTrue(TEXT("Reference generator State == Ready"), ReferenceMask.State == EVertexMaskForgeScalarMaskState::Ready);
+
+	// Non-uniformly-zero proof on the reference itself, before even reaching the orchestrator -- V0/V2
+	// (touched by the folded interior edge) must differ from V1/V3 (boundary-only, never accumulated).
+	float V0Value = 0.0f, V1Value = 0.0f;
+	const bool bHasV0 = ReferenceMask.TryGetValue(0, V0Value);
+	const bool bHasV1 = ReferenceMask.TryGetValue(1, V1Value);
+	TestTrue(TEXT("Reference mask has a value at V0"), bHasV0);
+	TestTrue(TEXT("Reference mask has a value at V1"), bHasV1);
+	if (bHasV0 && bHasV1)
+	{
+		TestNotEqual(TEXT("V0 (folded edge) differs from V1 (boundary-only) -- fixture is non-degenerate"), V0Value, V1Value);
+	}
+
+	FVertexMaskForgeDynamicLayerStack Stack;
+	AddCurvatureLayer(Stack, TEXT("Layer"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f,
+		Type, Multiplier, Blur, LevelsMin, LevelsMax, bInvert);
+
+	TArray<FColor> Out;
+	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, Out);
+	TestTrue(TEXT("Orchestrator accepts a Curvature layer"), bSucceeded);
+	TestEqual(TEXT("Out.Num() == 6"), Out.Num(), 6);
+	if (!bSucceeded || Out.Num() != 6)
+	{
+		return false;
+	}
+
+	// White Fill / Copy / Opacity 1.0 -> RGB == mask value broadcast, the same established contract every
+	// prior generator's own dispatch test already proves and reuses.
+	for (int32 CornerIndex = 0; CornerIndex < 6; ++CornerIndex)
+	{
+		const int32 VertexID = FixtureCornerToVertexID[CornerIndex];
+		float ExpectedMaskValue = 0.0f;
+		const bool bHasValue = ReferenceMask.TryGetValue(VertexID, ExpectedMaskValue);
+		TestTrue(*FString::Printf(TEXT("Reference mask has a value at VertexID %d (corner %d)"), VertexID, CornerIndex), bHasValue);
+		if (!bHasValue)
+		{
+			continue;
+		}
+		const uint8 ExpectedByte = UnitFloatToByte(ExpectedMaskValue);
+		TestEqual(*FString::Printf(TEXT("Out[%d].R byte-exact vs reference generator + vertex mapping"), CornerIndex), Out[CornerIndex].R, ExpectedByte);
+		TestEqual(*FString::Printf(TEXT("Out[%d].G byte-exact vs reference generator + vertex mapping"), CornerIndex), Out[CornerIndex].G, ExpectedByte);
+		TestEqual(*FString::Printf(TEXT("Out[%d].B byte-exact vs reference generator + vertex mapping"), CornerIndex), Out[CornerIndex].B, ExpectedByte);
+		TestEqual(*FString::Printf(TEXT("Out[%d].A == BaseColors[%d].A"), CornerIndex, CornerIndex), Out[CornerIndex].A, BaseColors[CornerIndex].A);
+	}
+
+	return true;
+}
+
+// B. Full authoritative parameter forwarding: a small matrix exercising Convex/Concave/Both, a
+// non-default Multiplier, a genuinely nonzero FRACTIONAL Blur, non-default Levels Min/Max, and Invert --
+// each combination independently proven byte-exact against a direct generator call with the SAME
+// parameters (its own fresh FVertexMaskForgeGeneratorState), never by re-deriving the Type-selection/
+// Multiplier/blur/Levels/Invert formulas here.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompCurvatureParamForwardingTest, "VertexMaskForge.DynamicSourceTopologyComposition.CurvatureParameterForwardingByteExactAgainstGenerator", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynSrcTopoCompCurvatureParamForwardingTest::RunTest(const FString& Parameters)
+{
+	const FVertexMaskForgeWorkingMesh WorkingMesh = BuildCurvatureFixtureWorkingMesh();
+	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
+
+	struct FConfig
+	{
+		const TCHAR* Label;
+		EVertexMaskForgeCurvatureType Type;
+		float Multiplier;
+		float Blur;
+		float LevelsMin;
+		float LevelsMax;
+		bool bInvert;
+	};
+	const FConfig Configs[] = {
+		{ TEXT("Convex/DefaultMultiplier/NoBlur/DefaultLevels/NoInvert"), EVertexMaskForgeCurvatureType::Convex, 1.0f, 0.0f, 0.0f, 1.0f, false },
+		{ TEXT("Concave/DefaultMultiplier/NoBlur/DefaultLevels/NoInvert"), EVertexMaskForgeCurvatureType::Concave, 1.0f, 0.0f, 0.0f, 1.0f, false },
+		{ TEXT("Both/NonDefaultMultiplier/FractionalBlur/NonDefaultLevels/Invert"), EVertexMaskForgeCurvatureType::Both, 2.5f, 1.5f, 0.1f, 0.9f, true },
+	};
+
+	for (const FConfig& Config : Configs)
+	{
+		FVertexMaskForgeGeneratorState ReferenceGeneratorState;
+		const FVertexMaskForgeScalarMask ReferenceMask = VertexMaskForgeCurvatureGenerator::GenerateCurvatureMaskFromDynamicMesh(
+			WorkingMesh, ReferenceGeneratorState, Config.Type, Config.Multiplier, Config.Blur, Config.LevelsMin, Config.LevelsMax, Config.bInvert);
+		TestTrue(*FString::Printf(TEXT("%s: reference generator State == Ready"), Config.Label), ReferenceMask.State == EVertexMaskForgeScalarMaskState::Ready);
+
+		FVertexMaskForgeDynamicLayerStack Stack;
+		AddCurvatureLayer(Stack, TEXT("Layer"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f,
+			Config.Type, Config.Multiplier, Config.Blur, Config.LevelsMin, Config.LevelsMax, Config.bInvert);
+
+		TArray<FColor> Out;
+		const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, Out);
+		TestTrue(*FString::Printf(TEXT("%s: orchestrator succeeds"), Config.Label), bSucceeded);
+		if (!bSucceeded || Out.Num() != 6)
+		{
+			continue;
+		}
+
+		for (int32 CornerIndex = 0; CornerIndex < 6; ++CornerIndex)
+		{
+			const int32 VertexID = FixtureCornerToVertexID[CornerIndex];
+			float ExpectedMaskValue = 0.0f;
+			if (!ReferenceMask.TryGetValue(VertexID, ExpectedMaskValue))
+			{
+				continue;
+			}
+			const uint8 ExpectedByte = UnitFloatToByte(ExpectedMaskValue);
+			TestEqual(*FString::Printf(TEXT("%s: Out[%d].R byte-exact"), Config.Label, CornerIndex), Out[CornerIndex].R, ExpectedByte);
+		}
+	}
+
+	return true;
+}
+
+// C. DynamicMesh Vertex domain correctness: corners 0 and 3 share VertexID 0 (both map to V0 per
+// FixtureCornerToVertexID); corners 2 and 4 share VertexID 2. A genuinely DynamicMeshVertex-domain
+// implementation MUST show identical values at each pair (Curvature has no per-corner attribute input at
+// all, unlike Directional Normal's normals -- its value is purely a function of VertexID). An accidental
+// Corner-domain implementation would instead read Values[CornerIndex] against an array sized/indexed by
+// VertexID (MaxVertexID == 4 here, far smaller than the 6-corner count), which would NOT reproduce this
+// equality in general (Values[3] and Values[4] are actually V3's/out-of-range data, not V0's/V2's) --
+// this fixture is specifically non-constant (see BuildCurvatureFixtureWorkingMesh's own doc comment) so
+// this proof cannot pass by coincidence on a uniformly-zero mask.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompCurvatureVertexDomainTest, "VertexMaskForge.DynamicSourceTopologyComposition.CurvatureDynamicMeshVertexDomainCorrectness", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynSrcTopoCompCurvatureVertexDomainTest::RunTest(const FString& Parameters)
+{
+	const FVertexMaskForgeWorkingMesh WorkingMesh = BuildCurvatureFixtureWorkingMesh();
+	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
+
+	FVertexMaskForgeDynamicLayerStack Stack;
+	AddCurvatureLayer(Stack, TEXT("Layer"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f,
+		EVertexMaskForgeCurvatureType::Both, 0.2f, 0.0f, 0.0f, 1.0f, false);
+
+	TArray<FColor> Out;
+	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, Out);
+	TestTrue(TEXT("Orchestrator succeeds"), bSucceeded);
+	if (!bSucceeded || Out.Num() != 6)
+	{
+		return false;
+	}
+
+	TestEqual(TEXT("Corner 3 maps to the same VertexID as corner 0 (fixture precondition)"), FixtureCornerToVertexID[3], FixtureCornerToVertexID[0]);
+	TestEqual(TEXT("Corner 4 maps to the same VertexID as corner 2 (fixture precondition)"), FixtureCornerToVertexID[4], FixtureCornerToVertexID[2]);
+
+	TestEqual(TEXT("Corner 0 and corner 3 (same welded VertexID) resolve the identical Curvature value"), Out[0].R, Out[3].R);
+	TestEqual(TEXT("Corner 2 and corner 4 (same welded VertexID) resolve the identical Curvature value"), Out[2].R, Out[4].R);
+
+	// Non-constant-mask proof -- V0/V2 (folded) must differ from V1 (boundary-only), so this equality did
+	// not pass merely because every value happens to be identical.
+	TestNotEqual(TEXT("Output is not a constant mask (corner 0 differs from corner 1)"), Out[0].R, Out[1].R);
+
+	return true;
+}
+
+// D. Independent Curvature layers and reorder: two layers with meaningfully different artistic params
+// (differing Multiplier, both Type=Both so the shared fixture's fold contributes to both regardless of
+// its dihedral sign), Copy/Opacity-1.0 so the LAST-folded layer's own mask determines the result -- the
+// same "folded last wins" technique TwoBoundingBoxLayers/TwoDirectionalNormalLayers already establish.
+// Each independently-computed reference uses its OWN fresh FVertexMaskForgeGeneratorState (never the
+// orchestrator's shared one), proving the composed result matches independent evaluation regardless of
+// whether the orchestrator shares raw Curvature internally.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompCurvatureTwoLayersOrderTest, "VertexMaskForge.DynamicSourceTopologyComposition.TwoCurvatureLayersRetainDistinctMasksAndReorderChangesResult", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynSrcTopoCompCurvatureTwoLayersOrderTest::RunTest(const FString& Parameters)
+{
+	const FVertexMaskForgeWorkingMesh WorkingMesh = BuildCurvatureFixtureWorkingMesh();
+	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
+
+	FVertexMaskForgeGeneratorState LowGeneratorState;
+	const FVertexMaskForgeScalarMask LowReference = VertexMaskForgeCurvatureGenerator::GenerateCurvatureMaskFromDynamicMesh(
+		WorkingMesh, LowGeneratorState, EVertexMaskForgeCurvatureType::Both, 0.2f, 0.0f, 0.0f, 1.0f, false);
+	FVertexMaskForgeGeneratorState HighGeneratorState;
+	const FVertexMaskForgeScalarMask HighReference = VertexMaskForgeCurvatureGenerator::GenerateCurvatureMaskFromDynamicMesh(
+		WorkingMesh, HighGeneratorState, EVertexMaskForgeCurvatureType::Both, 3.0f, 0.0f, 0.0f, 1.0f, false);
+	TestTrue(TEXT("Low-Multiplier reference State == Ready"), LowReference.State == EVertexMaskForgeScalarMaskState::Ready);
+	TestTrue(TEXT("High-Multiplier reference State == Ready"), HighReference.State == EVertexMaskForgeScalarMaskState::Ready);
+
+	// Forward: Low-Multiplier layer first, High-Multiplier layer last -- High (folded last) determines
+	// the Copy result.
+	FVertexMaskForgeDynamicLayerStack ForwardStack;
+	AddCurvatureLayer(ForwardStack, TEXT("Low"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f,
+		EVertexMaskForgeCurvatureType::Both, 0.2f, 0.0f, 0.0f, 1.0f, false);
+	AddCurvatureLayer(ForwardStack, TEXT("High"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f,
+		EVertexMaskForgeCurvatureType::Both, 3.0f, 0.0f, 0.0f, 1.0f, false);
+
+	// Reverse: same two layers, opposite order -- Low (folded last) determines the Copy result instead.
+	FVertexMaskForgeDynamicLayerStack ReverseStack;
+	AddCurvatureLayer(ReverseStack, TEXT("High"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f,
+		EVertexMaskForgeCurvatureType::Both, 3.0f, 0.0f, 0.0f, 1.0f, false);
+	AddCurvatureLayer(ReverseStack, TEXT("Low"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f,
+		EVertexMaskForgeCurvatureType::Both, 0.2f, 0.0f, 0.0f, 1.0f, false);
+
+	TArray<FColor> ForwardOut;
+	TArray<FColor> ReverseOut;
+	const bool bForwardSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, ForwardStack, BaseColors, ForwardOut);
+	const bool bReverseSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, ReverseStack, BaseColors, ReverseOut);
+	TestTrue(TEXT("Forward succeeds"), bForwardSucceeded);
+	TestTrue(TEXT("Reverse succeeds"), bReverseSucceeded);
+	if (!bForwardSucceeded || !bReverseSucceeded || ForwardOut.Num() != 6 || ReverseOut.Num() != 6)
+	{
+		return false;
+	}
+
+	for (int32 CornerIndex = 0; CornerIndex < 6; ++CornerIndex)
+	{
+		const int32 VertexID = FixtureCornerToVertexID[CornerIndex];
+		float ExpectedHighValue = 0.0f;
+		float ExpectedLowValue = 0.0f;
+		if (!HighReference.TryGetValue(VertexID, ExpectedHighValue) || !LowReference.TryGetValue(VertexID, ExpectedLowValue))
+		{
+			continue;
+		}
+		TestEqual(*FString::Printf(TEXT("Forward[%d].R matches High-Multiplier (folded last)"), CornerIndex), ForwardOut[CornerIndex].R, UnitFloatToByte(ExpectedHighValue));
+		TestEqual(*FString::Printf(TEXT("Reverse[%d].R matches Low-Multiplier (folded last)"), CornerIndex), ReverseOut[CornerIndex].R, UnitFloatToByte(ExpectedLowValue));
+	}
+
+	// Distinctness precondition -- if Low and High produced identical masks the test above would pass
+	// vacuously; confirm the two Multipliers genuinely diverge at the folded vertex.
+	float LowV0 = 0.0f, HighV0 = 0.0f;
+	if (LowReference.TryGetValue(0, LowV0) && HighReference.TryGetValue(0, HighV0))
+	{
+		TestNotEqual(TEXT("Low-Multiplier and High-Multiplier references genuinely differ at V0"), LowV0, HighV0);
+	}
+
+	return true;
+}
+
+// E. Generic gating: a disabled Curvature layer contributes nothing (Baseline passthrough), exactly
+// mirroring DirectionalNormalDisabledLayerPreservesBaseColors' own established pattern. Work avoidance
+// (Curvature generation never invoked for a disabled layer) is proven structurally by the existing
+// pre-dispatch `if (!Layer.bEnabled || !Layer.Mask.IsSet()) continue;` early-out in Pass 1 -- confirmed by
+// direct source inspection, not by production instrumentation.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompCurvatureDisabledTest, "VertexMaskForge.DynamicSourceTopologyComposition.CurvatureDisabledLayerPreservesBaseColors", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynSrcTopoCompCurvatureDisabledTest::RunTest(const FString& Parameters)
+{
+	const FVertexMaskForgeWorkingMesh WorkingMesh = BuildCurvatureFixtureWorkingMesh();
+	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
+
+	FVertexMaskForgeDynamicLayerStack Stack;
+	const FGuid LayerId = AddCurvatureLayer(Stack, TEXT("Layer"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f,
+		EVertexMaskForgeCurvatureType::Both, 0.2f, 0.0f, 0.0f, 1.0f, false);
+	Stack.SetLayerEnabled(LayerId, false);
+
+	TArray<FColor> Out;
+	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, Out);
+	TestTrue(TEXT("Succeeds"), bSucceeded);
+	if (bSucceeded && Out.Num() == 6)
+	{
+		for (int32 Index = 0; Index < 6; ++Index)
+		{
+			TestEqual(*FString::Printf(TEXT("Out[%d] byte-exact passthrough (disabled layer = no-op)"), Index), Out[Index], BaseColors[Index]);
+		}
+	}
+
+	return true;
+}
+
+// F. Shared-state safety / no cross-layer contamination: evaluates three DISTINCT Curvature parameter
+// sets against ONE shared FVertexMaskForgeGeneratorState, in the same sequential order the orchestrator's
+// own Pass 1 loop would use, capturing each completed mask BY VALUE immediately after its own call --
+// then independently recomputes the same three parameter sets, each against its OWN fresh
+// FVertexMaskForgeGeneratorState. If shared-state reuse ever leaked one layer's artistic result into
+// another's, or if a later call ever mutated an earlier layer's already-captured mask (both explicitly
+// guarded against by GenerateCurvatureMaskFromDynamicMesh returning its FVertexMaskForgeScalarMask
+// entirely by value -- see the Pass 1 dispatch's own doc comment), the shared-state and independent-state
+// results would diverge. This does not by itself prove an internal cache HIT occurred (that is confirmed
+// by source inspection of EnsureCurvatureRawCache's fingerprint gate and the orchestrator's own single
+// CurvatureLocalGeneratorState declaration, not by this test) -- it proves output correctness/isolation
+// regardless of whether sharing occurred.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompCurvatureSharedStateSafetyTest, "VertexMaskForge.DynamicSourceTopologyComposition.CurvatureSharedGeneratorStateProducesIndependentPerLayerResults", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynSrcTopoCompCurvatureSharedStateSafetyTest::RunTest(const FString& Parameters)
+{
+	const FVertexMaskForgeWorkingMesh WorkingMesh = BuildCurvatureFixtureWorkingMesh();
+
+	struct FConfig
+	{
+		const TCHAR* Label;
+		EVertexMaskForgeCurvatureType Type;
+		float Multiplier;
+		float Blur;
+		float LevelsMin;
+		float LevelsMax;
+		bool bInvert;
+	};
+	const FConfig Configs[] = {
+		{ TEXT("Concave/Mult1/NoBlur"), EVertexMaskForgeCurvatureType::Concave, 1.0f, 0.0f, 0.0f, 1.0f, false },
+		{ TEXT("Convex/Mult2/Blur1.5"), EVertexMaskForgeCurvatureType::Convex, 2.0f, 1.5f, 0.0f, 1.0f, false },
+		{ TEXT("Both/Mult1/Levels0.2-0.8/Invert"), EVertexMaskForgeCurvatureType::Both, 1.0f, 0.0f, 0.2f, 0.8f, true },
+	};
+
+	// Sequential evaluation against ONE shared state, mirroring the orchestrator's own Pass 1 reuse --
+	// each result captured BY VALUE (MoveTemp) immediately, so no later call can retroactively mutate an
+	// earlier entry even if the underlying representation somehow aliased shared storage.
+	FVertexMaskForgeGeneratorState SharedGeneratorState;
+	TArray<FVertexMaskForgeScalarMask> SharedResults;
+	for (const FConfig& Config : Configs)
+	{
+		FVertexMaskForgeScalarMask Result = VertexMaskForgeCurvatureGenerator::GenerateCurvatureMaskFromDynamicMesh(
+			WorkingMesh, SharedGeneratorState, Config.Type, Config.Multiplier, Config.Blur, Config.LevelsMin, Config.LevelsMax, Config.bInvert);
+		TestTrue(*FString::Printf(TEXT("%s: shared-state result State == Ready"), Config.Label), Result.State == EVertexMaskForgeScalarMaskState::Ready);
+		SharedResults.Add(MoveTemp(Result));
+	}
+
+	// Independent evaluation: each config against its OWN fresh state, never reusing SharedGeneratorState.
+	for (int32 ConfigIndex = 0; ConfigIndex < UE_ARRAY_COUNT(Configs); ++ConfigIndex)
+	{
+		const FConfig& Config = Configs[ConfigIndex];
+		FVertexMaskForgeGeneratorState IndependentGeneratorState;
+		const FVertexMaskForgeScalarMask IndependentResult = VertexMaskForgeCurvatureGenerator::GenerateCurvatureMaskFromDynamicMesh(
+			WorkingMesh, IndependentGeneratorState, Config.Type, Config.Multiplier, Config.Blur, Config.LevelsMin, Config.LevelsMax, Config.bInvert);
+		TestTrue(*FString::Printf(TEXT("%s: independent-state result State == Ready"), Config.Label), IndependentResult.State == EVertexMaskForgeScalarMaskState::Ready);
+
+		const FVertexMaskForgeScalarMask& SharedResult = SharedResults[ConfigIndex];
+		for (const int32 VertexID : WorkingMesh.Mesh->VertexIndicesItr())
+		{
+			float SharedValue = 0.0f;
+			float IndependentValue = 0.0f;
+			const bool bSharedHasValue = SharedResult.TryGetValue(VertexID, SharedValue);
+			const bool bIndependentHasValue = IndependentResult.TryGetValue(VertexID, IndependentValue);
+			TestEqual(*FString::Printf(TEXT("%s: VertexID %d has-value agrees between shared and independent state"), Config.Label, VertexID), bSharedHasValue, bIndependentHasValue);
+			if (bSharedHasValue && bIndependentHasValue)
+			{
+				TestEqual(*FString::Printf(TEXT("%s: VertexID %d value byte-exact between shared and independent state"), Config.Label, VertexID), UnitFloatToByte(SharedValue), UnitFloatToByte(IndependentValue));
+			}
 		}
 	}
 

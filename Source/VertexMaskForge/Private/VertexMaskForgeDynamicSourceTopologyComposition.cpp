@@ -21,6 +21,7 @@
 #include "DynamicMesh/DynamicMesh3.h"
 #include "VertexMaskForgeBoundingBoxGenerator.h"
 #include "VertexMaskForgeColorConversion.h"
+#include "VertexMaskForgeCurvatureGenerator.h"
 #include "VertexMaskForgeDirectionalNormalGenerator.h"
 #include "VertexMaskForgeDynamicLayerEvaluator.h"
 #include "VertexMaskForgeDynamicLayerStack.h"
@@ -91,6 +92,23 @@ bool VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSo
 	// both domains agree on what a given CornerIndex physically is.
 	TArray<int32> CornerToVertexID;
 	bool bCornerToVertexIDBuilt = false;
+
+	// M16-K.6D-8E-B: ONE function-local FVertexMaskForgeGeneratorState, declared here (outside the
+	// per-layer loop below) and reused for every enabled Curvature layer THIS call evaluates -- never
+	// per-layer, never keyed by LayerId, never the Legacy per-entry FVertexMaskForgeGeneratorState (never
+	// reachable from this orchestrator), never static/persistent, never exposed through this function's
+	// own public signature, and never retained beyond this single call (destroyed when this function
+	// returns). GenerateCurvatureMaskFromDynamicMesh's own EnsureCurvatureRawCache internally gates its
+	// expensive raw Convex/Concave computation on this state's own CurvatureCacheFingerprint versus
+	// WorkingMesh.GeometryFingerprint -- since that fingerprint never changes within one call, the FIRST
+	// enabled Curvature layer computes the raw arrays and every SUBSEQUENT enabled Curvature layer in the
+	// same call reuses them for free, while each layer still applies its own Type/Multiplier/Blur/Levels/
+	// Invert independently (see the Curvature branch below). This provides WITHIN-CALL sharing only --
+	// a later, separate orchestrator invocation (e.g. a subsequent Auto Update Preview recomposition)
+	// starts with a fresh, empty CurvatureLocalGeneratorState and recomputes the raw arrays again, even
+	// if geometry has not changed; persistent cross-call caching is explicitly deferred, not implemented
+	// here.
+	FVertexMaskForgeGeneratorState CurvatureLocalGeneratorState;
 
 	for (int32 LayerIndex = 0; LayerIndex < Layers.Num(); ++LayerIndex)
 	{
@@ -226,11 +244,70 @@ bool VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSo
 			LayerMasks[LayerIndex].Mask = MoveTemp(GeneratedMask);
 			LayerMasks[LayerIndex].Domain = ELayerMaskDomain::Corner;
 		}
+		else if (Layer.Mask->GeneratorType == EVertexMaskForgeGeneratorType::Curvature)
+		{
+			const FVertexMaskForgeCurvatureParams* CurvatureParams = Layer.Mask->Params.TryGet<FVertexMaskForgeCurvatureParams>();
+			if (!CurvatureParams)
+			{
+				// Defensive -- mirrors the Material Slot/Bounding Box/Directional Normal coherence checks
+				// above.
+				return false;
+			}
+
+			// M16-K.6D-8E-B scope: Curvature has no Local/World-space concept and no ComponentTransform
+			// dependency at all (confirmed directly from GenerateCurvatureMaskFromDynamicMesh's own
+			// signature) -- unlike Bounding Box/Directional Normal, there is no space-rejection check
+			// here. Every authoritative field (Type/Multiplier/Blur/LevelsMin/LevelsMax/bInvert) is
+			// forwarded unchanged; none are normalized, swapped, or rewritten here -- the generator's own
+			// ApplyCurvatureArtisticParams already clamps/defends each field internally (e.g.
+			// LevelsMin<=LevelsMax is never enforced by this orchestrator, since ApplyCurvatureLevels'
+			// own Max(LevelsMax-LevelsMin, Epsilon) denominator already makes any stored relationship
+			// well-defined).
+			//
+			// CurvatureLocalGeneratorState (declared once, above Pass 1) is reused here across every
+			// enabled Curvature layer in THIS call -- see its own declaration comment for the full
+			// within-call-sharing/no-cross-call-persistence contract.
+			//
+			// GenerateCurvatureMaskFromDynamicMesh returns its FVertexMaskForgeScalarMask entirely BY
+			// VALUE (its own Values/bHasValue arrays are freshly allocated inside that function every
+			// call, from ApplyCurvatureArtisticParams' own freshly-returned-by-value TArray<float> --
+			// neither is ever aliased to CurvatureLocalGeneratorState's cached raw arrays) -- so the
+			// MoveTemp below is always safe: a later Curvature layer's call can never retroactively
+			// mutate an earlier layer's already-stored completed mask.
+			FVertexMaskForgeScalarMask GeneratedMask = VertexMaskForgeCurvatureGenerator::GenerateCurvatureMaskFromDynamicMesh(
+				WorkingMesh, CurvatureLocalGeneratorState, CurvatureParams->Type, CurvatureParams->Multiplier,
+				CurvatureParams->Blur, CurvatureParams->LevelsMin, CurvatureParams->LevelsMax, CurvatureParams->bInvert);
+			if (GeneratedMask.State != EVertexMaskForgeScalarMaskState::Ready)
+			{
+				// Mirrors Bounding Box's own check exactly -- Curvature's output is DynamicMeshVertex-
+				// domain and sparse-safe (resolved only via TryGetValue in Pass 2 below), so no separate
+				// cardinality check is required here, matching
+				// GenerateBoundingBoxMaskFromDynamicMesh's own established precedent.
+				return false;
+			}
+
+			LayerMasks[LayerIndex].Mask = MoveTemp(GeneratedMask);
+			LayerMasks[LayerIndex].Domain = ELayerMaskDomain::DynamicMeshVertex;
+
+			if (!bCornerToVertexIDBuilt)
+			{
+				CornerToVertexID.SetNumUninitialized(ExpectedCornerCount);
+				int32 RunningCornerIndex = 0;
+				for (const int32 TriangleID : WorkingMesh.Mesh->TriangleIndicesItr())
+				{
+					const UE::Geometry::FIndex3i Tri = WorkingMesh.Mesh->GetTriangle(TriangleID);
+					CornerToVertexID[RunningCornerIndex++] = Tri.A;
+					CornerToVertexID[RunningCornerIndex++] = Tri.B;
+					CornerToVertexID[RunningCornerIndex++] = Tri.C;
+				}
+				bCornerToVertexIDBuilt = true;
+			}
+		}
 		else
 		{
 			// Explicit, whole-call failure -- any generator type beyond this checkpoint's own supported
-			// set (Material Slot, Bounding Box Local-space, Directional Normal Local-space) never
-			// silently skips or treats itself as Fill-only.
+			// set (Material Slot, Bounding Box Local-space, Directional Normal Local-space, Curvature)
+			// never silently skips or treats itself as Fill-only.
 			return false;
 		}
 	}

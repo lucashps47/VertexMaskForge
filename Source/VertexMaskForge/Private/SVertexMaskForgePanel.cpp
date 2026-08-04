@@ -1055,13 +1055,13 @@ namespace VertexMaskForgePanel
 	}
 
 	/**
-	 * M16-K.6B; extended M16-K.6D-8C-C, M16-K.6D-8D-C: human-readable label for one Dynamic Layer row's
-	 * Generator Type combo option/current value. A null InOption represents "None/Unassigned" (mirrors
-	 * DynamicLayerGeneratorTypeOptions' own element-0-is-null convention). A non-null InOption is expected
-	 * to only ever be MaterialSlot, BoundingBox, or DirectionalNormal in this checkpoint (the only values
-	 * DynamicLayerGeneratorTypeOptions offers) -- the default case covers any other
-	 * EVertexMaskForgeGeneratorType defensively (e.g. if a layer's Mask was assigned by something other
-	 * than this combo), without claiming Dynamic support for it.
+	 * M16-K.6B; extended M16-K.6D-8C-C, M16-K.6D-8D-C, M16-K.6D-8E-C: human-readable label for one Dynamic
+	 * Layer row's Generator Type combo option/current value. A null InOption represents "None/Unassigned"
+	 * (mirrors DynamicLayerGeneratorTypeOptions' own element-0-is-null convention). A non-null InOption is
+	 * expected to only ever be MaterialSlot, BoundingBox, DirectionalNormal, or Curvature in this
+	 * checkpoint (the only values DynamicLayerGeneratorTypeOptions offers) -- the default case covers any
+	 * other EVertexMaskForgeGeneratorType defensively (e.g. if a layer's Mask was assigned by something
+	 * other than this combo), without claiming Dynamic support for it.
 	 */
 	static FText GetDynamicLayerGeneratorTypeLabel(const EVertexMaskForgeGeneratorType* InOption)
 	{
@@ -1077,6 +1077,8 @@ namespace VertexMaskForgePanel
 			return LOCTEXT("DynamicLayerGeneratorBoundingBox", "Bounding Box");
 		case EVertexMaskForgeGeneratorType::DirectionalNormal:
 			return LOCTEXT("DynamicLayerGeneratorDirectionalNormal", "Directional Normal");
+		case EVertexMaskForgeGeneratorType::Curvature:
+			return LOCTEXT("DynamicLayerGeneratorCurvature", "Curvature");
 		default:
 			return LOCTEXT("DynamicLayerGeneratorUnsupported", "Unsupported");
 		}
@@ -4024,7 +4026,8 @@ TSharedRef<SWidget> SVertexMaskForgePanel::BuildDynamicLayerRow(const FGuid Laye
 				}
 				return (Mask->GeneratorType == EVertexMaskForgeGeneratorType::MaterialSlot
 					|| Mask->GeneratorType == EVertexMaskForgeGeneratorType::BoundingBox
-					|| Mask->GeneratorType == EVertexMaskForgeGeneratorType::DirectionalNormal)
+					|| Mask->GeneratorType == EVertexMaskForgeGeneratorType::DirectionalNormal
+					|| Mask->GeneratorType == EVertexMaskForgeGeneratorType::Curvature)
 					? EVisibility::Visible : EVisibility::Collapsed;
 			})
 			.HeaderContent()
@@ -4339,6 +4342,18 @@ TSharedRef<SWidget> SVertexMaskForgePanel::BuildDynamicLayerRow(const FGuid Laye
 			.Padding(FMargin(0.f, 2.f, 0.f, 0.f))
 			[
 				BuildDynamicDirectionalNormalLayerParamsBlock(LayerId, MaterialSlotExpectedMaskInstanceId)
+				]
+
+			// M16-K.6D-8E-C: Curvature configurational editor -- sibling of the Material Slot, Bounding
+			// Box, and Directional Normal blocks above, inside the SAME "Generator Parameters" expander
+			// body. Visible/editable only when this layer's assigned generator is Curvature (see
+			// BuildDynamicCurvatureLayerParamsBlock's own doc comment for the full contract). Curvature has
+			// no Space concept, so unlike its two siblings above there is no incompatible-state warning.
+			+ SVerticalBox::Slot()
+			.AutoHeight()
+			.Padding(FMargin(0.f, 2.f, 0.f, 0.f))
+			[
+				BuildDynamicCurvatureLayerParamsBlock(LayerId, MaterialSlotExpectedMaskInstanceId)
 				]
 			]
 		]
@@ -4865,6 +4880,281 @@ TSharedRef<SWidget> SVertexMaskForgePanel::BuildDynamicDirectionalNormalLayerPar
 	];
 }
 
+void SVertexMaskForgePanel::MutateDynamicCurvatureParam(
+	const FGuid LayerId, const FGuid ExpectedMaskInstanceId,
+	TFunctionRef<void(FVertexMaskForgeCurvatureParams&)> Mutator)
+{
+	// AUDITED (M16-K.6D-8E-C): mirrors MutateDynamicDirectionalNormalParam's own six-step identity-
+	// validated write path exactly -- mask exists, GeneratorType is still Curvature, Params is still the
+	// Curvature payload type, and MaskInstanceId still matches what THIS widget was built for. Any
+	// mismatch (cleared, reassigned to a different generator, or replaced by a newer instance) is a silent
+	// no-op, never a fallback to another layer or a stale write.
+	const FVertexMaskForgeGeneratorMaskInstance* Mask = DynamicLayerStack.GetLayerMask(LayerId);
+	if (!Mask
+		|| Mask->GeneratorType != EVertexMaskForgeGeneratorType::Curvature
+		|| !Mask->Params.IsType<FVertexMaskForgeCurvatureParams>()
+		|| Mask->MaskInstanceId != ExpectedMaskInstanceId)
+	{
+		return;
+	}
+	// AUDITED: copies the CURRENT Params (every field byte/value-exact), mutates the copy via Mutator
+	// (including the Levels Min/Max coupled-invariant maintenance the Angle/Falloff callbacks below
+	// perform entirely inside their own Mutator, exactly like Directional Normal's own established
+	// pattern), then writes back through the existing stack API in ONE call -- never a second/cached copy
+	// of parameters retained across calls, never a second callback-driven write.
+	FVertexMaskForgeGeneratorParams NewParams = Mask->Params;
+	Mutator(NewParams.Get<FVertexMaskForgeCurvatureParams>());
+	DynamicLayerStack.SetLayerMaskParams(LayerId, ExpectedMaskInstanceId, NewParams);
+	OnDynamicLayerStackMutated();
+}
+
+TSharedRef<SWidget> SVertexMaskForgePanel::BuildDynamicCurvatureLayerParamsBlock(const FGuid LayerId, const FGuid ExpectedMaskInstanceId)
+{
+	// AUDITED: every Value_Lambda/IsChecked_Lambda/Text_Lambda below re-resolves LayerId's CURRENT stored
+	// Curvature params fresh on every call (never a cached copy) -- if the layer/mask/params no longer
+	// match (e.g. generator switched away), the accessor falls back to the authoritative default
+	// (Concave/Multiplier=1/Blur=0/Levels=[0,1]/not inverted) rather than reading garbage. Read-only;
+	// never mutates.
+	auto GetParams = [this, LayerId]() -> FVertexMaskForgeCurvatureParams
+	{
+		const FVertexMaskForgeGeneratorMaskInstance* Mask = DynamicLayerStack.GetLayerMask(LayerId);
+		const FVertexMaskForgeCurvatureParams* CurvatureParams = Mask ? Mask->Params.TryGet<FVertexMaskForgeCurvatureParams>() : nullptr;
+		return CurvatureParams ? *CurvatureParams : FVertexMaskForgeCurvatureParams();
+	};
+
+	return SNew(SVerticalBox)
+	.Visibility_Lambda([this, LayerId]()
+	{
+		const FVertexMaskForgeGeneratorMaskInstance* Mask = DynamicLayerStack.GetLayerMask(LayerId);
+		return (Mask && Mask->GeneratorType == EVertexMaskForgeGeneratorType::Curvature) ? EVisibility::Visible : EVisibility::Collapsed;
+	})
+
+	// Type -- reuses the existing, panel-wide, immutable CurvatureTypeOptions array (already populated in
+	// Construct() for the Legacy Curvature combo) as pure presentation data, exactly how the Directional
+	// Normal block reuses NormalDirectionOptions -- never a new UI-owned enum, never authoritative state.
+	+ SVerticalBox::Slot()
+	.AutoHeight()
+	.Padding(FMargin(0.f, 2.f, 0.f, 2.f))
+	[
+		SNew(SHorizontalBox)
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.VAlign(VAlign_Center)
+		[
+			SNew(STextBlock)
+			.Text(LOCTEXT("DynamicCurvatureTypeLabel", "Curvature Type:"))
+			.ToolTipText(LOCTEXT("DynamicCurvatureTypeTooltip",
+				"Convex: only outward edges/bulges. Concave: only cavities/creases. Both: both signs, without cancelling out."))
+		]
+
+		+ SHorizontalBox::Slot()
+		.FillWidth(1.f)
+		.Padding(FMargin(4.f, 0.f, 0.f, 0.f))
+		[
+			SNew(SComboBox<TSharedPtr<EVertexMaskForgeCurvatureType>>)
+			.OptionsSource(&CurvatureTypeOptions)
+			.OnGenerateWidget_Lambda([](TSharedPtr<EVertexMaskForgeCurvatureType> InOption)
+			{
+				return SNew(STextBlock).Text(InOption.IsValid() ? VertexMaskForgePanel::GetCurvatureTypeLabel(*InOption) : FText::GetEmpty());
+			})
+			.OnSelectionChanged_Lambda([this, LayerId, ExpectedMaskInstanceId](TSharedPtr<EVertexMaskForgeCurvatureType> NewSelection, ESelectInfo::Type)
+			{
+				if (!NewSelection.IsValid())
+				{
+					return;
+				}
+				const EVertexMaskForgeCurvatureType NewType = *NewSelection;
+				MutateDynamicCurvatureParam(LayerId, ExpectedMaskInstanceId, [NewType](FVertexMaskForgeCurvatureParams& Params)
+				{
+					Params.Type = NewType;
+				});
+			})
+			.Content()
+			[
+				SNew(STextBlock).Text_Lambda([GetParams]() { return VertexMaskForgePanel::GetCurvatureTypeLabel(GetParams().Type); })
+			]
+		]
+	]
+
+	// Multiplier -- [0,10], Delta 0.01, matching the Legacy widget's own range/step exactly.
+	+ SVerticalBox::Slot()
+	.AutoHeight()
+	.Padding(FMargin(0.f, 2.f, 0.f, 2.f))
+	[
+		SNew(SHorizontalBox)
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.VAlign(VAlign_Center)
+		[
+			SNew(STextBlock).Text(LOCTEXT("DynamicCurvatureMultiplierLabel", "Multiplier"))
+		]
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.Padding(FMargin(4.f, 0.f, 0.f, 0.f))
+		[
+			SNew(SSpinBox<float>)
+			.MinDesiredWidth(52.f)
+			.MinValue(0.0f)
+			.MaxValue(10.0f)
+			.Delta(0.01f)
+			.Value_Lambda([GetParams]() { return GetParams().Multiplier; })
+			.OnValueChanged_Lambda([this, LayerId, ExpectedMaskInstanceId](const float NewValue)
+			{
+				MutateDynamicCurvatureParam(LayerId, ExpectedMaskInstanceId, [NewValue](FVertexMaskForgeCurvatureParams& Params)
+				{
+					Params.Multiplier = FMath::Max(NewValue, 0.0f);
+				});
+			})
+		]
+	]
+
+	// Blur -- [0,10], Delta 0.01, retains full float precision (fractional iteration blend), matching the
+	// Legacy widget's own range/step/tooltip exactly.
+	+ SVerticalBox::Slot()
+	.AutoHeight()
+	.Padding(FMargin(0.f, 2.f, 0.f, 2.f))
+	[
+		SNew(SHorizontalBox)
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.VAlign(VAlign_Center)
+		[
+			SNew(STextBlock)
+			.Text(LOCTEXT("DynamicCurvatureBlurLabel", "Blur"))
+			.ToolTipText(LOCTEXT("DynamicCurvatureBlurTooltip",
+				"Topological smoothing of the Curvature mask. Whole number = full iterations; fractional part blends toward one more."))
+		]
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.Padding(FMargin(4.f, 0.f, 0.f, 0.f))
+		[
+			SNew(SSpinBox<float>)
+			.MinDesiredWidth(52.f)
+			.MinValue(0.0f)
+			.MaxValue(10.0f)
+			.Delta(0.01f)
+			.Value_Lambda([GetParams]() { return GetParams().Blur; })
+			.OnValueChanged_Lambda([this, LayerId, ExpectedMaskInstanceId](const float NewValue)
+			{
+				MutateDynamicCurvatureParam(LayerId, ExpectedMaskInstanceId, [NewValue](FVertexMaskForgeCurvatureParams& Params)
+				{
+					Params.Blur = FMath::Clamp(NewValue, 0.0f, 10.0f);
+				});
+			})
+		]
+	]
+
+	// Levels Min / Levels Max -- [0,1], Delta 0.01, matching the Legacy widgets' own range/step/tooltips
+	// exactly. Coupled invariant (LevelsMin <= LevelsMax) is maintained entirely inside each callback's own
+	// Mutator -- the edited field is always assigned first and preserved, the OTHER field is raised/lowered
+	// only if the pair would otherwise become invalid -- committed through the SAME single
+	// MutateDynamicCurvatureParam call (one SetLayerMaskParams write, one OnDynamicLayerStackMutated
+	// notification), never a second callback-driven write. A malformed stored pair (LevelsMin > LevelsMax,
+	// unreachable through this UI but not otherwise precluded) displays safely (ApplyCurvatureLevels' own
+	// Max(LevelsMax-LevelsMin, Epsilon) denominator never divides by zero) and becomes valid the moment the
+	// artist edits either control.
+	+ SVerticalBox::Slot()
+	.AutoHeight()
+	.Padding(FMargin(0.f, 2.f, 0.f, 2.f))
+	[
+		SNew(SHorizontalBox)
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.VAlign(VAlign_Center)
+		[
+			SNew(STextBlock)
+			.Text(LOCTEXT("DynamicCurvatureLevelsMinLabel", "Levels Min"))
+			.ToolTipText(LOCTEXT("DynamicCurvatureLevelsMinTooltip", "Values at or below this threshold become black."))
+		]
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.Padding(FMargin(4.f, 0.f, 12.f, 0.f))
+		[
+			SNew(SSpinBox<float>)
+			.MinDesiredWidth(52.f)
+			.MinValue(0.0f)
+			.MaxValue(1.0f)
+			.Delta(0.01f)
+			.ToolTipText(LOCTEXT("DynamicCurvatureLevelsMinTooltip", "Values at or below this threshold become black."))
+			.Value_Lambda([GetParams]() { return GetParams().LevelsMin; })
+			.OnValueChanged_Lambda([this, LayerId, ExpectedMaskInstanceId](const float NewValue)
+			{
+				MutateDynamicCurvatureParam(LayerId, ExpectedMaskInstanceId, [NewValue](FVertexMaskForgeCurvatureParams& Params)
+				{
+					Params.LevelsMin = FMath::Clamp(NewValue, 0.0f, 1.0f);
+					if (Params.LevelsMin > Params.LevelsMax)
+					{
+						Params.LevelsMax = Params.LevelsMin;
+					}
+				});
+			})
+		]
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.VAlign(VAlign_Center)
+		[
+			SNew(STextBlock)
+			.Text(LOCTEXT("DynamicCurvatureLevelsMaxLabel", "Levels Max"))
+			.ToolTipText(LOCTEXT("DynamicCurvatureLevelsMaxTooltip", "Values at or above this threshold become white."))
+		]
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.Padding(FMargin(4.f, 0.f, 0.f, 0.f))
+		[
+			SNew(SSpinBox<float>)
+			.MinDesiredWidth(52.f)
+			.MinValue(0.0f)
+			.MaxValue(1.0f)
+			.Delta(0.01f)
+			.ToolTipText(LOCTEXT("DynamicCurvatureLevelsMaxTooltip", "Values at or above this threshold become white."))
+			.Value_Lambda([GetParams]() { return GetParams().LevelsMax; })
+			.OnValueChanged_Lambda([this, LayerId, ExpectedMaskInstanceId](const float NewValue)
+			{
+				MutateDynamicCurvatureParam(LayerId, ExpectedMaskInstanceId, [NewValue](FVertexMaskForgeCurvatureParams& Params)
+				{
+					Params.LevelsMax = FMath::Clamp(NewValue, 0.0f, 1.0f);
+					if (Params.LevelsMax < Params.LevelsMin)
+					{
+						Params.LevelsMin = Params.LevelsMax;
+					}
+				});
+			})
+		]
+	]
+
+	// Invert
+	+ SVerticalBox::Slot()
+	.AutoHeight()
+	.Padding(FMargin(0.f, 2.f, 0.f, 0.f))
+	[
+		SNew(SCheckBox)
+		.IsChecked_Lambda([GetParams]()
+		{
+			return GetParams().bInvert ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
+		})
+		.OnCheckStateChanged_Lambda([this, LayerId, ExpectedMaskInstanceId](const ECheckBoxState NewState)
+		{
+			MutateDynamicCurvatureParam(LayerId, ExpectedMaskInstanceId, [NewState](FVertexMaskForgeCurvatureParams& Params)
+			{
+				Params.bInvert = (NewState == ECheckBoxState::Checked);
+			});
+		})
+		.Content()
+		[
+			SNew(STextBlock).Text(LOCTEXT("DynamicCurvatureInvertLabel", "Invert"))
+		]
+	];
+}
+
 namespace
 {
 	// M16-K.6D-6 (Correction 2): the panel's own drag-drop payload for reordering Dynamic Layers rows --
@@ -5252,16 +5542,18 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 	DynamicLayerFillOptions.Add(MakeShared<EVertexMaskForgeLayerFill>(EVertexMaskForgeLayerFill::Black));
 	DynamicLayerFillOptions.Add(MakeShared<EVertexMaskForgeLayerFill>(EVertexMaskForgeLayerFill::White));
 
-	// M16-K.6B; corrected M16-K.6D-6; extended M16-K.6D-8C-C, M16-K.6D-8D-C: element 0 is a VALID
-	// TSharedPtr to an UNSET TOptional (None/Unassigned) -- NOT a null TSharedPtr, which SListView's own
-	// row-generation loop unconditionally skips (see this array's own doc comment in SVertexMaskForgePanel.h
-	// for the confirmed root cause). MaterialSlot, BoundingBox (M16-K.6D-8B), and DirectionalNormal
-	// (M16-K.6D-8D-B) are the only three generators offered -- every other EVertexMaskForgeGeneratorType
-	// value is deliberately NOT added here, since the orchestrator still rejects any other type outright.
+	// M16-K.6B; corrected M16-K.6D-6; extended M16-K.6D-8C-C, M16-K.6D-8D-C, M16-K.6D-8E-C: element 0 is a
+	// VALID TSharedPtr to an UNSET TOptional (None/Unassigned) -- NOT a null TSharedPtr, which SListView's
+	// own row-generation loop unconditionally skips (see this array's own doc comment in
+	// SVertexMaskForgePanel.h for the confirmed root cause). MaterialSlot, BoundingBox (M16-K.6D-8B),
+	// DirectionalNormal (M16-K.6D-8D-B), and Curvature (M16-K.6D-8E-B) are the only four generators
+	// offered -- every other EVertexMaskForgeGeneratorType value is deliberately NOT added here, since the
+	// orchestrator still rejects any other type outright.
 	DynamicLayerGeneratorTypeOptions.Add(MakeShared<TOptional<EVertexMaskForgeGeneratorType>>());
 	DynamicLayerGeneratorTypeOptions.Add(MakeShared<TOptional<EVertexMaskForgeGeneratorType>>(EVertexMaskForgeGeneratorType::MaterialSlot));
 	DynamicLayerGeneratorTypeOptions.Add(MakeShared<TOptional<EVertexMaskForgeGeneratorType>>(EVertexMaskForgeGeneratorType::BoundingBox));
 	DynamicLayerGeneratorTypeOptions.Add(MakeShared<TOptional<EVertexMaskForgeGeneratorType>>(EVertexMaskForgeGeneratorType::DirectionalNormal));
+	DynamicLayerGeneratorTypeOptions.Add(MakeShared<TOptional<EVertexMaskForgeGeneratorType>>(EVertexMaskForgeGeneratorType::Curvature));
 
 	CurvatureTypeOptions.Add(MakeShared<EVertexMaskForgeCurvatureType>(EVertexMaskForgeCurvatureType::Convex));
 	CurvatureTypeOptions.Add(MakeShared<EVertexMaskForgeCurvatureType>(EVertexMaskForgeCurvatureType::Concave));
