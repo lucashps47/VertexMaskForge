@@ -21,6 +21,7 @@
 #include "DynamicMesh/DynamicMesh3.h"
 #include "VertexMaskForgeBoundingBoxGenerator.h"
 #include "VertexMaskForgeColorConversion.h"
+#include "VertexMaskForgeDirectionalNormalGenerator.h"
 #include "VertexMaskForgeDynamicLayerEvaluator.h"
 #include "VertexMaskForgeDynamicLayerStack.h"
 #include "VertexMaskForgeLayerTypes.h"
@@ -180,11 +181,56 @@ bool VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSo
 				bCornerToVertexIDBuilt = true;
 			}
 		}
+		else if (Layer.Mask->GeneratorType == EVertexMaskForgeGeneratorType::DirectionalNormal)
+		{
+			const FVertexMaskForgeDirectionalNormalParams* NormalParams = Layer.Mask->Params.TryGet<FVertexMaskForgeDirectionalNormalParams>();
+			if (!NormalParams)
+			{
+				// Defensive -- mirrors the Material Slot/Bounding Box coherence checks above.
+				return false;
+			}
+
+			// M16-K.6D-8D-B scope: Local-space only. World Space is explicitly REJECTED here (whole-call
+			// failure), never silently reinterpreted as Local -- World Space requires a per-component
+			// transform this orchestrator does not receive in this checkpoint, the same class of gap
+			// that made Bounding Box's own World Space/Unified Bounds explicitly rejected in M16-K.6D-8B.
+			if (NormalParams->Space != EVertexMaskForgeNormalSpace::Local)
+			{
+				return false;
+			}
+
+			// Local-space evaluation never reads ComponentTransform (confirmed directly from
+			// GenerateDirectionalNormalMaskFromDynamicMesh's own header doc comment and its Space==Local
+			// branch), so FTransform::Identity is safe here ONLY because Local-space was just proven
+			// above, never supplied as a guess ahead of validation.
+			FVertexMaskForgeScalarMask GeneratedMask = VertexMaskForgeDirectionalNormalGenerator::GenerateDirectionalNormalMaskFromDynamicMesh(
+				WorkingMesh, NormalParams->Space, NormalParams->Direction, NormalParams->Angle, NormalParams->Falloff,
+				NormalParams->Blur, NormalParams->bInvert, FTransform::Identity);
+			if (GeneratedMask.State != EVertexMaskForgeScalarMaskState::Ready
+				|| GeneratedMask.Values.Num() != ExpectedCornerCount
+				|| GeneratedMask.NumValidValues != ExpectedCornerCount)
+			{
+				// The third check additionally requires EVERY corner to have resolved a real value --
+				// GenerateDirectionalNormalMaskFromDynamicMesh's own contract allows an individual corner
+				// to be left unwritten (missing Normal Overlay element, degenerate normal) while still
+				// reporting Ready overall (NumValidValues > 0 is its own success threshold). This
+				// orchestrator's Corner-domain Pass 2 reads Values[CornerIndex] directly and
+				// unconditionally (Material Slot's own established precedent, always dense) -- a hole
+				// here would silently read a zero-initialized placeholder as a real computed value,
+				// exactly the guess FVertexMaskForgeScalarMask's own contract forbids. Rejecting the
+				// whole call on any hole is the safe choice; it introduces no new domain, no per-corner
+				// TryGetValue path, and no composition-path change.
+				return false;
+			}
+
+			LayerMasks[LayerIndex].Mask = MoveTemp(GeneratedMask);
+			LayerMasks[LayerIndex].Domain = ELayerMaskDomain::Corner;
+		}
 		else
 		{
 			// Explicit, whole-call failure -- any generator type beyond this checkpoint's own supported
-			// set (Material Slot, Bounding Box Local-space) never silently skips or treats itself as
-			// Fill-only.
+			// set (Material Slot, Bounding Box Local-space, Directional Normal Local-space) never
+			// silently skips or treats itself as Fill-only.
 			return false;
 		}
 	}

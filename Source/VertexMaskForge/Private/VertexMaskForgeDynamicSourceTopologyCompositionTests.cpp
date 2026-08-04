@@ -8,8 +8,10 @@
 #if WITH_DEV_AUTOMATION_TESTS
 
 #include "DynamicMesh/DynamicMesh3.h"
+#include "DynamicMesh/DynamicMeshAttributeSet.h"
 #include "Misc/AutomationTest.h"
 #include "VertexMaskForgeBoundingBoxGenerator.h"
+#include "VertexMaskForgeDirectionalNormalGenerator.h"
 #include "VertexMaskForgeDynamicLayerStack.h"
 #include "VertexMaskForgeDynamicSourceTopologyComposition.h"
 #include "VertexMaskForgeLayerTypes.h"
@@ -143,6 +145,87 @@ namespace
 	uint8 UnitFloatToByte(const float Value)
 	{
 		return static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(Value * 255.0f), 0, 255));
+	}
+
+	// M16-K.6D-8D-B: same two-triangle quad shape/vertex positions as BuildOrchestratorFixtureWorkingMesh
+	// (so FixtureCornerToVertexID above still applies), but with a real Normal Overlay populated --
+	// GenerateDirectionalNormalMaskFromDynamicMesh requires Mesh.HasAttributes() &&
+	// Mesh.Attributes()->PrimaryNormals() != nullptr (Unavailable otherwise), which the other fixture in
+	// this file deliberately never enables (Material Slot/Bounding Box need no normals at all). Every
+	// corner gets its OWN, DELIBERATELY DISTINCT normal element -- including corners 0/3 (both at V0) and
+	// corners 2/4 (both at V2), which share a vertex POSITION but never a normal here -- so a test built
+	// on this fixture can distinguish genuine corner-domain treatment (each corner independent) from an
+	// accidental vertex-domain one (which would incorrectly read the same value at those shared-position
+	// corner pairs).
+	FVertexMaskForgeWorkingMesh BuildDirectionalNormalFixtureWorkingMesh()
+	{
+		FVertexMaskForgeWorkingMesh WorkingMesh;
+		WorkingMesh.Mesh = MakeUnique<UE::Geometry::FDynamicMesh3>();
+		WorkingMesh.Mesh->AppendVertex(FVector3d(0.0, 0.0, 0.0)); // V0
+		WorkingMesh.Mesh->AppendVertex(FVector3d(1.0, 0.0, 0.0)); // V1
+		WorkingMesh.Mesh->AppendVertex(FVector3d(1.0, 1.0, 0.0)); // V2
+		WorkingMesh.Mesh->AppendVertex(FVector3d(0.0, 1.0, 0.0)); // V3
+		WorkingMesh.Mesh->AppendTriangle(0, 1, 2);
+		WorkingMesh.Mesh->AppendTriangle(0, 2, 3);
+
+		WorkingMesh.Mesh->EnableAttributes();
+		UE::Geometry::FDynamicMeshNormalOverlay* NormalOverlay = WorkingMesh.Mesh->Attributes()->PrimaryNormals();
+
+		// AUDITED: wide angular spread (0 deg / ~45 deg / 90 deg / ~72 deg / ~63 deg / 180 deg from +Z),
+		// deliberately spanning well inside, at the transition edge of, and well outside a typical
+		// Angle=90/Falloff=45 cone -- small tilts (a few degrees) were tried first and produced an
+		// entirely constant (all-1.0) reference mask, since every corner landed deep inside the cone's
+		// flat-top region; this spread guarantees genuine, non-constant raw values.
+		const FVector3f CornerNormals[6] = {
+			FVector3f(0.00f, 0.00f, 1.00f),                                  // corner 0 (Tri0, V0): 0 deg
+			FVector3f(1.00f, 0.00f, 1.00f).GetSafeNormal(),                  // corner 1 (Tri0, V1): 45 deg
+			FVector3f(1.00f, 0.00f, 0.00f),                                  // corner 2 (Tri0, V2): 90 deg
+			FVector3f(-1.00f, 0.00f, 0.30f).GetSafeNormal(),                 // corner 3 (Tri1, V0): ~73 deg -- distinct from corner 0
+			FVector3f(0.00f, 1.00f, 0.50f).GetSafeNormal(),                  // corner 4 (Tri1, V2): ~63 deg -- distinct from corner 2
+			FVector3f(0.00f, 0.00f, -1.00f),                                 // corner 5 (Tri1, V3): 180 deg
+		};
+
+		int32 CornerIndex = 0;
+		for (const int32 TriangleID : WorkingMesh.Mesh->TriangleIndicesItr())
+		{
+			UE::Geometry::FIndex3i ElementTri;
+			for (int32 Corner = 0; Corner < 3; ++Corner, ++CornerIndex)
+			{
+				ElementTri[Corner] = NormalOverlay->AppendElement(CornerNormals[CornerIndex]);
+			}
+			NormalOverlay->SetTriangle(TriangleID, ElementTri);
+		}
+
+		return WorkingMesh;
+	}
+
+	// Adds a layer with a Directional Normal mask, configured via the stack's own controlled mutators --
+	// mirrors AddMaterialSlotLayer's/AddBoundingBoxLayer's own setup sequence exactly.
+	FGuid AddDirectionalNormalLayer(
+		FVertexMaskForgeDynamicLayerStack& Stack, const FString& Name,
+		EVertexMaskForgeLayerFill Fill, EVertexMaskForgeBlendMode BlendMode, float Opacity,
+		EVertexMaskForgeNormalSpace Space, EVertexMaskForgeNormalDirection Direction,
+		float Angle, float Falloff, float Blur, bool bInvert)
+	{
+		const FGuid LayerId = Stack.AddLayer(Name);
+		Stack.SetLayerFill(LayerId, Fill);
+		Stack.SetLayerBlendMode(LayerId, BlendMode);
+		Stack.SetLayerOpacity(LayerId, Opacity);
+		Stack.SetLayerMaskGeneratorType(LayerId, EVertexMaskForgeGeneratorType::DirectionalNormal);
+
+		const FVertexMaskForgeGeneratorMaskInstance* MaskInstance = Stack.GetLayerMask(LayerId);
+		check(MaskInstance);
+		FVertexMaskForgeGeneratorParams NewParams = MakeVertexMaskForgeGeneratorParams(EVertexMaskForgeGeneratorType::DirectionalNormal);
+		FVertexMaskForgeDirectionalNormalParams& NormalParams = NewParams.Get<FVertexMaskForgeDirectionalNormalParams>();
+		NormalParams.Space = Space;
+		NormalParams.Direction = Direction;
+		NormalParams.Angle = Angle;
+		NormalParams.Falloff = Falloff;
+		NormalParams.Blur = Blur;
+		NormalParams.bInvert = bInvert;
+		Stack.SetLayerMaskParams(LayerId, MaskInstance->MaskInstanceId, NewParams);
+
+		return LayerId;
 	}
 }
 
@@ -994,6 +1077,274 @@ bool FVertexMaskForgeDynSrcTopoCompBBoxUnifiedBoundsRejectedTest::RunTest(const 
 	if (Out.Num() == 1)
 	{
 		TestEqual(TEXT("Out[0] sentinel preserved"), Out[0], FColor(5, 6, 7, 8));
+	}
+
+	return true;
+}
+
+// --- M16-K.6D-8D-B: Local-space Directional Normal support ----------------------------------------
+
+// A. A Local-space Directional Normal layer is accepted and produces a byte-exact result against the
+// REAL, authoritative generator (called directly, never reimplemented). The fixture's deliberately
+// distinct per-corner normals (including at corners sharing one vertex position) mean this test cannot
+// pass via accidental constant-mask behavior, wrong corner indexing, or vertex-domain treatment.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompDirNormalLocalDispatchTest, "VertexMaskForge.DynamicSourceTopologyComposition.DirectionalNormalLocalSpaceByteExactAgainstGeneratorAndCornerDomain", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynSrcTopoCompDirNormalLocalDispatchTest::RunTest(const FString& Parameters)
+{
+	const FVertexMaskForgeWorkingMesh WorkingMesh = BuildDirectionalNormalFixtureWorkingMesh();
+	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
+
+	const EVertexMaskForgeNormalSpace Space = EVertexMaskForgeNormalSpace::Local;
+	const EVertexMaskForgeNormalDirection Direction = EVertexMaskForgeNormalDirection::PositiveZ;
+	const float Angle = 90.0f;
+	const float Falloff = 45.0f;
+	const float Blur = 0.0f;
+	const bool bInvert = false;
+
+	// Authoritative, independent reference -- the REAL generator, called directly, never reimplemented.
+	const FVertexMaskForgeScalarMask ReferenceMask = VertexMaskForgeDirectionalNormalGenerator::GenerateDirectionalNormalMaskFromDynamicMesh(
+		WorkingMesh, Space, Direction, Angle, Falloff, Blur, bInvert, FTransform::Identity);
+	TestTrue(TEXT("Reference generator State == Ready"), ReferenceMask.State == EVertexMaskForgeScalarMaskState::Ready);
+	TestEqual(TEXT("Reference generator NumValidValues == 6 (fixture has no holes)"), ReferenceMask.NumValidValues, 6);
+
+	FVertexMaskForgeDynamicLayerStack Stack;
+	AddDirectionalNormalLayer(Stack, TEXT("Layer"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f,
+		Space, Direction, Angle, Falloff, Blur, bInvert);
+
+	TArray<FColor> Out;
+	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, Out);
+	TestTrue(TEXT("Orchestrator accepts a Local-space Directional Normal layer"), bSucceeded);
+	TestEqual(TEXT("Out.Num() == 6"), Out.Num(), 6);
+	if (!bSucceeded || Out.Num() != 6)
+	{
+		return false;
+	}
+
+	// White Fill / Copy / Opacity 1.0 -> RGB == mask value broadcast, exactly the same established
+	// contract SingleMaterialSlotLayerTest/BoundingBoxLocalXAxisTest already prove and reuse.
+	for (int32 CornerIndex = 0; CornerIndex < 6; ++CornerIndex)
+	{
+		float ExpectedMaskValue = 0.0f;
+		const bool bHasValue = ReferenceMask.TryGetValue(CornerIndex, ExpectedMaskValue);
+		TestTrue(*FString::Printf(TEXT("Reference mask has a value at corner %d"), CornerIndex), bHasValue);
+		if (!bHasValue)
+		{
+			continue;
+		}
+		const uint8 ExpectedByte = UnitFloatToByte(ExpectedMaskValue);
+		TestEqual(*FString::Printf(TEXT("Out[%d].R byte-exact vs reference generator"), CornerIndex), Out[CornerIndex].R, ExpectedByte);
+		TestEqual(*FString::Printf(TEXT("Out[%d].G byte-exact vs reference generator"), CornerIndex), Out[CornerIndex].G, ExpectedByte);
+		TestEqual(*FString::Printf(TEXT("Out[%d].B byte-exact vs reference generator"), CornerIndex), Out[CornerIndex].B, ExpectedByte);
+		TestEqual(*FString::Printf(TEXT("Out[%d].A == BaseColors[%d].A"), CornerIndex, CornerIndex), Out[CornerIndex].A, BaseColors[CornerIndex].A);
+	}
+
+	// Corner-domain proof: corners 0/3 share a vertex POSITION (both at V0) but were given DIFFERENT
+	// normals in the fixture -- a genuinely corner-domain implementation must show different reference
+	// values there; an accidental vertex-domain implementation could not. Same for corners 2/4 (V2).
+	TestNotEqual(TEXT("Corner 0 and corner 3 (same vertex position, different normals) differ"), ReferenceMask.Values[0], ReferenceMask.Values[3]);
+	TestNotEqual(TEXT("Corner 2 and corner 4 (same vertex position, different normals) differ"), ReferenceMask.Values[2], ReferenceMask.Values[4]);
+	// Non-constant-mask proof.
+	TestFalse(TEXT("Output is not a constant mask across all six corners"),
+		Out[0].R == Out[1].R && Out[1].R == Out[2].R && Out[2].R == Out[3].R && Out[3].R == Out[4].R && Out[4].R == Out[5].R);
+
+	return true;
+}
+
+// B. Parameter forwarding: Direction, Angle, Falloff, Blur (genuinely nonzero), and Invert are each
+// forwarded unchanged to the real generator -- proven by byte-exact comparison against a direct call
+// with the SAME parameters, never by re-deriving the trigonometric/blur formulas here.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompDirNormalParamForwardingTest, "VertexMaskForge.DynamicSourceTopologyComposition.DirectionalNormalParameterForwardingByteExactAgainstGenerator", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynSrcTopoCompDirNormalParamForwardingTest::RunTest(const FString& Parameters)
+{
+	const FVertexMaskForgeWorkingMesh WorkingMesh = BuildDirectionalNormalFixtureWorkingMesh();
+	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
+
+	struct FConfig
+	{
+		const TCHAR* Label;
+		EVertexMaskForgeNormalDirection Direction;
+		float Angle;
+		float Falloff;
+		float Blur;
+		bool bInvert;
+	};
+	const FConfig Configs[] = {
+		{ TEXT("DirectionPositiveX"), EVertexMaskForgeNormalDirection::PositiveX, 90.0f, 45.0f, 0.0f, false },
+		{ TEXT("NarrowAngle"),        EVertexMaskForgeNormalDirection::PositiveZ, 30.0f, 10.0f, 0.0f, false },
+		{ TEXT("WideAngleFalloff"),   EVertexMaskForgeNormalDirection::PositiveZ, 170.0f, 90.0f, 0.0f, false },
+		{ TEXT("NonzeroBlur"),        EVertexMaskForgeNormalDirection::PositiveZ, 90.0f, 45.0f, 2.0f, false },
+		{ TEXT("Inverted"),           EVertexMaskForgeNormalDirection::PositiveZ, 90.0f, 45.0f, 0.0f, true },
+	};
+
+	for (const FConfig& Config : Configs)
+	{
+		const FVertexMaskForgeScalarMask ReferenceMask = VertexMaskForgeDirectionalNormalGenerator::GenerateDirectionalNormalMaskFromDynamicMesh(
+			WorkingMesh, EVertexMaskForgeNormalSpace::Local, Config.Direction, Config.Angle, Config.Falloff, Config.Blur, Config.bInvert, FTransform::Identity);
+		TestTrue(*FString::Printf(TEXT("%s: reference generator State == Ready"), Config.Label), ReferenceMask.State == EVertexMaskForgeScalarMaskState::Ready);
+
+		FVertexMaskForgeDynamicLayerStack Stack;
+		AddDirectionalNormalLayer(Stack, TEXT("Layer"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f,
+			EVertexMaskForgeNormalSpace::Local, Config.Direction, Config.Angle, Config.Falloff, Config.Blur, Config.bInvert);
+
+		TArray<FColor> Out;
+		const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, Out);
+		TestTrue(*FString::Printf(TEXT("%s: succeeds"), Config.Label), bSucceeded);
+		if (!bSucceeded || Out.Num() != 6)
+		{
+			continue;
+		}
+
+		for (int32 CornerIndex = 0; CornerIndex < 6; ++CornerIndex)
+		{
+			float ExpectedMaskValue = 0.0f;
+			if (!ReferenceMask.TryGetValue(CornerIndex, ExpectedMaskValue))
+			{
+				continue;
+			}
+			TestEqual(*FString::Printf(TEXT("%s: Out[%d].R byte-exact"), Config.Label, CornerIndex), Out[CornerIndex].R, UnitFloatToByte(ExpectedMaskValue));
+		}
+	}
+
+	// Explicit proof Blur is genuinely nonzero and changes the result versus an unblurred reference --
+	// not merely accepted as a parameter, but actually forwarded into the generator's own blur pass.
+	const FVertexMaskForgeScalarMask UnblurredMask = VertexMaskForgeDirectionalNormalGenerator::GenerateDirectionalNormalMaskFromDynamicMesh(
+		WorkingMesh, EVertexMaskForgeNormalSpace::Local, EVertexMaskForgeNormalDirection::PositiveZ, 90.0f, 45.0f, 0.0f, false, FTransform::Identity);
+	const FVertexMaskForgeScalarMask BlurredMask = VertexMaskForgeDirectionalNormalGenerator::GenerateDirectionalNormalMaskFromDynamicMesh(
+		WorkingMesh, EVertexMaskForgeNormalSpace::Local, EVertexMaskForgeNormalDirection::PositiveZ, 90.0f, 45.0f, 2.0f, false, FTransform::Identity);
+	bool bAnyDifference = false;
+	for (int32 CornerIndex = 0; CornerIndex < 6; ++CornerIndex)
+	{
+		float UnblurredValue = 0.0f;
+		float BlurredValue = 0.0f;
+		if (UnblurredMask.TryGetValue(CornerIndex, UnblurredValue) && BlurredMask.TryGetValue(CornerIndex, BlurredValue) && UnblurredValue != BlurredValue)
+		{
+			bAnyDifference = true;
+		}
+	}
+	TestTrue(TEXT("Nonzero Blur genuinely changes the reference generator's own output (not a no-op)"), bAnyDifference);
+
+	return true;
+}
+
+// C. World Space is REJECTED (whole-call failure), never silently reinterpreted as Local Space -- Out is
+// left completely untouched on failure, and the layer's own stored params are never mutated by the
+// rejected call. Mirrors BoundingBoxWorldSpaceRejectedInThisCheckpoint's own established pattern.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompDirNormalWorldSpaceRejectedTest, "VertexMaskForge.DynamicSourceTopologyComposition.DirectionalNormalWorldSpaceRejectedInThisCheckpoint", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynSrcTopoCompDirNormalWorldSpaceRejectedTest::RunTest(const FString& Parameters)
+{
+	const FVertexMaskForgeWorkingMesh WorkingMesh = BuildDirectionalNormalFixtureWorkingMesh();
+	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
+
+	FVertexMaskForgeDynamicLayerStack Stack;
+	const FGuid LayerId = AddDirectionalNormalLayer(Stack, TEXT("Layer"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f,
+		EVertexMaskForgeNormalSpace::World, EVertexMaskForgeNormalDirection::PositiveZ, 90.0f, 45.0f, 0.0f, false);
+
+	TArray<FColor> Out = { FColor(1, 2, 3, 4) }; // sentinel, wrong size on purpose
+	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, Out);
+
+	TestFalse(TEXT("World Space is rejected (fails the whole call)"), bSucceeded);
+	TestEqual(TEXT("Out left completely untouched on failure"), Out.Num(), 1);
+	if (Out.Num() == 1)
+	{
+		TestEqual(TEXT("Out[0] sentinel preserved"), Out[0], FColor(1, 2, 3, 4));
+	}
+
+	// Stored params must remain exactly as configured -- never rewritten/normalized to Local by the
+	// rejected call.
+	const FVertexMaskForgeGeneratorMaskInstance* Mask = Stack.GetLayerMask(LayerId);
+	TestNotNull(TEXT("Layer mask still present after rejection"), Mask);
+	if (Mask && Mask->Params.IsType<FVertexMaskForgeDirectionalNormalParams>())
+	{
+		TestTrue(TEXT("Stored Space is still World (never silently reinterpreted as Local)"),
+			Mask->Params.Get<FVertexMaskForgeDirectionalNormalParams>().Space == EVertexMaskForgeNormalSpace::World);
+	}
+
+	return true;
+}
+
+// D. Two independently parameterized Directional Normal layers retain distinct masks and compose
+// strictly in Stack order (Copy always wins with the LAST enabled layer's own value, the same order
+// contract OrderMattersTest/TwoBoundingBoxLayersRetainDistinctMasksAndReorderChangesResult already
+// prove) -- and reordering changes the final result, proving this generator type is not special-cased
+// around the authoritative orchestrator.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompDirNormalTwoLayersOrderTest, "VertexMaskForge.DynamicSourceTopologyComposition.TwoDirectionalNormalLayersRetainDistinctMasksAndReorderChangesResult", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynSrcTopoCompDirNormalTwoLayersOrderTest::RunTest(const FString& Parameters)
+{
+	const FVertexMaskForgeWorkingMesh WorkingMesh = BuildDirectionalNormalFixtureWorkingMesh();
+	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
+
+	const FVertexMaskForgeScalarMask XReference = VertexMaskForgeDirectionalNormalGenerator::GenerateDirectionalNormalMaskFromDynamicMesh(
+		WorkingMesh, EVertexMaskForgeNormalSpace::Local, EVertexMaskForgeNormalDirection::PositiveX, 90.0f, 45.0f, 0.0f, false, FTransform::Identity);
+	const FVertexMaskForgeScalarMask ZReference = VertexMaskForgeDirectionalNormalGenerator::GenerateDirectionalNormalMaskFromDynamicMesh(
+		WorkingMesh, EVertexMaskForgeNormalSpace::Local, EVertexMaskForgeNormalDirection::PositiveZ, 90.0f, 45.0f, 0.0f, false, FTransform::Identity);
+	TestTrue(TEXT("X reference State == Ready"), XReference.State == EVertexMaskForgeScalarMaskState::Ready);
+	TestTrue(TEXT("Z reference State == Ready"), ZReference.State == EVertexMaskForgeScalarMaskState::Ready);
+
+	// Forward: X-direction layer first, Z-direction layer last -- Z (folded last) determines the Copy result.
+	FVertexMaskForgeDynamicLayerStack ForwardStack;
+	AddDirectionalNormalLayer(ForwardStack, TEXT("X"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f,
+		EVertexMaskForgeNormalSpace::Local, EVertexMaskForgeNormalDirection::PositiveX, 90.0f, 45.0f, 0.0f, false);
+	AddDirectionalNormalLayer(ForwardStack, TEXT("Z"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f,
+		EVertexMaskForgeNormalSpace::Local, EVertexMaskForgeNormalDirection::PositiveZ, 90.0f, 45.0f, 0.0f, false);
+
+	// Reverse: same two layers, opposite order -- X (folded last) determines the Copy result instead.
+	FVertexMaskForgeDynamicLayerStack ReverseStack;
+	AddDirectionalNormalLayer(ReverseStack, TEXT("Z"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f,
+		EVertexMaskForgeNormalSpace::Local, EVertexMaskForgeNormalDirection::PositiveZ, 90.0f, 45.0f, 0.0f, false);
+	AddDirectionalNormalLayer(ReverseStack, TEXT("X"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f,
+		EVertexMaskForgeNormalSpace::Local, EVertexMaskForgeNormalDirection::PositiveX, 90.0f, 45.0f, 0.0f, false);
+
+	TArray<FColor> ForwardOut;
+	TArray<FColor> ReverseOut;
+	const bool bForwardSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, ForwardStack, BaseColors, ForwardOut);
+	const bool bReverseSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, ReverseStack, BaseColors, ReverseOut);
+	TestTrue(TEXT("Forward succeeds"), bForwardSucceeded);
+	TestTrue(TEXT("Reverse succeeds"), bReverseSucceeded);
+	if (!bForwardSucceeded || !bReverseSucceeded || ForwardOut.Num() != 6 || ReverseOut.Num() != 6)
+	{
+		return false;
+	}
+
+	for (int32 CornerIndex = 0; CornerIndex < 6; ++CornerIndex)
+	{
+		float ExpectedZValue = 0.0f;
+		float ExpectedXValue = 0.0f;
+		if (!ZReference.TryGetValue(CornerIndex, ExpectedZValue) || !XReference.TryGetValue(CornerIndex, ExpectedXValue))
+		{
+			continue;
+		}
+		TestEqual(*FString::Printf(TEXT("Forward[%d].R matches Z (folded last)"), CornerIndex), ForwardOut[CornerIndex].R, UnitFloatToByte(ExpectedZValue));
+		TestEqual(*FString::Printf(TEXT("Reverse[%d].R matches X (folded last)"), CornerIndex), ReverseOut[CornerIndex].R, UnitFloatToByte(ExpectedXValue));
+	}
+
+	return true;
+}
+
+// E. Generic gating: a disabled Directional Normal layer contributes nothing (Baseline passthrough),
+// exactly mirroring BoundingBoxOpacityZeroAndDisabledLayerPreserveBaseColors' own established pattern.
+// Genuinely-unsupported-generator coverage (UnsupportedGeneratorTypeFailsWholeCall,
+// DisabledLayerContributesNothingAndSkipsValidation) already uses AmbientOcclusion, still genuinely
+// unsupported, and needed no change for Directional Normal's own dispatch to be added.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompDirNormalDisabledTest, "VertexMaskForge.DynamicSourceTopologyComposition.DirectionalNormalDisabledLayerPreservesBaseColors", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynSrcTopoCompDirNormalDisabledTest::RunTest(const FString& Parameters)
+{
+	const FVertexMaskForgeWorkingMesh WorkingMesh = BuildDirectionalNormalFixtureWorkingMesh();
+	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
+
+	FVertexMaskForgeDynamicLayerStack Stack;
+	const FGuid LayerId = AddDirectionalNormalLayer(Stack, TEXT("Layer"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f,
+		EVertexMaskForgeNormalSpace::Local, EVertexMaskForgeNormalDirection::PositiveZ, 90.0f, 45.0f, 0.0f, false);
+	Stack.SetLayerEnabled(LayerId, false);
+
+	TArray<FColor> Out;
+	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, Out);
+	TestTrue(TEXT("Succeeds"), bSucceeded);
+	if (bSucceeded && Out.Num() == 6)
+	{
+		for (int32 Index = 0; Index < 6; ++Index)
+		{
+			TestEqual(*FString::Printf(TEXT("Out[%d] byte-exact passthrough (disabled layer = no-op)"), Index), Out[Index], BaseColors[Index]);
+		}
 	}
 
 	return true;

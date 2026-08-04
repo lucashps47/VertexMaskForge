@@ -63,9 +63,10 @@ namespace VertexMaskForgeDynamicSourceTopologyComposition
 	 *   - BaseColors.Num() must equal EXACTLY WorkingMesh.Mesh->TriangleCount() * 3 (the Source-Topology
 	 *     corner count); any mismatch fails outright -- no resize, no partial composition.
 	 *   - Every ENABLED layer that carries a Mask (TOptional set) must have
-	 *     Mask->GeneratorType == EVertexMaskForgeGeneratorType::MaterialSlot or
-	 *     EVertexMaskForgeGeneratorType::BoundingBox (M16-K.6D-8B; any other generator type still fails
-	 *     the WHOLE call rather than being silently skipped or treated as Fill-only).
+	 *     Mask->GeneratorType == EVertexMaskForgeGeneratorType::MaterialSlot,
+	 *     EVertexMaskForgeGeneratorType::BoundingBox, or EVertexMaskForgeGeneratorType::DirectionalNormal
+	 *     (M16-K.6D-8B/8D-B; any other generator type still fails the WHOLE call rather than being
+	 *     silently skipped or treated as Fill-only).
 	 *   - Material Slot: VertexMaskForgeMaterialSlotGenerator::GenerateMaterialSlotMaskFromDynamicMesh is
 	 *     called directly (never GenerateMaterialSlotMaskInstanceResult, never
 	 *     GenerateStoredResultForMaterialSlotInstance, never any stored wrapper) with that layer's own
@@ -84,6 +85,17 @@ namespace VertexMaskForgeDynamicSourceTopologyComposition
 	 *     FVertexMaskForgeScalarMask::TryGetValue (never a direct Values[] index), mirroring the same
 	 *     per-generator domain distinction Legacy's own Source-Topology composition already establishes
 	 *     for this generator -- see the .cpp for the exact resolution.
+	 *   - Directional Normal (M16-K.6D-8D-B, Local-space only): VertexMaskForgeDirectionalNormalGenerator::
+	 *     GenerateDirectionalNormalMaskFromDynamicMesh is called directly with that layer's own
+	 *     FVertexMaskForgeDirectionalNormalParams (Direction/Angle/Falloff/Blur/bInvert unchanged), ONLY
+	 *     after confirming Space == EVertexMaskForgeNormalSpace::Local -- World Space fails the WHOLE call
+	 *     (needs a per-component transform this orchestrator does not receive; never silently reinterpreted
+	 *     as Local). This mask is already corner-domain, like Material Slot's -- but unlike Material Slot's
+	 *     own dense result, an individual corner may legitimately be left unwritten by the generator (a
+	 *     missing Normal Overlay element or degenerate normal) while the mask as a whole still reports
+	 *     Ready; every corner must have resolved a real value (NumValidValues == the expected corner count)
+	 *     or the WHOLE call fails, since Pass 2's corner-domain read is a direct, unconditional index, never
+	 *     a TryGetValue lookup.
 	 * A disabled layer (bEnabled == false) contributes nothing and is never validated for its Mask's
 	 * GeneratorType, exactly mirroring EvaluateColor's own "bEnabled==false -> complete no-op" contract.
 	 *

@@ -1055,10 +1055,10 @@ namespace VertexMaskForgePanel
 	}
 
 	/**
-	 * M16-K.6B; extended M16-K.6D-8C-C: human-readable label for one Dynamic Layer row's Generator Type
-	 * combo option/current value. A null InOption represents "None/Unassigned" (mirrors
+	 * M16-K.6B; extended M16-K.6D-8C-C, M16-K.6D-8D-C: human-readable label for one Dynamic Layer row's
+	 * Generator Type combo option/current value. A null InOption represents "None/Unassigned" (mirrors
 	 * DynamicLayerGeneratorTypeOptions' own element-0-is-null convention). A non-null InOption is expected
-	 * to only ever be MaterialSlot or BoundingBox in this checkpoint (the only values
+	 * to only ever be MaterialSlot, BoundingBox, or DirectionalNormal in this checkpoint (the only values
 	 * DynamicLayerGeneratorTypeOptions offers) -- the default case covers any other
 	 * EVertexMaskForgeGeneratorType defensively (e.g. if a layer's Mask was assigned by something other
 	 * than this combo), without claiming Dynamic support for it.
@@ -1075,6 +1075,8 @@ namespace VertexMaskForgePanel
 			return LOCTEXT("DynamicLayerGeneratorMaterialSlot", "Material Slot");
 		case EVertexMaskForgeGeneratorType::BoundingBox:
 			return LOCTEXT("DynamicLayerGeneratorBoundingBox", "Bounding Box");
+		case EVertexMaskForgeGeneratorType::DirectionalNormal:
+			return LOCTEXT("DynamicLayerGeneratorDirectionalNormal", "Directional Normal");
 		default:
 			return LOCTEXT("DynamicLayerGeneratorUnsupported", "Unsupported");
 		}
@@ -4021,7 +4023,8 @@ TSharedRef<SWidget> SVertexMaskForgePanel::BuildDynamicLayerRow(const FGuid Laye
 					return EVisibility::Collapsed;
 				}
 				return (Mask->GeneratorType == EVertexMaskForgeGeneratorType::MaterialSlot
-					|| Mask->GeneratorType == EVertexMaskForgeGeneratorType::BoundingBox)
+					|| Mask->GeneratorType == EVertexMaskForgeGeneratorType::BoundingBox
+					|| Mask->GeneratorType == EVertexMaskForgeGeneratorType::DirectionalNormal)
 					? EVisibility::Visible : EVisibility::Collapsed;
 			})
 			.HeaderContent()
@@ -4325,6 +4328,18 @@ TSharedRef<SWidget> SVertexMaskForgePanel::BuildDynamicLayerRow(const FGuid Laye
 			[
 				BuildDynamicBoundingBoxLayerParamsBlock(LayerId, MaterialSlotExpectedMaskInstanceId)
 				]
+
+			// M16-K.6D-8D-C: Directional Normal configurational editor -- sibling of the Material Slot and
+			// Bounding Box blocks above, inside the SAME "Generator Parameters" expander body. Visible/
+			// editable only when this layer's assigned generator is DirectionalNormal (see
+			// BuildDynamicDirectionalNormalLayerParamsBlock's own doc comment for the full contract,
+			// including the Local-space-only enforcement and incompatible-state warning).
+			+ SVerticalBox::Slot()
+			.AutoHeight()
+			.Padding(FMargin(0.f, 2.f, 0.f, 0.f))
+			[
+				BuildDynamicDirectionalNormalLayerParamsBlock(LayerId, MaterialSlotExpectedMaskInstanceId)
+				]
 			]
 		]
 	];
@@ -4588,6 +4603,265 @@ TSharedRef<SWidget> SVertexMaskForgePanel::BuildDynamicBoundingBoxLayerParamsBlo
 	.AutoHeight()
 	[
 		BuildDynamicBoundingBoxAxisRow(LayerId, ExpectedMaskInstanceId, EVertexMaskForgeBoundsAxis::Z, LOCTEXT("DynamicAxisZLabel", "Z"))
+	];
+}
+
+bool SVertexMaskForgePanel::IsDynamicDirectionalNormalLayerLocalSpaceCompatible(const FGuid LayerId) const
+{
+	const FVertexMaskForgeGeneratorMaskInstance* Mask = DynamicLayerStack.GetLayerMask(LayerId);
+	if (!Mask || Mask->GeneratorType != EVertexMaskForgeGeneratorType::DirectionalNormal)
+	{
+		return true;
+	}
+	const FVertexMaskForgeDirectionalNormalParams* NormalParams = Mask->Params.TryGet<FVertexMaskForgeDirectionalNormalParams>();
+	if (!NormalParams)
+	{
+		return true;
+	}
+	return NormalParams->Space == EVertexMaskForgeNormalSpace::Local;
+}
+
+void SVertexMaskForgePanel::MutateDynamicDirectionalNormalParam(
+	const FGuid LayerId, const FGuid ExpectedMaskInstanceId,
+	TFunctionRef<void(FVertexMaskForgeDirectionalNormalParams&)> Mutator)
+{
+	// AUDITED (M16-K.6D-8D-C): mirrors MutateDynamicBoundingBoxAxisParam's own six-step identity-validated
+	// write path exactly -- mask exists, GeneratorType is still DirectionalNormal, Params is still the
+	// DirectionalNormal payload type, and MaskInstanceId still matches what THIS widget was built for. Any
+	// mismatch (cleared, reassigned to a different generator, or replaced by a newer instance) is a silent
+	// no-op, never a fallback to another layer or a stale write.
+	const FVertexMaskForgeGeneratorMaskInstance* Mask = DynamicLayerStack.GetLayerMask(LayerId);
+	if (!Mask
+		|| Mask->GeneratorType != EVertexMaskForgeGeneratorType::DirectionalNormal
+		|| !Mask->Params.IsType<FVertexMaskForgeDirectionalNormalParams>()
+		|| Mask->MaskInstanceId != ExpectedMaskInstanceId)
+	{
+		return;
+	}
+	// AUDITED: copies the CURRENT Params (every field byte/value-exact, including Space -- never touched
+	// here), mutates the copy via Mutator, then writes back through the existing stack API -- never a
+	// second/cached copy of parameters retained across calls.
+	FVertexMaskForgeGeneratorParams NewParams = Mask->Params;
+	Mutator(NewParams.Get<FVertexMaskForgeDirectionalNormalParams>());
+	DynamicLayerStack.SetLayerMaskParams(LayerId, ExpectedMaskInstanceId, NewParams);
+	OnDynamicLayerStackMutated();
+}
+
+TSharedRef<SWidget> SVertexMaskForgePanel::BuildDynamicDirectionalNormalLayerParamsBlock(const FGuid LayerId, const FGuid ExpectedMaskInstanceId)
+{
+	// AUDITED: every Value_Lambda/IsChecked_Lambda/Text_Lambda below re-resolves LayerId's CURRENT stored
+	// Directional Normal params fresh on every call (never a cached copy) -- if the layer/mask/params no
+	// longer match (e.g. generator switched away), the accessor falls back to the authoritative default
+	// (Local/PositiveZ/90/45/0/false) rather than reading garbage. Read-only; never mutates.
+	auto GetParams = [this, LayerId]() -> FVertexMaskForgeDirectionalNormalParams
+	{
+		const FVertexMaskForgeGeneratorMaskInstance* Mask = DynamicLayerStack.GetLayerMask(LayerId);
+		const FVertexMaskForgeDirectionalNormalParams* NormalParams = Mask ? Mask->Params.TryGet<FVertexMaskForgeDirectionalNormalParams>() : nullptr;
+		return NormalParams ? *NormalParams : FVertexMaskForgeDirectionalNormalParams();
+	};
+
+	return SNew(SVerticalBox)
+	.Visibility_Lambda([this, LayerId]()
+	{
+		const FVertexMaskForgeGeneratorMaskInstance* Mask = DynamicLayerStack.GetLayerMask(LayerId);
+		return (Mask && Mask->GeneratorType == EVertexMaskForgeGeneratorType::DirectionalNormal) ? EVisibility::Visible : EVisibility::Collapsed;
+	})
+
+	// AUDITED (M16-K.6D-8D-C): Local-space-only enforcement is NOT performed here or by any control below
+	// -- it is enforced solely by VertexMaskForgeDynamicSourceTopologyComposition's own Pass 1 (rejects
+	// World Space outright). This warning is a read-only, honest ECHO of that same predicate
+	// (IsDynamicDirectionalNormalLayerLocalSpaceCompatible), shown only when the layer's CURRENTLY STORED
+	// data already requests something this checkpoint's UI cannot create through its own controls (no
+	// Space toggle exists below) -- never a data migration, never a silent rewrite, never a
+	// reinterpretation as Local Space.
+	+ SVerticalBox::Slot()
+	.AutoHeight()
+	.Padding(FMargin(0.f, 0.f, 0.f, 2.f))
+	[
+		SNew(STextBlock)
+		.AutoWrapText(true)
+		.Visibility_Lambda([this, LayerId]()
+		{
+			return IsDynamicDirectionalNormalLayerLocalSpaceCompatible(LayerId) ? EVisibility::Collapsed : EVisibility::Visible;
+		})
+		.Text(LOCTEXT("DynamicLayerDirectionalNormalUnsupportedStateWarning",
+			"This layer's stored Directional Normal parameters request World Space. Dynamic Directional Normal currently supports Local Space only; controls below are disabled until this layer's data is edited back to a supported state (composition and Accept will reject this layer as-is)."))
+	]
+
+	+ SVerticalBox::Slot()
+	.AutoHeight()
+	.Padding(FMargin(0.f, 2.f, 0.f, 2.f))
+	[
+		SNew(SHorizontalBox)
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.VAlign(VAlign_Center)
+		[
+			SNew(STextBlock).Text(LOCTEXT("DynamicDirectionalNormalDirectionLabel", "Direction"))
+		]
+
+		+ SHorizontalBox::Slot()
+		.FillWidth(1.f)
+		.Padding(FMargin(4.f, 0.f, 0.f, 0.f))
+		[
+			SNew(SComboBox<TSharedPtr<EVertexMaskForgeNormalDirection>>)
+			.IsEnabled_Lambda([this, LayerId]() { return IsDynamicDirectionalNormalLayerLocalSpaceCompatible(LayerId); })
+			.OptionsSource(&NormalDirectionOptions)
+			.OnGenerateWidget_Lambda([](TSharedPtr<EVertexMaskForgeNormalDirection> InOption)
+			{
+				return SNew(STextBlock).Text(InOption.IsValid() ? VertexMaskForgePanel::GetNormalDirectionLabel(*InOption) : FText::GetEmpty());
+			})
+			.OnSelectionChanged_Lambda([this, LayerId, ExpectedMaskInstanceId](TSharedPtr<EVertexMaskForgeNormalDirection> NewSelection, ESelectInfo::Type)
+			{
+				if (!NewSelection.IsValid())
+				{
+					return;
+				}
+				const EVertexMaskForgeNormalDirection NewDirection = *NewSelection;
+				MutateDynamicDirectionalNormalParam(LayerId, ExpectedMaskInstanceId, [NewDirection](FVertexMaskForgeDirectionalNormalParams& Params)
+				{
+					Params.Direction = NewDirection;
+				});
+			})
+			.Content()
+			[
+				SNew(STextBlock).Text_Lambda([GetParams]() { return VertexMaskForgePanel::GetNormalDirectionLabel(GetParams().Direction); })
+			]
+		]
+	]
+
+	+ SVerticalBox::Slot()
+	.AutoHeight()
+	.Padding(FMargin(0.f, 2.f, 0.f, 2.f))
+	[
+		SNew(SHorizontalBox)
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.VAlign(VAlign_Center)
+		[
+			SNew(STextBlock).Text(LOCTEXT("DynamicDirectionalNormalAngleLabel", "Angle"))
+		]
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.Padding(FMargin(4.f, 0.f, 0.f, 0.f))
+		[
+			SNew(SSpinBox<float>)
+			.IsEnabled_Lambda([this, LayerId]() { return IsDynamicDirectionalNormalLayerLocalSpaceCompatible(LayerId); })
+			.MinDesiredWidth(52.f)
+			.MinValue(0.0f)
+			.MaxValue(180.0f)
+			.Delta(1.0f)
+			.Value_Lambda([GetParams]() { return GetParams().Angle; })
+			.OnValueChanged_Lambda([this, LayerId, ExpectedMaskInstanceId](const float NewValue)
+			{
+				// Minimum invariant maintenance only: reducing Angle below the currently stored Falloff
+				// clamps Falloff down to match; no other field is touched.
+				MutateDynamicDirectionalNormalParam(LayerId, ExpectedMaskInstanceId, [NewValue](FVertexMaskForgeDirectionalNormalParams& Params)
+				{
+					Params.Angle = NewValue;
+					if (Params.Falloff > Params.Angle)
+					{
+						Params.Falloff = Params.Angle;
+					}
+				});
+			})
+		]
+	]
+
+	+ SVerticalBox::Slot()
+	.AutoHeight()
+	.Padding(FMargin(0.f, 2.f, 0.f, 2.f))
+	[
+		SNew(SHorizontalBox)
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.VAlign(VAlign_Center)
+		[
+			SNew(STextBlock).Text(LOCTEXT("DynamicDirectionalNormalFalloffLabel", "Falloff"))
+		]
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.Padding(FMargin(4.f, 0.f, 0.f, 0.f))
+		[
+			SNew(SSpinBox<float>)
+			.IsEnabled_Lambda([this, LayerId]() { return IsDynamicDirectionalNormalLayerLocalSpaceCompatible(LayerId); })
+			.MinDesiredWidth(52.f)
+			.MinValue(0.0f)
+			.MaxValue_Lambda([GetParams]() -> TOptional<float> { return GetParams().Angle; })
+			.Delta(1.0f)
+			.Value_Lambda([GetParams]() { return GetParams().Falloff; })
+			.OnValueChanged_Lambda([this, LayerId, ExpectedMaskInstanceId](const float NewValue)
+			{
+				// Clamp a newly requested Falloff to the CURRENT authoritative Angle (Falloff <= Angle) --
+				// no other field is touched.
+				MutateDynamicDirectionalNormalParam(LayerId, ExpectedMaskInstanceId, [NewValue](FVertexMaskForgeDirectionalNormalParams& Params)
+				{
+					Params.Falloff = FMath::Min(NewValue, Params.Angle);
+				});
+			})
+		]
+	]
+
+	+ SVerticalBox::Slot()
+	.AutoHeight()
+	.Padding(FMargin(0.f, 2.f, 0.f, 2.f))
+	[
+		SNew(SHorizontalBox)
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.VAlign(VAlign_Center)
+		[
+			SNew(STextBlock).Text(LOCTEXT("DynamicDirectionalNormalBlurLabel", "Blur"))
+		]
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.Padding(FMargin(4.f, 0.f, 0.f, 0.f))
+		[
+			SNew(SSpinBox<float>)
+			.IsEnabled_Lambda([this, LayerId]() { return IsDynamicDirectionalNormalLayerLocalSpaceCompatible(LayerId); })
+			.MinDesiredWidth(52.f)
+			.MinValue(0.0f)
+			.MaxValue(10.0f)
+			.Delta(0.1f)
+			.Value_Lambda([GetParams]() { return GetParams().Blur; })
+			.OnValueChanged_Lambda([this, LayerId, ExpectedMaskInstanceId](const float NewValue)
+			{
+				MutateDynamicDirectionalNormalParam(LayerId, ExpectedMaskInstanceId, [NewValue](FVertexMaskForgeDirectionalNormalParams& Params)
+				{
+					Params.Blur = NewValue;
+				});
+			})
+		]
+	]
+
+	+ SVerticalBox::Slot()
+	.AutoHeight()
+	.Padding(FMargin(0.f, 2.f, 0.f, 0.f))
+	[
+		SNew(SCheckBox)
+		.IsEnabled_Lambda([this, LayerId]() { return IsDynamicDirectionalNormalLayerLocalSpaceCompatible(LayerId); })
+		.IsChecked_Lambda([GetParams]()
+		{
+			return GetParams().bInvert ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
+		})
+		.OnCheckStateChanged_Lambda([this, LayerId, ExpectedMaskInstanceId](const ECheckBoxState NewState)
+		{
+			MutateDynamicDirectionalNormalParam(LayerId, ExpectedMaskInstanceId, [NewState](FVertexMaskForgeDirectionalNormalParams& Params)
+			{
+				Params.bInvert = (NewState == ECheckBoxState::Checked);
+			});
+		})
+		.Content()
+		[
+			SNew(STextBlock).Text(LOCTEXT("DynamicDirectionalNormalInvertLabel", "Invert"))
+		]
 	];
 }
 
@@ -4978,16 +5252,16 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 	DynamicLayerFillOptions.Add(MakeShared<EVertexMaskForgeLayerFill>(EVertexMaskForgeLayerFill::Black));
 	DynamicLayerFillOptions.Add(MakeShared<EVertexMaskForgeLayerFill>(EVertexMaskForgeLayerFill::White));
 
-	// M16-K.6B; corrected M16-K.6D-6; extended M16-K.6D-8C-C: element 0 is a VALID TSharedPtr to an UNSET
-	// TOptional (None/Unassigned) -- NOT a null TSharedPtr, which SListView's own row-generation loop
-	// unconditionally skips (see this array's own doc comment in SVertexMaskForgePanel.h for the confirmed
-	// root cause). MaterialSlot and BoundingBox (M16-K.6D-8B added Local-space Bounding Box support to the
-	// authoritative Dynamic Source-Topology orchestrator) are the only two generators offered -- every
-	// other EVertexMaskForgeGeneratorType value is deliberately NOT added here, since the orchestrator
-	// still rejects any other type outright.
+	// M16-K.6B; corrected M16-K.6D-6; extended M16-K.6D-8C-C, M16-K.6D-8D-C: element 0 is a VALID
+	// TSharedPtr to an UNSET TOptional (None/Unassigned) -- NOT a null TSharedPtr, which SListView's own
+	// row-generation loop unconditionally skips (see this array's own doc comment in SVertexMaskForgePanel.h
+	// for the confirmed root cause). MaterialSlot, BoundingBox (M16-K.6D-8B), and DirectionalNormal
+	// (M16-K.6D-8D-B) are the only three generators offered -- every other EVertexMaskForgeGeneratorType
+	// value is deliberately NOT added here, since the orchestrator still rejects any other type outright.
 	DynamicLayerGeneratorTypeOptions.Add(MakeShared<TOptional<EVertexMaskForgeGeneratorType>>());
 	DynamicLayerGeneratorTypeOptions.Add(MakeShared<TOptional<EVertexMaskForgeGeneratorType>>(EVertexMaskForgeGeneratorType::MaterialSlot));
 	DynamicLayerGeneratorTypeOptions.Add(MakeShared<TOptional<EVertexMaskForgeGeneratorType>>(EVertexMaskForgeGeneratorType::BoundingBox));
+	DynamicLayerGeneratorTypeOptions.Add(MakeShared<TOptional<EVertexMaskForgeGeneratorType>>(EVertexMaskForgeGeneratorType::DirectionalNormal));
 
 	CurvatureTypeOptions.Add(MakeShared<EVertexMaskForgeCurvatureType>(EVertexMaskForgeCurvatureType::Convex));
 	CurvatureTypeOptions.Add(MakeShared<EVertexMaskForgeCurvatureType>(EVertexMaskForgeCurvatureType::Concave));

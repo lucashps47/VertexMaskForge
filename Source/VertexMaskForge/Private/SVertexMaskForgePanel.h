@@ -411,6 +411,44 @@ private:
 	void MutateDynamicBoundingBoxAxisParam(FGuid LayerId, FGuid ExpectedMaskInstanceId, int32 AxisIndex, TFunctionRef<void(FVertexMaskForgeAxisMaskParams&)> Mutator);
 
 	/**
+	 * M16-K.6D-8D-C: layer-owned Local-space Directional Normal editor -- an incompatible-state warning
+	 * (see IsDynamicDirectionalNormalLayerLocalSpaceCompatible) followed by Direction/Angle/Falloff/Blur/
+	 * Invert controls, mirroring BuildDynamicBoundingBoxLayerParamsBlock's own structure and sibling
+	 * placement inside the "Generator Parameters" expander. Deliberately exposes no Space control -- Space
+	 * remains model-owned and hidden; the authoritative default (from MakeVertexMaskForgeGeneratorParams)
+	 * is Local. ExpectedMaskInstanceId is the MaskInstanceId this row was built for (captured once by
+	 * BuildDynamicLayerRow, mirroring MaterialSlotExpectedMaskInstanceId's own established role) -- every
+	 * mutation below validates against it, never a freshly re-read id.
+	 */
+	TSharedRef<SWidget> BuildDynamicDirectionalNormalLayerParamsBlock(FGuid LayerId, FGuid ExpectedMaskInstanceId);
+
+	/**
+	 * M16-K.6D-8D-C: true iff LayerId's CURRENT Directional Normal parameters (if any) are already
+	 * compatible with this checkpoint's Local-space-only Dynamic support -- Space ==
+	 * EVertexMaskForgeNormalSpace::Local (the exact same predicate
+	 * VertexMaskForgeDynamicSourceTopologyComposition's own Pass 1 already enforces as the real,
+	 * authoritative rejection boundary -- this is a read-only UI-side echo of that check, for honest
+	 * presentation only, never a second enforcement point and never a normalization). False for a layer
+	 * with no mask, or a mask that is not Directional Normal (callers only consult this when already known
+	 * to be Directional Normal; the defensive default keeps this function safe to call unconditionally). A
+	 * stored layer that already requests World Space (never reachable through this checkpoint's own UI, but
+	 * not otherwise precluded) is surfaced via this function, never silently reinterpreted.
+	 */
+	bool IsDynamicDirectionalNormalLayerLocalSpaceCompatible(FGuid LayerId) const;
+
+	/**
+	 * Shared mutation helper for one Dynamic layer's Directional Normal parameters: resolves LayerId's
+	 * current mask fresh, validates the same six-step identity/coherence contract every Material Slot/
+	 * Bounding Box mutation callback already establishes (mask exists, GeneratorType == DirectionalNormal,
+	 * Params is the DirectionalNormal payload type, MaskInstanceId == ExpectedMaskInstanceId) -- on any
+	 * mismatch, a silent no-op. On success: copies the current FVertexMaskForgeDirectionalNormalParams,
+	 * invokes Mutator on the copy (every other field preserved byte-for-byte), calls SetLayerMaskParams with
+	 * the captured ExpectedMaskInstanceId, then OnDynamicLayerStackMutated(). Never retains Mutator or any
+	 * parameter reference beyond this single call.
+	 */
+	void MutateDynamicDirectionalNormalParam(FGuid LayerId, FGuid ExpectedMaskInstanceId, TFunctionRef<void(FVertexMaskForgeDirectionalNormalParams&)> Mutator);
+
+	/**
 	 * M16-K.6D-6 (Correction 2): Reorder is now drag-and-drop only -- the Up/Down buttons and their
 	 * OnMoveDynamicLayerUpClicked/OnMoveDynamicLayerDownClicked/CanMoveDynamicLayerUp/
 	 * CanMoveDynamicLayerDown panel-UI-glue wrappers were removed (FVertexMaskForgeDynamicLayerStack::
