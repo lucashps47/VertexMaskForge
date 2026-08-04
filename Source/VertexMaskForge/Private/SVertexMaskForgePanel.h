@@ -280,50 +280,6 @@ private:
 	 */
 	void BuildWorkingMeshes(TArray<TSharedPtr<FVertexMaskForgeSelectedMesh>>& InOutMeshes) const;
 
-	// --- M16-K.3: Layers (minimal generator layer order UI) ---------------------------------
-
-	/**
-	 * Rebuilds ONLY the visual rows of the Layers list, from GeneratorLayerOrder's own current
-	 * sequence -- clears GeneratorLayerListContainer's slots and re-adds exactly one row per entry, in
-	 * order. Purely a view refresh: never mutates GeneratorLayerOrder, never invalidates any raw mask,
-	 * never rebuilds Working Mesh, never calls RefreshSelection, never recomposes (the caller decides
-	 * whether recomposition is also needed -- see OnMoveGeneratorLayerUp/Down's own doc comment). Safe
-	 * to call before GeneratorLayerListContainer exists (no-op) or any number of times.
-	 */
-	void RebuildGeneratorLayerList();
-
-	/** Builds ONE Layers row for Source: display name (left) + Move Up/Move Down buttons (right). Never
-	 *  displays or edits Enabled/Blend Mode/Opacity/Invert -- those remain exclusively in this
-	 *  generator's own existing section below. */
-	TSharedRef<SWidget> BuildGeneratorLayerRow(EVertexMaskForgeScalarMaskSource Source);
-
-	/**
-	 * AUDITED (M16-K.3): the ONLY two functions that mutate GeneratorLayerOrder. Both delegate the
-	 * actual movement to VertexMaskForgeLayerOrder::MoveUp/MoveDown (the K.1 domain) -- never a manual
-	 * Swap/RemoveAt/Insert/Sort here. On success: rebuilds the visual list and requests exactly one
-	 * recomposition (RecomposeWorkingColors -- pure composition, never invalidates a raw mask, never
-	 * rebuilds Working Mesh). On failure (boundary no-op, invalid Source, or Source absent): the UI is
-	 * left completely untouched and no recomposition is requested.
-	 */
-	FReply OnMoveGeneratorLayerUp(EVertexMaskForgeScalarMaskSource Source);
-	FReply OnMoveGeneratorLayerDown(EVertexMaskForgeScalarMaskSource Source);
-
-	/**
-	 * Read-only: True iff Source currently occupies a position in GeneratorLayerOrder from which the
-	 * corresponding move is possible (not already first/last, not absent, not a non-generator Source).
-	 * Always resolves Source's CURRENT index by looking it up fresh in GeneratorLayerOrder -- never a
-	 * position captured once at row-construction time, which would go stale after any reorder.
-	 */
-	bool CanMoveGeneratorLayerUp(EVertexMaskForgeScalarMaskSource Source) const;
-	bool CanMoveGeneratorLayerDown(EVertexMaskForgeScalarMaskSource Source) const;
-
-	/**
-	 * UI-only reference to the Layers list's row container -- never a second source of order (that
-	 * remains GeneratorLayerOrder exclusively), never holds generator data/masks/caches, never
-	 * serialized. Populated by RebuildGeneratorLayerList(); assigned once in Construct().
-	 */
-	TSharedPtr<SVerticalBox> GeneratorLayerListContainer;
-
 	// --- M16-K.4: Dynamic Layers UI (M16-K.6D-5: live-connected to the Dynamic preview) ------------------
 	//
 	// DynamicLayerStack is a SEPARATE, isolated owner from GeneratorLayerOrder above -- GeneratorLayerOrder

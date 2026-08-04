@@ -1092,43 +1092,6 @@ namespace VertexMaskForgePanel
 		}
 	}
 
-	/**
-	 * M16-K.3: stable, human-readable name for one generator layer identity, used only by the Layers
-	 * list's own rows (see SVertexMaskForgePanel::BuildGeneratorLayerRow). Explicit mapping, one case
-	 * per generator -- never derived from the enum's own numeric value or declaration order. Matches
-	 * each generator's own existing section title verbatim (BBoxMaskSectionTitle/AOSectionTitle/
-	 * CurvatureSectionTitle/NoiseSectionTitle/MaterialSlotMaskSectionTitle/
-	 * DirectionalNormalMaskSectionTitle/ThicknessMaskSectionTitle) so the same generator is never named
-	 * two different ways in the same panel. ConstantWhite/ConstantBlack (Fill overrides, not generators)
-	 * and any unknown/cast-invalid value fall to the diagnosed default -- never a silent empty row (see
-	 * VertexMaskForgeLayerOrder::IsGeneratorLayer's own allowlist, which this switch mirrors).
-	 */
-	static FText GetGeneratorLayerDisplayName(const EVertexMaskForgeScalarMaskSource Source)
-	{
-		switch (Source)
-		{
-		case EVertexMaskForgeScalarMaskSource::BoundingBox:
-			return LOCTEXT("LayerRowBoundingBox", "Bounding Box");
-		case EVertexMaskForgeScalarMaskSource::AmbientOcclusion:
-			return LOCTEXT("LayerRowAmbientOcclusion", "Ambient Occlusion");
-		case EVertexMaskForgeScalarMaskSource::Curvature:
-			return LOCTEXT("LayerRowCurvature", "Curvature");
-		case EVertexMaskForgeScalarMaskSource::Noise:
-			return LOCTEXT("LayerRowNoise", "Noise");
-		case EVertexMaskForgeScalarMaskSource::MaterialSlot:
-			return LOCTEXT("LayerRowMaterialSlot", "Material Slot");
-		case EVertexMaskForgeScalarMaskSource::DirectionalNormal:
-			return LOCTEXT("LayerRowDirectionalNormal", "Directional Normal");
-		case EVertexMaskForgeScalarMaskSource::Thickness:
-			return LOCTEXT("LayerRowThickness", "Thickness");
-		default:
-			UE_LOG(LogVertexMaskForge, Warning,
-				TEXT("Vertex Mask Forge: GetGeneratorLayerDisplayName received a non-generator Source (%d) -- this should never happen for a row built from GeneratorLayerOrder."),
-				static_cast<int32>(Source));
-			return LOCTEXT("LayerRowUnknown", "<Unknown Layer>");
-		}
-	}
-
 	// --- Blend Mode math (see EVertexMaskForgeBlendMode) -------------------------------------
 	// AUDITED (M16-J final): the panel-level ComposeMaskStack wrapper (which called
 	// VertexMaskForgeMaskStackComposer::ComposeStack, the legacy fixed-stage/Blend-Mode-grouped
@@ -3526,126 +3489,6 @@ FText SVertexMaskForgePanel::GetActiveMaskSourceText() const
 		FText::FromString(FString::Join(LayerStrings, TEXT(" + "))));
 }
 
-void SVertexMaskForgePanel::RebuildGeneratorLayerList()
-{
-	if (!GeneratorLayerListContainer.IsValid())
-	{
-		return;
-	}
-
-	// AUDITED (M16-K.3): view refresh only -- clears and re-adds ROW WIDGETS, never touches
-	// GeneratorLayerOrder itself (read here, never written). Walking GeneratorLayerOrder directly (not
-	// any cached/parallel copy) is what guarantees the visible list can never drift from the one real
-	// order the production composition path also reads.
-	GeneratorLayerListContainer->ClearChildren();
-	for (const EVertexMaskForgeScalarMaskSource Source : GeneratorLayerOrder)
-	{
-		GeneratorLayerListContainer->AddSlot()
-			.AutoHeight()
-			.Padding(FMargin(0.f, 1.f))
-			[
-				BuildGeneratorLayerRow(Source)
-			];
-	}
-}
-
-TSharedRef<SWidget> SVertexMaskForgePanel::BuildGeneratorLayerRow(const EVertexMaskForgeScalarMaskSource Source)
-{
-	// AUDITED (M16-K.3): this row shows identity + reorder controls ONLY -- Enabled/Blend Mode/Opacity/
-	// Invert/generator-specific parameters remain exclusively in this generator's own existing section
-	// further down the panel (unchanged by this checkpoint). Source is captured by value in both
-	// lambdas below; CanMoveGeneratorLayerUp/Down and OnMoveGeneratorLayerUp/Down each resolve Source's
-	// CURRENT position fresh, every call -- never a position/index captured once here at row-build time,
-	// which would go stale the moment any reorder happens.
-	return SNew(SHorizontalBox)
-
-	+ SHorizontalBox::Slot()
-	.FillWidth(1.f)
-	.VAlign(VAlign_Center)
-	[
-		SNew(STextBlock)
-		.Text(VertexMaskForgePanel::GetGeneratorLayerDisplayName(Source))
-	]
-
-	+ SHorizontalBox::Slot()
-	.AutoWidth()
-	.VAlign(VAlign_Center)
-	.Padding(FMargin(4.f, 0.f, 0.f, 0.f))
-	[
-		SNew(SButton)
-		.ContentPadding(FMargin(8.f, 1.f))
-		.ToolTipText(LOCTEXT("MoveLayerUpTooltip", "Move this layer one position earlier in the composition order."))
-		.Text(LOCTEXT("MoveLayerUp", "Up"))
-		.IsEnabled_Lambda([this, Source]() { return CanMoveGeneratorLayerUp(Source); })
-		.OnClicked(FOnClicked::CreateLambda([this, Source]() { return OnMoveGeneratorLayerUp(Source); }))
-	]
-
-	+ SHorizontalBox::Slot()
-	.AutoWidth()
-	.VAlign(VAlign_Center)
-	.Padding(FMargin(2.f, 0.f, 0.f, 0.f))
-	[
-		SNew(SButton)
-		.ContentPadding(FMargin(8.f, 1.f))
-		.ToolTipText(LOCTEXT("MoveLayerDownTooltip", "Move this layer one position later in the composition order."))
-		.Text(LOCTEXT("MoveLayerDown", "Down"))
-		.IsEnabled_Lambda([this, Source]() { return CanMoveGeneratorLayerDown(Source); })
-		.OnClicked(FOnClicked::CreateLambda([this, Source]() { return OnMoveGeneratorLayerDown(Source); }))
-	];
-}
-
-bool SVertexMaskForgePanel::CanMoveGeneratorLayerUp(const EVertexMaskForgeScalarMaskSource Source) const
-{
-	if (!VertexMaskForgeLayerOrder::IsGeneratorLayer(Source))
-	{
-		return false;
-	}
-	const int32 CurrentIndex = GeneratorLayerOrder.IndexOfByKey(Source);
-	return CurrentIndex != INDEX_NONE && CurrentIndex > 0;
-}
-
-bool SVertexMaskForgePanel::CanMoveGeneratorLayerDown(const EVertexMaskForgeScalarMaskSource Source) const
-{
-	if (!VertexMaskForgeLayerOrder::IsGeneratorLayer(Source))
-	{
-		return false;
-	}
-	const int32 CurrentIndex = GeneratorLayerOrder.IndexOfByKey(Source);
-	return CurrentIndex != INDEX_NONE && CurrentIndex < GeneratorLayerOrder.Num() - 1;
-}
-
-FReply SVertexMaskForgePanel::OnMoveGeneratorLayerUp(const EVertexMaskForgeScalarMaskSource Source)
-{
-	// AUDITED (M16-K.3): the K.1 domain (VertexMaskForgeLayerOrder::MoveUp) is authoritative for the
-	// actual movement -- no Swap/RemoveAt/Insert/Sort/enum arithmetic here. On a boundary/invalid no-op
-	// (returns false), GeneratorLayerOrder is guaranteed untouched by MoveUp's own contract, so this
-	// function does nothing further -- no rebuild, no recomposition -- matching a click that had no
-	// real effect.
-	if (!VertexMaskForgeLayerOrder::MoveUp(GeneratorLayerOrder, Source))
-	{
-		return FReply::Handled();
-	}
-
-	// AUDITED (M16-K.3): exactly one visual rebuild and one recomposition request per successful move --
-	// RecomposeWorkingColors() is pure composition (UpdateAllPreviews(false)), never invalidates a raw
-	// mask, never rebuilds Working Mesh, never calls RefreshSelection.
-	RebuildGeneratorLayerList();
-	RecomposeWorkingColors();
-	return FReply::Handled();
-}
-
-FReply SVertexMaskForgePanel::OnMoveGeneratorLayerDown(const EVertexMaskForgeScalarMaskSource Source)
-{
-	if (!VertexMaskForgeLayerOrder::MoveDown(GeneratorLayerOrder, Source))
-	{
-		return FReply::Handled();
-	}
-
-	RebuildGeneratorLayerList();
-	RecomposeWorkingColors();
-	return FReply::Handled();
-}
-
 // ==================================================================================================
 // M16-K.4: Dynamic Layers UI Prototype -- domain-only, deliberately disconnected from composition/
 // preview. Every function below reads/writes ONLY DynamicLayerStack (via its own controlled, GUID-based
@@ -4929,45 +4772,11 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 				.ColorAndOpacity(FSlateColor::UseSubduedForeground())
 			]
 
-			// AUDITED (M16-K.3): the first visual representation of the generator layer composition
-			// order -- a minimal, non-expandable list (identity + Move Up/Move Down only, see
-			// BuildGeneratorLayerRow's own doc comment) placed BEFORE the seven individual generator
-			// sections below, since it reports/controls the ORDER those sections compose in. Rows are
-			// (re)built by RebuildGeneratorLayerList() directly from GeneratorLayerOrder -- this
-			// SVerticalBox::Slot() only ever assigns the empty container once; it is never itself
-			// re-entered by Construct().
-			+ SVerticalBox::Slot()
-			.AutoHeight()
-			.Padding(FMargin(0.f, 0.f, 0.f, 12.f))
-			[
-				SNew(SBorder)
-				.Padding(FMargin(8.f))
-				[
-					SNew(SVerticalBox)
-
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					.Padding(FMargin(0.f, 0.f, 0.f, 4.f))
-					[
-						SNew(STextBlock)
-						.Text(LOCTEXT("GeneratorLayersSectionTitle", "Layers"))
-						.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
-					]
-
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					[
-						SAssignNew(GeneratorLayerListContainer, SVerticalBox)
-					]
-				]
-			]
-
-			// AUDITED (M16-K.4): "Dynamic Layers" -- a SEPARATE section from "Layers" above (the K.3
-			// prototype, still GeneratorLayerOrder-backed). This one is backed entirely by
-			// DynamicLayerStack, the M16-K.3A/K.3B domain -- explicitly disconnected from composition/
-			// preview (see the "Prototype" caption below and DynamicLayerStack's own doc comment). No
-			// production call (RecomposeWorkingColors, UpdateAllPreviews, generator invalidation, etc.)
-			// is ever made from any control in this section.
+			// AUDITED (M16-K.4): "Dynamic Layers" -- backed entirely by DynamicLayerStack, the
+			// M16-K.3A/K.3B domain -- explicitly disconnected from composition/preview (see the
+			// "Prototype" caption below and DynamicLayerStack's own doc comment). No production call
+			// (RecomposeWorkingColors, UpdateAllPreviews, generator invalidation, etc.) is ever made
+			// from any control in this section.
 			+ SVerticalBox::Slot()
 			.AutoHeight()
 			.Padding(FMargin(0.f, 0.f, 0.f, 12.f))
@@ -7633,19 +7442,11 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 		]
 	];
 
-	// AUDITED (M16-K.3): GeneratorLayerListContainer now exists (assigned via SAssignNew above, inside
-	// the ChildSlot expression just completed) -- populate its rows from GeneratorLayerOrder's own
-	// member-initializer default (VertexMaskForgeLayerOrder::MakeDefault(), set once when this panel
-	// instance's fields were constructed, BEFORE this function body even started running). This is a
-	// single, one-time initial population -- never a second default derivation.
-	RebuildGeneratorLayerList();
-
 	// AUDITED (M16-K.4): DynamicLayersListContainer now exists (assigned via SAssignNew above) --
 	// populate its rows from DynamicLayerStack's own member-initializer default
 	// (FVertexMaskForgeDynamicLayerStack::MakeInitialStack(), set once when this panel instance's
-	// fields were constructed) -- a single, one-time initial population, mirroring
-	// RebuildGeneratorLayerList's own call just above. DynamicLayerStack itself is never
-	// re-initialized here or anywhere else in Construct().
+	// fields were constructed) -- a single, one-time initial population. DynamicLayerStack itself is
+	// never re-initialized here or anywhere else in Construct().
 	RebuildDynamicLayersList();
 
 	// AUDITED (UX1, explicit Edit Vertex Mask session entry): Construct() must never itself start an
