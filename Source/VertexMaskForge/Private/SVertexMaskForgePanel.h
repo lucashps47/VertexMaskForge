@@ -34,6 +34,40 @@ enum class EVertexMaskForgeWorkingColorsPublicationValidationStatus : uint8;
 
 namespace UE::Geometry { class FDynamicMesh3; }
 
+namespace VertexMaskForgePanel
+{
+	/**
+	 * M16-K.6D-8F-D.1: production-internal (non-Slate, non-panel-instance) Dynamic Noise Scale-lock
+	 * normalization algorithm. Extracted specifically so it is genuinely shared between the real
+	 * Dynamic Noise inspector callback (SVertexMaskForgePanel::OnDynamicNoiseScaleAxesLockChanged,
+	 * SVertexMaskForgePanel.cpp) and this module's own automation tests
+	 * (VertexMaskForgeDynamicNoiseUISelectorTests.cpp) -- external linkage (declared here, in the
+	 * module's own Private header, never in a Public one) so the separate test translation unit can
+	 * call the SAME function the real callback calls, without either instantiating
+	 * SVertexMaskForgePanel or duplicating this algorithm. Not a public plugin API (Private/ headers
+	 * are module-internal only) and not a test-only hook (the real callback is the primary, first
+	 * caller). Operates purely on FVertexMaskForgeNoiseParams -- no LayerId, no MaskInstanceId, no
+	 * FVertexMaskForgeDynamicLayerStack, no Slate, no SVertexMaskForgePanel instance state.
+	 *
+	 * If Params.ScaleY and Params.ScaleZ already both equal Params.ScaleX, leaves Params entirely
+	 * unchanged and returns false. Otherwise copies Params.ScaleX ABSOLUTELY (never ratio-preserving)
+	 * into both Params.ScaleY and Params.ScaleZ, preserves every other field, and returns true. The
+	 * return value is how callers decide whether a SetLayerMaskParams write/recomposition is actually
+	 * needed.
+	 */
+	bool NormalizeDynamicNoiseScaleForAxisLock(FVertexMaskForgeNoiseParams& Params);
+
+	/**
+	 * Production-internal Dynamic Noise Scale X edit algorithm -- same sharing rationale as
+	 * NormalizeDynamicNoiseScaleForAxisLock above. Clamps NewValue to the same [0.001f, +inf) floor the
+	 * real Scale X/Y/Z spin boxes already enforce (matching SSpinBox's own MinValue), unconditionally
+	 * assigns the clamped value to Params.ScaleX, and -- only when bAxesLocked is true -- also assigns
+	 * that SAME clamped value absolutely to Params.ScaleY and Params.ScaleZ (never ratio-preserving).
+	 * Every other Noise field is left untouched.
+	 */
+	void ApplyDynamicNoiseScaleXEdit(FVertexMaskForgeNoiseParams& Params, float NewValue, bool bAxesLocked);
+}
+
 /**
  * Explicit state of the Pending Changes workflow (Accept/Cancel). Never inferred merely from
  * whether a PreviewComponent exists -- see SVertexMaskForgePanel::RecomputeOperationState().
@@ -471,6 +505,70 @@ private:
 	 * parameter reference beyond this single call.
 	 */
 	void MutateDynamicCurvatureParam(FGuid LayerId, FGuid ExpectedMaskInstanceId, TFunctionRef<void(FVertexMaskForgeCurvatureParams&)> Mutator);
+
+	/**
+	 * M16-K.6D-8F-C: layer-owned Noise/Grunge editor -- all 17 authoritative fields (Type, Scale X/Y/Z,
+	 * Offset X/Y/Z, Seed, Octaves, Roughness, Lacunarity, Turbulence Strength, Blur, Multiplier, Levels
+	 * Min/Max, Invert), mirroring BuildDynamicCurvatureLayerParamsBlock's own structure and sibling
+	 * placement inside the "Generator Parameters" expander. Displayed under the artist-facing label
+	 * "Noise/Grunge" (the selector's own display string; the underlying generator/type names remain
+	 * "Noise" throughout the code, matching Legacy). ExpectedMaskInstanceId is the MaskInstanceId this row
+	 * was built for (captured once by BuildDynamicLayerRow, mirroring MaterialSlotExpectedMaskInstanceId's
+	 * own established role) -- every mutation below validates against it, never a freshly re-read id.
+	 */
+	TSharedRef<SWidget> BuildDynamicNoiseLayerParamsBlock(FGuid LayerId, FGuid ExpectedMaskInstanceId);
+
+	/**
+	 * Shared mutation helper for one Dynamic layer's Noise parameters: resolves LayerId's current mask
+	 * fresh, validates the same six-step identity/coherence contract every Material Slot/Bounding Box/
+	 * Directional Normal/Curvature mutation callback already establishes (mask exists, GeneratorType ==
+	 * Noise, Params is the Noise payload type, MaskInstanceId == ExpectedMaskInstanceId) -- on any
+	 * mismatch, a silent no-op. On success: copies the current FVertexMaskForgeNoiseParams, invokes
+	 * Mutator on the copy (every other field preserved byte-for-byte, including the Levels Min/Max
+	 * coupled-invariant maintenance performed BY the Mutator itself, mirroring Curvature's own established
+	 * pattern), calls SetLayerMaskParams with the captured ExpectedMaskInstanceId, then
+	 * OnDynamicLayerStackMutated(). Never retains Mutator or any parameter reference beyond this single
+	 * call.
+	 */
+	void MutateDynamicNoiseParam(FGuid LayerId, FGuid ExpectedMaskInstanceId, TFunctionRef<void(FVertexMaskForgeNoiseParams&)> Mutator);
+
+	/**
+	 * M16-K.6D-8F-C.1: ephemeral, panel-owned, per-layer UI-only preference reproducing Legacy's
+	 * bNoiseScaleAxesLocked convenience checkbox for the Dynamic Noise/Grunge inspector -- keyed by
+	 * LayerId (stable across reorder/rename), NEVER by array index, row position, or MaskInstanceId (a
+	 * Noise layer's MaskInstanceId changes if its generator is ever replaced and reassigned back to
+	 * Noise, but its LayerId never does -- see the six-step identity checks throughout this class for why
+	 * LayerId, not MaskInstanceId, is the correct long-lived key). An absent entry means unlocked
+	 * (false), exactly matching Legacy's own false default -- see IsDynamicNoiseScaleAxesLocked, the only
+	 * sanctioned reader, which never inserts. NOT part of FVertexMaskForgeNoiseParams (that struct's own
+	 * doc comment already excludes this exact convenience for the same reason: the generated result is
+	 * fully determined by the final Scale X/Y/Z values alone) -- never read by SetLayerMaskParams, the
+	 * orchestrator, or any generator; never serialized; never affects generator equality/cache identity.
+	 * Survives RebuildDynamicLayersList() (row/widget rebuilds never touch this panel member), so
+	 * switching between two Noise layers and back restores each one's own last checkbox state within the
+	 * same panel session. Entry removed on permanent layer removal (OnRemoveDynamicLayerClicked), so a
+	 * stale key can never influence a later, unrelated layer. Reset entirely when this
+	 * SVertexMaskForgePanel instance is destroyed (tool close/reopen constructs a fresh panel, exactly
+	 * like Legacy's own bNoiseScaleAxesLocked panel member).
+	 */
+	TMap<FGuid, bool> DynamicNoiseScaleAxesLockedByLayerId;
+
+	/** Read-only lookup for DynamicNoiseScaleAxesLockedByLayerId -- true iff LayerId currently has Lock
+	 *  Axes enabled in the Dynamic Noise inspector. A missing entry (never locked yet, or the layer/its
+	 *  lock state was never set) returns false without inserting anything. */
+	bool IsDynamicNoiseScaleAxesLocked(FGuid LayerId) const;
+
+	/**
+	 * Checkbox handler for the Dynamic Noise Scale row's "Lock Axes" control -- mirrors Legacy's own
+	 * OnNoiseScaleAxesLockChanged contract exactly: turning OFF only flips
+	 * DynamicNoiseScaleAxesLockedByLayerId's entry for LayerId (Scale is never touched, so no
+	 * SetLayerMaskParams call and no OnDynamicLayerStackMutated()). Turning ON flips the same entry, then
+	 * -- ONLY if the layer's current Scale Y or Z actually differs from its current Scale X -- snaps both
+	 * to the current X through the SAME MutateDynamicNoiseParam identity-validated path every other Noise
+	 * control uses (one SetLayerMaskParams call, one OnDynamicLayerStackMutated()). Already-equal axes
+	 * produce no payload write and no recomposition, matching Legacy's own "no-op beyond the flag" case.
+	 */
+	void OnDynamicNoiseScaleAxesLockChanged(FGuid LayerId, FGuid ExpectedMaskInstanceId, ECheckBoxState NewState);
 
 	/**
 	 * M16-K.6D-6 (Correction 2): Reorder is now drag-and-drop only -- the Up/Down buttons and their

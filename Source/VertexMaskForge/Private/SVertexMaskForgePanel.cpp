@@ -946,6 +946,58 @@ namespace VertexMaskForgePanel
 		}
 	}
 
+	/**
+	 * M16-K.6D-8F-C: parameterized extraction of the Legacy panel's own UsesFractalParameters() member
+	 * (SVertexMaskForgePanel.h) -- same five-type switch (FractalPerlin, Billow, Ridged, Turbulence,
+	 * Alligator), but taking an explicit EVertexMaskForgeNoiseType instead of reading the Legacy-only
+	 * NoiseType field, so the Dynamic Noise block's Octaves/Roughness/Lacunarity gating can reuse the exact
+	 * same rule for a layer-owned FVertexMaskForgeNoiseParams::Type value. Real production logic (not
+	 * test-only), private to this file, removes what would otherwise be a third duplicate of the switch.
+	 * Behavior is byte-for-byte identical to the Legacy member for every enumerator.
+	 */
+	static bool NoiseTypeUsesFractalParameters(const EVertexMaskForgeNoiseType Type)
+	{
+		switch (Type)
+		{
+		case EVertexMaskForgeNoiseType::FractalPerlin:
+		case EVertexMaskForgeNoiseType::Billow:
+		case EVertexMaskForgeNoiseType::Ridged:
+		case EVertexMaskForgeNoiseType::Turbulence:
+		case EVertexMaskForgeNoiseType::Alligator:
+			return true;
+		default:
+			return false;
+		}
+	}
+
+	// M16-K.6D-8F-D.1: definitions for the two production-internal Dynamic Noise Scale-lock functions
+	// declared (with their full contracts) in SVertexMaskForgePanel.h -- deliberately NOT `static`
+	// (unlike GetCurvatureTypeLabel/NoiseTypeUsesFractalParameters above), since these two specifically
+	// need external linkage so VertexMaskForgeDynamicNoiseUISelectorTests.cpp's own automation tests can
+	// call the SAME functions SVertexMaskForgePanel::OnDynamicNoiseScaleAxesLockChanged and the Scale X
+	// callback (below) call, rather than a test-local reconstruction of this algorithm.
+	bool NormalizeDynamicNoiseScaleForAxisLock(FVertexMaskForgeNoiseParams& Params)
+	{
+		if (Params.ScaleY == Params.ScaleX && Params.ScaleZ == Params.ScaleX)
+		{
+			return false;
+		}
+		Params.ScaleY = Params.ScaleX;
+		Params.ScaleZ = Params.ScaleX;
+		return true;
+	}
+
+	void ApplyDynamicNoiseScaleXEdit(FVertexMaskForgeNoiseParams& Params, const float NewValue, const bool bAxesLocked)
+	{
+		const float ClampedValue = FMath::Max(NewValue, 0.001f);
+		Params.ScaleX = ClampedValue;
+		if (bAxesLocked)
+		{
+			Params.ScaleY = ClampedValue;
+			Params.ScaleZ = ClampedValue;
+		}
+	}
+
 	// --- Directional Normal Mask (V2-E) --------------------------------------------------------------
 
 	static FText GetNormalDirectionLabel(const EVertexMaskForgeNormalDirection Direction)
@@ -1079,6 +1131,8 @@ namespace VertexMaskForgePanel
 			return LOCTEXT("DynamicLayerGeneratorDirectionalNormal", "Directional Normal");
 		case EVertexMaskForgeGeneratorType::Curvature:
 			return LOCTEXT("DynamicLayerGeneratorCurvature", "Curvature");
+		case EVertexMaskForgeGeneratorType::Noise:
+			return LOCTEXT("DynamicLayerGeneratorNoise", "Noise/Grunge");
 		default:
 			return LOCTEXT("DynamicLayerGeneratorUnsupported", "Unsupported");
 		}
@@ -4027,7 +4081,8 @@ TSharedRef<SWidget> SVertexMaskForgePanel::BuildDynamicLayerRow(const FGuid Laye
 				return (Mask->GeneratorType == EVertexMaskForgeGeneratorType::MaterialSlot
 					|| Mask->GeneratorType == EVertexMaskForgeGeneratorType::BoundingBox
 					|| Mask->GeneratorType == EVertexMaskForgeGeneratorType::DirectionalNormal
-					|| Mask->GeneratorType == EVertexMaskForgeGeneratorType::Curvature)
+					|| Mask->GeneratorType == EVertexMaskForgeGeneratorType::Curvature
+					|| Mask->GeneratorType == EVertexMaskForgeGeneratorType::Noise)
 					? EVisibility::Visible : EVisibility::Collapsed;
 			})
 			.HeaderContent()
@@ -4354,6 +4409,18 @@ TSharedRef<SWidget> SVertexMaskForgePanel::BuildDynamicLayerRow(const FGuid Laye
 			.Padding(FMargin(0.f, 2.f, 0.f, 0.f))
 			[
 				BuildDynamicCurvatureLayerParamsBlock(LayerId, MaterialSlotExpectedMaskInstanceId)
+				]
+
+			// M16-K.6D-8F-C: Noise/Grunge configurational editor -- sibling of the Material Slot, Bounding
+			// Box, Directional Normal, and Curvature blocks above, inside the SAME "Generator Parameters"
+			// expander body. Visible/editable only when this layer's assigned generator is Noise (see
+			// BuildDynamicNoiseLayerParamsBlock's own doc comment for the full contract). Noise has no
+			// Space concept, so like Curvature there is no incompatible-state warning.
+			+ SVerticalBox::Slot()
+			.AutoHeight()
+			.Padding(FMargin(0.f, 2.f, 0.f, 0.f))
+			[
+				BuildDynamicNoiseLayerParamsBlock(LayerId, MaterialSlotExpectedMaskInstanceId)
 				]
 			]
 		]
@@ -5155,6 +5222,721 @@ TSharedRef<SWidget> SVertexMaskForgePanel::BuildDynamicCurvatureLayerParamsBlock
 	];
 }
 
+void SVertexMaskForgePanel::MutateDynamicNoiseParam(
+	const FGuid LayerId, const FGuid ExpectedMaskInstanceId,
+	TFunctionRef<void(FVertexMaskForgeNoiseParams&)> Mutator)
+{
+	// AUDITED (M16-K.6D-8F-C): mirrors MutateDynamicCurvatureParam's own six-step identity-validated write
+	// path exactly -- mask exists, GeneratorType is still Noise, Params is still the Noise payload type,
+	// and MaskInstanceId still matches what THIS widget was built for. Any mismatch (cleared, reassigned
+	// to a different generator, or replaced by a newer instance) is a silent no-op, never a fallback to
+	// another layer or a stale write.
+	const FVertexMaskForgeGeneratorMaskInstance* Mask = DynamicLayerStack.GetLayerMask(LayerId);
+	if (!Mask
+		|| Mask->GeneratorType != EVertexMaskForgeGeneratorType::Noise
+		|| !Mask->Params.IsType<FVertexMaskForgeNoiseParams>()
+		|| Mask->MaskInstanceId != ExpectedMaskInstanceId)
+	{
+		return;
+	}
+	// AUDITED: copies the CURRENT Params (every field byte/value-exact), mutates the copy via Mutator
+	// (including the Levels Min/Max coupled-invariant maintenance the Levels callbacks below perform
+	// entirely inside their own Mutator, exactly like Curvature's own established pattern), then writes
+	// back through the existing stack API in ONE call -- never a second/cached copy of parameters retained
+	// across calls, never a second callback-driven write.
+	FVertexMaskForgeGeneratorParams NewParams = Mask->Params;
+	Mutator(NewParams.Get<FVertexMaskForgeNoiseParams>());
+	DynamicLayerStack.SetLayerMaskParams(LayerId, ExpectedMaskInstanceId, NewParams);
+	OnDynamicLayerStackMutated();
+}
+
+bool SVertexMaskForgePanel::IsDynamicNoiseScaleAxesLocked(const FGuid LayerId) const
+{
+	// AUDITED (M16-K.6D-8F-C.1): pure lookup, never inserts -- FindRef defaults to false (unlocked) for a
+	// missing entry, exactly matching Legacy's own bNoiseScaleAxesLocked=false default, without ever
+	// growing the map merely because a control was rendered/queried.
+	return DynamicNoiseScaleAxesLockedByLayerId.FindRef(LayerId);
+}
+
+void SVertexMaskForgePanel::OnDynamicNoiseScaleAxesLockChanged(const FGuid LayerId, const FGuid ExpectedMaskInstanceId, const ECheckBoxState NewState)
+{
+	// AUDITED: the flag itself is UI-only and harmless to write unconditionally -- unlike the Noise
+	// payload, no identity validation is needed to record the artist's own checkbox intent for this
+	// LayerId. Mirrors Legacy's OnNoiseScaleAxesLockChanged exactly: turning OFF only flips this flag,
+	// never touches Scale, never invalidates/recomposes.
+	const bool bNewLocked = (NewState == ECheckBoxState::Checked);
+	DynamicNoiseScaleAxesLockedByLayerId.Add(LayerId, bNewLocked);
+
+	if (!bNewLocked)
+	{
+		return;
+	}
+
+	// AUDITED (M16-K.6D-8F-D.1): turning ON snaps Y/Z to the CURRENT X immediately, per Legacy's own
+	// contract -- via VertexMaskForgePanel::NormalizeDynamicNoiseScaleForAxisLock, the SAME production
+	// function this module's own automation tests call. Applied here FIRST to a plain local copy purely
+	// to DECIDE whether a write is actually needed (already-equal axes must produce no payload write and
+	// no recomposition, matching Legacy's own "no-op beyond the flag" case) -- this decision-read never
+	// mutates the stack. When a write IS needed, the SAME idempotent function is applied again, this time
+	// inside MutateDynamicNoiseParam's own six-step identity-validated Mutator, so an unknown/stale/
+	// reassigned layer remains a safe no-op exactly like every other Noise control, and exactly one
+	// SetLayerMaskParams + one OnDynamicLayerStackMutated() occur.
+	const FVertexMaskForgeGeneratorMaskInstance* Mask = DynamicLayerStack.GetLayerMask(LayerId);
+	const FVertexMaskForgeNoiseParams* CurrentParams = Mask ? Mask->Params.TryGet<FVertexMaskForgeNoiseParams>() : nullptr;
+	if (!CurrentParams)
+	{
+		return;
+	}
+	FVertexMaskForgeNoiseParams DecisionCopy = *CurrentParams;
+	if (!VertexMaskForgePanel::NormalizeDynamicNoiseScaleForAxisLock(DecisionCopy))
+	{
+		return;
+	}
+
+	MutateDynamicNoiseParam(LayerId, ExpectedMaskInstanceId, [](FVertexMaskForgeNoiseParams& Params)
+	{
+		VertexMaskForgePanel::NormalizeDynamicNoiseScaleForAxisLock(Params);
+	});
+}
+
+TSharedRef<SWidget> SVertexMaskForgePanel::BuildDynamicNoiseLayerParamsBlock(const FGuid LayerId, const FGuid ExpectedMaskInstanceId)
+{
+	// AUDITED: every Value_Lambda/IsChecked_Lambda/Text_Lambda/IsEnabled_Lambda below re-resolves LayerId's
+	// CURRENT stored Noise params fresh on every call (never a cached copy) -- if the layer/mask/params no
+	// longer match (e.g. generator switched away), the accessor falls back to the authoritative default
+	// (FractalPerlin/Scale=1/Offset=0/Seed=0/Octaves=4/Roughness=0.5/Lacunarity=2/TurbulenceStrength=0.5/
+	// Multiplier=1/Blur=0/Levels=[0,1]/not inverted -- FVertexMaskForgeNoiseParams' own default member
+	// initializers) rather than reading garbage. Read-only; never mutates.
+	auto GetParams = [this, LayerId]() -> FVertexMaskForgeNoiseParams
+	{
+		const FVertexMaskForgeGeneratorMaskInstance* Mask = DynamicLayerStack.GetLayerMask(LayerId);
+		const FVertexMaskForgeNoiseParams* NoiseParams = Mask ? Mask->Params.TryGet<FVertexMaskForgeNoiseParams>() : nullptr;
+		return NoiseParams ? *NoiseParams : FVertexMaskForgeNoiseParams();
+	};
+
+	return SNew(SVerticalBox)
+	.Visibility_Lambda([this, LayerId]()
+	{
+		const FVertexMaskForgeGeneratorMaskInstance* Mask = DynamicLayerStack.GetLayerMask(LayerId);
+		return (Mask && Mask->GeneratorType == EVertexMaskForgeGeneratorType::Noise) ? EVisibility::Visible : EVisibility::Collapsed;
+	})
+
+	// --- Noise Generation group -----------------------------------------------------------------------
+
+	+ SVerticalBox::Slot()
+	.AutoHeight()
+	.Padding(FMargin(0.f, 2.f, 0.f, 2.f))
+	[
+		SNew(STextBlock)
+		.Text(LOCTEXT("DynamicNoiseGenerationGroupLabel", "Noise Generation"))
+		.Font(FCoreStyle::GetDefaultFontStyle("Bold", 8))
+	]
+
+	// Type -- reuses the existing, panel-wide, immutable NoiseTypeOptions array (already populated in
+	// Construct() for the Legacy Noise combo) as pure presentation data, exactly how the Curvature block
+	// reuses CurvatureTypeOptions -- never a new UI-owned enum, never authoritative state.
+	+ SVerticalBox::Slot()
+	.AutoHeight()
+	.Padding(FMargin(0.f, 2.f, 0.f, 2.f))
+	[
+		SNew(SHorizontalBox)
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.VAlign(VAlign_Center)
+		[
+			SNew(STextBlock)
+			.Text(LOCTEXT("DynamicNoiseTypeLabel", "Noise Type:"))
+			.ToolTipText(LOCTEXT("DynamicNoiseTypeTooltip",
+				"Perlin: a single noise octave. Fractal Perlin (FBM): several octaves summed for more detail."))
+		]
+
+		+ SHorizontalBox::Slot()
+		.FillWidth(1.f)
+		.Padding(FMargin(4.f, 0.f, 0.f, 0.f))
+		[
+			SNew(SComboBox<TSharedPtr<EVertexMaskForgeNoiseType>>)
+			.OptionsSource(&NoiseTypeOptions)
+			.OnGenerateWidget_Lambda([](TSharedPtr<EVertexMaskForgeNoiseType> InOption)
+			{
+				return SNew(STextBlock).Text(InOption.IsValid() ? VertexMaskForgePanel::GetNoiseTypeLabel(*InOption) : FText::GetEmpty());
+			})
+			.OnSelectionChanged_Lambda([this, LayerId, ExpectedMaskInstanceId](TSharedPtr<EVertexMaskForgeNoiseType> NewSelection, ESelectInfo::Type)
+			{
+				if (!NewSelection.IsValid())
+				{
+					return;
+				}
+				const EVertexMaskForgeNoiseType NewType = *NewSelection;
+				MutateDynamicNoiseParam(LayerId, ExpectedMaskInstanceId, [NewType](FVertexMaskForgeNoiseParams& Params)
+				{
+					Params.Type = NewType;
+				});
+			})
+			.Content()
+			[
+				SNew(STextBlock).Text_Lambda([GetParams]() { return VertexMaskForgePanel::GetNoiseTypeLabel(GetParams().Type); })
+			]
+		]
+	]
+
+	// Scale X/Y/Z -- [0.001,1000], Delta 0.01, matching the Legacy widgets' own range/step exactly.
+	// M16-K.6D-8F-C.1: "Lock Axes" reproduces Legacy's own bNoiseScaleAxesLocked workflow convenience
+	// (X is the sole master; absolute copy, not ratio-preserving; see
+	// DynamicNoiseScaleAxesLockedByLayerId's own doc comment) at per-layer granularity via a panel-owned,
+	// LayerId-keyed map -- never as an 18th authoritative field (FVertexMaskForgeNoiseParams' own doc
+	// comment already excludes it for the same reason Legacy does).
+	+ SVerticalBox::Slot()
+	.AutoHeight()
+	.Padding(FMargin(0.f, 2.f, 0.f, 2.f))
+	[
+		SNew(SHorizontalBox)
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.VAlign(VAlign_Center)
+		[
+			SNew(STextBlock).Text(LOCTEXT("DynamicNoiseScaleLabel", "Scale X/Y/Z"))
+		]
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.Padding(FMargin(4.f, 0.f, 4.f, 0.f))
+		[
+			SNew(SSpinBox<float>)
+			.MinDesiredWidth(52.f)
+			.MinValue(0.001f)
+			.MaxValue(1000.0f)
+			.Delta(0.01f)
+			.ToolTipText(LOCTEXT("DynamicNoiseScaleXTooltip", "Frequency multiplier along local X. 1.0 is approximately one noise unit per meter."))
+			.Value_Lambda([GetParams]() { return GetParams().ScaleX; })
+			.OnValueChanged_Lambda([this, LayerId, ExpectedMaskInstanceId](const float NewValue)
+			{
+				// AUDITED (M16-K.6D-8F-D.1): single atomic entry point for Scale X, mirroring Legacy's own
+				// OnNoiseScaleXChanged -- delegates the clamp/assign/conditional-Y-Z-sync algorithm entirely
+				// to VertexMaskForgePanel::ApplyDynamicNoiseScaleXEdit (the SAME production function this
+				// module's own automation tests call), invoked exactly once inside MutateDynamicNoiseParam's
+				// own Mutator, so exactly one SetLayerMaskParams write and one OnDynamicLayerStackMutated()
+				// fire per edit, never three, and no second handwritten copy of this branching exists here.
+				const bool bLocked = IsDynamicNoiseScaleAxesLocked(LayerId);
+				MutateDynamicNoiseParam(LayerId, ExpectedMaskInstanceId, [NewValue, bLocked](FVertexMaskForgeNoiseParams& Params)
+				{
+					VertexMaskForgePanel::ApplyDynamicNoiseScaleXEdit(Params, NewValue, bLocked);
+				});
+			})
+		]
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
+		[
+			SNew(SSpinBox<float>)
+			.MinDesiredWidth(52.f)
+			.MinValue(0.001f)
+			.MaxValue(1000.0f)
+			.Delta(0.01f)
+			.ToolTipText(LOCTEXT("DynamicNoiseScaleYTooltip", "Frequency multiplier along local Y."))
+			.IsEnabled_Lambda([this, LayerId]() { return !IsDynamicNoiseScaleAxesLocked(LayerId); })
+			.Value_Lambda([GetParams]() { return GetParams().ScaleY; })
+			.OnValueChanged_Lambda([this, LayerId, ExpectedMaskInstanceId](const float NewValue)
+			{
+				// Defensive: Y is disabled while locked, so this is unreachable through the real UI -- but a
+				// stale/programmatic callback must not violate the locked invariant.
+				if (IsDynamicNoiseScaleAxesLocked(LayerId))
+				{
+					return;
+				}
+				MutateDynamicNoiseParam(LayerId, ExpectedMaskInstanceId, [NewValue](FVertexMaskForgeNoiseParams& Params)
+				{
+					Params.ScaleY = FMath::Max(NewValue, 0.001f);
+				});
+			})
+		]
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
+		[
+			SNew(SSpinBox<float>)
+			.MinDesiredWidth(52.f)
+			.MinValue(0.001f)
+			.MaxValue(1000.0f)
+			.Delta(0.01f)
+			.ToolTipText(LOCTEXT("DynamicNoiseScaleZTooltip", "Frequency multiplier along local Z."))
+			.IsEnabled_Lambda([this, LayerId]() { return !IsDynamicNoiseScaleAxesLocked(LayerId); })
+			.Value_Lambda([GetParams]() { return GetParams().ScaleZ; })
+			.OnValueChanged_Lambda([this, LayerId, ExpectedMaskInstanceId](const float NewValue)
+			{
+				// Defensive: Z is disabled while locked, so this is unreachable through the real UI -- but a
+				// stale/programmatic callback must not violate the locked invariant.
+				if (IsDynamicNoiseScaleAxesLocked(LayerId))
+				{
+					return;
+				}
+				MutateDynamicNoiseParam(LayerId, ExpectedMaskInstanceId, [NewValue](FVertexMaskForgeNoiseParams& Params)
+				{
+					Params.ScaleZ = FMath::Max(NewValue, 0.001f);
+				});
+			})
+		]
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.VAlign(VAlign_Center)
+		.Padding(FMargin(4.f, 0.f, 0.f, 0.f))
+		[
+			SNew(SCheckBox)
+			.ToolTipText(LOCTEXT("DynamicNoiseScaleAxesLockedTooltip", "Use Scale X for all three axes."))
+			.IsChecked_Lambda([this, LayerId]()
+			{
+				return IsDynamicNoiseScaleAxesLocked(LayerId) ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
+			})
+			.OnCheckStateChanged_Lambda([this, LayerId, ExpectedMaskInstanceId](const ECheckBoxState NewState)
+			{
+				OnDynamicNoiseScaleAxesLockChanged(LayerId, ExpectedMaskInstanceId, NewState);
+			})
+			.Content()
+			[
+				SNew(STextBlock).Text(LOCTEXT("DynamicNoiseScaleAxesLockedLabel", "Lock Axes"))
+			]
+		]
+	]
+
+	// Offset X/Y/Z -- [-100000,100000], Delta 0.1, matching the Legacy widgets' own range/step exactly.
+	+ SVerticalBox::Slot()
+	.AutoHeight()
+	.Padding(FMargin(0.f, 2.f, 0.f, 2.f))
+	[
+		SNew(SHorizontalBox)
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.VAlign(VAlign_Center)
+		[
+			SNew(STextBlock).Text(LOCTEXT("DynamicNoiseOffsetLabel", "Offset X/Y/Z"))
+		]
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.Padding(FMargin(4.f, 0.f, 4.f, 0.f))
+		[
+			SNew(SSpinBox<float>)
+			.MinDesiredWidth(52.f)
+			.MinValue(-100000.0f)
+			.MaxValue(100000.0f)
+			.Delta(0.1f)
+			.ToolTipText(LOCTEXT("DynamicNoiseOffsetXTooltip", "Domain offset along X, in noise space."))
+			.Value_Lambda([GetParams]() { return GetParams().OffsetX; })
+			.OnValueChanged_Lambda([this, LayerId, ExpectedMaskInstanceId](const float NewValue)
+			{
+				MutateDynamicNoiseParam(LayerId, ExpectedMaskInstanceId, [NewValue](FVertexMaskForgeNoiseParams& Params)
+				{
+					Params.OffsetX = NewValue;
+				});
+			})
+		]
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
+		[
+			SNew(SSpinBox<float>)
+			.MinDesiredWidth(52.f)
+			.MinValue(-100000.0f)
+			.MaxValue(100000.0f)
+			.Delta(0.1f)
+			.ToolTipText(LOCTEXT("DynamicNoiseOffsetYTooltip", "Domain offset along Y, in noise space."))
+			.Value_Lambda([GetParams]() { return GetParams().OffsetY; })
+			.OnValueChanged_Lambda([this, LayerId, ExpectedMaskInstanceId](const float NewValue)
+			{
+				MutateDynamicNoiseParam(LayerId, ExpectedMaskInstanceId, [NewValue](FVertexMaskForgeNoiseParams& Params)
+				{
+					Params.OffsetY = NewValue;
+				});
+			})
+		]
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.Padding(FMargin(0.f, 0.f, 0.f, 0.f))
+		[
+			SNew(SSpinBox<float>)
+			.MinDesiredWidth(52.f)
+			.MinValue(-100000.0f)
+			.MaxValue(100000.0f)
+			.Delta(0.1f)
+			.ToolTipText(LOCTEXT("DynamicNoiseOffsetZTooltip", "Domain offset along Z, in noise space."))
+			.Value_Lambda([GetParams]() { return GetParams().OffsetZ; })
+			.OnValueChanged_Lambda([this, LayerId, ExpectedMaskInstanceId](const float NewValue)
+			{
+				MutateDynamicNoiseParam(LayerId, ExpectedMaskInstanceId, [NewValue](FVertexMaskForgeNoiseParams& Params)
+				{
+					Params.OffsetZ = NewValue;
+				});
+			})
+		]
+	]
+
+	// Seed -- int32, [-2147483647,2147483647], Delta 1, matching the Legacy widget's own range/step exactly.
+	+ SVerticalBox::Slot()
+	.AutoHeight()
+	.Padding(FMargin(0.f, 2.f, 0.f, 2.f))
+	[
+		SNew(SHorizontalBox)
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.VAlign(VAlign_Center)
+		[
+			SNew(STextBlock).Text(LOCTEXT("DynamicNoiseSeedLabel", "Seed"))
+		]
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.Padding(FMargin(4.f, 0.f, 0.f, 0.f))
+		[
+			SNew(SSpinBox<int32>)
+			.MinDesiredWidth(64.f)
+			.MinValue(-2147483647)
+			.MaxValue(2147483647)
+			.Delta(1)
+			.Value_Lambda([GetParams]() { return GetParams().Seed; })
+			.OnValueChanged_Lambda([this, LayerId, ExpectedMaskInstanceId](const int32 NewValue)
+			{
+				MutateDynamicNoiseParam(LayerId, ExpectedMaskInstanceId, [NewValue](FVertexMaskForgeNoiseParams& Params)
+				{
+					Params.Seed = NewValue;
+				});
+			})
+		]
+	]
+
+	// Octaves/Roughness/Lacunarity -- multi-octave types only (FractalPerlin, Billow, Ridged, Turbulence,
+	// Alligator), gated via NoiseTypeUsesFractalParameters (a parameterized extraction of the Legacy
+	// panel's own UsesFractalParameters() member) -- disabled, not hidden, for single-sample/cellular
+	// types, matching the Legacy widgets' own gating contract exactly. Ranges/steps also match the Legacy
+	// widgets exactly: Octaves int32 [1,8] Delta 1; Roughness float [0,1] Delta 0.01; Lacunarity float
+	// [1,10] Delta 0.01.
+	+ SVerticalBox::Slot()
+	.AutoHeight()
+	.Padding(FMargin(0.f, 2.f, 0.f, 2.f))
+	[
+		SNew(SHorizontalBox)
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.VAlign(VAlign_Center)
+		[
+			SNew(STextBlock)
+			.Text(LOCTEXT("DynamicNoiseOctavesLabel", "Octaves"))
+			.ToolTipText(LOCTEXT("DynamicNoiseOctavesTooltip", "Multi-octave types only (Fractal Perlin, Billow, Ridged, Turbulence, Alligator)."))
+		]
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.Padding(FMargin(4.f, 0.f, 12.f, 0.f))
+		[
+			SNew(SSpinBox<int32>)
+			.MinDesiredWidth(44.f)
+			.MinValue(1)
+			.MaxValue(8)
+			.Delta(1)
+			.IsEnabled_Lambda([GetParams]() { return VertexMaskForgePanel::NoiseTypeUsesFractalParameters(GetParams().Type); })
+			.Value_Lambda([GetParams]() { return GetParams().Octaves; })
+			.OnValueChanged_Lambda([this, LayerId, ExpectedMaskInstanceId](const int32 NewValue)
+			{
+				MutateDynamicNoiseParam(LayerId, ExpectedMaskInstanceId, [NewValue](FVertexMaskForgeNoiseParams& Params)
+				{
+					Params.Octaves = FMath::Clamp(NewValue, 1, 8);
+				});
+			})
+		]
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.VAlign(VAlign_Center)
+		[
+			SNew(STextBlock)
+			.Text(LOCTEXT("DynamicNoiseRoughnessLabel", "Roughness"))
+			.ToolTipText(LOCTEXT("DynamicNoiseRoughnessTooltip", "Per-octave amplitude multiplier. Multi-octave types only."))
+		]
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.Padding(FMargin(4.f, 0.f, 0.f, 0.f))
+		[
+			SNew(SSpinBox<float>)
+			.MinDesiredWidth(52.f)
+			.MinValue(0.0f)
+			.MaxValue(1.0f)
+			.Delta(0.01f)
+			.IsEnabled_Lambda([GetParams]() { return VertexMaskForgePanel::NoiseTypeUsesFractalParameters(GetParams().Type); })
+			.Value_Lambda([GetParams]() { return GetParams().Roughness; })
+			.OnValueChanged_Lambda([this, LayerId, ExpectedMaskInstanceId](const float NewValue)
+			{
+				MutateDynamicNoiseParam(LayerId, ExpectedMaskInstanceId, [NewValue](FVertexMaskForgeNoiseParams& Params)
+				{
+					Params.Roughness = FMath::Clamp(NewValue, 0.0f, 1.0f);
+				});
+			})
+		]
+	]
+
+	+ SVerticalBox::Slot()
+	.AutoHeight()
+	.Padding(FMargin(0.f, 2.f, 0.f, 2.f))
+	[
+		SNew(SHorizontalBox)
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.VAlign(VAlign_Center)
+		[
+			SNew(STextBlock)
+			.Text(LOCTEXT("DynamicNoiseLacunarityLabel", "Lacunarity"))
+			.ToolTipText(LOCTEXT("DynamicNoiseLacunarityTooltip", "Per-octave frequency multiplier. Multi-octave types only."))
+		]
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.Padding(FMargin(4.f, 0.f, 0.f, 0.f))
+		[
+			SNew(SSpinBox<float>)
+			.MinDesiredWidth(52.f)
+			.MinValue(1.0f)
+			.MaxValue(10.0f)
+			.Delta(0.01f)
+			.IsEnabled_Lambda([GetParams]() { return VertexMaskForgePanel::NoiseTypeUsesFractalParameters(GetParams().Type); })
+			.Value_Lambda([GetParams]() { return GetParams().Lacunarity; })
+			.OnValueChanged_Lambda([this, LayerId, ExpectedMaskInstanceId](const float NewValue)
+			{
+				MutateDynamicNoiseParam(LayerId, ExpectedMaskInstanceId, [NewValue](FVertexMaskForgeNoiseParams& Params)
+				{
+					Params.Lacunarity = FMath::Max(NewValue, 1.0f);
+				});
+			})
+		]
+
+		// Turbulence Strength -- [0,5], Delta 0.01, matching the Legacy widget's own range/step exactly.
+		// Enabled only when Type == Turbulence, same contract as the Legacy widget.
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.VAlign(VAlign_Center)
+		.Padding(FMargin(12.f, 0.f, 0.f, 0.f))
+		[
+			SNew(STextBlock)
+			.Text(LOCTEXT("DynamicNoiseTurbulenceStrengthLabel", "Turbulence Strength"))
+			.ToolTipText(LOCTEXT("DynamicNoiseTurbulenceStrengthTooltip", "Domain-warp displacement strength, in noise space. Turbulence only."))
+		]
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.Padding(FMargin(4.f, 0.f, 0.f, 0.f))
+		[
+			SNew(SSpinBox<float>)
+			.MinDesiredWidth(52.f)
+			.MinValue(0.0f)
+			.MaxValue(5.0f)
+			.Delta(0.01f)
+			.IsEnabled_Lambda([GetParams]() { return GetParams().Type == EVertexMaskForgeNoiseType::Turbulence; })
+			.Value_Lambda([GetParams]() { return GetParams().TurbulenceStrength; })
+			.OnValueChanged_Lambda([this, LayerId, ExpectedMaskInstanceId](const float NewValue)
+			{
+				MutateDynamicNoiseParam(LayerId, ExpectedMaskInstanceId, [NewValue](FVertexMaskForgeNoiseParams& Params)
+				{
+					Params.TurbulenceStrength = FMath::Clamp(NewValue, 0.0f, 5.0f);
+				});
+			})
+		]
+	]
+
+	// Blur -- [0,1], Delta 0.01. NOTE: this range intentionally matches Legacy Noise's OWN Blur range
+	// ([0,1]), NOT Curvature's Dynamic Blur range ([0,10]) -- the two generators' Blur semantics/scales
+	// differ (confirmed via Legacy Noise's own widget, SVertexMaskForgePanel.cpp NoiseBlurLabel row).
+	+ SVerticalBox::Slot()
+	.AutoHeight()
+	.Padding(FMargin(0.f, 2.f, 0.f, 2.f))
+	[
+		SNew(SHorizontalBox)
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.VAlign(VAlign_Center)
+		[
+			SNew(STextBlock)
+			.Text(LOCTEXT("DynamicNoiseBlurLabel", "Blur"))
+			.ToolTipText(LOCTEXT("DynamicNoiseBlurTooltip", "Smooths the procedural noise field before Multiplier and Levels are applied."))
+		]
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.Padding(FMargin(4.f, 0.f, 0.f, 0.f))
+		[
+			SNew(SSpinBox<float>)
+			.MinDesiredWidth(52.f)
+			.MinValue(0.0f)
+			.MaxValue(1.0f)
+			.Delta(0.01f)
+			.ToolTipText(LOCTEXT("DynamicNoiseBlurTooltip", "Smooths the procedural noise field before Multiplier and Levels are applied."))
+			.Value_Lambda([GetParams]() { return GetParams().Blur; })
+			.OnValueChanged_Lambda([this, LayerId, ExpectedMaskInstanceId](const float NewValue)
+			{
+				MutateDynamicNoiseParam(LayerId, ExpectedMaskInstanceId, [NewValue](FVertexMaskForgeNoiseParams& Params)
+				{
+					Params.Blur = FMath::Clamp(NewValue, 0.0f, 1.0f);
+				});
+			})
+		]
+	]
+
+	// --- Artistic Adjustment group ---------------------------------------------------------------------
+
+	+ SVerticalBox::Slot()
+	.AutoHeight()
+	.Padding(FMargin(0.f, 6.f, 0.f, 2.f))
+	[
+		SNew(STextBlock)
+		.Text(LOCTEXT("DynamicNoiseArtisticAdjustmentGroupLabel", "Artistic Adjustment"))
+		.Font(FCoreStyle::GetDefaultFontStyle("Bold", 8))
+	]
+
+	// Multiplier -- [0,10], Delta 0.01, matching the Legacy widget's own range/step exactly.
+	+ SVerticalBox::Slot()
+	.AutoHeight()
+	.Padding(FMargin(0.f, 2.f, 0.f, 2.f))
+	[
+		SNew(SHorizontalBox)
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.VAlign(VAlign_Center)
+		[
+			SNew(STextBlock).Text(LOCTEXT("DynamicNoiseMultiplierLabel", "Multiplier"))
+		]
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.Padding(FMargin(4.f, 0.f, 0.f, 0.f))
+		[
+			SNew(SSpinBox<float>)
+			.MinDesiredWidth(52.f)
+			.MinValue(0.0f)
+			.MaxValue(10.0f)
+			.Delta(0.01f)
+			.Value_Lambda([GetParams]() { return GetParams().Multiplier; })
+			.OnValueChanged_Lambda([this, LayerId, ExpectedMaskInstanceId](const float NewValue)
+			{
+				MutateDynamicNoiseParam(LayerId, ExpectedMaskInstanceId, [NewValue](FVertexMaskForgeNoiseParams& Params)
+				{
+					Params.Multiplier = FMath::Max(NewValue, 0.0f);
+				});
+			})
+		]
+	]
+
+	// Levels Min / Levels Max -- [0,1], Delta 0.01, matching the Legacy widgets' own range/step/tooltips
+	// exactly. Coupled invariant (LevelsMin <= LevelsMax) is maintained entirely inside each callback's own
+	// Mutator, mirroring Curvature's own established pattern exactly -- the edited field is always assigned
+	// first and preserved, the OTHER field is raised/lowered only if the pair would otherwise become
+	// invalid -- committed through the SAME single MutateDynamicNoiseParam call (one SetLayerMaskParams
+	// write, one OnDynamicLayerStackMutated notification), never a second callback-driven write.
+	+ SVerticalBox::Slot()
+	.AutoHeight()
+	.Padding(FMargin(0.f, 2.f, 0.f, 2.f))
+	[
+		SNew(SHorizontalBox)
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.VAlign(VAlign_Center)
+		[
+			SNew(STextBlock)
+			.Text(LOCTEXT("DynamicNoiseLevelsMinLabel", "Levels Min"))
+			.ToolTipText(LOCTEXT("DynamicNoiseLevelsMinTooltip", "Values at or below this threshold become black."))
+		]
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.Padding(FMargin(4.f, 0.f, 12.f, 0.f))
+		[
+			SNew(SSpinBox<float>)
+			.MinDesiredWidth(52.f)
+			.MinValue(0.0f)
+			.MaxValue(1.0f)
+			.Delta(0.01f)
+			.ToolTipText(LOCTEXT("DynamicNoiseLevelsMinTooltip", "Values at or below this threshold become black."))
+			.Value_Lambda([GetParams]() { return GetParams().LevelsMin; })
+			.OnValueChanged_Lambda([this, LayerId, ExpectedMaskInstanceId](const float NewValue)
+			{
+				MutateDynamicNoiseParam(LayerId, ExpectedMaskInstanceId, [NewValue](FVertexMaskForgeNoiseParams& Params)
+				{
+					Params.LevelsMin = FMath::Clamp(NewValue, 0.0f, 1.0f);
+					if (Params.LevelsMin > Params.LevelsMax)
+					{
+						Params.LevelsMax = Params.LevelsMin;
+					}
+				});
+			})
+		]
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.VAlign(VAlign_Center)
+		[
+			SNew(STextBlock)
+			.Text(LOCTEXT("DynamicNoiseLevelsMaxLabel", "Levels Max"))
+			.ToolTipText(LOCTEXT("DynamicNoiseLevelsMaxTooltip", "Values at or above this threshold become white."))
+		]
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.Padding(FMargin(4.f, 0.f, 0.f, 0.f))
+		[
+			SNew(SSpinBox<float>)
+			.MinDesiredWidth(52.f)
+			.MinValue(0.0f)
+			.MaxValue(1.0f)
+			.Delta(0.01f)
+			.ToolTipText(LOCTEXT("DynamicNoiseLevelsMaxTooltip", "Values at or above this threshold become white."))
+			.Value_Lambda([GetParams]() { return GetParams().LevelsMax; })
+			.OnValueChanged_Lambda([this, LayerId, ExpectedMaskInstanceId](const float NewValue)
+			{
+				MutateDynamicNoiseParam(LayerId, ExpectedMaskInstanceId, [NewValue](FVertexMaskForgeNoiseParams& Params)
+				{
+					Params.LevelsMax = FMath::Clamp(NewValue, 0.0f, 1.0f);
+					if (Params.LevelsMax < Params.LevelsMin)
+					{
+						Params.LevelsMin = Params.LevelsMax;
+					}
+				});
+			})
+		]
+	]
+
+	// Invert
+	+ SVerticalBox::Slot()
+	.AutoHeight()
+	.Padding(FMargin(0.f, 2.f, 0.f, 0.f))
+	[
+		SNew(SCheckBox)
+		.IsChecked_Lambda([GetParams]()
+		{
+			return GetParams().bInvert ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
+		})
+		.OnCheckStateChanged_Lambda([this, LayerId, ExpectedMaskInstanceId](const ECheckBoxState NewState)
+		{
+			MutateDynamicNoiseParam(LayerId, ExpectedMaskInstanceId, [NewState](FVertexMaskForgeNoiseParams& Params)
+			{
+				Params.bInvert = (NewState == ECheckBoxState::Checked);
+			});
+		})
+		.Content()
+		[
+			SNew(STextBlock).Text(LOCTEXT("DynamicNoiseInvertLabel", "Invert"))
+		]
+	];
+}
+
 namespace
 {
 	// M16-K.6D-6 (Correction 2): the panel's own drag-drop payload for reordering Dynamic Layers rows --
@@ -5279,6 +6061,11 @@ FReply SVertexMaskForgePanel::OnRemoveDynamicLayerClicked(const FGuid LayerId)
 	// explicitly supported and safe (IsEmpty() stack is a valid stack) -- RebuildDynamicLayersList's own
 	// empty-state branch handles the resulting empty list.
 	DynamicLayerStack.RemoveLayer(LayerId);
+
+	// M16-K.6D-8F-C.1: permanent removal also drops this layer's ephemeral Lock Axes entry (if any) --
+	// Remove() is itself a safe no-op if LayerId never had an entry -- so a stale key can never later
+	// influence a different, unrelated layer.
+	DynamicNoiseScaleAxesLockedByLayerId.Remove(LayerId);
 
 	RebuildDynamicLayersList();
 	OnDynamicLayerStackMutated();
@@ -5542,18 +6329,19 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 	DynamicLayerFillOptions.Add(MakeShared<EVertexMaskForgeLayerFill>(EVertexMaskForgeLayerFill::Black));
 	DynamicLayerFillOptions.Add(MakeShared<EVertexMaskForgeLayerFill>(EVertexMaskForgeLayerFill::White));
 
-	// M16-K.6B; corrected M16-K.6D-6; extended M16-K.6D-8C-C, M16-K.6D-8D-C, M16-K.6D-8E-C: element 0 is a
-	// VALID TSharedPtr to an UNSET TOptional (None/Unassigned) -- NOT a null TSharedPtr, which SListView's
-	// own row-generation loop unconditionally skips (see this array's own doc comment in
+	// M16-K.6B; corrected M16-K.6D-6; extended M16-K.6D-8C-C, M16-K.6D-8D-C, M16-K.6D-8E-C, M16-K.6D-8F-C:
+	// element 0 is a VALID TSharedPtr to an UNSET TOptional (None/Unassigned) -- NOT a null TSharedPtr,
+	// which SListView's own row-generation loop unconditionally skips (see this array's own doc comment in
 	// SVertexMaskForgePanel.h for the confirmed root cause). MaterialSlot, BoundingBox (M16-K.6D-8B),
-	// DirectionalNormal (M16-K.6D-8D-B), and Curvature (M16-K.6D-8E-B) are the only four generators
-	// offered -- every other EVertexMaskForgeGeneratorType value is deliberately NOT added here, since the
-	// orchestrator still rejects any other type outright.
+	// DirectionalNormal (M16-K.6D-8D-B), Curvature (M16-K.6D-8E-B), and Noise (M16-K.6D-8F-C, displayed as
+	// "Noise/Grunge") are the only five generators offered -- every other EVertexMaskForgeGeneratorType
+	// value is deliberately NOT added here, since the orchestrator still rejects any other type outright.
 	DynamicLayerGeneratorTypeOptions.Add(MakeShared<TOptional<EVertexMaskForgeGeneratorType>>());
 	DynamicLayerGeneratorTypeOptions.Add(MakeShared<TOptional<EVertexMaskForgeGeneratorType>>(EVertexMaskForgeGeneratorType::MaterialSlot));
 	DynamicLayerGeneratorTypeOptions.Add(MakeShared<TOptional<EVertexMaskForgeGeneratorType>>(EVertexMaskForgeGeneratorType::BoundingBox));
 	DynamicLayerGeneratorTypeOptions.Add(MakeShared<TOptional<EVertexMaskForgeGeneratorType>>(EVertexMaskForgeGeneratorType::DirectionalNormal));
 	DynamicLayerGeneratorTypeOptions.Add(MakeShared<TOptional<EVertexMaskForgeGeneratorType>>(EVertexMaskForgeGeneratorType::Curvature));
+	DynamicLayerGeneratorTypeOptions.Add(MakeShared<TOptional<EVertexMaskForgeGeneratorType>>(EVertexMaskForgeGeneratorType::Noise));
 
 	CurvatureTypeOptions.Add(MakeShared<EVertexMaskForgeCurvatureType>(EVertexMaskForgeCurvatureType::Convex));
 	CurvatureTypeOptions.Add(MakeShared<EVertexMaskForgeCurvatureType>(EVertexMaskForgeCurvatureType::Concave));
