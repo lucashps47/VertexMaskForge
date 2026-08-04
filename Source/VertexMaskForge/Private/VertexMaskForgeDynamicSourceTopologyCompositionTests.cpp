@@ -16,6 +16,7 @@
 #include "VertexMaskForgeDynamicLayerStack.h"
 #include "VertexMaskForgeDynamicSourceTopologyComposition.h"
 #include "VertexMaskForgeLayerTypes.h"
+#include "VertexMaskForgeNoiseGenerator.h"
 #include "VertexMaskForgeRecipeTypes.h"
 #include "VertexMaskForgeWorkingMeshTypes.h"
 
@@ -276,6 +277,83 @@ namespace
 		CurvatureParams.LevelsMin = LevelsMin;
 		CurvatureParams.LevelsMax = LevelsMax;
 		CurvatureParams.bInvert = bInvert;
+		Stack.SetLayerMaskParams(LayerId, MaskInstance->MaskInstanceId, NewParams);
+
+		return LayerId;
+	}
+
+	// M16-K.6D-8F-B: maps a layer-owned FVertexMaskForgeNoiseParams onto the generator's own
+	// FVertexMaskForgeNoiseGenerativeParams (the "raw/generative" field subset only -- Multiplier/
+	// LevelsMin/LevelsMax/bInvert are forwarded as separate positional arguments, exactly mirroring the
+	// orchestrator's own Noise dispatch branch). This is a pure field-mapping helper, never a re-derivation
+	// of any Noise formula -- reused identically by every test below to build its own independent reference
+	// call to the real generator.
+	FVertexMaskForgeNoiseGenerativeParams MakeNoiseGenerativeParams(const FVertexMaskForgeNoiseParams& Params)
+	{
+		FVertexMaskForgeNoiseGenerativeParams Generative;
+		Generative.NoiseType = Params.Type;
+		Generative.ScaleX = Params.ScaleX;
+		Generative.ScaleY = Params.ScaleY;
+		Generative.ScaleZ = Params.ScaleZ;
+		Generative.OffsetX = Params.OffsetX;
+		Generative.OffsetY = Params.OffsetY;
+		Generative.OffsetZ = Params.OffsetZ;
+		Generative.Seed = Params.Seed;
+		Generative.Octaves = Params.Octaves;
+		Generative.Roughness = Params.Roughness;
+		Generative.Lacunarity = Params.Lacunarity;
+		Generative.TurbulenceStrength = Params.TurbulenceStrength;
+		Generative.Blur = Params.Blur;
+		return Generative;
+	}
+
+	// A non-degenerate, fully-specified baseline -- ScaleX/Y/Z=2 (not the struct's own default of 1, so a
+	// forwarding bug that silently falls back to the default would very likely diverge from a reference call
+	// using this same struct), genuinely nonzero across all three axes given BuildZVaryingFixtureWorkingMesh's
+	// own non-degenerate X/Y/Z spread.
+	FVertexMaskForgeNoiseParams MakeNoiseBaselineParams()
+	{
+		FVertexMaskForgeNoiseParams P;
+		P.Type = EVertexMaskForgeNoiseType::FractalPerlin;
+		P.ScaleX = 2.0f;
+		P.ScaleY = 2.0f;
+		P.ScaleZ = 2.0f;
+		P.OffsetX = 0.0f;
+		P.OffsetY = 0.0f;
+		P.OffsetZ = 0.0f;
+		P.Seed = 0;
+		P.Octaves = 4;
+		P.Roughness = 0.5f;
+		P.Lacunarity = 2.0f;
+		P.TurbulenceStrength = 0.5f;
+		P.Multiplier = 1.0f;
+		P.Blur = 0.0f;
+		P.LevelsMin = 0.0f;
+		P.LevelsMax = 1.0f;
+		P.bInvert = false;
+		return P;
+	}
+
+	// Adds a layer with a Noise mask, configured via the stack's own controlled mutators -- mirrors
+	// AddCurvatureLayer's own setup sequence, but takes the full FVertexMaskForgeNoiseParams by value/const-
+	// ref (rather than one argument per field) since Noise's authoritative field count (16) is materially
+	// larger than any other generator wired into Dynamic so far. Noise has no Space field/concept at all
+	// (confirmed by M16-K.6D-8F-A), so unlike AddDirectionalNormalLayer there is no Space parameter here.
+	FGuid AddNoiseLayer(
+		FVertexMaskForgeDynamicLayerStack& Stack, const FString& Name,
+		EVertexMaskForgeLayerFill Fill, EVertexMaskForgeBlendMode BlendMode, float Opacity,
+		const FVertexMaskForgeNoiseParams& NoiseParams)
+	{
+		const FGuid LayerId = Stack.AddLayer(Name);
+		Stack.SetLayerFill(LayerId, Fill);
+		Stack.SetLayerBlendMode(LayerId, BlendMode);
+		Stack.SetLayerOpacity(LayerId, Opacity);
+		Stack.SetLayerMaskGeneratorType(LayerId, EVertexMaskForgeGeneratorType::Noise);
+
+		const FVertexMaskForgeGeneratorMaskInstance* MaskInstance = Stack.GetLayerMask(LayerId);
+		check(MaskInstance);
+		FVertexMaskForgeGeneratorParams NewParams = MakeVertexMaskForgeGeneratorParams(EVertexMaskForgeGeneratorType::Noise);
+		NewParams.Get<FVertexMaskForgeNoiseParams>() = NoiseParams;
 		Stack.SetLayerMaskParams(LayerId, MaskInstance->MaskInstanceId, NewParams);
 
 		return LayerId;
@@ -1747,6 +1825,412 @@ bool FVertexMaskForgeDynSrcTopoCompCurvatureSharedStateSafetyTest::RunTest(const
 				TestEqual(*FString::Printf(TEXT("%s: VertexID %d value byte-exact between shared and independent state"), Config.Label, VertexID), UnitFloatToByte(SharedValue), UnitFloatToByte(IndependentValue));
 			}
 		}
+	}
+
+	return true;
+}
+
+// M16-K.6D-8F-B: 1. Dispatch and exact generator parity -- proves the orchestrator's Noise branch is real
+// dispatch (not merely non-empty output) by comparing byte-exact against a direct
+// GenerateNoiseMaskFromDynamicMesh call (its own fresh, independent FVertexMaskForgeGeneratorState),
+// resolved through the SAME FixtureCornerToVertexID/TryGetValue correspondence the orchestrator's own
+// DynamicMeshVertex-domain Pass 2 path uses.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompNoiseDispatchTest, "VertexMaskForge.DynamicSourceTopologyComposition.NoiseDispatchMatchesDirectGenerator", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynSrcTopoCompNoiseDispatchTest::RunTest(const FString& Parameters)
+{
+	const FVertexMaskForgeWorkingMesh WorkingMesh = BuildZVaryingFixtureWorkingMesh();
+	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
+
+	FVertexMaskForgeNoiseParams NoiseParams = MakeNoiseBaselineParams();
+	NoiseParams.ScaleX = 3.0f;
+	NoiseParams.ScaleY = 5.0f;
+	NoiseParams.ScaleZ = 7.0f;
+	NoiseParams.OffsetX = 11.0f;
+	NoiseParams.OffsetY = 13.0f;
+	NoiseParams.OffsetZ = 17.0f;
+	NoiseParams.Seed = 42;
+	NoiseParams.Octaves = 3;
+	NoiseParams.Roughness = 0.6f;
+	NoiseParams.Lacunarity = 2.5f;
+
+	// Authoritative, independent reference -- the REAL generator, called directly with its OWN fresh
+	// FVertexMaskForgeGeneratorState, never reimplemented.
+	FVertexMaskForgeGeneratorState ReferenceState;
+	const FVertexMaskForgeScalarMask ReferenceMask = VertexMaskForgeNoiseGenerator::GenerateNoiseMaskFromDynamicMesh(
+		WorkingMesh, ReferenceState, MakeNoiseGenerativeParams(NoiseParams), NoiseParams.Multiplier, NoiseParams.LevelsMin, NoiseParams.LevelsMax, NoiseParams.bInvert);
+	TestTrue(TEXT("Reference generator State == Ready"), ReferenceMask.State == EVertexMaskForgeScalarMaskState::Ready);
+
+	FVertexMaskForgeDynamicLayerStack Stack;
+	AddNoiseLayer(Stack, TEXT("Layer"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f, NoiseParams);
+
+	TArray<FColor> Out;
+	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, Out);
+	TestTrue(TEXT("Orchestrator accepts a Noise layer"), bSucceeded);
+	TestEqual(TEXT("Out.Num() == 6"), Out.Num(), 6);
+	if (!bSucceeded || Out.Num() != 6)
+	{
+		return false;
+	}
+
+	// White Fill / Copy / Opacity 1.0 -> RGB == mask value broadcast, the same established contract every
+	// prior generator's own dispatch test already proves and reuses.
+	for (int32 CornerIndex = 0; CornerIndex < 6; ++CornerIndex)
+	{
+		const int32 VertexID = FixtureCornerToVertexID[CornerIndex];
+		float ExpectedMaskValue = 0.0f;
+		const bool bHasValue = ReferenceMask.TryGetValue(VertexID, ExpectedMaskValue);
+		TestTrue(*FString::Printf(TEXT("Reference mask has a value at VertexID %d (corner %d)"), VertexID, CornerIndex), bHasValue);
+		if (!bHasValue)
+		{
+			continue;
+		}
+		const uint8 ExpectedByte = UnitFloatToByte(ExpectedMaskValue);
+		TestEqual(*FString::Printf(TEXT("Out[%d].R byte-exact vs reference generator + vertex mapping"), CornerIndex), Out[CornerIndex].R, ExpectedByte);
+		TestEqual(*FString::Printf(TEXT("Out[%d].G byte-exact vs reference generator + vertex mapping"), CornerIndex), Out[CornerIndex].G, ExpectedByte);
+		TestEqual(*FString::Printf(TEXT("Out[%d].B byte-exact vs reference generator + vertex mapping"), CornerIndex), Out[CornerIndex].B, ExpectedByte);
+		TestEqual(*FString::Printf(TEXT("Out[%d].A == BaseColors[%d].A"), CornerIndex, CornerIndex), Out[CornerIndex].A, BaseColors[CornerIndex].A);
+	}
+
+	return true;
+}
+
+// 2. Full authoritative parameter forwarding: a baseline plus 17 single-field-modified configs (all raw/
+// generative fields: Type, ScaleX/Y/Z, OffsetX/Y/Z, Seed, Octaves, Roughness, Lacunarity,
+// TurbulenceStrength, Blur; all artistic fields: Multiplier, LevelsMin, LevelsMax, Invert), each
+// independently proven byte-exact against a direct generator call using the SAME NoiseParams -> if the
+// orchestrator's own field-copy ever drops or mis-maps one field, that config's own reference (built from
+// the actual modified value) would diverge from the orchestrator's actual internal (wrongly-defaulted)
+// behavior, and the byte-exact comparison below would catch it. TurbulenceStrength's own config uses
+// Type=Turbulence specifically, since that field is otherwise harmless/unused for every other Noise Type.
+// Multiplier uses a sub-1.0 value to avoid the same clamp-saturation collision already discovered and
+// fixed for Curvature's own equivalent test in M16-K.6D-8E-B.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompNoiseParamForwardingTest, "VertexMaskForge.DynamicSourceTopologyComposition.NoiseForwardsAllAuthoritativeParameters", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynSrcTopoCompNoiseParamForwardingTest::RunTest(const FString& Parameters)
+{
+	const FVertexMaskForgeWorkingMesh WorkingMesh = BuildZVaryingFixtureWorkingMesh();
+	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
+	const FVertexMaskForgeNoiseParams Baseline = MakeNoiseBaselineParams();
+
+	struct FConfig
+	{
+		const TCHAR* Label;
+		FVertexMaskForgeNoiseParams Params;
+	};
+	TArray<FConfig> Configs;
+
+	{ FConfig C{ TEXT("Type"), Baseline }; C.Params.Type = EVertexMaskForgeNoiseType::Perlin; Configs.Add(C); }
+	{ FConfig C{ TEXT("ScaleX"), Baseline }; C.Params.ScaleX = 9.0f; Configs.Add(C); }
+	{ FConfig C{ TEXT("ScaleY"), Baseline }; C.Params.ScaleY = 9.0f; Configs.Add(C); }
+	{ FConfig C{ TEXT("ScaleZ"), Baseline }; C.Params.ScaleZ = 9.0f; Configs.Add(C); }
+	{ FConfig C{ TEXT("OffsetX"), Baseline }; C.Params.OffsetX = 37.0f; Configs.Add(C); }
+	{ FConfig C{ TEXT("OffsetY"), Baseline }; C.Params.OffsetY = 41.0f; Configs.Add(C); }
+	{ FConfig C{ TEXT("OffsetZ"), Baseline }; C.Params.OffsetZ = 53.0f; Configs.Add(C); }
+	{ FConfig C{ TEXT("Seed"), Baseline }; C.Params.Seed = 12345; Configs.Add(C); }
+	{ FConfig C{ TEXT("Octaves"), Baseline }; C.Params.Octaves = 1; Configs.Add(C); }
+	{ FConfig C{ TEXT("Roughness"), Baseline }; C.Params.Roughness = 0.1f; Configs.Add(C); }
+	{ FConfig C{ TEXT("Lacunarity"), Baseline }; C.Params.Lacunarity = 4.0f; Configs.Add(C); }
+	{ FConfig C{ TEXT("TurbulenceStrength"), Baseline }; C.Params.Type = EVertexMaskForgeNoiseType::Turbulence; C.Params.TurbulenceStrength = 3.0f; Configs.Add(C); }
+	{ FConfig C{ TEXT("Blur"), Baseline }; C.Params.Blur = 0.6f; Configs.Add(C); }
+	{ FConfig C{ TEXT("Multiplier"), Baseline }; C.Params.Multiplier = 0.37f; Configs.Add(C); }
+	{ FConfig C{ TEXT("LevelsMin"), Baseline }; C.Params.LevelsMin = 0.3f; Configs.Add(C); }
+	{ FConfig C{ TEXT("LevelsMax"), Baseline }; C.Params.LevelsMax = 0.7f; Configs.Add(C); }
+	{ FConfig C{ TEXT("Invert"), Baseline }; C.Params.bInvert = true; Configs.Add(C); }
+
+	for (const FConfig& Config : Configs)
+	{
+		FVertexMaskForgeGeneratorState ReferenceState;
+		const FVertexMaskForgeScalarMask ReferenceMask = VertexMaskForgeNoiseGenerator::GenerateNoiseMaskFromDynamicMesh(
+			WorkingMesh, ReferenceState, MakeNoiseGenerativeParams(Config.Params), Config.Params.Multiplier, Config.Params.LevelsMin, Config.Params.LevelsMax, Config.Params.bInvert);
+		TestTrue(*FString::Printf(TEXT("%s: reference generator State == Ready"), Config.Label), ReferenceMask.State == EVertexMaskForgeScalarMaskState::Ready);
+
+		FVertexMaskForgeDynamicLayerStack Stack;
+		AddNoiseLayer(Stack, TEXT("Layer"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f, Config.Params);
+
+		TArray<FColor> Out;
+		const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, Out);
+		TestTrue(*FString::Printf(TEXT("%s: orchestrator succeeds"), Config.Label), bSucceeded);
+		if (!bSucceeded || Out.Num() != 6)
+		{
+			continue;
+		}
+
+		for (int32 CornerIndex = 0; CornerIndex < 6; ++CornerIndex)
+		{
+			const int32 VertexID = FixtureCornerToVertexID[CornerIndex];
+			float ExpectedMaskValue = 0.0f;
+			if (!ReferenceMask.TryGetValue(VertexID, ExpectedMaskValue))
+			{
+				continue;
+			}
+			const uint8 ExpectedByte = UnitFloatToByte(ExpectedMaskValue);
+			TestEqual(*FString::Printf(TEXT("%s: Out[%d].R byte-exact"), Config.Label, CornerIndex), Out[CornerIndex].R, ExpectedByte);
+		}
+	}
+
+	return true;
+}
+
+// 3. Mismatched tagged payload: AUDITED (M16-K.6D-8F-B; renamed M16-K.6D-8F-B.1 -- see that checkpoint's
+// own report for the full rationale). This test does NOT deliver a mismatched payload to the orchestrator
+// and does NOT prove orchestrator-level rejection -- a true GeneratorType==Noise/Params!=
+// FVertexMaskForgeNoiseParams mismatch is structurally UNREACHABLE through
+// FVertexMaskForgeDynamicLayerStack's own public API -- Layers is private, GetLayers() returns only a
+// const reference, and SetLayerMaskParams itself refuses (returns false, stack left completely
+// unmodified) any Params whose active TVariant alternative does not match the mask's stored GeneratorType
+// (see that function's own doc contract, already generically proven by
+// VertexMaskForge.GeneratorMaskInstance.SetParamsFailsOnParamsTypeMismatch). This is the SAME structural
+// guarantee that already makes Material Slot's/Bounding Box's/Directional Normal's/Curvature's own
+// identical defensive TryGet checks in the orchestrator provably unreachable in production (each is
+// commented "should be unreachable... but never assumed") -- none of those four generators has a
+// dedicated mismatch test in this file either, for the same reason. No test-only production hook was
+// added to force a lower-level incoherent state. What this test actually proves, precisely matching its
+// own registered name: the Dynamic LAYER STACK rejects an attempt to write a mismatched (Curvature)
+// payload onto an already-Noise-tagged mask instance -- SetLayerMaskParams returns false, the layer's
+// Noise payload remains completely unchanged -- and the orchestrator, run afterward against that still-
+// coherent, never-actually-mismatched stack, continues to succeed normally (no crash, no fallback, no
+// partial composition). It does not exercise the orchestrator's own Noise TryGet defensive branch, which
+// remains untested for the same "unreachable in production" reason the other four generators' identical
+// branches are untested.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompNoiseMismatchRejectedByStackTest, "VertexMaskForge.DynamicSourceTopologyComposition.NoiseMismatchedTaggedPayloadRejectedByLayerStackBeforeOrchestration", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynSrcTopoCompNoiseMismatchRejectedByStackTest::RunTest(const FString& Parameters)
+{
+	const FVertexMaskForgeWorkingMesh WorkingMesh = BuildZVaryingFixtureWorkingMesh();
+	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
+
+	FVertexMaskForgeDynamicLayerStack Stack;
+	const FGuid LayerId = AddNoiseLayer(Stack, TEXT("Layer"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f, MakeNoiseBaselineParams());
+
+	const FVertexMaskForgeGeneratorMaskInstance* MaskInstance = Stack.GetLayerMask(LayerId);
+	check(MaskInstance);
+	const FGuid ExpectedMaskInstanceId = MaskInstance->MaskInstanceId;
+
+	// Attempt to overwrite the Noise-tagged mask instance's Params with a Curvature payload -- must fail.
+	const FVertexMaskForgeGeneratorParams MismatchedParams = MakeVertexMaskForgeGeneratorParams(EVertexMaskForgeGeneratorType::Curvature);
+	const bool bMismatchedWriteSucceeded = Stack.SetLayerMaskParams(LayerId, ExpectedMaskInstanceId, MismatchedParams);
+	TestFalse(TEXT("SetLayerMaskParams rejects a Curvature payload for a Noise-tagged mask instance"), bMismatchedWriteSucceeded);
+
+	const FVertexMaskForgeGeneratorMaskInstance* MaskAfterRejectedWrite = Stack.GetLayerMask(LayerId);
+	check(MaskAfterRejectedWrite);
+	TestTrue(TEXT("Mask remains Noise-tagged after the rejected write"), MaskAfterRejectedWrite->GeneratorType == EVertexMaskForgeGeneratorType::Noise);
+	TestTrue(TEXT("Params remain the Noise payload type after the rejected write"), MaskAfterRejectedWrite->Params.IsType<FVertexMaskForgeNoiseParams>());
+
+	// The stack therefore remains fully coherent -- the orchestrator succeeds normally against it, never
+	// crashing, never falling back, never partially composing.
+	TArray<FColor> Out;
+	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, Out);
+	TestTrue(TEXT("Orchestrator succeeds against the still-coherent stack"), bSucceeded);
+	TestEqual(TEXT("Out.Num() == 6"), Out.Num(), 6);
+
+	return true;
+}
+
+// 4. DynamicMesh Vertex domain correctness: corners 0 and 3 share VertexID 0 (both map to V0 per
+// FixtureCornerToVertexID); corners 2 and 4 share VertexID 2. A genuinely DynamicMeshVertex-domain
+// implementation MUST show identical values at each pair (Noise has no per-corner attribute input at all
+// -- its value is purely a function of VertexID position). An accidental Corner-domain implementation
+// would instead read Values[CornerIndex] against an array sized/indexed by VertexID, which would NOT
+// reproduce this equality in general.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompNoiseVertexDomainTest, "VertexMaskForge.DynamicSourceTopologyComposition.NoiseUsesDynamicMeshVertexDomainAcrossWeldedRenderCorners", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynSrcTopoCompNoiseVertexDomainTest::RunTest(const FString& Parameters)
+{
+	const FVertexMaskForgeWorkingMesh WorkingMesh = BuildZVaryingFixtureWorkingMesh();
+	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
+
+	FVertexMaskForgeDynamicLayerStack Stack;
+	AddNoiseLayer(Stack, TEXT("Layer"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f, MakeNoiseBaselineParams());
+
+	TArray<FColor> Out;
+	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, Out);
+	TestTrue(TEXT("Orchestrator succeeds"), bSucceeded);
+	if (!bSucceeded || Out.Num() != 6)
+	{
+		return false;
+	}
+
+	TestEqual(TEXT("Corner 3 maps to the same VertexID as corner 0 (fixture precondition)"), FixtureCornerToVertexID[3], FixtureCornerToVertexID[0]);
+	TestEqual(TEXT("Corner 4 maps to the same VertexID as corner 2 (fixture precondition)"), FixtureCornerToVertexID[4], FixtureCornerToVertexID[2]);
+
+	TestEqual(TEXT("Corner 0 and corner 3 (same welded VertexID) resolve the identical Noise value"), Out[0].R, Out[3].R);
+	TestEqual(TEXT("Corner 2 and corner 4 (same welded VertexID) resolve the identical Noise value"), Out[2].R, Out[4].R);
+
+	// Non-constant-mask proof -- V0..V3 have genuinely distinct positions in this fixture (see
+	// BuildZVaryingFixtureWorkingMesh's own doc comment), so Noise (a position-derived generator) must not
+	// be a uniformly-constant mask across all six corners.
+	TestFalse(TEXT("Output is not a constant mask across all six corners"),
+		Out[0].R == Out[1].R && Out[1].R == Out[2].R && Out[2].R == Out[3].R && Out[3].R == Out[4].R && Out[4].R == Out[5].R);
+
+	// Independently represented vertex retains its own value -- V1 (corner 1, touched by no other corner)
+	// need not equal V0's value.
+	TestNotEqual(TEXT("Corner 1 (independent VertexID 1) is not forced to equal corner 0's value"), Out[1].R, Out[0].R);
+
+	return true;
+}
+
+// 5. Independent Noise layers and reorder: two layers with meaningfully different generative parameters
+// (different Seed and Scale), Copy/Opacity-1.0 so the LAST-folded layer's own mask determines the
+// result -- the same "folded last wins" technique every prior generator's own two-layer test already
+// establishes. Each independently-computed reference uses its OWN fresh FVertexMaskForgeGeneratorState.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompNoiseTwoLayersOrderTest, "VertexMaskForge.DynamicSourceTopologyComposition.TwoNoiseLayersRetainDistinctMasksAndReorderChangesResult", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynSrcTopoCompNoiseTwoLayersOrderTest::RunTest(const FString& Parameters)
+{
+	const FVertexMaskForgeWorkingMesh WorkingMesh = BuildZVaryingFixtureWorkingMesh();
+	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
+
+	FVertexMaskForgeNoiseParams ParamsA = MakeNoiseBaselineParams();
+	ParamsA.Seed = 111;
+	FVertexMaskForgeNoiseParams ParamsB = MakeNoiseBaselineParams();
+	ParamsB.Seed = 222;
+	ParamsB.ScaleX = 6.0f;
+
+	FVertexMaskForgeGeneratorState RefStateA;
+	const FVertexMaskForgeScalarMask ReferenceA = VertexMaskForgeNoiseGenerator::GenerateNoiseMaskFromDynamicMesh(
+		WorkingMesh, RefStateA, MakeNoiseGenerativeParams(ParamsA), ParamsA.Multiplier, ParamsA.LevelsMin, ParamsA.LevelsMax, ParamsA.bInvert);
+	FVertexMaskForgeGeneratorState RefStateB;
+	const FVertexMaskForgeScalarMask ReferenceB = VertexMaskForgeNoiseGenerator::GenerateNoiseMaskFromDynamicMesh(
+		WorkingMesh, RefStateB, MakeNoiseGenerativeParams(ParamsB), ParamsB.Multiplier, ParamsB.LevelsMin, ParamsB.LevelsMax, ParamsB.bInvert);
+	TestTrue(TEXT("Reference A State == Ready"), ReferenceA.State == EVertexMaskForgeScalarMaskState::Ready);
+	TestTrue(TEXT("Reference B State == Ready"), ReferenceB.State == EVertexMaskForgeScalarMaskState::Ready);
+
+	// Forward: A first, B last -- B (folded last) determines the Copy result.
+	FVertexMaskForgeDynamicLayerStack ForwardStack;
+	AddNoiseLayer(ForwardStack, TEXT("A"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f, ParamsA);
+	AddNoiseLayer(ForwardStack, TEXT("B"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f, ParamsB);
+
+	// Reverse: same two layers, opposite order -- A (folded last) determines the Copy result instead.
+	FVertexMaskForgeDynamicLayerStack ReverseStack;
+	AddNoiseLayer(ReverseStack, TEXT("B"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f, ParamsB);
+	AddNoiseLayer(ReverseStack, TEXT("A"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f, ParamsA);
+
+	TArray<FColor> ForwardOut;
+	TArray<FColor> ReverseOut;
+	const bool bForwardSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, ForwardStack, BaseColors, ForwardOut);
+	const bool bReverseSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, ReverseStack, BaseColors, ReverseOut);
+	TestTrue(TEXT("Forward succeeds"), bForwardSucceeded);
+	TestTrue(TEXT("Reverse succeeds"), bReverseSucceeded);
+	if (!bForwardSucceeded || !bReverseSucceeded || ForwardOut.Num() != 6 || ReverseOut.Num() != 6)
+	{
+		return false;
+	}
+
+	for (int32 CornerIndex = 0; CornerIndex < 6; ++CornerIndex)
+	{
+		const int32 VertexID = FixtureCornerToVertexID[CornerIndex];
+		float ExpectedBValue = 0.0f;
+		float ExpectedAValue = 0.0f;
+		if (!ReferenceB.TryGetValue(VertexID, ExpectedBValue) || !ReferenceA.TryGetValue(VertexID, ExpectedAValue))
+		{
+			continue;
+		}
+		TestEqual(*FString::Printf(TEXT("Forward[%d].R matches B (folded last)"), CornerIndex), ForwardOut[CornerIndex].R, UnitFloatToByte(ExpectedBValue));
+		TestEqual(*FString::Printf(TEXT("Reverse[%d].R matches A (folded last)"), CornerIndex), ReverseOut[CornerIndex].R, UnitFloatToByte(ExpectedAValue));
+	}
+
+	// Distinctness precondition -- if A and B produced identical masks the test above would pass
+	// vacuously; confirm the two configs genuinely diverge at V0.
+	float AV0 = 0.0f, BV0 = 0.0f;
+	if (ReferenceA.TryGetValue(0, AV0) && ReferenceB.TryGetValue(0, BV0))
+	{
+		TestNotEqual(TEXT("A and B references genuinely differ at V0"), AV0, BV0);
+	}
+
+	return true;
+}
+
+// 6. Generic gating: a disabled Noise layer contributes nothing (Baseline passthrough), exactly mirroring
+// CurvatureDisabledLayerPreservesBaseColors' own established pattern. Work avoidance (Noise generation
+// never invoked for a disabled layer) is proven structurally by the existing pre-dispatch
+// `if (!Layer.bEnabled || !Layer.Mask.IsSet()) continue;` early-out in Pass 1 -- confirmed by direct source
+// inspection, not by production instrumentation.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompNoiseDisabledTest, "VertexMaskForge.DynamicSourceTopologyComposition.DisabledNoiseLayerIsNoOp", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynSrcTopoCompNoiseDisabledTest::RunTest(const FString& Parameters)
+{
+	const FVertexMaskForgeWorkingMesh WorkingMesh = BuildZVaryingFixtureWorkingMesh();
+	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
+
+	FVertexMaskForgeDynamicLayerStack Stack;
+	const FGuid LayerId = AddNoiseLayer(Stack, TEXT("Layer"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f, MakeNoiseBaselineParams());
+	Stack.SetLayerEnabled(LayerId, false);
+
+	TArray<FColor> Out;
+	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, Out);
+	TestTrue(TEXT("Succeeds"), bSucceeded);
+	if (bSucceeded && Out.Num() == 6)
+	{
+		for (int32 Index = 0; Index < 6; ++Index)
+		{
+			TestEqual(*FString::Printf(TEXT("Out[%d] byte-exact passthrough (disabled layer = no-op)"), Index), Out[Index], BaseColors[Index]);
+		}
+	}
+
+	return true;
+}
+
+// 7. Independent per-layer generator state / no cross-layer contamination: three enabled Noise layers,
+// each with meaningfully DIFFERENT generative configurations (different Seed/Scale/Type), each isolated to
+// its own RGB channel via SetLayerChannelFilter so the orchestrator's own multi-layer composed OUTPUT
+// (not merely a standalone helper call) can be compared directly, per channel, against three fully
+// independent direct-generator reference calls. UNLIKE Curvature's own shared-state-safety test (which
+// proves a SHARED state produces correct results), this proves the opposite design: since Noise layers use
+// INDEPENDENT per-layer transient state (never shared), evaluation order must never let a later layer's
+// state affect an earlier layer's already-composed contribution, and a genuinely different generative
+// configuration must never accidentally reuse another layer's raw pattern.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompNoiseIndependentStateTest, "VertexMaskForge.DynamicSourceTopologyComposition.MultipleNoiseLayersUseIndependentGeneratorState", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynSrcTopoCompNoiseIndependentStateTest::RunTest(const FString& Parameters)
+{
+	const FVertexMaskForgeWorkingMesh WorkingMesh = BuildZVaryingFixtureWorkingMesh();
+	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
+
+	FVertexMaskForgeNoiseParams ParamsA = MakeNoiseBaselineParams();
+	ParamsA.Seed = 10;
+	ParamsA.Type = EVertexMaskForgeNoiseType::Perlin;
+	FVertexMaskForgeNoiseParams ParamsB = MakeNoiseBaselineParams();
+	ParamsB.Seed = 20;
+	ParamsB.ScaleX = 6.0f;
+	FVertexMaskForgeNoiseParams ParamsC = MakeNoiseBaselineParams();
+	ParamsC.Seed = 30;
+	ParamsC.Type = EVertexMaskForgeNoiseType::Ridged;
+
+	FVertexMaskForgeGeneratorState RefStateA;
+	const FVertexMaskForgeScalarMask ReferenceA = VertexMaskForgeNoiseGenerator::GenerateNoiseMaskFromDynamicMesh(
+		WorkingMesh, RefStateA, MakeNoiseGenerativeParams(ParamsA), ParamsA.Multiplier, ParamsA.LevelsMin, ParamsA.LevelsMax, ParamsA.bInvert);
+	FVertexMaskForgeGeneratorState RefStateB;
+	const FVertexMaskForgeScalarMask ReferenceB = VertexMaskForgeNoiseGenerator::GenerateNoiseMaskFromDynamicMesh(
+		WorkingMesh, RefStateB, MakeNoiseGenerativeParams(ParamsB), ParamsB.Multiplier, ParamsB.LevelsMin, ParamsB.LevelsMax, ParamsB.bInvert);
+	FVertexMaskForgeGeneratorState RefStateC;
+	const FVertexMaskForgeScalarMask ReferenceC = VertexMaskForgeNoiseGenerator::GenerateNoiseMaskFromDynamicMesh(
+		WorkingMesh, RefStateC, MakeNoiseGenerativeParams(ParamsC), ParamsC.Multiplier, ParamsC.LevelsMin, ParamsC.LevelsMax, ParamsC.bInvert);
+	TestTrue(TEXT("Reference A/B/C all Ready"),
+		ReferenceA.State == EVertexMaskForgeScalarMaskState::Ready
+		&& ReferenceB.State == EVertexMaskForgeScalarMaskState::Ready
+		&& ReferenceC.State == EVertexMaskForgeScalarMaskState::Ready);
+
+	FVertexMaskForgeDynamicLayerStack Stack;
+	const FGuid LayerA = AddNoiseLayer(Stack, TEXT("A"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f, ParamsA);
+	const FGuid LayerB = AddNoiseLayer(Stack, TEXT("B"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f, ParamsB);
+	const FGuid LayerC = AddNoiseLayer(Stack, TEXT("C"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f, ParamsC);
+	Stack.SetLayerChannelFilter(LayerA, /*bAffectRed=*/true, /*bAffectGreen=*/false, /*bAffectBlue=*/false);
+	Stack.SetLayerChannelFilter(LayerB, /*bAffectRed=*/false, /*bAffectGreen=*/true, /*bAffectBlue=*/false);
+	Stack.SetLayerChannelFilter(LayerC, /*bAffectRed=*/false, /*bAffectGreen=*/false, /*bAffectBlue=*/true);
+
+	TArray<FColor> Out;
+	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, Out);
+	TestTrue(TEXT("Orchestrator succeeds with three independent Noise layers in one invocation"), bSucceeded);
+	if (!bSucceeded || Out.Num() != 6)
+	{
+		return false;
+	}
+
+	for (int32 CornerIndex = 0; CornerIndex < 6; ++CornerIndex)
+	{
+		const int32 VertexID = FixtureCornerToVertexID[CornerIndex];
+		float ExpectedA = 0.0f, ExpectedB = 0.0f, ExpectedC = 0.0f;
+		if (!ReferenceA.TryGetValue(VertexID, ExpectedA) || !ReferenceB.TryGetValue(VertexID, ExpectedB) || !ReferenceC.TryGetValue(VertexID, ExpectedC))
+		{
+			continue;
+		}
+		TestEqual(*FString::Printf(TEXT("Out[%d].R matches independent Layer A (not contaminated by B/C)"), CornerIndex), Out[CornerIndex].R, UnitFloatToByte(ExpectedA));
+		TestEqual(*FString::Printf(TEXT("Out[%d].G matches independent Layer B (not contaminated by A/C)"), CornerIndex), Out[CornerIndex].G, UnitFloatToByte(ExpectedB));
+		TestEqual(*FString::Printf(TEXT("Out[%d].B matches independent Layer C (not contaminated by A/B)"), CornerIndex), Out[CornerIndex].B, UnitFloatToByte(ExpectedC));
 	}
 
 	return true;

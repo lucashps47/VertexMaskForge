@@ -28,6 +28,7 @@
 #include "VertexMaskForgeLayerTypes.h"
 #include "VertexMaskForgeMaskTypes.h"
 #include "VertexMaskForgeMaterialSlotGenerator.h"
+#include "VertexMaskForgeNoiseGenerator.h"
 #include "VertexMaskForgeRecipeTypes.h"
 #include "VertexMaskForgeSequentialEvaluator.h"
 #include "VertexMaskForgeWorkingMeshTypes.h"
@@ -303,11 +304,91 @@ bool VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSo
 				bCornerToVertexIDBuilt = true;
 			}
 		}
+		else if (Layer.Mask->GeneratorType == EVertexMaskForgeGeneratorType::Noise)
+		{
+			const FVertexMaskForgeNoiseParams* NoiseParams = Layer.Mask->Params.TryGet<FVertexMaskForgeNoiseParams>();
+			if (!NoiseParams)
+			{
+				// Defensive -- mirrors the Material Slot/Bounding Box/Directional Normal/Curvature
+				// coherence checks above.
+				return false;
+			}
+
+			// M16-K.6D-8F-B scope: Noise has no Local/World-space concept and no ComponentTransform
+			// dependency at all (confirmed directly from GenerateNoiseMaskFromDynamicMesh's own signature)
+			// -- no space-rejection check here, mirroring Curvature's own precedent. Every authoritative
+			// field is forwarded unchanged; none are normalized, swapped, or rewritten here.
+			//
+			// UNLIKE Curvature's single shared CurvatureLocalGeneratorState (reused across every enabled
+			// Curvature layer in one call, safe because Curvature's raw-cache key is geometry-only), Noise's
+			// own raw-cache key additionally includes its full FVertexMaskForgeNoiseGenerativeParams (see
+			// that type's own operator==) -- two Noise layers commonly differ in Type/Scale/Offset/Seed/
+			// Octaves/Roughness/Lacunarity/TurbulenceStrength/Blur, so sharing one state across them would
+			// merely thrash (each layer's own call would invalidate the previous layer's cached raw pattern
+			// via that struct's own field-by-field comparison) rather than ever hit a genuine cache reuse.
+			// Accordingly, this branch constructs a NEW, INDEPENDENT, function-local
+			// FVertexMaskForgeGeneratorState for THIS Noise layer only -- never shared with another Noise
+			// layer, never the Legacy per-entry FVertexMaskForgeGeneratorState (never reachable from this
+			// orchestrator), never static/persistent, never exposed through this function's own public
+			// signature, and never retained beyond this single layer's evaluation (destroyed at the end of
+			// this loop iteration). This is a deliberate design difference from Curvature, not a claim that
+			// Noise is cheaper or more/less expensive to evaluate -- no comparative performance measurement
+			// was made.
+			FVertexMaskForgeGeneratorState NoiseLocalGeneratorState;
+
+			FVertexMaskForgeNoiseGenerativeParams GenerativeParams;
+			GenerativeParams.NoiseType = NoiseParams->Type;
+			GenerativeParams.ScaleX = NoiseParams->ScaleX;
+			GenerativeParams.ScaleY = NoiseParams->ScaleY;
+			GenerativeParams.ScaleZ = NoiseParams->ScaleZ;
+			GenerativeParams.OffsetX = NoiseParams->OffsetX;
+			GenerativeParams.OffsetY = NoiseParams->OffsetY;
+			GenerativeParams.OffsetZ = NoiseParams->OffsetZ;
+			GenerativeParams.Seed = NoiseParams->Seed;
+			GenerativeParams.Octaves = NoiseParams->Octaves;
+			GenerativeParams.Roughness = NoiseParams->Roughness;
+			GenerativeParams.Lacunarity = NoiseParams->Lacunarity;
+			GenerativeParams.TurbulenceStrength = NoiseParams->TurbulenceStrength;
+			GenerativeParams.Blur = NoiseParams->Blur;
+
+			// GenerateNoiseMaskFromDynamicMesh returns its FVertexMaskForgeScalarMask entirely BY VALUE
+			// (freshly allocated inside that function every call, from ApplyNoiseArtisticParams' own
+			// freshly-returned-by-value TArray<float> -- never aliased to NoiseLocalGeneratorState's own
+			// cached raw array) -- so the MoveTemp below is always safe, exactly like Curvature's own
+			// established precedent.
+			FVertexMaskForgeScalarMask GeneratedMask = VertexMaskForgeNoiseGenerator::GenerateNoiseMaskFromDynamicMesh(
+				WorkingMesh, NoiseLocalGeneratorState, GenerativeParams, NoiseParams->Multiplier,
+				NoiseParams->LevelsMin, NoiseParams->LevelsMax, NoiseParams->bInvert);
+			if (GeneratedMask.State != EVertexMaskForgeScalarMaskState::Ready)
+			{
+				// Mirrors Curvature's/Bounding Box's own check exactly -- Noise's output is
+				// DynamicMeshVertex-domain and sparse-safe (resolved only via TryGetValue in Pass 2 below),
+				// so no separate cardinality check is required here.
+				return false;
+			}
+
+			LayerMasks[LayerIndex].Mask = MoveTemp(GeneratedMask);
+			LayerMasks[LayerIndex].Domain = ELayerMaskDomain::DynamicMeshVertex;
+
+			if (!bCornerToVertexIDBuilt)
+			{
+				CornerToVertexID.SetNumUninitialized(ExpectedCornerCount);
+				int32 RunningCornerIndex = 0;
+				for (const int32 TriangleID : WorkingMesh.Mesh->TriangleIndicesItr())
+				{
+					const UE::Geometry::FIndex3i Tri = WorkingMesh.Mesh->GetTriangle(TriangleID);
+					CornerToVertexID[RunningCornerIndex++] = Tri.A;
+					CornerToVertexID[RunningCornerIndex++] = Tri.B;
+					CornerToVertexID[RunningCornerIndex++] = Tri.C;
+				}
+				bCornerToVertexIDBuilt = true;
+			}
+		}
 		else
 		{
 			// Explicit, whole-call failure -- any generator type beyond this checkpoint's own supported
-			// set (Material Slot, Bounding Box Local-space, Directional Normal Local-space, Curvature)
-			// never silently skips or treats itself as Fill-only.
+			// set (Material Slot, Bounding Box Local-space, Directional Normal Local-space, Curvature,
+			// Noise) never silently skips or treats itself as Fill-only.
 			return false;
 		}
 	}
