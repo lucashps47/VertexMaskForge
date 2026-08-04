@@ -106,10 +106,20 @@ namespace VertexMaskForgeDynamicSourceTopologyComposition
 	 * WorkingMesh.Mesh->TriangleCount() * 3 caller-owned FColor entries. Returns false, with
 	 * OutComposedColors left completely untouched (whatever it held before the call, unmodified), on any
 	 * validation failure above.
+	 *
+	 * M16-K.6D-8G-B: ComponentTransform is the real transform of the specific UStaticMeshComponent whose
+	 * source-topology colors are being evaluated (never FTransform::Identity from a production caller --
+	 * see each call site's own doc comment for how it is resolved). This checkpoint threads the parameter
+	 * through ONLY -- no existing generator dispatch below reads it, and none of the five currently
+	 * supported generator types (Material Slot, Bounding Box Local-space, Directional Normal Local-space,
+	 * Curvature, Noise) may consume it; it exists so a future World-Space-dependent generator (Ambient
+	 * Occlusion, see M16-K.6D-8G-A/8G-A.1) can be dispatched without a second signature change. Test
+	 * callers exercising the five existing generators must pass FTransform::Identity.
 	 */
 	bool ComputeComposedColorsRGBSourceTopology(
 		const FVertexMaskForgeWorkingMesh& WorkingMesh,
 		const FVertexMaskForgeDynamicLayerStack& Stack,
 		TConstArrayView<FColor> BaseColors,
+		const FTransform& ComponentTransform,
 		TArray<FColor>& OutComposedColors);
 }

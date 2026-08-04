@@ -11004,8 +11004,13 @@ void SVertexMaskForgePanel::ApplyPreviewToEntry(
 				// remainder of this one component's own update -- never retained on State/StateOwner/
 				// the panel, never cached, never given a generation counter.
 				TArray<FColor> DynamicComposedColors;
+				// M16-K.6D-8G-B: the real transform of THIS component (SourceComponent, resolved above at
+				// the top of this per-component loop) -- never Identity, never another component's
+				// transform, never cached elsewhere. Unused by any generator dispatched this checkpoint;
+				// threaded through only so a future World-Space-dependent generator (Ambient Occlusion)
+				// does not require a second signature change.
 				const bool bDynamicComposed = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(
-					WorkingMesh, DynamicLayerStack, StateOwner->GetBaselineColors(), DynamicComposedColors);
+					WorkingMesh, DynamicLayerStack, StateOwner->GetBaselineColors(), SourceComponent->GetComponentTransform(), DynamicComposedColors);
 				if (!bDynamicComposed)
 				{
 					// AUDITED: an explicit, non-destructive failure -- the orchestrator's own contract

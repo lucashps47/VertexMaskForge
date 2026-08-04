@@ -72,8 +72,11 @@ namespace VertexMaskForgeDynamicAcceptTargetBuilder
 				}
 
 				TArray<FColor> ComponentColors;
+				// M16-K.6D-8G-B: the real transform of THIS component (SourceComponent, resolved above) --
+				// never Identity. Unused by any generator dispatched this checkpoint; see the orchestrator's
+				// own header doc comment.
 				const bool bComposed = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(
-					WorkingMesh, DynamicLayerStack, StateOwner->GetBaselineColors(), ComponentColors);
+					WorkingMesh, DynamicLayerStack, StateOwner->GetBaselineColors(), SourceComponent->GetComponentTransform(), ComponentColors);
 				if (!bComposed)
 				{
 					OutErrorText = FText::Format(

@@ -200,7 +200,7 @@ bool FVertexMaskForgeDynamicAcceptTargetBuilderValidComponentTest::RunTest(const
 	// Direct orchestrator call, same inputs -- byte-exact comparison, no duplicated formula.
 	TArray<FColor> ExpectedColors;
 	const bool bComposed = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(
-		Entry->MeshOwner->GetWorkingMesh(), Stack, Baseline, ExpectedColors);
+		Entry->MeshOwner->GetWorkingMesh(), Stack, Baseline, FTransform::Identity, ExpectedColors);
 	TestTrue(TEXT("Direct orchestrator call succeeds"), bComposed);
 
 	TestEqual(TEXT("FinalColors.Num() == ExpectedColors.Num()"), Targets[0].FinalColors.Num(), ExpectedColors.Num());
@@ -294,7 +294,7 @@ bool FVertexMaskForgeDynamicAcceptTargetBuilderNoneGeneratorTest::RunTest(const 
 
 	TArray<FColor> ExpectedColors;
 	VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(
-		Entry->MeshOwner->GetWorkingMesh(), Stack, Baseline, ExpectedColors);
+		Entry->MeshOwner->GetWorkingMesh(), Stack, Baseline, FTransform::Identity, ExpectedColors);
 	for (int32 Index = 0; Index < ExpectedColors.Num(); ++Index)
 	{
 		TestEqual(*FString::Printf(TEXT("FinalColors[%d] matches expected None-generator (full coverage) White"), Index), Targets[0].FinalColors[Index], ExpectedColors[Index]);
@@ -392,7 +392,7 @@ bool FVertexMaskForgeDynamicAcceptTargetBuilderMultiLayerParityTest::RunTest(con
 
 	TArray<FColor> ExpectedColors;
 	const bool bComposed = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(
-		Entry->MeshOwner->GetWorkingMesh(), Stack, Baseline, ExpectedColors);
+		Entry->MeshOwner->GetWorkingMesh(), Stack, Baseline, FTransform::Identity, ExpectedColors);
 	TestTrue(TEXT("Direct orchestrator call succeeds"), bComposed);
 	for (int32 Index = 0; Index < ExpectedColors.Num(); ++Index)
 	{

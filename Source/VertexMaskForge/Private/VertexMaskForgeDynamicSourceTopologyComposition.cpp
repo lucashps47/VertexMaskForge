@@ -64,8 +64,15 @@ bool VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSo
 	const FVertexMaskForgeWorkingMesh& WorkingMesh,
 	const FVertexMaskForgeDynamicLayerStack& Stack,
 	TConstArrayView<FColor> BaseColors,
+	const FTransform& ComponentTransform,
 	TArray<FColor>& OutComposedColors)
 {
+	// M16-K.6D-8G-B: ComponentTransform is intentionally unused this checkpoint -- see this function's
+	// own header doc comment. Referencing it here only to keep -Wunused-parameter silent would invent
+	// behavior; the parameter is simply threaded through, unread, until M16-K.6D-8G-C's Ambient Occlusion
+	// dispatch branch consumes it.
+	(void)ComponentTransform;
+
 	if (!WorkingMesh.Mesh.IsValid())
 	{
 		return false;
