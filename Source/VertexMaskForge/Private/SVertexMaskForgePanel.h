@@ -364,6 +364,53 @@ private:
 	TSharedRef<SWidget> OnGenerateDynamicMaterialSlotPickerRow(TSharedPtr<FVertexMaskForgeMaterialSlotInfo> InOption) const;
 
 	/**
+	 * M16-K.6D-8C-C: this layer's "Generator Parameters" body content for a Bounding Box mask -- an
+	 * incompatible-state warning (see IsDynamicBoundingBoxLayerLocalSpaceCompatible) followed by one
+	 * BuildDynamicBoundingBoxAxisRow per axis (X/Y/Z). ExpectedMaskInstanceId is the MaskInstanceId this
+	 * row was built for (captured once by BuildDynamicLayerRow, mirroring MaterialSlotExpectedMaskInstanceId's
+	 * own established role) -- every mutation below validates against it, never a freshly re-read id, so a
+	 * stale-firing callback from an earlier-built widget can never write to a different mask instance.
+	 */
+	TSharedRef<SWidget> BuildDynamicBoundingBoxLayerParamsBlock(FGuid LayerId, FGuid ExpectedMaskInstanceId);
+
+	/**
+	 * One axis row (Enabled/Position/Falloff/Invert/Mirror) for a Dynamic layer's own layer-owned
+	 * FVertexMaskForgeBoundingBoxParams -- visually mirrors BuildBoundingBoxAxisRow's own Legacy layout,
+	 * labels, tooltips, and numeric ranges, but every control reads/writes ONLY this specific LayerId's
+	 * own stored parameters via MutateDynamicBoundingBoxAxisParam, never the panel-owned
+	 * BoundingBoxAxisParams member. Deliberately exposes no World Space control -- see
+	 * IsDynamicBoundingBoxLayerLocalSpaceCompatible's own doc comment for why and where that restriction
+	 * is actually enforced.
+	 */
+	TSharedRef<SWidget> BuildDynamicBoundingBoxAxisRow(FGuid LayerId, FGuid ExpectedMaskInstanceId, EVertexMaskForgeBoundsAxis Axis, FText AxisLabel);
+
+	/**
+	 * M16-K.6D-8C-C: true iff LayerId's CURRENT Bounding Box parameters (if any) are already compatible
+	 * with this checkpoint's Local-space-only Dynamic support -- bUseUnifiedBounds == false AND no
+	 * ENABLED axis has bWorldSpace == true (the exact same predicate
+	 * VertexMaskForgeDynamicSourceTopologyComposition's own Pass 1 already enforces as the real,
+	 * authoritative rejection boundary -- this is a read-only UI-side echo of that check, for honest
+	 * presentation only, never a second enforcement point and never a normalization). False for a layer
+	 * with no mask, or a mask that is not Bounding Box (callers only consult this when already known to
+	 * be Bounding Box; the defensive default keeps this function safe to call unconditionally). A stored
+	 * layer that already requests World Space or Unified Bounds (never reachable through this checkpoint's
+	 * own UI, but not otherwise precluded) is surfaced via this function, never silently reinterpreted. */
+	bool IsDynamicBoundingBoxLayerLocalSpaceCompatible(FGuid LayerId) const;
+
+	/**
+	 * Shared mutation helper for one Dynamic layer's Bounding Box axis parameter: resolves LayerId's
+	 * current mask fresh, validates the same six-step identity/coherence contract every Material Slot
+	 * mutation callback already establishes (mask exists, GeneratorType == BoundingBox, Params is the
+	 * BoundingBox payload type, MaskInstanceId == ExpectedMaskInstanceId) -- on any mismatch, a silent
+	 * no-op, exactly like the Material Slot precedent. On success: copies the current
+	 * FVertexMaskForgeBoundingBoxParams, invokes Mutator on exactly Axes[AxisIndex] (every other field,
+	 * including the other two axes and bUseUnifiedBounds, is preserved byte-for-byte), calls
+	 * SetLayerMaskParams with the captured ExpectedMaskInstanceId, then OnDynamicLayerStackMutated(). Never
+	 * retains Mutator or any parameter reference beyond this single call.
+	 */
+	void MutateDynamicBoundingBoxAxisParam(FGuid LayerId, FGuid ExpectedMaskInstanceId, int32 AxisIndex, TFunctionRef<void(FVertexMaskForgeAxisMaskParams&)> Mutator);
+
+	/**
 	 * M16-K.6D-6 (Correction 2): Reorder is now drag-and-drop only -- the Up/Down buttons and their
 	 * OnMoveDynamicLayerUpClicked/OnMoveDynamicLayerDownClicked/CanMoveDynamicLayerUp/
 	 * CanMoveDynamicLayerDown panel-UI-glue wrappers were removed (FVertexMaskForgeDynamicLayerStack::

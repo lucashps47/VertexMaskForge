@@ -1055,12 +1055,13 @@ namespace VertexMaskForgePanel
 	}
 
 	/**
-	 * M16-K.6B: human-readable label for one Dynamic Layer row's Generator Type combo option/current
-	 * value. A null InOption represents "None/Unassigned" (mirrors DynamicLayerGeneratorTypeOptions' own
-	 * element-0-is-null convention). A non-null InOption is expected to only ever be MaterialSlot in this
-	 * checkpoint (the only value DynamicLayerGeneratorTypeOptions offers) -- the default case covers any
-	 * other EVertexMaskForgeGeneratorType defensively (e.g. if a layer's Mask was assigned by something
-	 * other than this combo), without claiming Dynamic support for it.
+	 * M16-K.6B; extended M16-K.6D-8C-C: human-readable label for one Dynamic Layer row's Generator Type
+	 * combo option/current value. A null InOption represents "None/Unassigned" (mirrors
+	 * DynamicLayerGeneratorTypeOptions' own element-0-is-null convention). A non-null InOption is expected
+	 * to only ever be MaterialSlot or BoundingBox in this checkpoint (the only values
+	 * DynamicLayerGeneratorTypeOptions offers) -- the default case covers any other
+	 * EVertexMaskForgeGeneratorType defensively (e.g. if a layer's Mask was assigned by something other
+	 * than this combo), without claiming Dynamic support for it.
 	 */
 	static FText GetDynamicLayerGeneratorTypeLabel(const EVertexMaskForgeGeneratorType* InOption)
 	{
@@ -1072,6 +1073,8 @@ namespace VertexMaskForgePanel
 		{
 		case EVertexMaskForgeGeneratorType::MaterialSlot:
 			return LOCTEXT("DynamicLayerGeneratorMaterialSlot", "Material Slot");
+		case EVertexMaskForgeGeneratorType::BoundingBox:
+			return LOCTEXT("DynamicLayerGeneratorBoundingBox", "Bounding Box");
 		default:
 			return LOCTEXT("DynamicLayerGeneratorUnsupported", "Unsupported");
 		}
@@ -3998,41 +4001,78 @@ TSharedRef<SWidget> SVertexMaskForgePanel::BuildDynamicLayerRow(const FGuid Laye
 			]
 		]
 
-		// M16-K.6C-2 / ADR-010: Material Slot configurational editor -- visible ONLY when this layer's
-		// assigned generator is MaterialSlot. Editing is gated to exactly one selected Static Mesh asset
-		// (SelectedMeshes.Num()==1, identical to the legacy IsMaterialSlotMaskAvailableForSelection gate)
-		// with at least one real material slot on that asset's own WorkingMesh.MaterialSlotOptions -- see
-		// GetSingleAssetWorkingMeshForDynamicMaterialSlot. Zero, multiple, or slot-less assets leave this
-		// section visible but non-editable, with an explicit inline message -- never a silent clamp,
-		// fallback to index 0, arbitrary mesh pick, or intersection/union across assets. A stale/out-of-
-		// range stored SelectedSlotIndex is preserved verbatim and surfaced explicitly, never clamped or
-		// silently reselected -- the user repairs it by picking a valid option themselves.
-		//
-		// M16-K.6C-2-FIX: the picker's and Invert's write callbacks below validate identity against
-		// MaterialSlotExpectedMaskInstanceId -- the id captured ONCE when this row was built (see above) --
-		// never against a freshly re-read Mask->MaskInstanceId. A freshly re-read id is always trivially
-		// equal to itself and therefore proves nothing about whether THIS widget instance still corresponds
-		// to the mask instance currently in the stack; only comparing against the construction-time capture
-		// can detect a stale-firing callback from a widget built for an instance that was since cleared or
-		// replaced (see the six-step check inside each callback below). Only SetLayerMaskParams is ever
-		// called, and only from real user-driven selection events (SelectType != ESelectInfo::Direct guards
-		// against a programmatic/reconstruction-driven event, e.g. from this row's own OptionsSource being
-		// refreshed on dropdown-open).
+		// M16-K.6D-8C-C: "Generator Parameters" -- one expander per layer, visible only when the layer's
+		// assigned generator actually has Dynamic-exposed parameters (today: MaterialSlot or BoundingBox;
+		// a Fill-only/None layer shows no expander at all, never an empty one). Belongs to THIS layer --
+		// never a shared panel-level control -- and is never the obsolete standalone Layers panel (removed
+		// entirely in M16-K.6D-8C-B; this is a sibling section inside one Dynamic Layer's own row).
 		+ SVerticalBox::Slot()
 		.AutoHeight()
 		.Padding(FMargin(0.f, 2.f, 0.f, 0.f))
 		[
-			SNew(SVerticalBox)
+			SNew(SExpandableArea)
+			.InitiallyCollapsed(false)
+			.Padding(FMargin(4.f))
 			.Visibility_Lambda([this, LayerId]()
 			{
 				const FVertexMaskForgeGeneratorMaskInstance* Mask = DynamicLayerStack.GetLayerMask(LayerId);
-				return (Mask && Mask->GeneratorType == EVertexMaskForgeGeneratorType::MaterialSlot) ? EVisibility::Visible : EVisibility::Collapsed;
+				if (!Mask)
+				{
+					return EVisibility::Collapsed;
+				}
+				return (Mask->GeneratorType == EVertexMaskForgeGeneratorType::MaterialSlot
+					|| Mask->GeneratorType == EVertexMaskForgeGeneratorType::BoundingBox)
+					? EVisibility::Visible : EVisibility::Collapsed;
 			})
-
-			+ SVerticalBox::Slot()
-			.AutoHeight()
+			.HeaderContent()
 			[
-				SNew(SHorizontalBox)
+				SNew(STextBlock)
+				.Text(LOCTEXT("DynamicLayerGeneratorParametersTitle", "Generator Parameters"))
+				.Font(FCoreStyle::GetDefaultFontStyle("Bold", 9))
+			]
+			.BodyContent()
+			[
+				SNew(SVerticalBox)
+
+				// M16-K.6C-2 / ADR-010: Material Slot configurational editor -- visible ONLY when this
+				// layer's assigned generator is MaterialSlot. Editing is gated to exactly one selected
+				// Static Mesh asset (SelectedMeshes.Num()==1, identical to the legacy
+				// IsMaterialSlotMaskAvailableForSelection gate) with at least one real material slot on
+				// that asset's own WorkingMesh.MaterialSlotOptions -- see
+				// GetSingleAssetWorkingMeshForDynamicMaterialSlot. Zero, multiple, or slot-less assets
+				// leave this section visible but non-editable, with an explicit inline message -- never a
+				// silent clamp, fallback to index 0, arbitrary mesh pick, or intersection/union across
+				// assets. A stale/out-of-range stored SelectedSlotIndex is preserved verbatim and surfaced
+				// explicitly, never clamped or silently reselected -- the user repairs it by picking a
+				// valid option themselves.
+				//
+				// M16-K.6C-2-FIX: the picker's and Invert's write callbacks below validate identity
+				// against MaterialSlotExpectedMaskInstanceId -- the id captured ONCE when this row was
+				// built (see above) -- never against a freshly re-read Mask->MaskInstanceId. A freshly
+				// re-read id is always trivially equal to itself and therefore proves nothing about
+				// whether THIS widget instance still corresponds to the mask instance currently in the
+				// stack; only comparing against the construction-time capture can detect a stale-firing
+				// callback from a widget built for an instance that was since cleared or replaced (see the
+				// six-step check inside each callback below). Only SetLayerMaskParams is ever called, and
+				// only from real user-driven selection events (SelectType != ESelectInfo::Direct guards
+				// against a programmatic/reconstruction-driven event, e.g. from this row's own
+				// OptionsSource being refreshed on dropdown-open). M16-K.6D-8C-C: unchanged below except
+				// for the SExpandableArea now wrapping it -- mutation semantics are byte-for-byte identical
+				// to before this checkpoint.
+				+ SVerticalBox::Slot()
+				.AutoHeight()
+				[
+					SNew(SVerticalBox)
+					.Visibility_Lambda([this, LayerId]()
+					{
+						const FVertexMaskForgeGeneratorMaskInstance* Mask = DynamicLayerStack.GetLayerMask(LayerId);
+						return (Mask && Mask->GeneratorType == EVertexMaskForgeGeneratorType::MaterialSlot) ? EVisibility::Visible : EVisibility::Collapsed;
+					})
+
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					[
+						SNew(SHorizontalBox)
 
 				+ SHorizontalBox::Slot()
 				.AutoWidth()
@@ -4271,8 +4311,283 @@ TSharedRef<SWidget> SVertexMaskForgePanel::BuildDynamicLayerRow(const FGuid Laye
 					return (WorkingMesh && WorkingMesh->MaterialSlotOptions.IsEmpty()) ? EVisibility::Visible : EVisibility::Collapsed;
 				})
 				.Text(LOCTEXT("DynamicLayerMaterialSlotNoSlots", "The selected Static Mesh asset has no material slots."))
+				]
+			]
+
+			// M16-K.6D-8C-C: Bounding Box configurational editor -- sibling of the Material Slot block
+			// above, inside the SAME "Generator Parameters" expander body. Visible/editable only when
+			// this layer's assigned generator is BoundingBox (see BuildDynamicBoundingBoxLayerParamsBlock's
+			// own doc comment for the full contract, including the Local-space-only enforcement and
+			// incompatible-state warning).
+			+ SVerticalBox::Slot()
+			.AutoHeight()
+			.Padding(FMargin(0.f, 2.f, 0.f, 0.f))
+			[
+				BuildDynamicBoundingBoxLayerParamsBlock(LayerId, MaterialSlotExpectedMaskInstanceId)
+				]
 			]
 		]
+	];
+}
+
+bool SVertexMaskForgePanel::IsDynamicBoundingBoxLayerLocalSpaceCompatible(const FGuid LayerId) const
+{
+	const FVertexMaskForgeGeneratorMaskInstance* Mask = DynamicLayerStack.GetLayerMask(LayerId);
+	if (!Mask || Mask->GeneratorType != EVertexMaskForgeGeneratorType::BoundingBox)
+	{
+		return true;
+	}
+	const FVertexMaskForgeBoundingBoxParams* BBoxParams = Mask->Params.TryGet<FVertexMaskForgeBoundingBoxParams>();
+	if (!BBoxParams)
+	{
+		return true;
+	}
+	if (BBoxParams->bUseUnifiedBounds)
+	{
+		return false;
+	}
+	for (const FVertexMaskForgeAxisMaskParams& AxisParams : BBoxParams->Axes)
+	{
+		if (AxisParams.bEnabled && AxisParams.bWorldSpace)
+		{
+			return false;
+		}
+	}
+	return true;
+}
+
+void SVertexMaskForgePanel::MutateDynamicBoundingBoxAxisParam(
+	const FGuid LayerId, const FGuid ExpectedMaskInstanceId, const int32 AxisIndex,
+	TFunctionRef<void(FVertexMaskForgeAxisMaskParams&)> Mutator)
+{
+	// AUDITED (M16-K.6D-8C-C): mirrors the Material Slot picker/Invert callbacks' own six-step identity-
+	// validated write path exactly -- mask exists, GeneratorType is still BoundingBox, Params is still the
+	// BoundingBox payload type, and MaskInstanceId still matches what THIS widget was built for. Any
+	// mismatch (cleared, reassigned to a different generator, or replaced by a newer instance) is a silent
+	// no-op, never a fallback to another layer or a stale write.
+	const FVertexMaskForgeGeneratorMaskInstance* Mask = DynamicLayerStack.GetLayerMask(LayerId);
+	if (!Mask
+		|| Mask->GeneratorType != EVertexMaskForgeGeneratorType::BoundingBox
+		|| !Mask->Params.IsType<FVertexMaskForgeBoundingBoxParams>()
+		|| Mask->MaskInstanceId != ExpectedMaskInstanceId
+		|| AxisIndex < 0 || AxisIndex >= Mask->Params.Get<FVertexMaskForgeBoundingBoxParams>().Axes.Num())
+	{
+		return;
+	}
+	// AUDITED: copies the CURRENT Params (every field byte/value-exact, including the other two axes and
+	// bUseUnifiedBounds), mutates ONLY Axes[AxisIndex] via Mutator, then writes back through the existing
+	// stack API -- never a second/cached copy of parameters retained across calls.
+	FVertexMaskForgeGeneratorParams NewParams = Mask->Params;
+	Mutator(NewParams.Get<FVertexMaskForgeBoundingBoxParams>().Axes[AxisIndex]);
+	DynamicLayerStack.SetLayerMaskParams(LayerId, ExpectedMaskInstanceId, NewParams);
+	OnDynamicLayerStackMutated();
+}
+
+TSharedRef<SWidget> SVertexMaskForgePanel::BuildDynamicBoundingBoxAxisRow(
+	const FGuid LayerId, const FGuid ExpectedMaskInstanceId, const EVertexMaskForgeBoundsAxis Axis, const FText AxisLabel)
+{
+	const int32 AxisIndex = static_cast<int32>(Axis);
+
+	// AUDITED: every Value_Lambda/IsChecked_Lambda below re-resolves LayerId's CURRENT stored Bounding Box
+	// params fresh on every call (never a cached copy) -- if the layer/mask/params no longer match (e.g.
+	// generator switched away), each accessor falls back to its own axis default rather than reading
+	// garbage. Read-only; never mutates.
+	auto GetAxisParams = [this, LayerId](const int32 InAxisIndex) -> FVertexMaskForgeAxisMaskParams
+	{
+		const FVertexMaskForgeGeneratorMaskInstance* Mask = DynamicLayerStack.GetLayerMask(LayerId);
+		const FVertexMaskForgeBoundingBoxParams* BBoxParams = Mask ? Mask->Params.TryGet<FVertexMaskForgeBoundingBoxParams>() : nullptr;
+		if (BBoxParams && InAxisIndex >= 0 && InAxisIndex < BBoxParams->Axes.Num())
+		{
+			return BBoxParams->Axes[InAxisIndex];
+		}
+		return FVertexMaskForgeAxisMaskParams();
+	};
+
+	return SNew(SVerticalBox)
+
+	+ SVerticalBox::Slot()
+	.AutoHeight()
+	.Padding(FMargin(0.f, 6.f, 0.f, 2.f))
+	[
+		SNew(SCheckBox)
+		.IsEnabled_Lambda([this, LayerId]() { return IsDynamicBoundingBoxLayerLocalSpaceCompatible(LayerId); })
+		.IsChecked_Lambda([GetAxisParams, AxisIndex]()
+		{
+			return GetAxisParams(AxisIndex).bEnabled ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
+		})
+		.OnCheckStateChanged_Lambda([this, LayerId, ExpectedMaskInstanceId, AxisIndex](const ECheckBoxState NewState)
+		{
+			MutateDynamicBoundingBoxAxisParam(LayerId, ExpectedMaskInstanceId, AxisIndex, [NewState](FVertexMaskForgeAxisMaskParams& AxisParams)
+			{
+				AxisParams.bEnabled = (NewState == ECheckBoxState::Checked);
+			});
+		})
+		.Content()
+		[
+			SNew(STextBlock)
+			.Text(AxisLabel)
+			.Font(FCoreStyle::GetDefaultFontStyle("Bold", 9))
+		]
+	]
+
+	+ SVerticalBox::Slot()
+	.AutoHeight()
+	[
+		SNew(SHorizontalBox)
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.VAlign(VAlign_Center)
+		[
+			SNew(STextBlock).Text(LOCTEXT("DynamicAxisPositionLabel", "Position"))
+		]
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.VAlign(VAlign_Center)
+		.Padding(FMargin(4.f, 0.f, 8.f, 0.f))
+		[
+			SNew(SSpinBox<float>)
+			.IsEnabled_Lambda([this, LayerId]() { return IsDynamicBoundingBoxLayerLocalSpaceCompatible(LayerId); })
+			.MinDesiredWidth(52.f)
+			.MinValue(0.0f)
+			.MaxValue(1.0f)
+			.Delta(0.01f)
+			.Value_Lambda([GetAxisParams, AxisIndex]() { return GetAxisParams(AxisIndex).Position; })
+			.OnValueChanged_Lambda([this, LayerId, ExpectedMaskInstanceId, AxisIndex](const float NewValue)
+			{
+				MutateDynamicBoundingBoxAxisParam(LayerId, ExpectedMaskInstanceId, AxisIndex, [NewValue](FVertexMaskForgeAxisMaskParams& AxisParams)
+				{
+					AxisParams.Position = NewValue;
+				});
+			})
+		]
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.VAlign(VAlign_Center)
+		[
+			// Visible label only -- "Falloff", matching the Legacy control's own renamed label. The
+			// underlying field remains TransitionWidth, unchanged (see that field's own doc comment).
+			SNew(STextBlock).Text(LOCTEXT("DynamicAxisFalloffLabel", "Falloff"))
+		]
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.VAlign(VAlign_Center)
+		.Padding(FMargin(4.f, 0.f, 8.f, 0.f))
+		[
+			SNew(SSpinBox<float>)
+			.IsEnabled_Lambda([this, LayerId]() { return IsDynamicBoundingBoxLayerLocalSpaceCompatible(LayerId); })
+			.MinDesiredWidth(52.f)
+			.MinValue(0.001f)
+			.MaxValue(1.0f)
+			.Delta(0.01f)
+			.Value_Lambda([GetAxisParams, AxisIndex]() { return GetAxisParams(AxisIndex).TransitionWidth; })
+			.OnValueChanged_Lambda([this, LayerId, ExpectedMaskInstanceId, AxisIndex](const float NewValue)
+			{
+				MutateDynamicBoundingBoxAxisParam(LayerId, ExpectedMaskInstanceId, AxisIndex, [NewValue](FVertexMaskForgeAxisMaskParams& AxisParams)
+				{
+					AxisParams.TransitionWidth = NewValue;
+				});
+			})
+		]
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.VAlign(VAlign_Center)
+		.Padding(FMargin(0.f, 0.f, 6.f, 0.f))
+		[
+			SNew(SCheckBox)
+			.IsEnabled_Lambda([this, LayerId]() { return IsDynamicBoundingBoxLayerLocalSpaceCompatible(LayerId); })
+			.IsChecked_Lambda([GetAxisParams, AxisIndex]()
+			{
+				return GetAxisParams(AxisIndex).bInvert ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
+			})
+			.OnCheckStateChanged_Lambda([this, LayerId, ExpectedMaskInstanceId, AxisIndex](const ECheckBoxState NewState)
+			{
+				MutateDynamicBoundingBoxAxisParam(LayerId, ExpectedMaskInstanceId, AxisIndex, [NewState](FVertexMaskForgeAxisMaskParams& AxisParams)
+				{
+					AxisParams.bInvert = (NewState == ECheckBoxState::Checked);
+				});
+			})
+			.Content()
+			[
+				SNew(STextBlock).Text(LOCTEXT("DynamicAxisInvertLabel", "Invert"))
+			]
+		]
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.VAlign(VAlign_Center)
+		[
+			SNew(SCheckBox)
+			.IsEnabled_Lambda([this, LayerId]() { return IsDynamicBoundingBoxLayerLocalSpaceCompatible(LayerId); })
+			.IsChecked_Lambda([GetAxisParams, AxisIndex]()
+			{
+				return GetAxisParams(AxisIndex).bMirror ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
+			})
+			.OnCheckStateChanged_Lambda([this, LayerId, ExpectedMaskInstanceId, AxisIndex](const ECheckBoxState NewState)
+			{
+				MutateDynamicBoundingBoxAxisParam(LayerId, ExpectedMaskInstanceId, AxisIndex, [NewState](FVertexMaskForgeAxisMaskParams& AxisParams)
+				{
+					AxisParams.bMirror = (NewState == ECheckBoxState::Checked);
+				});
+			})
+			.Content()
+			[
+				SNew(STextBlock).Text(LOCTEXT("DynamicAxisMirrorLabel", "Mirror"))
+			]
+		]
+	];
+}
+
+TSharedRef<SWidget> SVertexMaskForgePanel::BuildDynamicBoundingBoxLayerParamsBlock(const FGuid LayerId, const FGuid ExpectedMaskInstanceId)
+{
+	return SNew(SVerticalBox)
+	.Visibility_Lambda([this, LayerId]()
+	{
+		const FVertexMaskForgeGeneratorMaskInstance* Mask = DynamicLayerStack.GetLayerMask(LayerId);
+		return (Mask && Mask->GeneratorType == EVertexMaskForgeGeneratorType::BoundingBox) ? EVisibility::Visible : EVisibility::Collapsed;
+	})
+
+	// AUDITED (M16-K.6D-8C-C): Local-space-only enforcement is NOT performed here or by any control below
+	// -- it is enforced solely by VertexMaskForgeDynamicSourceTopologyComposition's own Pass 1 (rejects
+	// World Space/Unified Bounds outright). This warning is a read-only, honest ECHO of that same
+	// predicate (IsDynamicBoundingBoxLayerLocalSpaceCompatible), shown only when the layer's CURRENTLY
+	// STORED data already requests something this checkpoint's UI cannot create through its own controls
+	// (no World Space toggle, no Unified Bounds toggle exist below) -- never a data migration, never a
+	// silent rewrite, never a reinterpretation as Local Space.
+	+ SVerticalBox::Slot()
+	.AutoHeight()
+	.Padding(FMargin(0.f, 0.f, 0.f, 2.f))
+	[
+		SNew(STextBlock)
+		.AutoWrapText(true)
+		.Visibility_Lambda([this, LayerId]()
+		{
+			return IsDynamicBoundingBoxLayerLocalSpaceCompatible(LayerId) ? EVisibility::Collapsed : EVisibility::Visible;
+		})
+		.Text(LOCTEXT("DynamicLayerBoundingBoxUnsupportedStateWarning",
+			"This layer's stored Bounding Box parameters request World Space or Unified Bounds. Dynamic Bounding Box currently supports Local Space only; axis controls below are disabled until this layer's data is edited back to a supported state (composition and Accept will reject this layer as-is)."))
+	]
+
+	+ SVerticalBox::Slot()
+	.AutoHeight()
+	[
+		BuildDynamicBoundingBoxAxisRow(LayerId, ExpectedMaskInstanceId, EVertexMaskForgeBoundsAxis::X, LOCTEXT("DynamicAxisXLabel", "X"))
+	]
+
+	+ SVerticalBox::Slot()
+	.AutoHeight()
+	[
+		BuildDynamicBoundingBoxAxisRow(LayerId, ExpectedMaskInstanceId, EVertexMaskForgeBoundsAxis::Y, LOCTEXT("DynamicAxisYLabel", "Y"))
+	]
+
+	+ SVerticalBox::Slot()
+	.AutoHeight()
+	[
+		BuildDynamicBoundingBoxAxisRow(LayerId, ExpectedMaskInstanceId, EVertexMaskForgeBoundsAxis::Z, LOCTEXT("DynamicAxisZLabel", "Z"))
 	];
 }
 
@@ -4663,13 +4978,16 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 	DynamicLayerFillOptions.Add(MakeShared<EVertexMaskForgeLayerFill>(EVertexMaskForgeLayerFill::Black));
 	DynamicLayerFillOptions.Add(MakeShared<EVertexMaskForgeLayerFill>(EVertexMaskForgeLayerFill::White));
 
-	// M16-K.6B; corrected M16-K.6D-6: element 0 is a VALID TSharedPtr to an UNSET TOptional (None/
-	// Unassigned) -- NOT a null TSharedPtr, which SListView's own row-generation loop unconditionally
-	// skips (see this array's own doc comment in SVertexMaskForgePanel.h for the confirmed root cause).
-	// Only MaterialSlot follows it -- the only Dynamic generator with real, test-proven generation. The
-	// other six EVertexMaskForgeGeneratorType values are deliberately NOT added here.
+	// M16-K.6B; corrected M16-K.6D-6; extended M16-K.6D-8C-C: element 0 is a VALID TSharedPtr to an UNSET
+	// TOptional (None/Unassigned) -- NOT a null TSharedPtr, which SListView's own row-generation loop
+	// unconditionally skips (see this array's own doc comment in SVertexMaskForgePanel.h for the confirmed
+	// root cause). MaterialSlot and BoundingBox (M16-K.6D-8B added Local-space Bounding Box support to the
+	// authoritative Dynamic Source-Topology orchestrator) are the only two generators offered -- every
+	// other EVertexMaskForgeGeneratorType value is deliberately NOT added here, since the orchestrator
+	// still rejects any other type outright.
 	DynamicLayerGeneratorTypeOptions.Add(MakeShared<TOptional<EVertexMaskForgeGeneratorType>>());
 	DynamicLayerGeneratorTypeOptions.Add(MakeShared<TOptional<EVertexMaskForgeGeneratorType>>(EVertexMaskForgeGeneratorType::MaterialSlot));
+	DynamicLayerGeneratorTypeOptions.Add(MakeShared<TOptional<EVertexMaskForgeGeneratorType>>(EVertexMaskForgeGeneratorType::BoundingBox));
 
 	CurvatureTypeOptions.Add(MakeShared<EVertexMaskForgeCurvatureType>(EVertexMaskForgeCurvatureType::Convex));
 	CurvatureTypeOptions.Add(MakeShared<EVertexMaskForgeCurvatureType>(EVertexMaskForgeCurvatureType::Concave));
