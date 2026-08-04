@@ -3870,14 +3870,58 @@ TSharedRef<SWidget> SVertexMaskForgePanel::BuildDynamicLayerRow(const FGuid Laye
 				.OnSelectionChanged(SComboBox<TSharedPtr<TOptional<EVertexMaskForgeGeneratorType>>>::FOnSelectionChanged::CreateLambda(
 					[this, LayerId](TSharedPtr<TOptional<EVertexMaskForgeGeneratorType>> NewSelection, ESelectInfo::Type)
 					{
+						// M16-K.6D-8G-C: captured BEFORE the mutation below, purely to detect whether this
+						// callback represents a GENUINE generator-type transition (vs. an idempotent
+						// same-type reselection, or clearing an already-unset mask) -- both
+						// SetLayerMaskGeneratorType and ClearLayerMask are deliberately idempotent (see
+						// their own doc comments in VertexMaskForgeDynamicLayerStack.cpp) and still return
+						// true for a no-op call, so that return value alone cannot distinguish "nothing
+						// changed" from "a real transition happened". A null result here means either "this
+						// LayerId currently has no mask" or "this LayerId no longer exists" -- both cases
+						// are resolved safely below without needing to tell them apart, because erasure is
+						// additionally gated on the mutator's own success below.
+						const FVertexMaskForgeGeneratorMaskInstance* ExistingMaskBeforeMutation = DynamicLayerStack.GetLayerMask(LayerId);
+
+						bool bGeneratorTypeMutationSucceeded = false;
+						bool bGenuineGeneratorTypeTransition = false;
 						if (NewSelection.IsValid() && NewSelection->IsSet())
 						{
-							DynamicLayerStack.SetLayerMaskGeneratorType(LayerId, NewSelection->GetValue());
+							bGenuineGeneratorTypeTransition = !ExistingMaskBeforeMutation
+								|| ExistingMaskBeforeMutation->GeneratorType != NewSelection->GetValue();
+							bGeneratorTypeMutationSucceeded = DynamicLayerStack.SetLayerMaskGeneratorType(LayerId, NewSelection->GetValue());
 						}
 						else
 						{
-							DynamicLayerStack.ClearLayerMask(LayerId);
+							bGenuineGeneratorTypeTransition = (ExistingMaskBeforeMutation != nullptr);
+							bGeneratorTypeMutationSucceeded = DynamicLayerStack.ClearLayerMask(LayerId);
 						}
+
+						// M16-K.6D-8G-C: a generator-type change invalidates any retained Dynamic AO cache
+						// entry for THIS LayerId -- erased ONLY on a genuine transition that the stack
+						// mutation above actually completed (never on an idempotent no-op, which must
+						// preserve a future AO layer's already-retained raw mask and tree unchanged, and
+						// never for a stale/unknown LayerId, which the mutator's own false return already
+						// rejects). Unrelated layers are never inspected or touched; LayerId itself is
+						// never regenerated. The map is still entirely dormant this checkpoint -- see
+						// FVertexMaskForgePreviewComponentState's own doc comment on
+						// DynamicSourceTopologyAOCachesByLayerId -- so this erasure is currently always a
+						// no-op in practice, establishing the lifecycle rule ahead of the backend that will
+						// make it observable.
+						if (bGeneratorTypeMutationSucceeded && bGenuineGeneratorTypeTransition)
+						{
+							for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
+							{
+								if (!Entry.IsValid())
+								{
+									continue;
+								}
+								for (const TUniquePtr<FVertexMaskForgeWorkingStateOwner>& StateOwner : Entry->PreviewComponents)
+								{
+									StateOwner->GetVisualSessionStateMutable().DynamicSourceTopologyAOCachesByLayerId.Remove(LayerId);
+								}
+							}
+						}
+
 						OnDynamicLayerStackMutated();
 						// M16-K.6C-2-FIX: rebuilds the row list so every per-generator configurational
 						// section (e.g. the Material Slot editor below) is reconstructed against whatever
@@ -6066,6 +6110,25 @@ FReply SVertexMaskForgePanel::OnRemoveDynamicLayerClicked(const FGuid LayerId)
 	// Remove() is itself a safe no-op if LayerId never had an entry -- so a stale key can never later
 	// influence a different, unrelated layer.
 	DynamicNoiseScaleAxesLockedByLayerId.Remove(LayerId);
+
+	// M16-K.6D-8G-C: permanent removal also drops this layer's persistent Dynamic AO cache entry (if
+	// any) from EVERY selected component's own state -- unconditionally, mirroring the Lock Axes
+	// cleanup immediately above: Remove() is a safe no-op if this LayerId never had an entry (the map is
+	// still entirely dormant this checkpoint -- see FVertexMaskForgePreviewComponentState's own doc
+	// comment on DynamicSourceTopologyAOCachesByLayerId), and a stale key can never later be
+	// misattributed to a different, unrelated layer that happens to reuse this LayerId (LayerIds are
+	// never reused -- see FVertexMaskForgeDynamicLayerStack::AddLayer's own FGuid::NewGuid() contract).
+	for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
+	{
+		if (!Entry.IsValid())
+		{
+			continue;
+		}
+		for (const TUniquePtr<FVertexMaskForgeWorkingStateOwner>& StateOwner : Entry->PreviewComponents)
+		{
+			StateOwner->GetVisualSessionStateMutable().DynamicSourceTopologyAOCachesByLayerId.Remove(LayerId);
+		}
+	}
 
 	RebuildDynamicLayersList();
 	OnDynamicLayerStackMutated();

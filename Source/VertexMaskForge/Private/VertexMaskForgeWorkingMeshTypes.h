@@ -1133,6 +1133,29 @@ public:
 	TUniquePtr<FVertexMaskForgeSourceTopologyAOCache> SourceTopologyAOCache;
 
 	/**
+	 * M16-K.6D-8G-C: panel-owned persistent storage for the future Dynamic Ambient Occlusion backend
+	 * (M16-K.6D-8G-D) -- ADDITIVE alongside SourceTopologyAOCache above, never a replacement or
+	 * reinterpretation of it (that field remains exclusively Legacy's own single-slot cache). Keyed by
+	 * the stable Dynamic Layer Stack LayerId (never MaskInstanceId -- a param edit that mints a new
+	 * MaskInstanceId must NOT orphan this layer's own retained raw AO result), so multiple enabled
+	 * Dynamic AO layers on the same component each own one complete, independent
+	 * FVertexMaskForgeSourceTopologyAOCache -- including its own retained acceleration tree -- with zero
+	 * cross-layer overwrite or contamination (see ADR-015, to be recorded when the AO backend lands).
+	 * This is the approved Model D ownership foundation (M16-K.6D-8G-A.1): tree sharing across layers on
+	 * the same geometry is deliberately deferred, never implemented here or implied by this field's
+	 * shape alone.
+	 *
+	 * Dormant this checkpoint: no production code creates, populates, or reads an entry yet -- only the
+	 * lifecycle erasure this checkpoint adds (Dynamic layer removal; a genuine Dynamic generator-type
+	 * change) ever touches this map before M16-K.6D-8G-D exists. Requires no explicit destructor/move
+	 * handling of its own: FVertexMaskForgePreviewComponentState's own move ctor/move assignment/
+	 * destructor are all `= default` (see the .cpp, out-of-line only because FVertexMaskForgeAOCache must
+	 * be a complete type at that point) -- a TMap member is therefore already moved/destroyed correctly
+	 * as part of the owning component state's own lifetime, exactly like every other field here.
+	 */
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> DynamicSourceTopologyAOCachesByLayerId;
+
+	/**
 	 * AUDITED (Nanite source-topology support): transient duplicate used ONLY when this entry is in
 	 * Source-Topology mode, in place of PreviewComponent (a UStaticMeshComponent, which Nanite's
 	 * renderer never reads OverrideVertexColors from). Renders WorkingMesh.Mesh directly (the SAME
