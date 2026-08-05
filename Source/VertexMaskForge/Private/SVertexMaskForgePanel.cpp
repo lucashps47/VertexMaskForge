@@ -11069,11 +11069,15 @@ void SVertexMaskForgePanel::ApplyPreviewToEntry(
 				TArray<FColor> DynamicComposedColors;
 				// M16-K.6D-8G-B: the real transform of THIS component (SourceComponent, resolved above at
 				// the top of this per-component loop) -- never Identity, never another component's
-				// transform, never cached elsewhere. Unused by any generator dispatched this checkpoint;
-				// threaded through only so a future World-Space-dependent generator (Ambient Occlusion)
-				// does not require a second signature change.
+				// transform, never cached elsewhere.
+				// M16-K.6D-8G-D: State.DynamicSourceTopologyAOCachesByLayerId is THIS component's own
+				// persistent Model D Ambient Occlusion cache map (established M16-K.6D-8G-C) -- State is
+				// the SAME FVertexMaskForgePreviewComponentState& already resolved above for this loop
+				// iteration, never a fresh/local/temporary map, so any AO layer's cache genuinely persists
+				// across recompositions exactly as Model D requires.
 				const bool bDynamicComposed = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(
-					WorkingMesh, DynamicLayerStack, StateOwner->GetBaselineColors(), SourceComponent->GetComponentTransform(), DynamicComposedColors);
+					WorkingMesh, DynamicLayerStack, StateOwner->GetBaselineColors(), SourceComponent->GetComponentTransform(),
+					State.DynamicSourceTopologyAOCachesByLayerId, DynamicComposedColors);
 				if (!bDynamicComposed)
 				{
 					// AUDITED: an explicit, non-destructive failure -- the orchestrator's own contract

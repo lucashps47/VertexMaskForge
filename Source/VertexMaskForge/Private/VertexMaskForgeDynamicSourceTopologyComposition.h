@@ -2,7 +2,10 @@
 
 #include "Containers/Array.h"
 #include "Containers/ArrayView.h"
+#include "Containers/Map.h"
 #include "Math/Color.h"
+#include "Misc/Guid.h"
+#include "VertexMaskForgeWorkingMeshTypes.h"
 
 struct FVertexMaskForgeWorkingMesh;
 class FVertexMaskForgeDynamicLayerStack;
@@ -96,6 +99,16 @@ namespace VertexMaskForgeDynamicSourceTopologyComposition
 	 *     Ready; every corner must have resolved a real value (NumValidValues == the expected corner count)
 	 *     or the WHOLE call fails, since Pass 2's corner-domain read is a direct, unconditional index, never
 	 *     a TryGetValue lookup.
+	 *   - Ambient Occlusion (M16-K.6D-8G-D): VertexMaskForgeAmbientOcclusionGenerator::
+	 *     GenerateAmbientOcclusionMaskFromDynamicMesh is called directly, using ComponentTransform (World
+	 *     Space -- Ambient Occlusion has no Local-space mode at all, unlike Bounding Box/Directional
+	 *     Normal, so no space-rejection check exists for it) and this layer's own persistent cache entry
+	 *     (DynamicSourceTopologyAOCachesByLayerId.FindOrAdd(Layer.LayerId)). The resulting mask is indexed
+	 *     by Normal Overlay Element ID, NOT corner and NOT Dynamic Mesh VertexID -- resolved per corner via
+	 *     that corner's own triangle's Normal Overlay element (NormalOverlay->GetTriangle(TriangleID)[Corner],
+	 *     the exact same lookup Legacy's own UpdateWorkingColorsSourceTopology already uses for this
+	 *     generator) and read only through FVertexMaskForgeScalarMask::TryGetValue, mirroring Bounding
+	 *     Box's own sparse-domain handling.
 	 * A disabled layer (bEnabled == false) contributes nothing and is never validated for its Mask's
 	 * GeneratorType, exactly mirroring EvaluateColor's own "bEnabled==false -> complete no-op" contract.
 	 *
@@ -109,17 +122,28 @@ namespace VertexMaskForgeDynamicSourceTopologyComposition
 	 *
 	 * M16-K.6D-8G-B: ComponentTransform is the real transform of the specific UStaticMeshComponent whose
 	 * source-topology colors are being evaluated (never FTransform::Identity from a production caller --
-	 * see each call site's own doc comment for how it is resolved). This checkpoint threads the parameter
-	 * through ONLY -- no existing generator dispatch below reads it, and none of the five currently
-	 * supported generator types (Material Slot, Bounding Box Local-space, Directional Normal Local-space,
-	 * Curvature, Noise) may consume it; it exists so a future World-Space-dependent generator (Ambient
-	 * Occlusion, see M16-K.6D-8G-A/8G-A.1) can be dispatched without a second signature change. Test
-	 * callers exercising the five existing generators must pass FTransform::Identity.
+	 * see each call site's own doc comment for how it is resolved). Test callers exercising the five
+	 * transform-independent generators (Material Slot, Bounding Box Local-space, Directional Normal
+	 * Local-space, Curvature, Noise) must pass FTransform::Identity.
+	 *
+	 * M16-K.6D-8G-D: DynamicSourceTopologyAOCachesByLayerId is the SAME per-component, per-stable-LayerId
+	 * persistent Ambient Occlusion cache storage established by M16-K.6D-8G-C
+	 * (FVertexMaskForgePreviewComponentState::DynamicSourceTopologyAOCachesByLayerId) -- this parameter is
+	 * that exact map, passed by the caller (never a fresh/local/temporary map, which would silently defeat
+	 * Model D's cross-call persistence contract). An enabled Ambient Occlusion layer resolves its own
+	 * cache entry from this map via FindOrAdd(Layer.LayerId), creating a fresh entry only on a genuine
+	 * first use for that LayerId -- never keyed by MaskInstanceId, stack index, or any other identity. A
+	 * caller with no Ambient Occlusion layers currently enabled may pass an empty map; it is never read
+	 * or written in that case. This parameter is a plain, non-nullable reference because both real
+	 * production callers always have a genuine, currently-valid owning FVertexMaskForgePreviewComponentState
+	 * in scope at their own call site -- there is no legitimate "no component state" case to represent
+	 * with a pointer.
 	 */
 	bool ComputeComposedColorsRGBSourceTopology(
 		const FVertexMaskForgeWorkingMesh& WorkingMesh,
 		const FVertexMaskForgeDynamicLayerStack& Stack,
 		TConstArrayView<FColor> BaseColors,
 		const FTransform& ComponentTransform,
+		TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache>& DynamicSourceTopologyAOCachesByLayerId,
 		TArray<FColor>& OutComposedColors);
 }

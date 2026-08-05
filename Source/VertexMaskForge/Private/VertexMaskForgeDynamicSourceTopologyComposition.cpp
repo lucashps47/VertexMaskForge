@@ -19,6 +19,7 @@
 #include "VertexMaskForgeDynamicSourceTopologyComposition.h"
 
 #include "DynamicMesh/DynamicMesh3.h"
+#include "VertexMaskForgeAmbientOcclusionGenerator.h"
 #include "VertexMaskForgeBoundingBoxGenerator.h"
 #include "VertexMaskForgeColorConversion.h"
 #include "VertexMaskForgeCurvatureGenerator.h"
@@ -51,6 +52,13 @@ namespace
 	{
 		Corner,
 		DynamicMeshVertex,
+
+		// M16-K.6D-8G-D: Ambient Occlusion's own raw mask is indexed by Normal Overlay Element ID, a
+		// third domain distinct from both above (see GenerateAmbientOcclusionMaskFromDynamicMesh's own
+		// doc comment) -- a hard-edge corner shares its Dynamic Mesh VertexID with its neighbors but has
+		// its OWN Normal Overlay element, so reusing the DynamicMeshVertex domain here would silently
+		// average/smooth hard edges.
+		NormalOverlayElement,
 	};
 
 	struct FLayerGeneratedMask
@@ -65,13 +73,9 @@ bool VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSo
 	const FVertexMaskForgeDynamicLayerStack& Stack,
 	TConstArrayView<FColor> BaseColors,
 	const FTransform& ComponentTransform,
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache>& DynamicSourceTopologyAOCachesByLayerId,
 	TArray<FColor>& OutComposedColors)
 {
-	// M16-K.6D-8G-B: ComponentTransform is intentionally unused this checkpoint -- see this function's
-	// own header doc comment. Referencing it here only to keep -Wunused-parameter silent would invent
-	// behavior; the parameter is simply threaded through, unread, until M16-K.6D-8G-C's Ambient Occlusion
-	// dispatch branch consumes it.
-	(void)ComponentTransform;
 
 	if (!WorkingMesh.Mesh.IsValid())
 	{
@@ -100,6 +104,14 @@ bool VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSo
 	// both domains agree on what a given CornerIndex physically is.
 	TArray<int32> CornerToVertexID;
 	bool bCornerToVertexIDBuilt = false;
+
+	// M16-K.6D-8G-D: sibling of CornerToVertexID above, lazily built only if at least one enabled layer
+	// actually requests Ambient Occlusion -- maps this call's own corner-domain index to the underlying
+	// Normal Overlay ELEMENT ID at that corner (NormalOverlay->GetTriangle(TriangleID)[Corner], never
+	// Mesh->GetTriangle), since Ambient Occlusion's raw mask is Normal-Overlay-Element-ID domain, not
+	// Dynamic Mesh VertexID domain (see ELayerMaskDomain::NormalOverlayElement's own comment above).
+	TArray<int32> CornerToElementID;
+	bool bCornerToElementIDBuilt = false;
 
 	// M16-K.6D-8E-B: ONE function-local FVertexMaskForgeGeneratorState, declared here (outside the
 	// per-layer loop below) and reused for every enabled Curvature layer THIS call evaluates -- never
@@ -391,11 +403,118 @@ bool VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSo
 				bCornerToVertexIDBuilt = true;
 			}
 		}
+		else if (Layer.Mask->GeneratorType == EVertexMaskForgeGeneratorType::AmbientOcclusion)
+		{
+			const FVertexMaskForgeAmbientOcclusionParams* AOParams = Layer.Mask->Params.TryGet<FVertexMaskForgeAmbientOcclusionParams>();
+			if (!AOParams)
+			{
+				// Defensive -- mirrors the Material Slot/Bounding Box/Directional Normal/Curvature/Noise
+				// coherence checks above.
+				return false;
+			}
+
+			// M16-K.6D-8G-D scope: Ambient Occlusion is unconditionally World-Space (confirmed directly
+			// from GenerateAmbientOcclusionMaskFromDynamicMesh's own doc comment) -- unlike Bounding Box/
+			// Directional Normal, it has no Local-space mode to restrict to at all, so no space-rejection
+			// check exists here; ComponentTransform (threaded through since M16-K.6D-8G-B, unused by
+			// every other generator) is exactly what this branch requires and is passed unmodified.
+			//
+			// FVertexMaskForgeAOParams (the generator's own raw-input struct, VertexMaskForgeWorkingMeshTypes.h)
+			// and FVertexMaskForgeAmbientOcclusionParams (this layer's own Dynamic recipe payload,
+			// VertexMaskForgeRecipeTypes.h) are deliberately two distinct types (see the recipe struct's
+			// own doc comment: FVertexMaskForgeAmbientOcclusionParams's defaults intentionally diverge from
+			// FVertexMaskForgeAOParams's) but share an identical field set -- translated 1:1 here, exactly
+			// mirroring how SVertexMaskForgePanel::ApplyPreviewToEntry's own Legacy AO branch builds its
+			// own EffectiveAOParams from the panel's separate UI state fields.
+			FVertexMaskForgeAOParams RawParams;
+			RawParams.Samples = AOParams->Samples;
+			RawParams.MaxDistance = AOParams->MaxDistance;
+			RawParams.Bias = AOParams->Bias;
+			RawParams.bInvert = AOParams->bInvert;
+			RawParams.LevelsMin = AOParams->LevelsMin;
+			RawParams.LevelsMax = AOParams->LevelsMax;
+
+			// M16-K.6D-8G-D: resolve THIS layer's own persistent cache entry from the caller-supplied,
+			// per-component map established by M16-K.6D-8G-C (Model D -- one complete, independent cache
+			// per component and stable Dynamic LayerId; tree sharing deliberately deferred). FindOrAdd
+			// creates a fresh, default-constructed (cold/invalid) entry on a genuine first use for this
+			// LayerId -- GenerateAmbientOcclusionMaskFromDynamicMesh's own internal freshness comparison
+			// (Tree layer keyed on mesh/fingerprint/transform; RawValues layer keyed additionally on
+			// Samples/MaxDistance/Bias) then correctly treats that as a cold cache and performs a real
+			// raycast pass, exactly as it would for a genuinely first-ever null-TUniquePtr call.
+			FVertexMaskForgeSourceTopologyAOCache& PersistentCacheEntry =
+				DynamicSourceTopologyAOCachesByLayerId.FindOrAdd(Layer.LayerId);
+
+			// ADAPTER (M16-K.6D-8G-D): GenerateAmbientOcclusionMaskFromDynamicMesh's own public interface
+			// (never modified -- protected file) requires a TUniquePtr<FVertexMaskForgeSourceTopologyAOCache>&,
+			// but Model D's own persistent ownership (M16-K.6D-8G-C) stores each cache BY VALUE, keyed by
+			// LayerId, in a plain TMap -- reusing the generator verbatim (never a second AO algorithm,
+			// never a duplicated/reshaped cache layout) requires bridging that one interface mismatch at
+			// the narrowest possible boundary. This TUniquePtr is a call-scoped adapter only, never itself
+			// the persisted state: PersistentCacheEntry's CURRENT content (cold on a genuine first use, or
+			// whatever was retained from a prior call otherwise) is moved into it immediately before the
+			// call, the generator mutates it in place exactly as it would any other caller's
+			// TUniquePtr-owned cache, and the (possibly rebuilt) result is moved back into the SAME
+			// persistent map entry immediately after -- so cross-call persistence (composition-only edits
+			// reusing RawValues without rebuilding the tree, raw-parameter changes invalidating only
+			// RawValues, geometry/transform changes invalidating both) is fully preserved through this map
+			// exactly as if it were a native TUniquePtr field.
+			TUniquePtr<FVertexMaskForgeSourceTopologyAOCache> TransientCachePtr =
+				MakeUnique<FVertexMaskForgeSourceTopologyAOCache>(MoveTemp(PersistentCacheEntry));
+
+			FVertexMaskForgeScalarMask GeneratedMask = VertexMaskForgeAmbientOcclusionGenerator::GenerateAmbientOcclusionMaskFromDynamicMesh(
+				TransientCachePtr, *WorkingMesh.Mesh, WorkingMesh.GeometryFingerprint, ComponentTransform, RawParams);
+
+			// Always valid after the call (the generator itself allocates on a null/first-use CachePtr,
+			// confirmed from its own source, and never resets an already-valid one back to null) --
+			// checked defensively rather than assumed, mirroring this codebase's own established
+			// "never assumed, always checked" discipline for defensive branches.
+			if (TransientCachePtr.IsValid())
+			{
+				PersistentCacheEntry = MoveTemp(*TransientCachePtr);
+			}
+
+			if (GeneratedMask.State != EVertexMaskForgeScalarMaskState::Ready)
+			{
+				// Mirrors Bounding Box's/Curvature's/Noise's own check exactly -- Ambient Occlusion's
+				// output is Normal-Overlay-Element-ID domain and sparse-safe (resolved only via
+				// TryGetValue in Pass 2 below), so no separate cardinality check is required here.
+				return false;
+			}
+
+			LayerMasks[LayerIndex].Mask = MoveTemp(GeneratedMask);
+			LayerMasks[LayerIndex].Domain = ELayerMaskDomain::NormalOverlayElement;
+
+			if (!bCornerToElementIDBuilt)
+			{
+				// M16-K.6D-8G-D: mirrors CornerToVertexID's own lazy-build pattern exactly (see its own
+				// declaration comment above), but resolves each corner's Normal Overlay ELEMENT ID
+				// instead of its Dynamic Mesh VERTEX ID -- built here, only once
+				// GenerateAmbientOcclusionMaskFromDynamicMesh has already confirmed (via its own Ready
+				// state above) that WorkingMesh.Mesh has a valid Normal Overlay with at least one element,
+				// so re-deriving the SAME overlay pointer here is guaranteed safe (never a second,
+				// independent validity check reinventing the generator's own contract). Uses
+				// NormalOverlay->GetTriangle(TriangleID)[Corner], the exact same lookup Legacy's own
+				// UpdateWorkingColorsSourceTopology already uses for this generator (SVertexMaskForgePanel.
+				// cpp) -- never a new/invented per-corner-normal resolution rule.
+				const UE::Geometry::FDynamicMeshNormalOverlay* NormalOverlay = WorkingMesh.Mesh->Attributes()->PrimaryNormals();
+				CornerToElementID.SetNumUninitialized(ExpectedCornerCount);
+				int32 RunningCornerIndex = 0;
+				for (const int32 TriangleID : WorkingMesh.Mesh->TriangleIndicesItr())
+				{
+					const UE::Geometry::FIndex3i TriElements = NormalOverlay->GetTriangle(TriangleID);
+					CornerToElementID[RunningCornerIndex++] = TriElements.A;
+					CornerToElementID[RunningCornerIndex++] = TriElements.B;
+					CornerToElementID[RunningCornerIndex++] = TriElements.C;
+				}
+				bCornerToElementIDBuilt = true;
+			}
+		}
 		else
 		{
 			// Explicit, whole-call failure -- any generator type beyond this checkpoint's own supported
 			// set (Material Slot, Bounding Box Local-space, Directional Normal Local-space, Curvature,
-			// Noise) never silently skips or treats itself as Fill-only.
+			// Noise, Ambient Occlusion) never silently skips or treats itself as Fill-only.
 			return false;
 		}
 	}
@@ -437,17 +556,33 @@ bool VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSo
 				{
 					EffectiveMask = GeneratedLayerMask.Mask.Values[CornerIndex];
 				}
-				else
+				else if (GeneratedLayerMask.Domain == ELayerMaskDomain::DynamicMeshVertex)
 				{
-					// DynamicMeshVertex domain (Bounding Box) -- resolve this corner's own underlying
-					// Dynamic Mesh VertexID, then read the mask ONLY through TryGetValue (never a direct
-					// Values[VertexID] index), exactly per FVertexMaskForgeScalarMask's own sparse-domain
-					// contract. A miss here means the corner's VertexID was never written by the
-					// generator -- stale/invalid topology -- and fails the WHOLE call safely rather than
-					// substituting a guessed value; OutComposedColors is still untouched on this path
+					// DynamicMeshVertex domain (Bounding Box/Curvature/Noise) -- resolve this corner's own
+					// underlying Dynamic Mesh VertexID, then read the mask ONLY through TryGetValue (never
+					// a direct Values[VertexID] index), exactly per FVertexMaskForgeScalarMask's own
+					// sparse-domain contract. A miss here means the corner's VertexID was never written by
+					// the generator -- stale/invalid topology -- and fails the WHOLE call safely rather
+					// than substituting a guessed value; OutComposedColors is still untouched on this path
 					// (LocalOutput is never assigned to it before this point).
 					const int32 VertexID = CornerToVertexID[CornerIndex];
 					if (!GeneratedLayerMask.Mask.TryGetValue(VertexID, EffectiveMask))
+					{
+						return false;
+					}
+				}
+				else
+				{
+					// M16-K.6D-8G-D: NormalOverlayElement domain (Ambient Occlusion) -- resolve this
+					// corner's own Normal Overlay Element ID via the CornerToElementID map built in Pass 1
+					// (never Mesh->GetTriangle, never a Dynamic Mesh VertexID -- see
+					// ELayerMaskDomain::NormalOverlayElement's own comment), then read the mask ONLY
+					// through TryGetValue, mirroring the DynamicMeshVertex branch's own sparse-domain
+					// contract exactly. A miss here (never expected once GenerateAmbientOcclusionMaskFrom
+					// DynamicMesh has already reported Ready) fails the WHOLE call safely rather than
+					// substituting a guessed value.
+					const int32 ElementID = CornerToElementID[CornerIndex];
+					if (!GeneratedLayerMask.Mask.TryGetValue(ElementID, EffectiveMask))
 					{
 						return false;
 					}

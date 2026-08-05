@@ -73,10 +73,20 @@ namespace VertexMaskForgeDynamicAcceptTargetBuilder
 
 				TArray<FColor> ComponentColors;
 				// M16-K.6D-8G-B: the real transform of THIS component (SourceComponent, resolved above) --
-				// never Identity. Unused by any generator dispatched this checkpoint; see the orchestrator's
-				// own header doc comment.
+				// never Identity.
+				// M16-K.6D-8G-D: StateOwner->GetVisualSessionStateMutable().DynamicSourceTopologyAOCachesByLayerId
+				// is THIS component's own persistent Model D Ambient Occlusion cache map (established
+				// M16-K.6D-8G-C) -- the const TUniquePtr<FVertexMaskForgeWorkingStateOwner>& loop variable
+				// only const-qualifies the smart-pointer wrapper itself, never its pointee, so this mutable
+				// accessor is legitimately callable here exactly as it is in the preview path. Accept
+				// recomposes independently from Baseline (never from a preview-populated intermediate), so
+				// this call correctly computes AO on a cache miss (a component whose preview never ran, or
+				// whose cache was invalidated) -- reusing the SAME per-component map the preview path would
+				// have populated is what makes preview and Accept produce byte-identical results for the
+				// same stack/mesh/transform/Baseline, never a copy-preview-colors shortcut.
 				const bool bComposed = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(
-					WorkingMesh, DynamicLayerStack, StateOwner->GetBaselineColors(), SourceComponent->GetComponentTransform(), ComponentColors);
+					WorkingMesh, DynamicLayerStack, StateOwner->GetBaselineColors(), SourceComponent->GetComponentTransform(),
+					StateOwner->GetVisualSessionStateMutable().DynamicSourceTopologyAOCachesByLayerId, ComponentColors);
 				if (!bComposed)
 				{
 					OutErrorText = FText::Format(

@@ -370,7 +370,8 @@ bool FVertexMaskForgeDynSrcTopoCompEmptyStackTest::RunTest(const FString& Parame
 	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
 
 	TArray<FColor> Out;
-	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, Out);
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, Out);
 
 	TestTrue(TEXT("Succeeds for an empty stack"), bSucceeded);
 	TestEqual(TEXT("Out.Num() == BaseColors.Num()"), Out.Num(), BaseColors.Num());
@@ -397,7 +398,8 @@ bool FVertexMaskForgeDynSrcTopoCompSingleMaterialSlotLayerTest::RunTest(const FS
 
 	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
 	TArray<FColor> Out;
-	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, Out);
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, Out);
 
 	TestTrue(TEXT("Succeeds"), bSucceeded);
 	TestEqual(TEXT("Out.Num() == 6"), Out.Num(), 6);
@@ -434,7 +436,8 @@ bool FVertexMaskForgeDynSrcTopoCompFillOnlyLayerTest::RunTest(const FString& Par
 
 	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
 	TArray<FColor> Out;
-	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, Out);
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, Out);
 
 	TestTrue(TEXT("Succeeds"), bSucceeded);
 	TestEqual(TEXT("Out.Num() == 6"), Out.Num(), 6);
@@ -455,9 +458,9 @@ bool FVertexMaskForgeDynSrcTopoCompFillOnlyLayerTest::RunTest(const FString& Par
 }
 
 // 4. A disabled layer contributes nothing AND is never validated for its Mask's GeneratorType -- an
-// unsupported generator type on a disabled layer must not fail the whole call. Uses AmbientOcclusion
-// (genuinely unsupported, unlike BoundingBox as of M16-K.6D-8B) so this test's own meaning survives
-// Bounding Box becoming a supported generator.
+// unsupported generator type on a disabled layer must not fail the whole call. Uses Thickness
+// (genuinely unsupported, unlike AmbientOcclusion as of M16-K.6D-8G-D) so this test's own meaning
+// survives Ambient Occlusion becoming a supported generator.
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompDisabledLayerTest, "VertexMaskForge.DynamicSourceTopologyComposition.DisabledLayerContributesNothingAndSkipsValidation", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
 bool FVertexMaskForgeDynSrcTopoCompDisabledLayerTest::RunTest(const FString& Parameters)
 {
@@ -467,13 +470,14 @@ bool FVertexMaskForgeDynSrcTopoCompDisabledLayerTest::RunTest(const FString& Par
 	Stack.SetLayerFill(LayerId, EVertexMaskForgeLayerFill::White);
 	Stack.SetLayerBlendMode(LayerId, EVertexMaskForgeBlendMode::Copy);
 	Stack.SetLayerOpacity(LayerId, 1.0f);
-	// AmbientOcclusion is genuinely unsupported -- would fail the whole call if this layer were enabled.
-	Stack.SetLayerMaskGeneratorType(LayerId, EVertexMaskForgeGeneratorType::AmbientOcclusion);
+	// Thickness is genuinely unsupported -- would fail the whole call if this layer were enabled.
+	Stack.SetLayerMaskGeneratorType(LayerId, EVertexMaskForgeGeneratorType::Thickness);
 	Stack.SetLayerEnabled(LayerId, false);
 
 	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
 	TArray<FColor> Out;
-	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, Out);
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, Out);
 
 	TestTrue(TEXT("Succeeds -- disabled layer's unsupported generator type is never validated"), bSucceeded);
 	TestEqual(TEXT("Out.Num() == 6"), Out.Num(), 6);
@@ -499,11 +503,14 @@ bool FVertexMaskForgeDynSrcTopoCompUnsupportedGeneratorTest::RunTest(const FStri
 	Stack.SetLayerFill(LayerId, EVertexMaskForgeLayerFill::White);
 	Stack.SetLayerBlendMode(LayerId, EVertexMaskForgeBlendMode::Copy);
 	Stack.SetLayerOpacity(LayerId, 1.0f);
-	Stack.SetLayerMaskGeneratorType(LayerId, EVertexMaskForgeGeneratorType::AmbientOcclusion);
+	// Thickness is genuinely unsupported (M16-K.6D-8G-D made Ambient Occlusion, the previous sentinel,
+	// a real dispatch branch) -- the only remaining generator type this orchestrator does not support.
+	Stack.SetLayerMaskGeneratorType(LayerId, EVertexMaskForgeGeneratorType::Thickness);
 
 	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
 	TArray<FColor> Out = { FColor(1, 2, 3, 4) }; // sentinel, wrong size on purpose
-	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, Out);
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, Out);
 
 	TestFalse(TEXT("Fails for an unsupported (non-MaterialSlot) masked generator type"), bSucceeded);
 	TestEqual(TEXT("Out left completely untouched on failure"), Out.Num(), 1);
@@ -527,7 +534,8 @@ bool FVertexMaskForgeDynSrcTopoCompCardinalityMismatchTest::RunTest(const FStrin
 	const TArray<FColor> BaseColors = { FColor(1, 1, 1, 255), FColor(2, 2, 2, 255), FColor(3, 3, 3, 255), FColor(4, 4, 4, 255) };
 	TArray<FColor> Out = { FColor(9, 9, 9, 9), FColor(8, 8, 8, 8) }; // prior content, must survive failure
 
-	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, Out);
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, Out);
 
 	TestFalse(TEXT("Fails for cardinality mismatch"), bSucceeded);
 	TestEqual(TEXT("Out.Num() unchanged (still 2, the prior content)"), Out.Num(), 2);
@@ -549,7 +557,8 @@ bool FVertexMaskForgeDynSrcTopoCompInvalidMeshTest::RunTest(const FString& Param
 	const TArray<FColor> BaseColors;
 
 	TArray<FColor> Out;
-	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, Out);
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, Out);
 
 	TestFalse(TEXT("Fails for a null Mesh"), bSucceeded);
 
@@ -568,7 +577,8 @@ bool FVertexMaskForgeDynSrcTopoCompGeneratorFailureTest::RunTest(const FString& 
 
 	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
 	TArray<FColor> Out;
-	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, Out);
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, Out);
 
 	TestFalse(TEXT("Fails when the underlying Material Slot generator is Unavailable"), bSucceeded);
 
@@ -586,7 +596,8 @@ bool FVertexMaskForgeDynSrcTopoCompAlphaPassthroughTest::RunTest(const FString& 
 
 	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
 	TArray<FColor> Out;
-	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, Out);
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, Out);
 
 	TestTrue(TEXT("Succeeds"), bSucceeded);
 	if (Out.Num() == 6)
@@ -614,7 +625,8 @@ bool FVertexMaskForgeDynSrcTopoCompChannelFilterTest::RunTest(const FString& Par
 
 	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
 	TArray<FColor> Out;
-	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, Out);
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, Out);
 
 	TestTrue(TEXT("Succeeds"), bSucceeded);
 	if (Out.Num() == 6)
@@ -661,9 +673,11 @@ bool FVertexMaskForgeDynSrcTopoCompOrderMattersTest::RunTest(const FString& Para
 	}
 
 	TArray<FColor> ForwardOut;
-	const bool bForwardSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, ForwardStack, BaseColors, FTransform::Identity, ForwardOut);
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> ForwardOutAOCaches;
+	const bool bForwardSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, ForwardStack, BaseColors, FTransform::Identity, ForwardOutAOCaches, ForwardOut);
 	TArray<FColor> ReverseOut;
-	const bool bReverseSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, ReverseStack, BaseColors, FTransform::Identity, ReverseOut);
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> ReverseOutAOCaches;
+	const bool bReverseSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, ReverseStack, BaseColors, FTransform::Identity, ReverseOutAOCaches, ReverseOut);
 
 	TestTrue(TEXT("Forward succeeds"), bForwardSucceeded);
 	TestTrue(TEXT("Reverse succeeds"), bReverseSucceeded);
@@ -695,7 +709,8 @@ bool FVertexMaskForgeDynSrcTopoCompNoStoreTouchedTest::RunTest(const FString& Pa
 
 	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
 	TArray<FColor> Out;
-	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, Out);
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, Out);
 
 	TestTrue(TEXT("Succeeds"), bSucceeded);
 	TestEqual(TEXT("InstanceResults still empty -- never written by this orchestrator"), WorkingMesh.InstanceResults.Num(), 0);
@@ -717,7 +732,8 @@ bool FVertexMaskForgeDynSrcTopoCompInputsUnchangedTest::RunTest(const FString& P
 	const TArray<FColor> BaseColorsCopy = BaseColors;
 
 	TArray<FColor> Out;
-	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, Out);
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, Out);
 
 	TestTrue(TEXT("Succeeds"), bSucceeded);
 	TestEqual(TEXT("Stack.Num() unchanged"), Stack.Num(), LayerCountBefore);
@@ -763,7 +779,8 @@ bool FVertexMaskForgeDynSrcTopoCompOpacityContinuityTest::RunTest(const FString&
 		AddFillOnlyLayer(Stack, TEXT("Layer"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, OpacitySamples[SampleIndex]);
 
 		TArray<FColor> Out;
-		const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, Out);
+		TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+		const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, Out);
 		TestTrue(*FString::Printf(TEXT("Opacity %f succeeds"), OpacitySamples[SampleIndex]), bSucceeded);
 		if (!bSucceeded || Out.Num() != 6)
 		{
@@ -811,7 +828,8 @@ bool FVertexMaskForgeDynSrcTopoCompBBoxLocalXAxisTest::RunTest(const FString& Pa
 
 	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
 	TArray<FColor> Out;
-	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, Out);
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, Out);
 
 	TestTrue(TEXT("Orchestrator accepts a Local-space Bounding Box layer"), bSucceeded);
 	TestEqual(TEXT("Out.Num() == 6"), Out.Num(), 6);
@@ -869,7 +887,8 @@ bool FVertexMaskForgeDynSrcTopoCompBBoxLocalYZAxisTest::RunTest(const FString& P
 		AddBoundingBoxLayer(Stack, TEXT("Layer"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f, Axes);
 
 		TArray<FColor> Out;
-		const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, Out);
+		TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+		const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, Out);
 		TestTrue(*FString::Printf(TEXT("Axis %d succeeds"), static_cast<int32>(Axis)), bSucceeded);
 		if (!bSucceeded || Out.Num() != 6)
 		{
@@ -917,7 +936,8 @@ bool FVertexMaskForgeDynSrcTopoCompBBoxMultipleAxesTest::RunTest(const FString& 
 	AddBoundingBoxLayer(Stack, TEXT("Layer"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f, Axes);
 
 	TArray<FColor> Out;
-	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, Out);
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, Out);
 	TestTrue(TEXT("Succeeds"), bSucceeded);
 	if (!bSucceeded || Out.Num() != 6)
 	{
@@ -963,7 +983,8 @@ bool FVertexMaskForgeDynSrcTopoCompBBoxInvertMirrorTest::RunTest(const FString& 
 		AddBoundingBoxLayer(Stack, TEXT("Layer"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f, Axes);
 
 		TArray<FColor> Out;
-		const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, Out);
+		TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+		const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, Out);
 		TestTrue(*FString::Printf(TEXT("%s: succeeds"), Label), bSucceeded);
 		if (!bSucceeded || Out.Num() != 6)
 		{
@@ -1009,7 +1030,8 @@ bool FVertexMaskForgeDynSrcTopoCompBBoxFalloffTest::RunTest(const FString& Param
 	AddBoundingBoxLayer(Stack, TEXT("Layer"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f, Axes);
 
 	TArray<FColor> Out;
-	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, Out);
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, Out);
 	TestTrue(TEXT("Succeeds"), bSucceeded);
 	if (!bSucceeded || Out.Num() != 6)
 	{
@@ -1060,7 +1082,8 @@ bool FVertexMaskForgeDynSrcTopoCompBBoxOpacityAndDisabledTest::RunTest(const FSt
 		AddBoundingBoxLayer(Stack, TEXT("Layer"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, /*Opacity=*/0.0f, Axes);
 
 		TArray<FColor> Out;
-		const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, Out);
+		TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+		const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, Out);
 		TestTrue(TEXT("Opacity 0.0: succeeds"), bSucceeded);
 		if (bSucceeded && Out.Num() == 6)
 		{
@@ -1078,7 +1101,8 @@ bool FVertexMaskForgeDynSrcTopoCompBBoxOpacityAndDisabledTest::RunTest(const FSt
 		Stack.SetLayerEnabled(LayerId, false);
 
 		TArray<FColor> Out;
-		const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, Out);
+		TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+		const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, Out);
 		TestTrue(TEXT("Disabled: succeeds"), bSucceeded);
 		if (bSucceeded && Out.Num() == 6)
 		{
@@ -1129,8 +1153,10 @@ bool FVertexMaskForgeDynSrcTopoCompBBoxTwoLayersOrderTest::RunTest(const FString
 
 	TArray<FColor> ForwardOut;
 	TArray<FColor> ReverseOut;
-	const bool bForwardSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, ForwardStack, BaseColors, FTransform::Identity, ForwardOut);
-	const bool bReverseSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, ReverseStack, BaseColors, FTransform::Identity, ReverseOut);
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> ForwardOutAOCaches;
+	const bool bForwardSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, ForwardStack, BaseColors, FTransform::Identity, ForwardOutAOCaches, ForwardOut);
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> ReverseOutAOCaches;
+	const bool bReverseSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, ReverseStack, BaseColors, FTransform::Identity, ReverseOutAOCaches, ReverseOut);
 	TestTrue(TEXT("Forward succeeds"), bForwardSucceeded);
 	TestTrue(TEXT("Reverse succeeds"), bReverseSucceeded);
 	if (!bForwardSucceeded || !bReverseSucceeded || ForwardOut.Num() != 6 || ReverseOut.Num() != 6)
@@ -1172,7 +1198,8 @@ bool FVertexMaskForgeDynSrcTopoCompBBoxWorldSpaceRejectedTest::RunTest(const FSt
 	AddBoundingBoxLayer(Stack, TEXT("Layer"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f, Axes);
 
 	TArray<FColor> Out = { FColor(1, 2, 3, 4) }; // sentinel, wrong size on purpose
-	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, Out);
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, Out);
 
 	TestFalse(TEXT("World Space is rejected (fails the whole call)"), bSucceeded);
 	TestEqual(TEXT("Out left completely untouched on failure"), Out.Num(), 1);
@@ -1201,7 +1228,8 @@ bool FVertexMaskForgeDynSrcTopoCompBBoxUnifiedBoundsRejectedTest::RunTest(const 
 	AddBoundingBoxLayer(Stack, TEXT("Layer"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f, Axes, /*bUseUnifiedBounds=*/true);
 
 	TArray<FColor> Out = { FColor(5, 6, 7, 8) }; // sentinel, wrong size on purpose
-	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, Out);
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, Out);
 
 	TestFalse(TEXT("Unified Bounds is rejected (fails the whole call)"), bSucceeded);
 	TestEqual(TEXT("Out left completely untouched on failure"), Out.Num(), 1);
@@ -1243,7 +1271,8 @@ bool FVertexMaskForgeDynSrcTopoCompDirNormalLocalDispatchTest::RunTest(const FSt
 		Space, Direction, Angle, Falloff, Blur, bInvert);
 
 	TArray<FColor> Out;
-	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, Out);
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, Out);
 	TestTrue(TEXT("Orchestrator accepts a Local-space Directional Normal layer"), bSucceeded);
 	TestEqual(TEXT("Out.Num() == 6"), Out.Num(), 6);
 	if (!bSucceeded || Out.Num() != 6)
@@ -1318,7 +1347,8 @@ bool FVertexMaskForgeDynSrcTopoCompDirNormalParamForwardingTest::RunTest(const F
 			EVertexMaskForgeNormalSpace::Local, Config.Direction, Config.Angle, Config.Falloff, Config.Blur, Config.bInvert);
 
 		TArray<FColor> Out;
-		const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, Out);
+		TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+		const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, Out);
 		TestTrue(*FString::Printf(TEXT("%s: succeeds"), Config.Label), bSucceeded);
 		if (!bSucceeded || Out.Num() != 6)
 		{
@@ -1371,7 +1401,8 @@ bool FVertexMaskForgeDynSrcTopoCompDirNormalWorldSpaceRejectedTest::RunTest(cons
 		EVertexMaskForgeNormalSpace::World, EVertexMaskForgeNormalDirection::PositiveZ, 90.0f, 45.0f, 0.0f, false);
 
 	TArray<FColor> Out = { FColor(1, 2, 3, 4) }; // sentinel, wrong size on purpose
-	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, Out);
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, Out);
 
 	TestFalse(TEXT("World Space is rejected (fails the whole call)"), bSucceeded);
 	TestEqual(TEXT("Out left completely untouched on failure"), Out.Num(), 1);
@@ -1427,8 +1458,10 @@ bool FVertexMaskForgeDynSrcTopoCompDirNormalTwoLayersOrderTest::RunTest(const FS
 
 	TArray<FColor> ForwardOut;
 	TArray<FColor> ReverseOut;
-	const bool bForwardSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, ForwardStack, BaseColors, FTransform::Identity, ForwardOut);
-	const bool bReverseSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, ReverseStack, BaseColors, FTransform::Identity, ReverseOut);
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> ForwardOutAOCaches;
+	const bool bForwardSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, ForwardStack, BaseColors, FTransform::Identity, ForwardOutAOCaches, ForwardOut);
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> ReverseOutAOCaches;
+	const bool bReverseSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, ReverseStack, BaseColors, FTransform::Identity, ReverseOutAOCaches, ReverseOut);
 	TestTrue(TEXT("Forward succeeds"), bForwardSucceeded);
 	TestTrue(TEXT("Reverse succeeds"), bReverseSucceeded);
 	if (!bForwardSucceeded || !bReverseSucceeded || ForwardOut.Num() != 6 || ReverseOut.Num() != 6)
@@ -1454,8 +1487,9 @@ bool FVertexMaskForgeDynSrcTopoCompDirNormalTwoLayersOrderTest::RunTest(const FS
 // E. Generic gating: a disabled Directional Normal layer contributes nothing (Baseline passthrough),
 // exactly mirroring BoundingBoxOpacityZeroAndDisabledLayerPreserveBaseColors' own established pattern.
 // Genuinely-unsupported-generator coverage (UnsupportedGeneratorTypeFailsWholeCall,
-// DisabledLayerContributesNothingAndSkipsValidation) already uses AmbientOcclusion, still genuinely
-// unsupported, and needed no change for Directional Normal's own dispatch to be added.
+// DisabledLayerContributesNothingAndSkipsValidation) needed no change for Directional Normal's own
+// dispatch to be added; it was later updated (M16-K.6D-8G-D) to use Thickness once Ambient Occlusion
+// itself became a supported dispatch branch.
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompDirNormalDisabledTest, "VertexMaskForge.DynamicSourceTopologyComposition.DirectionalNormalDisabledLayerPreservesBaseColors", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
 bool FVertexMaskForgeDynSrcTopoCompDirNormalDisabledTest::RunTest(const FString& Parameters)
 {
@@ -1468,7 +1502,8 @@ bool FVertexMaskForgeDynSrcTopoCompDirNormalDisabledTest::RunTest(const FString&
 	Stack.SetLayerEnabled(LayerId, false);
 
 	TArray<FColor> Out;
-	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, Out);
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, Out);
 	TestTrue(TEXT("Succeeds"), bSucceeded);
 	if (bSucceeded && Out.Num() == 6)
 	{
@@ -1523,7 +1558,8 @@ bool FVertexMaskForgeDynSrcTopoCompCurvatureDispatchTest::RunTest(const FString&
 		Type, Multiplier, Blur, LevelsMin, LevelsMax, bInvert);
 
 	TArray<FColor> Out;
-	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, Out);
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, Out);
 	TestTrue(TEXT("Orchestrator accepts a Curvature layer"), bSucceeded);
 	TestEqual(TEXT("Out.Num() == 6"), Out.Num(), 6);
 	if (!bSucceeded || Out.Num() != 6)
@@ -1592,7 +1628,8 @@ bool FVertexMaskForgeDynSrcTopoCompCurvatureParamForwardingTest::RunTest(const F
 			Config.Type, Config.Multiplier, Config.Blur, Config.LevelsMin, Config.LevelsMax, Config.bInvert);
 
 		TArray<FColor> Out;
-		const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, Out);
+		TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+		const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, Out);
 		TestTrue(*FString::Printf(TEXT("%s: orchestrator succeeds"), Config.Label), bSucceeded);
 		if (!bSucceeded || Out.Num() != 6)
 		{
@@ -1635,7 +1672,8 @@ bool FVertexMaskForgeDynSrcTopoCompCurvatureVertexDomainTest::RunTest(const FStr
 		EVertexMaskForgeCurvatureType::Both, 0.2f, 0.0f, 0.0f, 1.0f, false);
 
 	TArray<FColor> Out;
-	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, Out);
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, Out);
 	TestTrue(TEXT("Orchestrator succeeds"), bSucceeded);
 	if (!bSucceeded || Out.Num() != 6)
 	{
@@ -1694,8 +1732,10 @@ bool FVertexMaskForgeDynSrcTopoCompCurvatureTwoLayersOrderTest::RunTest(const FS
 
 	TArray<FColor> ForwardOut;
 	TArray<FColor> ReverseOut;
-	const bool bForwardSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, ForwardStack, BaseColors, FTransform::Identity, ForwardOut);
-	const bool bReverseSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, ReverseStack, BaseColors, FTransform::Identity, ReverseOut);
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> ForwardOutAOCaches;
+	const bool bForwardSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, ForwardStack, BaseColors, FTransform::Identity, ForwardOutAOCaches, ForwardOut);
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> ReverseOutAOCaches;
+	const bool bReverseSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, ReverseStack, BaseColors, FTransform::Identity, ReverseOutAOCaches, ReverseOut);
 	TestTrue(TEXT("Forward succeeds"), bForwardSucceeded);
 	TestTrue(TEXT("Reverse succeeds"), bReverseSucceeded);
 	if (!bForwardSucceeded || !bReverseSucceeded || ForwardOut.Num() != 6 || ReverseOut.Num() != 6)
@@ -1744,7 +1784,8 @@ bool FVertexMaskForgeDynSrcTopoCompCurvatureDisabledTest::RunTest(const FString&
 	Stack.SetLayerEnabled(LayerId, false);
 
 	TArray<FColor> Out;
-	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, Out);
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, Out);
 	TestTrue(TEXT("Succeeds"), bSucceeded);
 	if (bSucceeded && Out.Num() == 6)
 	{
@@ -1864,7 +1905,8 @@ bool FVertexMaskForgeDynSrcTopoCompNoiseDispatchTest::RunTest(const FString& Par
 	AddNoiseLayer(Stack, TEXT("Layer"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f, NoiseParams);
 
 	TArray<FColor> Out;
-	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, Out);
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, Out);
 	TestTrue(TEXT("Orchestrator accepts a Noise layer"), bSucceeded);
 	TestEqual(TEXT("Out.Num() == 6"), Out.Num(), 6);
 	if (!bSucceeded || Out.Num() != 6)
@@ -1947,7 +1989,8 @@ bool FVertexMaskForgeDynSrcTopoCompNoiseParamForwardingTest::RunTest(const FStri
 		AddNoiseLayer(Stack, TEXT("Layer"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f, Config.Params);
 
 		TArray<FColor> Out;
-		const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, Out);
+		TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+		const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, Out);
 		TestTrue(*FString::Printf(TEXT("%s: orchestrator succeeds"), Config.Label), bSucceeded);
 		if (!bSucceeded || Out.Num() != 6)
 		{
@@ -2017,7 +2060,8 @@ bool FVertexMaskForgeDynSrcTopoCompNoiseMismatchRejectedByStackTest::RunTest(con
 	// The stack therefore remains fully coherent -- the orchestrator succeeds normally against it, never
 	// crashing, never falling back, never partially composing.
 	TArray<FColor> Out;
-	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, Out);
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, Out);
 	TestTrue(TEXT("Orchestrator succeeds against the still-coherent stack"), bSucceeded);
 	TestEqual(TEXT("Out.Num() == 6"), Out.Num(), 6);
 
@@ -2040,7 +2084,8 @@ bool FVertexMaskForgeDynSrcTopoCompNoiseVertexDomainTest::RunTest(const FString&
 	AddNoiseLayer(Stack, TEXT("Layer"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f, MakeNoiseBaselineParams());
 
 	TArray<FColor> Out;
-	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, Out);
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, Out);
 	TestTrue(TEXT("Orchestrator succeeds"), bSucceeded);
 	if (!bSucceeded || Out.Num() != 6)
 	{
@@ -2103,8 +2148,10 @@ bool FVertexMaskForgeDynSrcTopoCompNoiseTwoLayersOrderTest::RunTest(const FStrin
 
 	TArray<FColor> ForwardOut;
 	TArray<FColor> ReverseOut;
-	const bool bForwardSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, ForwardStack, BaseColors, FTransform::Identity, ForwardOut);
-	const bool bReverseSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, ReverseStack, BaseColors, FTransform::Identity, ReverseOut);
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> ForwardOutAOCaches;
+	const bool bForwardSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, ForwardStack, BaseColors, FTransform::Identity, ForwardOutAOCaches, ForwardOut);
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> ReverseOutAOCaches;
+	const bool bReverseSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, ReverseStack, BaseColors, FTransform::Identity, ReverseOutAOCaches, ReverseOut);
 	TestTrue(TEXT("Forward succeeds"), bForwardSucceeded);
 	TestTrue(TEXT("Reverse succeeds"), bReverseSucceeded);
 	if (!bForwardSucceeded || !bReverseSucceeded || ForwardOut.Num() != 6 || ReverseOut.Num() != 6)
@@ -2152,7 +2199,8 @@ bool FVertexMaskForgeDynSrcTopoCompNoiseDisabledTest::RunTest(const FString& Par
 	Stack.SetLayerEnabled(LayerId, false);
 
 	TArray<FColor> Out;
-	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, Out);
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, Out);
 	TestTrue(TEXT("Succeeds"), bSucceeded);
 	if (bSucceeded && Out.Num() == 6)
 	{
@@ -2213,7 +2261,8 @@ bool FVertexMaskForgeDynSrcTopoCompNoiseIndependentStateTest::RunTest(const FStr
 	Stack.SetLayerChannelFilter(LayerC, /*bAffectRed=*/false, /*bAffectGreen=*/false, /*bAffectBlue=*/true);
 
 	TArray<FColor> Out;
-	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, Out);
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, Out);
 	TestTrue(TEXT("Orchestrator succeeds with three independent Noise layers in one invocation"), bSucceeded);
 	if (!bSucceeded || Out.Num() != 6)
 	{
