@@ -10,6 +10,7 @@
 #include "DynamicMesh/DynamicMesh3.h"
 #include "DynamicMesh/DynamicMeshAttributeSet.h"
 #include "Misc/AutomationTest.h"
+#include "VertexMaskForgeAmbientOcclusionGenerator.h"
 #include "VertexMaskForgeBoundingBoxGenerator.h"
 #include "VertexMaskForgeCurvatureGenerator.h"
 #include "VertexMaskForgeDirectionalNormalGenerator.h"
@@ -357,6 +358,138 @@ namespace
 		Stack.SetLayerMaskParams(LayerId, MaskInstance->MaskInstanceId, NewParams);
 
 		return LayerId;
+	}
+
+	// M16-K.6D-8G-E: a narrow, deep two-panel "canyon" (NOT flat, unlike BuildOrchestratorFixtureWorkingMesh
+	// -- a flat mesh gives Ambient Occlusion nothing to occlude against, since a hemisphere ray from a
+	// planar surface with no other nearby geometry almost never hits anything) -- same two-triangle
+	// topology/append order as every other fixture in this file (Tri0=(V0,V1,V2), Tri1=(V0,V2,V3)), so
+	// FixtureCornerToVertexID still applies, but V0/V2 (the shared ridge, low) and V1/V3 (each panel's own
+	// outer top corner, high and only slightly offset sideways) form two near-vertical walls ~0.8 units
+	// apart at the top, hinged along the V0-V2 ridge -- genuine, non-degenerate self-occlusion between the
+	// two panels, real enough for a raycaster to measure, never a hand-picked/faked scalar.
+	//
+	// A REAL Normal Overlay is populated with SIX INDEPENDENT elements (one per corner, never shared) --
+	// V0 (corner 0 in Tri0, corner 3 in Tri1) and V2 (corner 2 in Tri0, corner 4 in Tri1) each get TWO
+	// DELIBERATELY DISTINCT normals at the SAME geometric position: corner 0/2 point mostly toward +Z (up
+	// and away from both walls -- open sky, LOWER expected occlusion), corner 3/4 point mostly toward the
+	// OPPOSING wall (heavily -X/+X respectively -- INTO the canyon, HIGHER expected occlusion). This is
+	// what lets a test built on this fixture distinguish genuine per-corner Normal-Overlay-Element-ID
+	// resolution (each corner independently reads ITS OWN element's occlusion) from an incorrect
+	// vertex-averaged or arbitrary-first-element substitute -- using the ACTUAL raycast result, never an
+	// assumption about which value "should" be bigger asserted without also verifying real distinctness.
+	FVertexMaskForgeWorkingMesh BuildAOFoldFixtureWorkingMesh()
+	{
+		FVertexMaskForgeWorkingMesh WorkingMesh;
+		WorkingMesh.Mesh = MakeUnique<UE::Geometry::FDynamicMesh3>();
+		WorkingMesh.Mesh->AppendVertex(FVector3d(0.0, 0.0, 0.0));  // V0 -- ridge (shared, low)
+		WorkingMesh.Mesh->AppendVertex(FVector3d(0.4, 0.0, 1.2));  // V1 -- Tri0's own outer top corner (+X wall)
+		WorkingMesh.Mesh->AppendVertex(FVector3d(0.0, 1.0, 0.0));  // V2 -- ridge (shared, low)
+		WorkingMesh.Mesh->AppendVertex(FVector3d(-0.4, 1.0, 1.2)); // V3 -- Tri1's own outer top corner (-X wall)
+		WorkingMesh.Mesh->AppendTriangle(0, 1, 2);
+		WorkingMesh.Mesh->AppendTriangle(0, 2, 3);
+
+		WorkingMesh.Mesh->EnableAttributes();
+		UE::Geometry::FDynamicMeshNormalOverlay* NormalOverlay = WorkingMesh.Mesh->Attributes()->PrimaryNormals();
+
+		const FVector3f CornerNormals[6] = {
+			FVector3f(0.10f, 0.00f, 0.99f).GetSafeNormal(),   // corner 0 (Tri0, V0): mostly +Z, open sky
+			FVector3f(0.70f, 0.00f, 0.70f).GetSafeNormal(),   // corner 1 (Tri0, V1): outward, +X wall's own face
+			FVector3f(0.10f, 0.00f, 0.99f).GetSafeNormal(),   // corner 2 (Tri0, V2): mostly +Z, open sky
+			FVector3f(-0.85f, 0.00f, 0.30f).GetSafeNormal(),  // corner 3 (Tri1, V0): heavily -X, INTO the canyon toward the -X wall -- deliberately distinct from corner 0
+			FVector3f(0.85f, 0.00f, 0.30f).GetSafeNormal(),   // corner 4 (Tri1, V2): heavily +X, INTO the canyon toward the +X wall -- deliberately distinct from corner 2
+			FVector3f(-0.70f, 0.00f, 0.70f).GetSafeNormal(),  // corner 5 (Tri1, V3): outward, -X wall's own face
+		};
+
+		int32 CornerIndex = 0;
+		for (const int32 TriangleID : WorkingMesh.Mesh->TriangleIndicesItr())
+		{
+			UE::Geometry::FIndex3i ElementTri;
+			for (int32 Corner = 0; Corner < 3; ++Corner, ++CornerIndex)
+			{
+				ElementTri[Corner] = NormalOverlay->AppendElement(CornerNormals[CornerIndex]);
+			}
+			NormalOverlay->SetTriangle(TriangleID, ElementTri);
+		}
+
+		WorkingMesh.GeometryFingerprint = 1;
+		return WorkingMesh;
+	}
+
+	// Adds a layer with an Ambient Occlusion mask, configured via the stack's own controlled mutators --
+	// mirrors AddCurvatureLayer's/AddNoiseLayer's own setup sequence exactly.
+	FGuid AddAmbientOcclusionLayer(
+		FVertexMaskForgeDynamicLayerStack& Stack, const FString& Name,
+		EVertexMaskForgeLayerFill Fill, EVertexMaskForgeBlendMode BlendMode, float Opacity,
+		int32 Samples, float MaxDistance, float Bias, float LevelsMin, float LevelsMax, bool bInvert)
+	{
+		const FGuid LayerId = Stack.AddLayer(Name);
+		Stack.SetLayerFill(LayerId, Fill);
+		Stack.SetLayerBlendMode(LayerId, BlendMode);
+		Stack.SetLayerOpacity(LayerId, Opacity);
+		Stack.SetLayerMaskGeneratorType(LayerId, EVertexMaskForgeGeneratorType::AmbientOcclusion);
+
+		const FVertexMaskForgeGeneratorMaskInstance* MaskInstance = Stack.GetLayerMask(LayerId);
+		check(MaskInstance);
+		FVertexMaskForgeGeneratorParams NewParams = MakeVertexMaskForgeGeneratorParams(EVertexMaskForgeGeneratorType::AmbientOcclusion);
+		FVertexMaskForgeAmbientOcclusionParams& AOParams = NewParams.Get<FVertexMaskForgeAmbientOcclusionParams>();
+		AOParams.Samples = Samples;
+		AOParams.MaxDistance = MaxDistance;
+		AOParams.Bias = Bias;
+		AOParams.LevelsMin = LevelsMin;
+		AOParams.LevelsMax = LevelsMax;
+		AOParams.bInvert = bInvert;
+		Stack.SetLayerMaskParams(LayerId, MaskInstance->MaskInstanceId, NewParams);
+
+		return LayerId;
+	}
+
+	// Builds the exact FVertexMaskForgeAOParams the orchestrator's own AO branch would translate this
+	// layer's FVertexMaskForgeAmbientOcclusionParams into (see VertexMaskForgeDynamicSourceTopologyComposition
+	// .cpp's own 1:1 field translation) -- used ONLY to drive the direct, independent oracle generator call
+	// in a test, never to duplicate any AO math itself.
+	FVertexMaskForgeAOParams MakeOracleAOParams(int32 Samples, float MaxDistance, float Bias, float LevelsMin, float LevelsMax, bool bInvert)
+	{
+		FVertexMaskForgeAOParams RawParams;
+		RawParams.Samples = Samples;
+		RawParams.MaxDistance = MaxDistance;
+		RawParams.Bias = Bias;
+		RawParams.LevelsMin = LevelsMin;
+		RawParams.LevelsMax = LevelsMax;
+		RawParams.bInvert = bInvert;
+		return RawParams;
+	}
+
+	// Test-local only (never a production seam) -- copies LayerId's CURRENT Ambient Occlusion params
+	// (byte/value-exact), applies Mutator, writes back through the stack's own existing controlled API in
+	// ONE call, mirroring the exact pattern SVertexMaskForgePanel::MutateDynamicCurvatureParam/
+	// MutateDynamicNoiseParam already establish in production for every other generator.
+	void MutateAmbientOcclusionParams(FVertexMaskForgeDynamicLayerStack& Stack, const FGuid& LayerId, TFunctionRef<void(FVertexMaskForgeAmbientOcclusionParams&)> Mutator)
+	{
+		const FVertexMaskForgeGeneratorMaskInstance* MaskInstance = Stack.GetLayerMask(LayerId);
+		check(MaskInstance && MaskInstance->Params.IsType<FVertexMaskForgeAmbientOcclusionParams>());
+		FVertexMaskForgeGeneratorParams NewParams = MaskInstance->Params;
+		Mutator(NewParams.Get<FVertexMaskForgeAmbientOcclusionParams>());
+		Stack.SetLayerMaskParams(LayerId, MaskInstance->MaskInstanceId, NewParams);
+	}
+
+	// Byte-for-byte TArray<float> comparison -- used throughout this file's AO tests to prove RawValues
+	// reuse/invalidation without relying on any production accessor beyond the cache struct's own already-
+	// public fields.
+	bool AreRawValueArraysIdentical(const TArray<float>& A, const TArray<float>& B)
+	{
+		if (A.Num() != B.Num())
+		{
+			return false;
+		}
+		for (int32 i = 0; i < A.Num(); ++i)
+		{
+			if (A[i] != B[i])
+			{
+				return false;
+			}
+		}
+		return true;
 	}
 }
 
@@ -2280,6 +2413,654 @@ bool FVertexMaskForgeDynSrcTopoCompNoiseIndependentStateTest::RunTest(const FStr
 		TestEqual(*FString::Printf(TEXT("Out[%d].R matches independent Layer A (not contaminated by B/C)"), CornerIndex), Out[CornerIndex].R, UnitFloatToByte(ExpectedA));
 		TestEqual(*FString::Printf(TEXT("Out[%d].G matches independent Layer B (not contaminated by A/C)"), CornerIndex), Out[CornerIndex].G, UnitFloatToByte(ExpectedB));
 		TestEqual(*FString::Printf(TEXT("Out[%d].B matches independent Layer C (not contaminated by A/B)"), CornerIndex), Out[CornerIndex].B, UnitFloatToByte(ExpectedC));
+	}
+
+	return true;
+}
+
+// M16-K.6D-8G-E, AO-1/AO-6: a real, enabled Ambient Occlusion layer dispatched through the Dynamic
+// orchestrator, byte-exact against the direct, independent oracle generator call (own cold cache, same
+// per-corner Normal Overlay Element ID resolved via NormalOverlay->GetTriangle(TriangleID)[Corner] --
+// never Mesh->GetTriangle, never a positional VertexID/ElementID assumption). Also proves hard-edge
+// domain resolution (5.6): V0's two elements (corner 0 vs corner 3) and V2's two elements (corner 2 vs
+// corner 4) are asserted to produce GENUINELY DIFFERENT raw occlusion via the oracle itself (not assumed)
+// before checking that the orchestrator's own per-corner output correctly reflects each corner's OWN
+// element, never a shared/vertex-averaged value.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompAODispatchTest, "VertexMaskForge.DynamicSourceTopologyComposition.AmbientOcclusionDispatchByteExactAgainstGeneratorAndElementDomain", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynSrcTopoCompAODispatchTest::RunTest(const FString& Parameters)
+{
+	const FVertexMaskForgeWorkingMesh WorkingMesh = BuildAOFoldFixtureWorkingMesh();
+	const FVertexMaskForgeAOParams OracleParams = MakeOracleAOParams(/*Samples=*/32, /*MaxDistance=*/100.0f, /*Bias=*/0.05f, 0.0f, 1.0f, false);
+
+	TUniquePtr<FVertexMaskForgeSourceTopologyAOCache> OracleCachePtr;
+	const FVertexMaskForgeScalarMask ReferenceMask = VertexMaskForgeAmbientOcclusionGenerator::GenerateAmbientOcclusionMaskFromDynamicMesh(
+		OracleCachePtr, *WorkingMesh.Mesh, WorkingMesh.GeometryFingerprint, FTransform::Identity, OracleParams);
+	TestTrue(TEXT("Oracle generator State == Ready"), ReferenceMask.State == EVertexMaskForgeScalarMaskState::Ready);
+	if (ReferenceMask.State != EVertexMaskForgeScalarMaskState::Ready)
+	{
+		return false;
+	}
+
+	// Hard-edge distinctness (5.6): resolve the ACTUAL per-corner Element IDs the same way Legacy's own
+	// UpdateWorkingColorsSourceTopology does (NormalOverlay->GetTriangle(TriangleID)[Corner]), then prove
+	// V0's two elements (corners 0/3) and V2's two elements (corners 2/4) genuinely differ in the oracle's
+	// own raw output -- a real geometric/raycast fact, never assumed.
+	const UE::Geometry::FDynamicMeshNormalOverlay* NormalOverlay = WorkingMesh.Mesh->Attributes()->PrimaryNormals();
+	int32 ElementIDByCorner[6];
+	{
+		int32 RunningCorner = 0;
+		for (const int32 TriangleID : WorkingMesh.Mesh->TriangleIndicesItr())
+		{
+			const UE::Geometry::FIndex3i TriElements = NormalOverlay->GetTriangle(TriangleID);
+			ElementIDByCorner[RunningCorner++] = TriElements.A;
+			ElementIDByCorner[RunningCorner++] = TriElements.B;
+			ElementIDByCorner[RunningCorner++] = TriElements.C;
+		}
+	}
+	TestFalse(TEXT("Corner 0 and corner 3 (both at V0) resolve to DIFFERENT Normal Overlay Element IDs"), ElementIDByCorner[0] == ElementIDByCorner[3]);
+	TestFalse(TEXT("Corner 2 and corner 4 (both at V2) resolve to DIFFERENT Normal Overlay Element IDs"), ElementIDByCorner[2] == ElementIDByCorner[4]);
+
+	float Value0 = 0.0f, Value3 = 0.0f, Value2 = 0.0f, Value4 = 0.0f;
+	const bool bHas0 = ReferenceMask.TryGetValue(ElementIDByCorner[0], Value0);
+	const bool bHas3 = ReferenceMask.TryGetValue(ElementIDByCorner[3], Value3);
+	const bool bHas2 = ReferenceMask.TryGetValue(ElementIDByCorner[2], Value2);
+	const bool bHas4 = ReferenceMask.TryGetValue(ElementIDByCorner[4], Value4);
+	TestTrue(TEXT("Oracle has a value for corner 0's element"), bHas0);
+	TestTrue(TEXT("Oracle has a value for corner 3's element"), bHas3);
+	TestTrue(TEXT("Oracle has a value for corner 2's element"), bHas2);
+	TestTrue(TEXT("Oracle has a value for corner 4's element"), bHas4);
+	if (bHas0 && bHas3)
+	{
+		TestFalse(TEXT("V0's two elements (corners 0 vs 3) produce GENUINELY DIFFERENT raw AO -- proves the fixture's fold geometry is non-degenerate, never a vacuous flat-mesh result"), FMath::IsNearlyEqual(Value0, Value3, 1e-4f));
+	}
+	if (bHas2 && bHas4)
+	{
+		TestFalse(TEXT("V2's two elements (corners 2 vs 4) produce GENUINELY DIFFERENT raw AO"), FMath::IsNearlyEqual(Value2, Value4, 1e-4f));
+	}
+
+	FVertexMaskForgeDynamicLayerStack Stack;
+	AddAmbientOcclusionLayer(Stack, TEXT("AO"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f,
+		/*Samples=*/32, /*MaxDistance=*/100.0f, /*Bias=*/0.05f, 0.0f, 1.0f, false);
+
+	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
+	TArray<FColor> Out;
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, Out);
+
+	TestTrue(TEXT("Orchestrator accepts a real enabled Ambient Occlusion layer"), bSucceeded);
+	TestEqual(TEXT("Out.Num() == 6"), Out.Num(), 6);
+	TestEqual(TEXT("Exactly one AO cache entry was created"), OutAOCaches.Num(), 1);
+	TestTrue(TEXT("The AO cache entry is keyed by the AO layer's own stable LayerId"), OutAOCaches.Contains(Stack.GetLayers()[0].LayerId));
+	if (!bSucceeded || Out.Num() != 6)
+	{
+		return false;
+	}
+
+	for (int32 CornerIndex = 0; CornerIndex < 6; ++CornerIndex)
+	{
+		float ExpectedMaskValue = 0.0f;
+		const bool bHasValue = ReferenceMask.TryGetValue(ElementIDByCorner[CornerIndex], ExpectedMaskValue);
+		TestTrue(*FString::Printf(TEXT("Oracle has a value at ElementID %d (corner %d)"), ElementIDByCorner[CornerIndex], CornerIndex), bHasValue);
+		if (!bHasValue)
+		{
+			continue;
+		}
+
+		const uint8 ExpectedByte = UnitFloatToByte(ExpectedMaskValue);
+		TestEqual(*FString::Printf(TEXT("Out[%d].R byte-exact vs oracle generator + per-corner Element ID"), CornerIndex), Out[CornerIndex].R, ExpectedByte);
+		TestEqual(*FString::Printf(TEXT("Out[%d].G byte-exact vs oracle generator + per-corner Element ID"), CornerIndex), Out[CornerIndex].G, ExpectedByte);
+		TestEqual(*FString::Printf(TEXT("Out[%d].B byte-exact vs oracle generator + per-corner Element ID"), CornerIndex), Out[CornerIndex].B, ExpectedByte);
+		TestEqual(*FString::Printf(TEXT("Out[%d].A == BaseColors[%d].A"), CornerIndex, CornerIndex), Out[CornerIndex].A, BaseColors[CornerIndex].A);
+	}
+
+	// Corner 0 and corner 3 map to the SAME Dynamic Mesh VertexID (V0) but DIFFERENT Element IDs -- if the
+	// evaluator incorrectly used VertexID (or averaged/picked one element arbitrarily), Out[0] and Out[3]
+	// would incorrectly match despite their genuinely different oracle values.
+	if (!FMath::IsNearlyEqual(Value0, Value3, 1e-4f))
+	{
+		TestNotEqual(TEXT("Out[0] (corner 0, V0) != Out[3] (corner 3, also V0) -- proves per-ELEMENT, not per-VERTEX, resolution"), Out[0].R, Out[3].R);
+	}
+
+	return true;
+}
+
+// M16-K.6D-8G-E, AO-2: cold vs. warm cache -- proves the persistent Model D cache entry is genuinely
+// reused across two separate orchestrator calls with identical inputs, and implicitly proves the M16-K.6D-
+// 8G-D adapter (by-value map entry -> call-scoped TUniquePtr -> back into the same map entry) restores
+// ownership correctly on the success path: if it did not, the SECOND call would see FindOrAdd return a
+// fresh, cold (bTreeValid=false) entry instead of the warm one. No elapsed-time evidence is used.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompAOWarmCacheTest, "VertexMaskForge.DynamicSourceTopologyComposition.AmbientOcclusionColdAndWarmCacheProduceIdenticalResultAndReuseEntry", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynSrcTopoCompAOWarmCacheTest::RunTest(const FString& Parameters)
+{
+	const FVertexMaskForgeWorkingMesh WorkingMesh = BuildAOFoldFixtureWorkingMesh();
+	FVertexMaskForgeDynamicLayerStack Stack;
+	const FGuid LayerId = AddAmbientOcclusionLayer(Stack, TEXT("AO"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f,
+		/*Samples=*/32, /*MaxDistance=*/100.0f, /*Bias=*/0.05f, 0.0f, 1.0f, false);
+
+	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> AOCaches;
+
+	TArray<FColor> ColdOut;
+	const bool bColdSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, AOCaches, ColdOut);
+	TestTrue(TEXT("Cold evaluation succeeds"), bColdSucceeded);
+	TestEqual(TEXT("Exactly one cache entry after cold evaluation"), AOCaches.Num(), 1);
+
+	const FVertexMaskForgeSourceTopologyAOCache* ColdEntry = AOCaches.Find(LayerId);
+	TestTrue(TEXT("Cold entry exists under the AO layer's own LayerId"), ColdEntry != nullptr);
+	if (!ColdEntry || !bColdSucceeded)
+	{
+		return false;
+	}
+	TestTrue(TEXT("Cold entry's tree is valid -- proves the adapter restored ownership on the success path"), ColdEntry->bTreeValid);
+	TestTrue(TEXT("Cold entry's raw values are valid"), ColdEntry->bValuesValid);
+	TestTrue(TEXT("Cold entry retained a real, non-null acceleration tree"), ColdEntry->Tree.IsValid());
+	TestTrue(TEXT("Cold entry retained a real, non-null WorldMesh"), ColdEntry->WorldMesh.IsValid());
+	const TArray<float> ColdRawValues = ColdEntry->RawValues;
+
+	TArray<FColor> WarmOut;
+	const bool bWarmSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, AOCaches, WarmOut);
+	TestTrue(TEXT("Warm evaluation succeeds"), bWarmSucceeded);
+	TestEqual(TEXT("Still exactly one cache entry after warm evaluation -- no duplicate entry created"), AOCaches.Num(), 1);
+
+	TestEqual(TEXT("Cold and warm output counts match"), ColdOut.Num(), WarmOut.Num());
+	for (int32 Index = 0; Index < FMath::Min(ColdOut.Num(), WarmOut.Num()); ++Index)
+	{
+		TestEqual(*FString::Printf(TEXT("ColdOut[%d] == WarmOut[%d] (byte-identical)"), Index, Index), ColdOut[Index], WarmOut[Index]);
+	}
+
+	const FVertexMaskForgeSourceTopologyAOCache* WarmEntry = AOCaches.Find(LayerId);
+	TestTrue(TEXT("Warm entry still exists under the SAME LayerId"), WarmEntry != nullptr);
+	if (WarmEntry)
+	{
+		TestTrue(TEXT("Warm entry's tree remains valid"), WarmEntry->bTreeValid);
+		TestTrue(TEXT("Warm entry's raw values remain valid"), WarmEntry->bValuesValid);
+		// Strongest safely observable proof of reuse available without a production pointer-identity
+		// accessor (none exists, and none is added here) -- RawValues content identity across two calls.
+		TestTrue(TEXT("RawValues are byte-for-byte identical across cold/warm calls"), AreRawValueArraysIdentical(WarmEntry->RawValues, ColdRawValues));
+	}
+
+	return true;
+}
+
+// M16-K.6D-8G-E, AO-3: Levels and Invert are purely compositional -- both must reuse RawValues without
+// ever rebuilding the tree or rerunning raycasts, and must never be applied twice. Uses the fold fixture
+// (genuinely non-constant raw AO, never 0/1-everywhere) so a Levels/Invert change produces a REAL,
+// meaningfully different composed output, never a vacuous no-op.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompAOLevelsInvertReuseTest, "VertexMaskForge.DynamicSourceTopologyComposition.AmbientOcclusionLevelsAndInvertReuseRawValuesWithoutDoubleProcessing", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynSrcTopoCompAOLevelsInvertReuseTest::RunTest(const FString& Parameters)
+{
+	const FVertexMaskForgeWorkingMesh WorkingMesh = BuildAOFoldFixtureWorkingMesh();
+	FVertexMaskForgeDynamicLayerStack Stack;
+	const FGuid LayerId = AddAmbientOcclusionLayer(Stack, TEXT("AO"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f,
+		/*Samples=*/32, /*MaxDistance=*/100.0f, /*Bias=*/0.05f, 0.0f, 1.0f, false);
+
+	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> AOCaches;
+
+	TArray<FColor> BaselineOut;
+	TestTrue(TEXT("Baseline (Levels 0/1, Invert false) evaluation succeeds"),
+		VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, AOCaches, BaselineOut));
+
+	const FVertexMaskForgeSourceTopologyAOCache* Entry = AOCaches.Find(LayerId);
+	TestTrue(TEXT("Cache entry exists"), Entry != nullptr);
+	if (!Entry)
+	{
+		return false;
+	}
+	const TArray<float> RawAfterCold = Entry->RawValues;
+	const int32 CachedSamplesAfterCold = Entry->CachedSamples;
+
+	MutateAmbientOcclusionParams(Stack, LayerId, [](FVertexMaskForgeAmbientOcclusionParams& P) { P.LevelsMin = 0.4f; });
+
+	TArray<FColor> LevelsOut;
+	TestTrue(TEXT("Levels-only-changed evaluation succeeds"),
+		VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, AOCaches, LevelsOut));
+
+	const FVertexMaskForgeSourceTopologyAOCache* EntryAfterLevels = AOCaches.Find(LayerId);
+	TestTrue(TEXT("Same cache entry still exists after a Levels-only change"), EntryAfterLevels != nullptr);
+	TestEqual(TEXT("Still exactly one cache entry (no duplicate created by the param change)"), AOCaches.Num(), 1);
+	if (EntryAfterLevels)
+	{
+		TestEqual(TEXT("CachedSamples unchanged -- proves raw values were NOT recomputed for a Levels-only change"), EntryAfterLevels->CachedSamples, CachedSamplesAfterCold);
+		TestTrue(TEXT("RawValues are byte-for-byte unchanged after a Levels-only edit"), AreRawValueArraysIdentical(EntryAfterLevels->RawValues, RawAfterCold));
+	}
+	TestNotEqual(TEXT("Composed output DOES change when Levels changes (proves Levels is actually applied, not silently ignored)"), LevelsOut[0].R, BaselineOut[0].R);
+
+	MutateAmbientOcclusionParams(Stack, LayerId, [](FVertexMaskForgeAmbientOcclusionParams& P) { P.bInvert = true; });
+
+	TArray<FColor> InvertOut;
+	TestTrue(TEXT("Invert-added evaluation succeeds"),
+		VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, AOCaches, InvertOut));
+
+	const FVertexMaskForgeSourceTopologyAOCache* EntryAfterInvert = AOCaches.Find(LayerId);
+	TestTrue(TEXT("Same cache entry still exists after adding Invert"), EntryAfterInvert != nullptr);
+	if (EntryAfterInvert)
+	{
+		TestTrue(TEXT("RawValues remain byte-for-byte unchanged after also toggling Invert"), AreRawValueArraysIdentical(EntryAfterInvert->RawValues, RawAfterCold));
+	}
+	TestNotEqual(TEXT("Composed output changes again when Invert is added (proves Invert applied once, not skipped or double-applied)"), InvertOut[0].R, LevelsOut[0].R);
+
+	return true;
+}
+
+// M16-K.6D-8G-E, AO-4: ordinary Dynamic composition properties (Fill/Blend/Opacity/Channel Filter) never
+// touch AO's own raw generation state -- distinguishing AO generation state from ordinary layer-
+// composition state, exactly as the checkpoint requires.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompAOCompositionEditsPreserveRawTest, "VertexMaskForge.DynamicSourceTopologyComposition.AmbientOcclusionCompositionOnlyEditsPreserveRawValues", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynSrcTopoCompAOCompositionEditsPreserveRawTest::RunTest(const FString& Parameters)
+{
+	const FVertexMaskForgeWorkingMesh WorkingMesh = BuildAOFoldFixtureWorkingMesh();
+	FVertexMaskForgeDynamicLayerStack Stack;
+	const FGuid LayerId = AddAmbientOcclusionLayer(Stack, TEXT("AO"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f,
+		/*Samples=*/32, /*MaxDistance=*/100.0f, /*Bias=*/0.05f, 0.0f, 1.0f, false);
+
+	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> AOCaches;
+
+	TArray<FColor> BaselineOut;
+	TestTrue(TEXT("Baseline evaluation succeeds"),
+		VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, AOCaches, BaselineOut));
+	const TArray<float> RawAfterCold = AOCaches.FindChecked(LayerId).RawValues;
+
+	// Fill: White -> Black.
+	Stack.SetLayerFill(LayerId, EVertexMaskForgeLayerFill::Black);
+	TArray<FColor> FillChangedOut;
+	TestTrue(TEXT("Fill-changed evaluation succeeds"),
+		VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, AOCaches, FillChangedOut));
+	TestTrue(TEXT("RawValues unchanged after a Fill-only edit"), AreRawValueArraysIdentical(AOCaches.FindChecked(LayerId).RawValues, RawAfterCold));
+	TestNotEqual(TEXT("Composed output changes when Fill changes"), FillChangedOut[0].R, BaselineOut[0].R);
+	Stack.SetLayerFill(LayerId, EVertexMaskForgeLayerFill::White);
+
+	// Blend Mode: Copy -> Multiply.
+	Stack.SetLayerBlendMode(LayerId, EVertexMaskForgeBlendMode::Multiply);
+	TArray<FColor> BlendChangedOut;
+	TestTrue(TEXT("Blend-changed evaluation succeeds"),
+		VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, AOCaches, BlendChangedOut));
+	TestTrue(TEXT("RawValues unchanged after a Blend Mode-only edit"), AreRawValueArraysIdentical(AOCaches.FindChecked(LayerId).RawValues, RawAfterCold));
+	Stack.SetLayerBlendMode(LayerId, EVertexMaskForgeBlendMode::Copy);
+
+	// Opacity: 1.0 -> 0.5.
+	Stack.SetLayerOpacity(LayerId, 0.5f);
+	TArray<FColor> OpacityChangedOut;
+	TestTrue(TEXT("Opacity-changed evaluation succeeds"),
+		VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, AOCaches, OpacityChangedOut));
+	TestTrue(TEXT("RawValues unchanged after an Opacity-only edit"), AreRawValueArraysIdentical(AOCaches.FindChecked(LayerId).RawValues, RawAfterCold));
+	TestNotEqual(TEXT("Composed output changes when Opacity changes"), OpacityChangedOut[0].R, BaselineOut[0].R);
+	Stack.SetLayerOpacity(LayerId, 1.0f);
+
+	// Channel Filter: all -> Red only.
+	Stack.SetLayerChannelFilter(LayerId, true, false, false);
+	TArray<FColor> ChannelChangedOut;
+	TestTrue(TEXT("Channel-Filter-changed evaluation succeeds"),
+		VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, AOCaches, ChannelChangedOut));
+	TestTrue(TEXT("RawValues unchanged after a Channel-Filter-only edit"), AreRawValueArraysIdentical(AOCaches.FindChecked(LayerId).RawValues, RawAfterCold));
+	TestEqual(TEXT("Green channel untouched (Channel Filter excludes it) -- matches BaseColors' own Green"), ChannelChangedOut[0].G, BaseColors[0].G);
+	TestEqual(TEXT("Alpha preserved from BaseColors regardless of Channel Filter"), ChannelChangedOut[0].A, BaseColors[0].A);
+
+	TestEqual(TEXT("No additional AO cache entry was created by any composition-only edit"), AOCaches.Num(), 1);
+
+	return true;
+}
+
+// M16-K.6D-8G-E, AO-5: Samples/Max Distance/Bias are the ONLY inputs that invalidate RawValues -- each
+// must trigger a real recompute (CachedSamples/MaxDistance/Bias advancing to match), while the
+// acceleration tree (keyed only by mesh/fingerprint/transform) is retained, never rebuilt, across a
+// raw-parameter-only change.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompAORawInvalidationTest, "VertexMaskForge.DynamicSourceTopologyComposition.AmbientOcclusionRawParameterChangesInvalidateOnlyRawValues", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynSrcTopoCompAORawInvalidationTest::RunTest(const FString& Parameters)
+{
+	const FVertexMaskForgeWorkingMesh WorkingMesh = BuildAOFoldFixtureWorkingMesh();
+	FVertexMaskForgeDynamicLayerStack Stack;
+	const FGuid LayerId = AddAmbientOcclusionLayer(Stack, TEXT("AO"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f,
+		/*Samples=*/16, /*MaxDistance=*/100.0f, /*Bias=*/0.1f, 0.0f, 1.0f, false);
+
+	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> AOCaches;
+
+	TArray<FColor> Out;
+	TestTrue(TEXT("Baseline evaluation succeeds"),
+		VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, AOCaches, Out));
+	const UE::Geometry::FDynamicMesh3* TreeMeshAfterCold = AOCaches.FindChecked(LayerId).WorldMesh.Get();
+	TestTrue(TEXT("Tree valid after cold evaluation"), AOCaches.FindChecked(LayerId).bTreeValid);
+
+	// Samples: 16 -> 64.
+	MutateAmbientOcclusionParams(Stack, LayerId, [](FVertexMaskForgeAmbientOcclusionParams& P) { P.Samples = 64; });
+	TestTrue(TEXT("Samples-changed evaluation succeeds"),
+		VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, AOCaches, Out));
+	{
+		const FVertexMaskForgeSourceTopologyAOCache& E = AOCaches.FindChecked(LayerId);
+		TestEqual(TEXT("CachedSamples advanced to 64 -- proves a real raw recompute occurred"), E.CachedSamples, 64);
+		TestTrue(TEXT("Tree remains valid (never rebuilt for a Samples-only change)"), E.bTreeValid);
+		TestTrue(TEXT("WorldMesh pointer identity unchanged -- the tree was retained, not rebuilt"), E.WorldMesh.Get() == TreeMeshAfterCold);
+	}
+
+	// Max Distance: 100 -> 5 (a genuinely different search radius on this small fixture).
+	MutateAmbientOcclusionParams(Stack, LayerId, [](FVertexMaskForgeAmbientOcclusionParams& P) { P.MaxDistance = 5.0f; });
+	TestTrue(TEXT("MaxDistance-changed evaluation succeeds"),
+		VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, AOCaches, Out));
+	{
+		const FVertexMaskForgeSourceTopologyAOCache& E = AOCaches.FindChecked(LayerId);
+		TestEqual(TEXT("CachedMaxDistance advanced to 5.0"), E.CachedMaxDistance, 5.0f);
+		TestTrue(TEXT("Tree remains valid (never rebuilt for a MaxDistance-only change)"), E.bTreeValid);
+		TestTrue(TEXT("WorldMesh pointer identity still unchanged"), E.WorldMesh.Get() == TreeMeshAfterCold);
+	}
+
+	// Bias: 0.1 -> 0.5.
+	MutateAmbientOcclusionParams(Stack, LayerId, [](FVertexMaskForgeAmbientOcclusionParams& P) { P.Bias = 0.5f; });
+	TestTrue(TEXT("Bias-changed evaluation succeeds"),
+		VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, AOCaches, Out));
+	{
+		const FVertexMaskForgeSourceTopologyAOCache& E = AOCaches.FindChecked(LayerId);
+		TestEqual(TEXT("CachedBias advanced to 0.5"), E.CachedBias, 0.5f);
+		TestTrue(TEXT("Tree remains valid (never rebuilt for a Bias-only change)"), E.bTreeValid);
+		TestTrue(TEXT("WorldMesh pointer identity still unchanged"), E.WorldMesh.Get() == TreeMeshAfterCold);
+	}
+
+	TestEqual(TEXT("Still exactly one cache entry under the same LayerId across all three raw-parameter changes"), AOCaches.Num(), 1);
+
+	return true;
+}
+
+// M16-K.6D-8G-E, AO-6: a deliberately non-identity component transform (rotation + translation + non-
+// uniform scale) is genuinely propagated to the AO generator -- parity against the direct oracle using
+// the SAME real transform, and the result must differ from an identity-transform evaluation (proving no
+// silent identity-transform fallback).
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompAOTransformTest, "VertexMaskForge.DynamicSourceTopologyComposition.AmbientOcclusionNonIdentityTransformMatchesDirectGenerator", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynSrcTopoCompAOTransformTest::RunTest(const FString& Parameters)
+{
+	const FVertexMaskForgeWorkingMesh WorkingMesh = BuildAOFoldFixtureWorkingMesh();
+	const FTransform RealTransform(FRotator(20.0f, 35.0f, 10.0f), FVector(5.0f, -3.0f, 2.0f), FVector(1.3f, 0.7f, 1.1f));
+	const FVertexMaskForgeAOParams OracleParams = MakeOracleAOParams(/*Samples=*/32, /*MaxDistance=*/100.0f, /*Bias=*/0.05f, 0.0f, 1.0f, false);
+
+	TUniquePtr<FVertexMaskForgeSourceTopologyAOCache> OracleCachePtr;
+	const FVertexMaskForgeScalarMask ReferenceMask = VertexMaskForgeAmbientOcclusionGenerator::GenerateAmbientOcclusionMaskFromDynamicMesh(
+		OracleCachePtr, *WorkingMesh.Mesh, WorkingMesh.GeometryFingerprint, RealTransform, OracleParams);
+	TestTrue(TEXT("Oracle (real transform) State == Ready"), ReferenceMask.State == EVertexMaskForgeScalarMaskState::Ready);
+
+	FVertexMaskForgeDynamicLayerStack Stack;
+	AddAmbientOcclusionLayer(Stack, TEXT("AO"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f,
+		/*Samples=*/32, /*MaxDistance=*/100.0f, /*Bias=*/0.05f, 0.0f, 1.0f, false);
+	const FGuid LayerId = Stack.GetLayers()[0].LayerId;
+
+	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> AOCaches;
+	TArray<FColor> RealTransformOut;
+	TestTrue(TEXT("Orchestrator evaluation with the real transform succeeds"),
+		VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, RealTransform, AOCaches, RealTransformOut));
+
+	const UE::Geometry::FDynamicMeshNormalOverlay* NormalOverlay = WorkingMesh.Mesh->Attributes()->PrimaryNormals();
+	int32 ElementIDByCorner[6];
+	{
+		int32 RunningCorner = 0;
+		for (const int32 TriangleID : WorkingMesh.Mesh->TriangleIndicesItr())
+		{
+			const UE::Geometry::FIndex3i TriElements = NormalOverlay->GetTriangle(TriangleID);
+			ElementIDByCorner[RunningCorner++] = TriElements.A;
+			ElementIDByCorner[RunningCorner++] = TriElements.B;
+			ElementIDByCorner[RunningCorner++] = TriElements.C;
+		}
+	}
+	for (int32 CornerIndex = 0; CornerIndex < 6; ++CornerIndex)
+	{
+		float ExpectedMaskValue = 0.0f;
+		if (ReferenceMask.TryGetValue(ElementIDByCorner[CornerIndex], ExpectedMaskValue))
+		{
+			const uint8 ExpectedByte = UnitFloatToByte(ExpectedMaskValue);
+			TestEqual(*FString::Printf(TEXT("Out[%d].R byte-exact vs oracle using the SAME real transform"), CornerIndex), RealTransformOut[CornerIndex].R, ExpectedByte);
+		}
+	}
+
+	// The transform's own cache key (CachedTransform) must reflect the REAL transform, never Identity.
+	const FVertexMaskForgeSourceTopologyAOCache& Entry = AOCaches.FindChecked(LayerId);
+	TestTrue(TEXT("Cache entry's CachedTransform matches the real transform, not Identity"), Entry.CachedTransform.Equals(RealTransform, 1e-4f));
+	TestFalse(TEXT("Cache entry's CachedTransform is NOT Identity (proves no silent identity fallback)"), Entry.CachedTransform.Equals(FTransform::Identity, 1e-4f));
+
+	// A separate, independent Identity-transform evaluation (fresh cache map) must produce a DIFFERENT
+	// result, proving the transform genuinely affects the outcome rather than being ignored.
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> IdentityAOCaches;
+	TArray<FColor> IdentityOut;
+	TestTrue(TEXT("Identity-transform evaluation succeeds"),
+		VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, IdentityAOCaches, IdentityOut));
+	bool bAnyCornerDiffers = false;
+	for (int32 CornerIndex = 0; CornerIndex < 6; ++CornerIndex)
+	{
+		if (RealTransformOut[CornerIndex].R != IdentityOut[CornerIndex].R)
+		{
+			bAnyCornerDiffers = true;
+			break;
+		}
+	}
+	TestTrue(TEXT("Real-transform result differs from Identity-transform result on at least one corner"), bAnyCornerDiffers);
+
+	return true;
+}
+
+// M16-K.6D-8G-E, AO-7 (5.8): two enabled AO layers with different stable LayerId values, in the SAME
+// component-owned map, own two fully independent cache entries -- Model D never shares a tree between
+// layers. Changing one layer's raw parameters must never affect the other's retained state.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompAOMultiLayerIsolationTest, "VertexMaskForge.DynamicSourceTopologyComposition.AmbientOcclusionTwoLayersOwnIndependentCacheEntries", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynSrcTopoCompAOMultiLayerIsolationTest::RunTest(const FString& Parameters)
+{
+	const FVertexMaskForgeWorkingMesh WorkingMesh = BuildAOFoldFixtureWorkingMesh();
+	FVertexMaskForgeDynamicLayerStack Stack;
+	const FGuid LayerIdA = AddAmbientOcclusionLayer(Stack, TEXT("AO-A"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f,
+		/*Samples=*/16, /*MaxDistance=*/100.0f, /*Bias=*/0.05f, 0.0f, 1.0f, false);
+	const FGuid LayerIdB = AddAmbientOcclusionLayer(Stack, TEXT("AO-B"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Multiply, 1.0f,
+		/*Samples=*/48, /*MaxDistance=*/100.0f, /*Bias=*/0.05f, 0.0f, 1.0f, false);
+	TestNotEqual(TEXT("The two AO layers have distinct LayerIds"), LayerIdA, LayerIdB);
+
+	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> AOCaches;
+	TArray<FColor> Out;
+	TestTrue(TEXT("Two-AO-layer evaluation succeeds"),
+		VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, AOCaches, Out));
+
+	TestEqual(TEXT("Exactly two cache entries -- one per LayerId"), AOCaches.Num(), 2);
+	const FVertexMaskForgeSourceTopologyAOCache* EntryA = AOCaches.Find(LayerIdA);
+	const FVertexMaskForgeSourceTopologyAOCache* EntryB = AOCaches.Find(LayerIdB);
+	TestTrue(TEXT("Entry A exists under LayerIdA"), EntryA != nullptr);
+	TestTrue(TEXT("Entry B exists under LayerIdB"), EntryB != nullptr);
+	if (!EntryA || !EntryB)
+	{
+		return false;
+	}
+	TestEqual(TEXT("Entry A's CachedSamples matches ITS OWN layer's Samples (16)"), EntryA->CachedSamples, 16);
+	TestEqual(TEXT("Entry B's CachedSamples matches ITS OWN layer's Samples (48) -- no aliasing/overwrite"), EntryB->CachedSamples, 48);
+	TestTrue(TEXT("Entry A and Entry B own DIFFERENT (non-aliased) acceleration trees"), EntryA->Tree.Get() != EntryB->Tree.Get());
+	TestTrue(TEXT("Entry A and Entry B own DIFFERENT (non-aliased) WorldMesh objects"), EntryA->WorldMesh.Get() != EntryB->WorldMesh.Get());
+
+	const TArray<float> RawBBeforeChange = EntryB->RawValues;
+
+	// Change ONLY Layer A's Bias -- Layer B's own entry must remain completely untouched.
+	MutateAmbientOcclusionParams(Stack, LayerIdA, [](FVertexMaskForgeAmbientOcclusionParams& P) { P.Bias = 0.9f; });
+	TestTrue(TEXT("Re-evaluation after changing only Layer A's Bias succeeds"),
+		VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, AOCaches, Out));
+
+	const FVertexMaskForgeSourceTopologyAOCache& EntryAAfter = AOCaches.FindChecked(LayerIdA);
+	const FVertexMaskForgeSourceTopologyAOCache& EntryBAfter = AOCaches.FindChecked(LayerIdB);
+	TestEqual(TEXT("Entry A's CachedBias advanced to 0.9"), EntryAAfter.CachedBias, 0.9f);
+	TestEqual(TEXT("Entry B's CachedSamples STILL 48 -- unaffected by Layer A's own change"), EntryBAfter.CachedSamples, 48);
+	TestTrue(TEXT("Entry B's RawValues are UNCHANGED -- proves no cross-layer contamination"), AreRawValueArraysIdentical(EntryBAfter.RawValues, RawBBeforeChange));
+	TestEqual(TEXT("Still exactly two cache entries"), AOCaches.Num(), 2);
+
+	return true;
+}
+
+// M16-K.6D-8G-E, AO-8 (5.9): two SEPARATE component-owned maps (never a single shared/global map),
+// evaluated with the SAME stable LayerId but different raw parameters, own fully independent entries --
+// component identity comes from map ownership, never from the key.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompAOCrossComponentIsolationTest, "VertexMaskForge.DynamicSourceTopologyComposition.AmbientOcclusionTwoComponentOwnedMapsCannotShareEntries", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynSrcTopoCompAOCrossComponentIsolationTest::RunTest(const FString& Parameters)
+{
+	const FVertexMaskForgeWorkingMesh WorkingMesh = BuildAOFoldFixtureWorkingMesh();
+	FVertexMaskForgeDynamicLayerStack Stack;
+	const FGuid LayerId = AddAmbientOcclusionLayer(Stack, TEXT("AO"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f,
+		/*Samples=*/16, /*MaxDistance=*/100.0f, /*Bias=*/0.05f, 0.0f, 1.0f, false);
+
+	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
+
+	// "Component A" -- its own independent map.
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> MapA;
+	TArray<FColor> OutA;
+	TestTrue(TEXT("Component A evaluation succeeds"),
+		VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, MapA, OutA));
+
+	// "Component B" -- a SEPARATE map, same LayerId, DIFFERENT raw params.
+	MutateAmbientOcclusionParams(Stack, LayerId, [](FVertexMaskForgeAmbientOcclusionParams& P) { P.Samples = 64; P.Bias = 0.5f; });
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> MapB;
+	TArray<FColor> OutB;
+	TestTrue(TEXT("Component B evaluation succeeds"),
+		VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, MapB, OutB));
+
+	TestEqual(TEXT("Map A has exactly one entry"), MapA.Num(), 1);
+	TestEqual(TEXT("Map B has exactly one entry"), MapB.Num(), 1);
+	const FVertexMaskForgeSourceTopologyAOCache& EntryA = MapA.FindChecked(LayerId);
+	const FVertexMaskForgeSourceTopologyAOCache& EntryB = MapB.FindChecked(LayerId);
+	TestEqual(TEXT("Map A's entry retained its OWN original Samples (16)"), EntryA.CachedSamples, 16);
+	TestEqual(TEXT("Map B's entry reflects the NEW Samples (64) -- proves the two maps never shared storage"), EntryB.CachedSamples, 64);
+	TestTrue(TEXT("Map A and Map B own DIFFERENT (non-aliased) acceleration trees"), EntryA.Tree.Get() != EntryB.Tree.Get());
+
+	// Re-evaluate Component A again (same params as its own first call) -- Map A must be completely
+	// unaffected by whatever happened to Map B in between.
+	MutateAmbientOcclusionParams(Stack, LayerId, [](FVertexMaskForgeAmbientOcclusionParams& P) { P.Samples = 16; P.Bias = 0.05f; });
+	TArray<FColor> OutAAgain;
+	TestTrue(TEXT("Component A re-evaluation succeeds"),
+		VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, MapA, OutAAgain));
+	TestEqual(TEXT("Map A still has exactly one entry"), MapA.Num(), 1);
+	for (int32 Index = 0; Index < OutA.Num(); ++Index)
+	{
+		TestEqual(*FString::Printf(TEXT("OutA[%d] unaffected by Component B's own evaluations"), Index), OutA[Index], OutAAgain[Index]);
+	}
+
+	return true;
+}
+
+// M16-K.6D-8G-E, AO-9 (5.10): reorder preserves the AO cache under its original stable LayerId -- never
+// erased, never replaced, raw state remains reusable -- and the final composed output follows the NEW
+// sequential order for a Blend/Fill combination where order is observably noncommutative.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompAOReorderTest, "VertexMaskForge.DynamicSourceTopologyComposition.AmbientOcclusionReorderPreservesLayerIdCacheOwnership", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynSrcTopoCompAOReorderTest::RunTest(const FString& Parameters)
+{
+	const FVertexMaskForgeWorkingMesh WorkingMesh = BuildAOFoldFixtureWorkingMesh();
+	FVertexMaskForgeDynamicLayerStack Stack;
+	const FGuid AOLayerId = AddAmbientOcclusionLayer(Stack, TEXT("AO"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f,
+		/*Samples=*/16, /*MaxDistance=*/100.0f, /*Bias=*/0.05f, 0.0f, 1.0f, false);
+	// A second, fully deterministic Fill-only layer that OVERWRITES (Copy @ Opacity 1.0) whatever precedes
+	// it -- makes final-order sensitivity trivial and unambiguous to assert: whichever layer is LAST wins.
+	const FGuid FillLayerId = AddFillOnlyLayer(Stack, TEXT("Black Overwrite"), EVertexMaskForgeLayerFill::Black, EVertexMaskForgeBlendMode::Copy, 1.0f);
+
+	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> AOCaches;
+
+	TArray<FColor> OriginalOrderOut;
+	TestTrue(TEXT("Original order (AO, then Black overwrite) evaluation succeeds"),
+		VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, AOCaches, OriginalOrderOut));
+	TestEqual(TEXT("Black (the LAST layer) wins under the original order"), OriginalOrderOut[0].R, (uint8)0);
+	const TArray<float> RawBeforeReorder = AOCaches.FindChecked(AOLayerId).RawValues;
+	const int32 CachedSamplesBeforeReorder = AOCaches.FindChecked(AOLayerId).CachedSamples;
+
+	// Reorder: move the AO layer to the END (index 1), so it now overwrites the Black layer instead.
+	const bool bMoved = Stack.MoveLayer(AOLayerId, 1);
+	TestTrue(TEXT("MoveLayer succeeds"), bMoved);
+
+	TArray<FColor> ReorderedOut;
+	TestTrue(TEXT("Reordered evaluation succeeds"),
+		VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, AOCaches, ReorderedOut));
+
+	TestEqual(TEXT("Still exactly one AO cache entry after reorder -- no replacement entry created"), AOCaches.Num(), 1);
+	const FVertexMaskForgeSourceTopologyAOCache* EntryAfterReorder = AOCaches.Find(AOLayerId);
+	TestTrue(TEXT("AO cache entry remains under the ORIGINAL stable LayerId after reorder"), EntryAfterReorder != nullptr);
+	if (EntryAfterReorder)
+	{
+		TestEqual(TEXT("CachedSamples unchanged by reorder -- raw state remains reusable, no recompute forced"), EntryAfterReorder->CachedSamples, CachedSamplesBeforeReorder);
+		TestTrue(TEXT("RawValues byte-for-byte unchanged by reorder"), AreRawValueArraysIdentical(EntryAfterReorder->RawValues, RawBeforeReorder));
+	}
+
+	// AO is now LAST -- its own (non-Black, genuinely varying) value should win instead of Black.
+	TestNotEqual(TEXT("Composed output changes after reorder (AO, not Black, now wins -- proves the new order actually took effect)"), ReorderedOut[0].R, OriginalOrderOut[0].R);
+
+	return true;
+}
+
+// M16-K.6D-8G-E, AO-10 (5.11): a disabled AO layer contributes nothing and creates NO cache entry at
+// all -- no generation, no overlay-domain resolution required -- while another enabled layer still
+// produces its own correct, unaffected result. Preserves the existing Thickness-as-unsupported-generator
+// negative fixture unchanged elsewhere in this file.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompAODisabledNoCacheTest, "VertexMaskForge.DynamicSourceTopologyComposition.AmbientOcclusionDisabledLayerCreatesNoCacheEntry", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynSrcTopoCompAODisabledNoCacheTest::RunTest(const FString& Parameters)
+{
+	// The plain Material-Slot-ready fixture (never the AO fold fixture) -- AO is disabled here and needs
+	// no Normal Overlay at all, while the OTHER enabled layer (Material Slot) needs valid Material Slot
+	// resolution data, which only BuildOrchestratorFixtureWorkingMesh provides.
+	const FVertexMaskForgeWorkingMesh WorkingMesh = BuildOrchestratorFixtureWorkingMesh(0, 1);
+	FVertexMaskForgeDynamicLayerStack Stack;
+	const FGuid AOLayerId = AddAmbientOcclusionLayer(Stack, TEXT("AO"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f,
+		/*Samples=*/16, /*MaxDistance=*/100.0f, /*Bias=*/0.05f, 0.0f, 1.0f, false);
+	Stack.SetLayerEnabled(AOLayerId, false);
+	AddMaterialSlotLayer(Stack, TEXT("Slot"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f, /*SelectedSlotIndex=*/0);
+
+	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> AOCaches;
+	TArray<FColor> Out;
+	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, AOCaches, Out);
+
+	TestTrue(TEXT("Evaluation succeeds (disabled AO layer never fails the whole call)"), bSucceeded);
+	TestEqual(TEXT("NO AO cache entry was created for the disabled layer"), AOCaches.Num(), 0);
+	TestFalse(TEXT("The disabled layer's own LayerId has no entry"), AOCaches.Contains(AOLayerId));
+
+	if (bSucceeded && Out.Num() == 6)
+	{
+		// Material Slot 0 covers Tri0 (corners 0/1/2); the enabled layer's own result must still be correct
+		// and unaffected by the disabled AO layer sitting above it.
+		TestEqual(TEXT("Out[0] reflects the enabled Material Slot layer's own White result"), Out[0].R, (uint8)255);
+	}
+
+	return true;
+}
+
+// M16-K.6D-8G-E, AO-11 (5.12 + 5.13 failure path): a legitimate, already-existing AO failure --
+// GenerateAmbientOcclusionMaskFromDynamicMesh reports Unavailable when the mesh has no Normal Overlay at
+// all (BuildOrchestratorFixtureWorkingMesh never enables mesh attributes) -- proves the whole-call failure
+// contract (OutComposedColors left completely untouched) AND that the M16-K.6D-8G-D cache adapter still
+// restores the map entry after this internal generator failure (the FindOrAdd-created entry survives the
+// TUniquePtr round trip in a sane, cold, non-corrupted state), never leaking or double-owning the
+// acceleration tree. No production failure hook was added to reach this path -- it is already reachable
+// through a legitimate, pre-existing input (a mesh with no normals).
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompAOTransactionalFailureTest, "VertexMaskForge.DynamicSourceTopologyComposition.AmbientOcclusionMissingNormalOverlayFailsTransactionallyAndRestoresCacheOwnership", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynSrcTopoCompAOTransactionalFailureTest::RunTest(const FString& Parameters)
+{
+	// Deliberately the ORIGINAL fixture (no EnableAttributes(), no Normal Overlay) -- the AO generator's
+	// own committed contract reports Unavailable for exactly this input, never a crash/UB.
+	const FVertexMaskForgeWorkingMesh WorkingMesh = BuildOrchestratorFixtureWorkingMesh(0, 1);
+	FVertexMaskForgeDynamicLayerStack Stack;
+	const FGuid AOLayerId = AddAmbientOcclusionLayer(Stack, TEXT("AO"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f,
+		/*Samples=*/16, /*MaxDistance=*/100.0f, /*Bias=*/0.05f, 0.0f, 1.0f, false);
+
+	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> AOCaches;
+
+	// Recognizable sentinel, deliberately the wrong cardinality (proves OutComposedColors is untouched,
+	// never resized/padded/truncated on failure) -- same established idiom as
+	// UnsupportedGeneratorTypeFailsWholeCall's own sentinel elsewhere in this file.
+	TArray<FColor> Out = { FColor(9, 9, 9, 9) };
+	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, AOCaches, Out);
+
+	TestFalse(TEXT("Whole call fails when the mesh has no Normal Overlay"), bSucceeded);
+	TestEqual(TEXT("OutComposedColors left completely untouched (sentinel survives, no partial/fallback output)"), Out.Num(), 1);
+	if (Out.Num() == 1)
+	{
+		TestEqual(TEXT("Sentinel value itself is untouched"), Out[0], FColor(9, 9, 9, 9));
+	}
+
+	// The adapter must still have restored the map entry it took ownership of before returning false --
+	// proves no leak/double-ownership/corruption on this internal-failure path.
+	TestEqual(TEXT("A cache entry was created for the AO layer even though generation failed"), AOCaches.Num(), 1);
+	const FVertexMaskForgeSourceTopologyAOCache* Entry = AOCaches.Find(AOLayerId);
+	TestTrue(TEXT("The entry exists, safely destructible and reusable (not null/corrupted)"), Entry != nullptr);
+	if (Entry)
+	{
+		TestFalse(TEXT("Entry's tree was never built (no normal overlay to raycast against) -- sane cold state, not a half-built/corrupted one"), Entry->bTreeValid);
+		TestFalse(TEXT("Entry's raw values were never populated"), Entry->bValuesValid);
 	}
 
 	return true;

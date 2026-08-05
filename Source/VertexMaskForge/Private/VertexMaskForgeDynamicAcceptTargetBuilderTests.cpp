@@ -9,6 +9,7 @@
 #if WITH_DEV_AUTOMATION_TESTS
 
 #include "Components/StaticMeshComponent.h"
+#include "DynamicMesh/DynamicMeshAttributeSet.h"
 #include "Engine/StaticMesh.h"
 #include "MeshDescription.h"
 #include "MeshDescriptionBuilder.h"
@@ -167,6 +168,90 @@ namespace
 		Stack.SetLayerBlendMode(LayerId, EVertexMaskForgeBlendMode::Copy);
 		Stack.SetLayerOpacity(LayerId, 1.0f);
 		Stack.SetLayerChannelFilter(LayerId, true, true, true);
+		return LayerId;
+	}
+
+	// M16-K.6D-8G-E: same quad topology/Material-Slot/TriIDMap setup as MakeQuadWorkingMesh, PLUS a real
+	// Normal Overlay (EnableAttributes()/PrimaryNormals(), one independent element per corner) --
+	// Ambient Occlusion requires a Normal Overlay to report anything other than Unavailable, which
+	// MakeQuadWorkingMesh deliberately never provides (the other five generators need none).
+	FVertexMaskForgeWorkingMesh MakeQuadWorkingMeshWithNormalOverlay()
+	{
+		FVertexMaskForgeWorkingMesh WorkingMesh = MakeQuadWorkingMesh();
+
+		WorkingMesh.Mesh->EnableAttributes();
+		UE::Geometry::FDynamicMeshNormalOverlay* NormalOverlay = WorkingMesh.Mesh->Attributes()->PrimaryNormals();
+		const FVector3f CornerNormals[6] = {
+			FVector3f(0.0f, 0.0f, 1.0f),
+			FVector3f(0.3f, 0.0f, 0.95f).GetSafeNormal(),
+			FVector3f(0.0f, 0.3f, 0.95f).GetSafeNormal(),
+			FVector3f(-0.3f, 0.0f, 0.95f).GetSafeNormal(),
+			FVector3f(0.0f, -0.3f, 0.95f).GetSafeNormal(),
+			FVector3f(0.2f, 0.2f, 0.96f).GetSafeNormal(),
+		};
+		int32 CornerIndex = 0;
+		for (const int32 TriangleID : WorkingMesh.Mesh->TriangleIndicesItr())
+		{
+			UE::Geometry::FIndex3i ElementTri;
+			for (int32 Corner = 0; Corner < 3; ++Corner, ++CornerIndex)
+			{
+				ElementTri[Corner] = NormalOverlay->AppendElement(CornerNormals[CornerIndex]);
+			}
+			NormalOverlay->SetTriangle(TriangleID, ElementTri);
+		}
+		WorkingMesh.GeometryFingerprint = 1;
+		return WorkingMesh;
+	}
+
+	/** Same contract as MakeValidEntry, but installs MakeQuadWorkingMeshWithNormalOverlay instead, so a
+	 *  real Ambient Occlusion layer can be evaluated. */
+	TSharedPtr<FVertexMaskForgeSelectedMesh> MakeValidEntryWithNormalOverlay(FDynamicAcceptFixtureAsset& Asset, const TArray<FColor>& BaselineColors, FAutomationTestBase& Test)
+	{
+		CommitQuadMeshDescription(*Asset.Mesh);
+
+		TSharedPtr<FVertexMaskForgeSelectedMesh> Entry = MakeShared<FVertexMaskForgeSelectedMesh>();
+		Entry->Mesh = Asset.Mesh.Get();
+		Entry->AssetName = Asset.Mesh->GetName();
+		Entry->bUseSourceTopology = true;
+
+		const bool bIdentityConfigured = Entry->MeshOwner->ConfigureIdentity(Asset.Mesh.Get(), 0, /*bUseSourceTopology=*/true);
+		Test.TestTrue(TEXT("ConfigureIdentity succeeds"), bIdentityConfigured);
+
+		const bool bInstalled = Entry->MeshOwner->InstallWorkingMesh(MakeQuadWorkingMeshWithNormalOverlay(), /*ExpectedCardinality=*/6);
+		Test.TestTrue(TEXT("InstallWorkingMesh succeeds"), bInstalled);
+
+		TUniquePtr<FVertexMaskForgeWorkingStateOwner> StateOwner = MakeUnique<FVertexMaskForgeWorkingStateOwner>();
+		const bool bTargetConfigured = StateOwner->ConfigureTarget(Asset.Component.Get());
+		Test.TestTrue(TEXT("ConfigureTarget succeeds"), bTargetConfigured);
+		const bool bAttached = StateOwner->AttachToMeshOwner(Entry->MeshOwner);
+		Test.TestTrue(TEXT("AttachToMeshOwner succeeds"), bAttached);
+		const bool bInitialized = StateOwner->InitializeColors(BaselineColors);
+		Test.TestTrue(TEXT("InitializeColors succeeds"), bInitialized);
+
+		Entry->PreviewComponents.Add(MoveTemp(StateOwner));
+		return Entry;
+	}
+
+	/** One enabled White/Copy@1.0/all-channels layer, masked by Ambient Occlusion. */
+	FGuid AddEnabledAmbientOcclusionWhiteLayer(FVertexMaskForgeDynamicLayerStack& Stack)
+	{
+		const FGuid LayerId = Stack.AddLayer(TEXT("AO Layer"));
+		Stack.SetLayerFill(LayerId, EVertexMaskForgeLayerFill::White);
+		Stack.SetLayerBlendMode(LayerId, EVertexMaskForgeBlendMode::Copy);
+		Stack.SetLayerOpacity(LayerId, 1.0f);
+		Stack.SetLayerChannelFilter(LayerId, true, true, true);
+		Stack.SetLayerMaskGeneratorType(LayerId, EVertexMaskForgeGeneratorType::AmbientOcclusion);
+
+		const FVertexMaskForgeGeneratorMaskInstance* MaskInstance = Stack.GetLayerMask(LayerId);
+		if (MaskInstance)
+		{
+			FVertexMaskForgeGeneratorParams NewParams = MakeVertexMaskForgeGeneratorParams(EVertexMaskForgeGeneratorType::AmbientOcclusion);
+			FVertexMaskForgeAmbientOcclusionParams& AOParams = NewParams.Get<FVertexMaskForgeAmbientOcclusionParams>();
+			AOParams.Samples = 16;
+			AOParams.MaxDistance = 100.0f;
+			AOParams.Bias = 0.1f;
+			Stack.SetLayerMaskParams(LayerId, MaskInstance->MaskInstanceId, NewParams);
+		}
 		return LayerId;
 	}
 }
@@ -637,6 +722,92 @@ bool FVertexMaskForgeDynamicAcceptTargetBuilderNonMutationTest::RunTest(const FS
 	for (int32 Index = 0; Index < CommittedBefore.Num(); ++Index)
 	{
 		TestEqual(*FString::Printf(TEXT("CommittedColors[%d] byte-exact unchanged (never written by this builder)"), Index), StateOwner.GetCommittedColors()[Index], CommittedBefore[Index]);
+	}
+	return true;
+}
+
+// M16-K.6D-8G-E: a real, enabled Ambient Occlusion layer through Accept -- cold cache, byte-exact against
+// a direct orchestrator call using an independent (empty) cache map. Proves Accept recomposes from
+// Baseline (never a preview shortcut), passes the real component transform (Identity here, since a
+// freshly-constructed, unattached UStaticMeshComponent's own transform IS Identity -- never substituted),
+// and passes a valid cache map for the AO branch to consume on a genuine cold cache.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynamicAcceptTargetBuilderAOColdCacheTest, "VertexMaskForge.DynamicAcceptTargetBuilder.AmbientOcclusionColdCacheMatchesDirectOrchestrator", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynamicAcceptTargetBuilderAOColdCacheTest::RunTest(const FString& Parameters)
+{
+	FDynamicAcceptFixtureAsset Asset;
+	const TArray<FColor> Baseline = MakeDefaultBaseline();
+	const TSharedPtr<FVertexMaskForgeSelectedMesh> Entry = MakeValidEntryWithNormalOverlay(Asset, Baseline, *this);
+
+	FVertexMaskForgeDynamicLayerStack Stack;
+	AddEnabledAmbientOcclusionWhiteLayer(Stack);
+
+	TArray<VertexMaskForgeAcceptTargetBuilder::FSourceTopologyAcceptTarget> Targets;
+	FText ErrorText;
+	const bool bBuilt = VertexMaskForgeDynamicAcceptTargetBuilder::BuildSourceTopologyAcceptTargets({ Entry }, Stack, Targets, ErrorText);
+	TestTrue(TEXT("BuildSourceTopologyAcceptTargets succeeds for a real AO layer (cold cache)"), bBuilt);
+	TestEqual(TEXT("Targets.Num() == 1"), Targets.Num(), 1);
+	if (!bBuilt || Targets.Num() != 1)
+	{
+		return false;
+	}
+
+	// Direct orchestrator call, same Baseline/stack/mesh/transform, its own INDEPENDENT (empty, cold)
+	// cache map -- AO cache hit/miss never changes numeric output, only performance, so this remains a
+	// valid byte-exact oracle regardless of which map either side used.
+	TArray<FColor> ExpectedColors;
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> ExpectedColorsAOCaches;
+	const bool bComposed = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(
+		Entry->MeshOwner->GetWorkingMesh(), Stack, Baseline, FTransform::Identity, ExpectedColorsAOCaches, ExpectedColors);
+	TestTrue(TEXT("Direct orchestrator call succeeds"), bComposed);
+
+	TestEqual(TEXT("FinalColors.Num() == ExpectedColors.Num()"), Targets[0].FinalColors.Num(), ExpectedColors.Num());
+	if (Targets[0].FinalColors.Num() != ExpectedColors.Num())
+	{
+		return false;
+	}
+	for (int32 Index = 0; Index < ExpectedColors.Num(); ++Index)
+	{
+		TestEqual(*FString::Printf(TEXT("FinalColors[%d] byte-exact against orchestrator (AO, cold cache)"), Index), Targets[0].FinalColors[Index], ExpectedColors[Index]);
+		TestEqual(*FString::Printf(TEXT("FinalColors[%d].A matches Baseline Alpha"), Index), Targets[0].FinalColors[Index].A, Baseline[Index].A);
+	}
+	return true;
+}
+
+// M16-K.6D-8G-E: the SAME entry's persistent component-owned AO cache map (StateOwner->
+// GetVisualSessionStateMutable().DynamicSourceTopologyAOCachesByLayerId) is warm on a second Accept call
+// -- cold and warm Accept results must be byte-identical, proving Accept's own cache consumption (wired
+// in M16-K.6D-8G-D) works correctly on reuse, never just on a fresh/cold map.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynamicAcceptTargetBuilderAOWarmCacheTest, "VertexMaskForge.DynamicAcceptTargetBuilder.AmbientOcclusionWarmCacheMatchesColdCache", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynamicAcceptTargetBuilderAOWarmCacheTest::RunTest(const FString& Parameters)
+{
+	FDynamicAcceptFixtureAsset Asset;
+	const TArray<FColor> Baseline = MakeDefaultBaseline();
+	const TSharedPtr<FVertexMaskForgeSelectedMesh> Entry = MakeValidEntryWithNormalOverlay(Asset, Baseline, *this);
+
+	FVertexMaskForgeDynamicLayerStack Stack;
+	AddEnabledAmbientOcclusionWhiteLayer(Stack);
+
+	TArray<VertexMaskForgeAcceptTargetBuilder::FSourceTopologyAcceptTarget> ColdTargets;
+	FText ColdErrorText;
+	const bool bColdBuilt = VertexMaskForgeDynamicAcceptTargetBuilder::BuildSourceTopologyAcceptTargets({ Entry }, Stack, ColdTargets, ColdErrorText);
+	TestTrue(TEXT("Cold Accept build succeeds"), bColdBuilt);
+	TestEqual(TEXT("Cold Targets.Num() == 1"), ColdTargets.Num(), 1);
+
+	TArray<VertexMaskForgeAcceptTargetBuilder::FSourceTopologyAcceptTarget> WarmTargets;
+	FText WarmErrorText;
+	const bool bWarmBuilt = VertexMaskForgeDynamicAcceptTargetBuilder::BuildSourceTopologyAcceptTargets({ Entry }, Stack, WarmTargets, WarmErrorText);
+	TestTrue(TEXT("Warm Accept build (same Entry, same persistent AO cache map) succeeds"), bWarmBuilt);
+	TestEqual(TEXT("Warm Targets.Num() == 1"), WarmTargets.Num(), 1);
+
+	if (!bColdBuilt || !bWarmBuilt || ColdTargets.Num() != 1 || WarmTargets.Num() != 1)
+	{
+		return false;
+	}
+
+	TestEqual(TEXT("Cold and warm FinalColors counts match"), ColdTargets[0].FinalColors.Num(), WarmTargets[0].FinalColors.Num());
+	for (int32 Index = 0; Index < FMath::Min(ColdTargets[0].FinalColors.Num(), WarmTargets[0].FinalColors.Num()); ++Index)
+	{
+		TestEqual(*FString::Printf(TEXT("ColdTargets[0].FinalColors[%d] == WarmTargets[0].FinalColors[%d]"), Index, Index), ColdTargets[0].FinalColors[Index], WarmTargets[0].FinalColors[Index]);
 	}
 	return true;
 }
