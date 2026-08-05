@@ -359,6 +359,37 @@ namespace
 		return WorkingMesh;
 	}
 
+	// M17-TH-DL-E: the SAME dense (24/24, no fallback needed) octahedron as
+	// BuildIrregularOctahedronThicknessFixtureWorkingMesh, plus one ADDITIONAL, isolated, far-away
+	// triangle appended to the same mesh with nothing anywhere near it -- a genuine, total per-corner
+	// no-hit for its own 3 corners (center ray AND every M9 fallback ring ray miss), exactly like
+	// BuildIsolatedFlatQuadThicknessNoHitFixtureWorkingMesh's own single-triangle case, but co-existing
+	// in ONE mesh alongside 24 corners that DO resolve. Proves the corrected PARTIAL-validity contract:
+	// 24 valid + 3 genuinely unmeasurable, 27 total -- the exact real-mesh scenario (concave pocket/
+	// boundary/self-occlusion) that used to fail the WHOLE Dynamic composition call before M17-TH-DL-E.
+	FVertexMaskForgeWorkingMesh BuildThicknessPartialValidityFixtureWorkingMesh()
+	{
+		FVertexMaskForgeWorkingMesh WorkingMesh = BuildIrregularOctahedronThicknessFixtureWorkingMesh();
+		UE::Geometry::FDynamicMesh3& Mesh = *WorkingMesh.Mesh;
+		UE::Geometry::FDynamicMeshNormalOverlay* NormalOverlay = Mesh.Attributes()->PrimaryNormals();
+
+		const int32 V0 = Mesh.AppendVertex(FVector3d(5000.0, 5000.0, 5000.0));
+		const int32 V1 = Mesh.AppendVertex(FVector3d(5001.0, 5000.0, 5000.0));
+		const int32 V2 = Mesh.AppendVertex(FVector3d(5000.0, 5001.0, 5000.0));
+		const int32 TriIsolated = Mesh.AppendTriangle(V0, V1, V2);
+
+		const FVector3f N(0.0f, 0.0f, 1.0f);
+		UE::Geometry::FIndex3i ElementTri;
+		for (int32 Corner = 0; Corner < 3; ++Corner)
+		{
+			ElementTri[Corner] = NormalOverlay->AppendElement(N);
+		}
+		NormalOverlay->SetTriangle(TriIsolated, ElementTri);
+
+		WorkingMesh.GeometryFingerprint = 400;
+		return WorkingMesh;
+	}
+
 	// The fixed corner->VertexID mapping BOTH fixture meshes above share, by construction: Tri0=(V0,V1,V2),
 	// Tri1=(V0,V2,V3), appended in that order, so TriangleIndicesItr() yields Tri0 (ID 0) then Tri1 (ID 1)
 	// for this freshly-built, never-edited mesh. Corner 0/1/2 -> V0/V1/V2 (identity, by coincidence);
@@ -3572,6 +3603,50 @@ bool FVertexMaskForgeDynSrcTopoCompThicknessInvalidationClassificationTest::RunT
 		TestEqual(TEXT("CachedSearchDistance re-stamped to the NEW value -- a real recompute ran"), EntryAfter->CachedSearchDistance, 42.0f);
 	}
 
+	// --- Levels Min/Max-only edits (M17-TH-DL-E): remap only, never a new raycast. ---
+	{
+		FVertexMaskForgeDynamicLayerStack Stack;
+		const FGuid LayerId = AddThicknessLayer(Stack, TEXT("Thickness"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f,
+			0.0f, 1000.0f, 1000.0f, false);
+		TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> AOCaches;
+		TMap<FGuid, FVertexMaskForgeSourceTopologyThicknessCache> ThicknessCaches;
+		TArray<FColor> Out1;
+		TestTrue(TEXT("First evaluation succeeds"),
+			VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, AOCaches, ThicknessCaches, Out1));
+
+		const FVertexMaskForgeSourceTopologyThicknessCache* EntryBefore = ThicknessCaches.Find(LayerId);
+		if (!TestTrue(TEXT("Cache entry exists"), EntryBefore != nullptr)) { return false; }
+		const UE::Geometry::FDynamicMeshAABBTree3* TreeBefore = EntryBefore->Tree.Get();
+		const TArray<float> RawDistancesBefore = EntryBefore->RawDistances;
+		const float CachedSearchDistanceBefore = EntryBefore->CachedSearchDistance;
+		const float CachedBiasBefore = EntryBefore->CachedBias;
+
+		MutateThicknessParams(Stack, LayerId, [](FVertexMaskForgeThicknessParams& P) { P.LevelsMin = 0.25f; P.LevelsMax = 0.75f; });
+		TArray<FColor> Out2;
+		TestTrue(TEXT("Second evaluation (Levels Min/Max changed) succeeds"),
+			VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, AOCaches, ThicknessCaches, Out2));
+
+		const FVertexMaskForgeSourceTopologyThicknessCache* EntryAfter = ThicknessCaches.Find(LayerId);
+		if (!TestTrue(TEXT("Cache entry still exists"), EntryAfter != nullptr)) { return false; }
+		TestTrue(TEXT("Tree pointer UNCHANGED -- Levels never rebuild the acceleration structure"), EntryAfter->Tree.Get() == TreeBefore);
+		TestEqual(TEXT("CachedSearchDistance UNCHANGED -- Levels never trigger a new raycast"), EntryAfter->CachedSearchDistance, CachedSearchDistanceBefore);
+		TestEqual(TEXT("CachedBias UNCHANGED -- Levels never trigger a new raycast"), EntryAfter->CachedBias, CachedBiasBefore);
+		bool bRawDistancesIdentical = EntryAfter->RawDistances.Num() == RawDistancesBefore.Num();
+		for (int32 i = 0; bRawDistancesIdentical && i < RawDistancesBefore.Num(); ++i)
+		{
+			if (EntryAfter->RawDistances[i] != RawDistancesBefore[i]) { bRawDistancesIdentical = false; }
+		}
+		TestTrue(TEXT("RawDistances byte-identical -- Levels never touch the raw raycast cache"), bRawDistancesIdentical);
+
+		bool bOutputChanged = Out1.Num() == Out2.Num();
+		if (bOutputChanged)
+		{
+			bOutputChanged = false;
+			for (int32 i = 0; i < Out1.Num(); ++i) { if (Out1[i] != Out2[i]) { bOutputChanged = true; } }
+		}
+		TestTrue(TEXT("Composed output DID change -- the Levels remap itself really ran, even though the cache didn't"), bOutputChanged);
+	}
+
 	return true;
 }
 
@@ -3732,6 +3807,138 @@ bool FVertexMaskForgeDynSrcTopoCompThicknessFallbackRecoveryReachesComposedOutpu
 	const FColor DirectHitSample = Out[0];
 	TestTrue(TEXT("Special's fallback-recovered value matches PlateA/PlateB's own direct-hit value (both measure the same H+Bias separation)"),
 		FMath::Abs(SpecialA.R - DirectHitSample.R) <= 1);
+
+	return true;
+}
+
+// M17-TH-DL-E (root-cause regression test): a mesh with SOME corners genuinely unmeasurable (no opposing
+// surface even after M9) alongside others that resolve normally must no longer fail the WHOLE Dynamic
+// composition call -- this is the exact defect reproduced in the M17-TH-DL-D Editor validation checkpoint
+// (AO -> Thickness silently fell back to the plain material because one-or-more real-mesh corners missed).
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompThicknessPartialValidityTest, "VertexMaskForge.DynamicSourceTopologyComposition.ThicknessPartialValidityToleratedNotWholeCallFailure", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynSrcTopoCompThicknessPartialValidityTest::RunTest(const FString& Parameters)
+{
+	const FVertexMaskForgeWorkingMesh WorkingMesh = BuildThicknessPartialValidityFixtureWorkingMesh();
+	const int32 NumCorners = WorkingMesh.Mesh->TriangleCount() * 3;
+	TestEqual(TEXT("Fixture has 9 triangles / 27 corners (8 octahedron + 1 isolated)"), NumCorners, 27);
+
+	TArray<FColor> BaseColors;
+	BaseColors.Init(FColor::Black, NumCorners);
+
+	FVertexMaskForgeDynamicLayerStack Stack;
+	AddThicknessLayer(Stack, TEXT("Thickness"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f,
+		/*MinThickness=*/0.0f, /*MaxThickness=*/30.0f, /*SearchDistance=*/100.0f, /*bInvert=*/false);
+
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> AOCaches;
+	TMap<FGuid, FVertexMaskForgeSourceTopologyThicknessCache> ThicknessCaches;
+	TArray<FColor> Out;
+	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(
+		WorkingMesh, Stack, BaseColors, FTransform::Identity, AOCaches, ThicknessCaches, Out);
+
+	if (!TestTrue(TEXT("A partial (24/27) Thickness result no longer fails the whole call (M17-TH-DL-E)"), bSucceeded))
+	{
+		return false;
+	}
+	TestEqual(TEXT("Composed output has one FColor per corner"), Out.Num(), NumCorners);
+	if (Out.Num() != NumCorners) { return false; }
+
+	// Corners 0-23 (the octahedron) are the SAME dense fixture already proven fully valid by
+	// ThicknessDispatchedTest -- at least one must carry a REAL, non-substitute measured value here too.
+	int32 MaxOctahedronR = 0;
+	for (int32 i = 0; i < 24; ++i)
+	{
+		MaxOctahedronR = FMath::Max(MaxOctahedronR, static_cast<int32>(Out[i].R));
+	}
+	TestTrue(TEXT("At least one octahedron corner carries a real, non-zero measured value"), MaxOctahedronR > 0);
+
+	// Corners 24/25/26 (the isolated triangle) have NO opposing surface at all -- must receive the
+	// documented, deterministic substitute: 0.0f raw -> normalized 0 -> byte 0 (MinThickness=0.0f here).
+	TestEqual(TEXT("Isolated corner 24 receives the darkest/no-hit substitute"), Out[24].R, static_cast<uint8>(0));
+	TestEqual(TEXT("Isolated corner 25 receives the darkest/no-hit substitute"), Out[25].R, static_cast<uint8>(0));
+	TestEqual(TEXT("Isolated corner 26 receives the darkest/no-hit substitute"), Out[26].R, static_cast<uint8>(0));
+
+	return true;
+}
+
+// M17-TH-DL-E: Levels Min/Max contract -- identity no-op, formula-verified raised Min / lowered Max,
+// deterministic degenerate-range hard step, and processing order (Levels applied AFTER Invert, since
+// Invert is already baked into GeneratedMask.Values by the protected backend before this orchestrator's
+// Thickness branch ever sees it -- see that branch's own doc comment for the full justification).
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompThicknessLevelsTest, "VertexMaskForge.DynamicSourceTopologyComposition.ThicknessLevelsMinMaxContract", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynSrcTopoCompThicknessLevelsTest::RunTest(const FString& Parameters)
+{
+	const FVertexMaskForgeWorkingMesh WorkingMesh = BuildIrregularOctahedronThicknessFixtureWorkingMesh();
+	const int32 NumCorners = WorkingMesh.Mesh->TriangleCount() * 3;
+	TArray<FColor> BaseColors;
+	BaseColors.Init(FColor::Black, NumCorners);
+
+	auto Evaluate = [&WorkingMesh, &BaseColors](float LevelsMin, float LevelsMax, bool bInvert, TArray<FColor>& OutColors) -> bool
+	{
+		FVertexMaskForgeDynamicLayerStack Stack;
+		const FGuid LayerId = AddThicknessLayer(Stack, TEXT("Thickness"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f,
+			0.0f, 30.0f, 100.0f, bInvert);
+		MutateThicknessParams(Stack, LayerId, [LevelsMin, LevelsMax](FVertexMaskForgeThicknessParams& P) { P.LevelsMin = LevelsMin; P.LevelsMax = LevelsMax; });
+		TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> AOCaches;
+		TMap<FGuid, FVertexMaskForgeSourceTopologyThicknessCache> ThicknessCaches;
+		return VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(
+			WorkingMesh, Stack, BaseColors, FTransform::Identity, AOCaches, ThicknessCaches, OutColors);
+	};
+
+	// --- Identity Levels (0,1) baseline -- every other case below is formula-verified against this. ---
+	TArray<FColor> Identity;
+	if (!TestTrue(TEXT("Identity Levels evaluation succeeds"), Evaluate(0.0f, 1.0f, false, Identity))) { return false; }
+
+	// --- Raised Levels Min. ---
+	TArray<FColor> RaisedMin;
+	TestTrue(TEXT("Raised LevelsMin evaluation succeeds"), Evaluate(0.5f, 1.0f, false, RaisedMin));
+	bool bRaisedMinMatchesFormula = Identity.Num() == RaisedMin.Num();
+	for (int32 i = 0; bRaisedMinMatchesFormula && i < Identity.Num(); ++i)
+	{
+		const float BaselineNormalized = Identity[i].R / 255.0f;
+		const float Expected = FMath::Clamp((BaselineNormalized - 0.5f) / 0.5f, 0.0f, 1.0f);
+		const int32 ExpectedByte = FMath::Clamp(FMath::RoundToInt(Expected * 255.0f), 0, 255);
+		if (FMath::Abs(RaisedMin[i].R - ExpectedByte) > 1) { bRaisedMinMatchesFormula = false; }
+	}
+	TestTrue(TEXT("Raised LevelsMin output matches Clamp((v-0.5)/0.5,0,1) exactly, per corner"), bRaisedMinMatchesFormula);
+
+	// --- Lowered Levels Max. ---
+	TArray<FColor> LoweredMax;
+	TestTrue(TEXT("Lowered LevelsMax evaluation succeeds"), Evaluate(0.0f, 0.5f, false, LoweredMax));
+	bool bLoweredMaxMatchesFormula = Identity.Num() == LoweredMax.Num();
+	for (int32 i = 0; bLoweredMaxMatchesFormula && i < Identity.Num(); ++i)
+	{
+		const float BaselineNormalized = Identity[i].R / 255.0f;
+		const float Expected = FMath::Clamp((BaselineNormalized - 0.0f) / 0.5f, 0.0f, 1.0f);
+		const int32 ExpectedByte = FMath::Clamp(FMath::RoundToInt(Expected * 255.0f), 0, 255);
+		if (FMath::Abs(LoweredMax[i].R - ExpectedByte) > 1) { bLoweredMaxMatchesFormula = false; }
+	}
+	TestTrue(TEXT("Lowered LevelsMax output matches Clamp((v-0)/0.5,0,1) exactly, per corner"), bLoweredMaxMatchesFormula);
+
+	// --- Degenerate range: LevelsMin==LevelsMax must produce a deterministic hard step (Epsilon-guarded
+	//     denominator, matching AO's own established degenerate-range contract), never NaN/Inf/a crash.
+	TArray<FColor> Degenerate;
+	TestTrue(TEXT("Degenerate LevelsMin==LevelsMax evaluation succeeds (no NaN/Inf/crash)"), Evaluate(0.5f, 0.5f, false, Degenerate));
+	bool bDegenerateIsBinary = true;
+	for (const FColor& C : Degenerate)
+	{
+		if (C.R != 0 && C.R != 255) { bDegenerateIsBinary = false; }
+	}
+	TestTrue(TEXT("Degenerate range produces a hard black/white step, never an intermediate/garbage value"), bDegenerateIsBinary);
+
+	// --- Order: Levels applied AFTER Invert -- verify the actual result matches Leveled(Invert(v)), never
+	//     Invert(Leveled(v)), and never a double application of either step.
+	TArray<FColor> InvertedRaisedMin;
+	TestTrue(TEXT("Invert+raised-LevelsMin evaluation succeeds"), Evaluate(0.5f, 1.0f, true, InvertedRaisedMin));
+	bool bMatchesLevelsAfterInvert = Identity.Num() == InvertedRaisedMin.Num();
+	for (int32 i = 0; bMatchesLevelsAfterInvert && i < Identity.Num(); ++i)
+	{
+		const float BaselineNormalized = Identity[i].R / 255.0f;
+		const float InvertedFirst = 1.0f - BaselineNormalized;
+		const float ExpectedLevelsAfterInvert = FMath::Clamp((InvertedFirst - 0.5f) / 0.5f, 0.0f, 1.0f);
+		const int32 ExpectedByte = FMath::Clamp(FMath::RoundToInt(ExpectedLevelsAfterInvert * 255.0f), 0, 255);
+		if (FMath::Abs(InvertedRaisedMin[i].R - ExpectedByte) > 1) { bMatchesLevelsAfterInvert = false; }
+	}
+	TestTrue(TEXT("Output matches Levels-applied-AFTER-Invert exactly, proving the established processing order and no double application"), bMatchesLevelsAfterInvert);
 
 	return true;
 }

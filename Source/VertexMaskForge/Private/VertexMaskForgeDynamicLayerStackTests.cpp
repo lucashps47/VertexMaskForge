@@ -608,6 +608,8 @@ bool FVertexMaskForgeDynamicLayerStackThicknessGeneratorTest::RunTest(const FStr
 		TestEqual(TEXT("Default Bias == 0.01"), ThicknessParams->Bias, 0.01f);
 		TestEqual(TEXT("Default Blur == 0.0"), ThicknessParams->Blur, 0.0f);
 		TestFalse(TEXT("Default bInvert == false"), ThicknessParams->bInvert);
+		TestEqual(TEXT("Default LevelsMin == 0.0 (M17-TH-DL-E)"), ThicknessParams->LevelsMin, 0.0f);
+		TestEqual(TEXT("Default LevelsMax == 1.0 (M17-TH-DL-E)"), ThicknessParams->LevelsMax, 1.0f);
 	}
 	const FGuid FirstMaskInstanceId = Mask->MaskInstanceId;
 

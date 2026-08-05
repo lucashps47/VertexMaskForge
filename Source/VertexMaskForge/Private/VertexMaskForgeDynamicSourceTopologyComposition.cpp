@@ -557,17 +557,78 @@ bool VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSo
 			}
 
 			if (GeneratedMask.State != EVertexMaskForgeScalarMaskState::Ready
-				|| GeneratedMask.Values.Num() != ExpectedCornerCount
-				|| GeneratedMask.NumValidValues != ExpectedCornerCount)
+				|| GeneratedMask.Values.Num() != ExpectedCornerCount)
 			{
-				// Mirrors Directional Normal's own third check exactly, for the identical reason: this
-				// orchestrator's Corner-domain Pass 2 reads Values[CornerIndex] directly and unconditionally
-				// (never a TryGetValue lookup for Corner domain), so an individual corner legitimately left
-				// unwritten (no opposing surface found, even after the backend's own internal M9 fallback/
-				// gate) must fail the WHOLE call rather than silently reading a zero-initialized placeholder
-				// as a real computed value. This preserves the existing sparse-mask contract for Corner-
-				// domain masks without inventing a new validity policy.
+				// Structural failure only (mesh/array cardinality mismatch, or the generator never even
+				// reached Ready -- e.g. no Normal Overlay at all) -- unrelated to per-corner hit coverage,
+				// unchanged from before M17-TH-DL-E.
 				return false;
+			}
+
+			if (GeneratedMask.NumValidValues == 0)
+			{
+				// M17-TH-DL-E: a genuine TOTAL no-hit (center ray AND the backend's own internal M9
+				// fallback/gate miss for EVERY single corner, on an otherwise-Ready mask) preserves the
+				// existing whole-call failure contract exactly -- see ThicknessNoHitFailsWholeCallTest
+				// (VertexMaskForgeDynamicSourceTopologyCompositionTests.cpp), unchanged by this checkpoint.
+				return false;
+			}
+
+			if (GeneratedMask.NumValidValues != ExpectedCornerCount)
+			{
+				// M17-TH-DL-E (root-cause fix): a PARTIAL result -- some corners genuinely have no
+				// opposing surface even after the backend's own internal M9 fallback/gate -- is a normal,
+				// expected outcome on ordinary real closed meshes (concave pockets, boundary edges, thin
+				// or self-occluding features), not the same failure class as a total no-hit. The PRIOR
+				// requirement here (NumValidValues == ExpectedCornerCount, zero tolerance for any single
+				// missed corner) made this common case fail the WHOLE Dynamic composition call, which the
+				// panel's preview code then treated as "composition failed" and tore down the RGB Vertex
+				// Color preview override entirely, falling back to the plain material -- reproduced and
+				// diagnosed in the M17-TH-DL-D Editor validation checkpoint.
+				//
+				// This orchestrator's Corner-domain Pass 2 still reads Values[CornerIndex] directly and
+				// unconditionally (never a TryGetValue lookup for Corner domain) -- that global contract is
+				// NOT changed here. Instead, every corner the backend legitimately left unwritten is filled
+				// in, LOCALLY and ONLY for this one Dynamic Layer evaluation, with a fixed, documented,
+				// non-fabricated substitute (0.0f -- the darkest/"no measurable thickness" end of the
+				// mapped range) so Pass 2 always has a real value to read. This mirrors the INTENT (not the
+				// mechanism) of Legacy's own established Thickness behavior, where a per-vertex TryGetValue
+				// miss simply contributes nothing from this one layer at that one vertex
+				// (VertexMaskForgeGeneratorLayerBridge.cpp) -- the dense Corner-domain architecture has no
+				// per-corner "skip this layer" primitive, so a fixed, neutral substitute is the closest safe
+				// equivalent. Applied BEFORE Levels below, so a missed corner always renders as the true
+				// darkest value regardless of the artist's own Levels Min/Max setting.
+				for (int32 CornerIndex = 0; CornerIndex < GeneratedMask.Values.Num(); ++CornerIndex)
+				{
+					if (!GeneratedMask.bHasValue.IsValidIndex(CornerIndex) || !GeneratedMask.bHasValue[CornerIndex])
+					{
+						GeneratedMask.Values[CornerIndex] = 0.0f;
+						if (GeneratedMask.bHasValue.IsValidIndex(CornerIndex))
+						{
+							GeneratedMask.bHasValue[CornerIndex] = true;
+						}
+					}
+				}
+				GeneratedMask.NumValidValues = ExpectedCornerCount;
+			}
+
+			// M17-TH-DL-E: Levels Min/Max (FVertexMaskForgeThicknessParams, VertexMaskForgeRecipeTypes.h) --
+			// a pure artistic postprocess over the already-generated, already-mapped, already-inverted [0,1]
+			// mask, applied here (never inside the protected backend) exactly like Ambient Occlusion's own
+			// ApplyAOLevelsAndInvert (VertexMaskForgeAmbientOcclusionGenerator.cpp) in every respect EXCEPT
+			// order: AO applies Levels BEFORE Invert because its own generator file owns both steps
+			// together; Thickness's Invert is already baked into GeneratedMask.Values by the protected
+			// GenerateThicknessMaskFromDynamicMesh call above, so Levels can only be applied AFTER Invert
+			// here -- a proven, generator-specific architectural reason, not an arbitrary deviation. Never
+			// rebuilds the raycast/acceleration structure or touches RawDistances -- composition-only.
+			{
+				constexpr float LevelsEpsilon = 1e-4f;
+				const float LevelsDenom = FMath::Max(ThicknessParams->LevelsMax - ThicknessParams->LevelsMin, LevelsEpsilon);
+				for (int32 CornerIndex = 0; CornerIndex < GeneratedMask.Values.Num(); ++CornerIndex)
+				{
+					GeneratedMask.Values[CornerIndex] = FMath::Clamp(
+						(GeneratedMask.Values[CornerIndex] - ThicknessParams->LevelsMin) / LevelsDenom, 0.0f, 1.0f);
+				}
 			}
 
 			LayerMasks[LayerIndex].Mask = MoveTemp(GeneratedMask);

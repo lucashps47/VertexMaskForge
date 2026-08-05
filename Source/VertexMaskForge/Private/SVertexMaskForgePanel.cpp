@@ -6439,6 +6439,87 @@ TSharedRef<SWidget> SVertexMaskForgePanel::BuildDynamicThicknessLayerParamsBlock
 		]
 	]
 
+	// Levels Min / Levels Max -- [0,1], Delta 0.01, matching Ambient Occlusion's own Dynamic Levels
+	// widgets exactly (M17-TH-DL-E): same range/step/tooltips/coupled-invariant maintenance pattern
+	// (the edited field is always assigned first and preserved; the OTHER field is raised/lowered
+	// only if the pair would otherwise become invalid, committed through the SAME single
+	// MutateDynamicThicknessParam call). PURELY COMPOSITIONAL -- reuses valid raw Thickness values,
+	// never touches the raycast cache map (see this generator's own dispatch branch in
+	// VertexMaskForgeDynamicSourceTopologyComposition.cpp for the exact postprocess order relative
+	// to Invert).
+	+ SVerticalBox::Slot()
+	.AutoHeight()
+	.Padding(FMargin(0.f, 2.f, 0.f, 2.f))
+	[
+		SNew(SHorizontalBox)
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.VAlign(VAlign_Center)
+		[
+			SNew(STextBlock)
+			.Text(LOCTEXT("DynamicThicknessLevelsMinLabel", "Levels Min"))
+			.ToolTipText(LOCTEXT("DynamicThicknessLevelsMinTooltip", "Values at or below this threshold become black."))
+		]
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.Padding(FMargin(4.f, 0.f, 12.f, 0.f))
+		[
+			SNew(SSpinBox<float>)
+			.MinDesiredWidth(52.f)
+			.MinValue(0.0f)
+			.MaxValue(1.0f)
+			.Delta(0.01f)
+			.ToolTipText(LOCTEXT("DynamicThicknessLevelsMinTooltip", "Values at or below this threshold become black."))
+			.Value_Lambda([GetParams]() { return GetParams().LevelsMin; })
+			.OnValueChanged_Lambda([this, LayerId, ExpectedMaskInstanceId](const float NewValue)
+			{
+				MutateDynamicThicknessParam(LayerId, ExpectedMaskInstanceId, [NewValue](FVertexMaskForgeThicknessParams& Params)
+				{
+					Params.LevelsMin = FMath::Clamp(NewValue, 0.0f, 1.0f);
+					if (Params.LevelsMin > Params.LevelsMax)
+					{
+						Params.LevelsMax = Params.LevelsMin;
+					}
+				});
+			})
+		]
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.VAlign(VAlign_Center)
+		[
+			SNew(STextBlock)
+			.Text(LOCTEXT("DynamicThicknessLevelsMaxLabel", "Levels Max"))
+			.ToolTipText(LOCTEXT("DynamicThicknessLevelsMaxTooltip", "Values at or above this threshold become white."))
+		]
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.Padding(FMargin(4.f, 0.f, 0.f, 0.f))
+		[
+			SNew(SSpinBox<float>)
+			.MinDesiredWidth(52.f)
+			.MinValue(0.0f)
+			.MaxValue(1.0f)
+			.Delta(0.01f)
+			.ToolTipText(LOCTEXT("DynamicThicknessLevelsMaxTooltip", "Values at or above this threshold become white."))
+			.Value_Lambda([GetParams]() { return GetParams().LevelsMax; })
+			.OnValueChanged_Lambda([this, LayerId, ExpectedMaskInstanceId](const float NewValue)
+			{
+				MutateDynamicThicknessParam(LayerId, ExpectedMaskInstanceId, [NewValue](FVertexMaskForgeThicknessParams& Params)
+				{
+					Params.LevelsMax = FMath::Clamp(NewValue, 0.0f, 1.0f);
+					if (Params.LevelsMax < Params.LevelsMin)
+					{
+						Params.LevelsMin = Params.LevelsMax;
+					}
+				});
+			})
+		]
+	]
+
 	// Invert
 	+ SVerticalBox::Slot()
 	.AutoHeight()

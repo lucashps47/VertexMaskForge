@@ -118,7 +118,14 @@ struct FVertexMaskForgeDirectionalNormalParams
 };
 
 /** Mirrors SVertexMaskForgePanel::ThicknessMinThickness/MaxThickness/SearchDistance/Bias/Blur/
- *  bThicknessMaskInvert. */
+ *  bThicknessMaskInvert. LevelsMin/LevelsMax (M17-TH-DL-E) are Dynamic-Layers-only additions --
+ *  Legacy's own raw panel fields have no Levels equivalent for Thickness -- mirroring the same
+ *  field names/defaults/[0,1] semantics already established by FVertexMaskForgeAmbientOcclusionParams/
+ *  FVertexMaskForgeCurvatureParams/FVertexMaskForgeNoiseParams above. Applied as a postprocess AFTER
+ *  Invert (Invert is baked into the protected backend's own return value before the Dynamic
+ *  composition orchestrator ever sees it, unlike AO/Curvature/Noise where the same generator file
+ *  owns both steps and orders Levels before Invert -- see VertexMaskForgeDynamicSourceTopologyComposition.cpp's
+ *  own Thickness branch for the exact justification). */
 struct FVertexMaskForgeThicknessParams
 {
 	float MinThickness = 0.0f;
@@ -127,6 +134,8 @@ struct FVertexMaskForgeThicknessParams
 	float Bias = 0.01f;
 	float Blur = 0.0f;
 	bool bInvert = false;
+	float LevelsMin = 0.0f;
+	float LevelsMax = 1.0f;
 };
 
 /** Mirrors SVertexMaskForgePanel::SelectedMaterialSlotIndex/bMaterialSlotMaskInvert -- same
