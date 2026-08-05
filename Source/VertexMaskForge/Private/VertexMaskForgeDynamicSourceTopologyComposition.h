@@ -109,6 +109,17 @@ namespace VertexMaskForgeDynamicSourceTopologyComposition
 	 *     the exact same lookup Legacy's own UpdateWorkingColorsSourceTopology already uses for this
 	 *     generator) and read only through FVertexMaskForgeScalarMask::TryGetValue, mirroring Bounding
 	 *     Box's own sparse-domain handling.
+	 *   - Thickness (M17-TH-DL-B, Source Topology only): VertexMaskForgeThicknessGenerator::
+	 *     GenerateThicknessMaskFromDynamicMesh is called directly (never a duplicated raycast/fallback/
+	 *     confidence-gate implementation) with that layer's own FVertexMaskForgeThicknessParams
+	 *     (MinThickness/MaxThickness/SearchDistance/Bias/Blur/bInvert, unchanged/unreinterpreted) and this
+	 *     layer's own persistent cache entry (DynamicSourceTopologyThicknessCachesByLayerId.FindOrAdd(Layer.
+	 *     LayerId)). This mask is already corner-domain, like Material Slot's and Directional Normal's --
+	 *     and, like Directional Normal, an individual corner may legitimately be left unwritten (no opposing
+	 *     surface found, even after the backend's own internal M9 fallback/gate); every corner must have
+	 *     resolved a real value (NumValidValues == the expected corner count) or the WHOLE call fails, for
+	 *     the identical reason Directional Normal's own doc comment above gives (Pass 2's corner-domain read
+	 *     is a direct, unconditional index, never a TryGetValue lookup).
 	 * A disabled layer (bEnabled == false) contributes nothing and is never validated for its Mask's
 	 * GeneratorType, exactly mirroring EvaluateColor's own "bEnabled==false -> complete no-op" contract.
 	 *
@@ -138,6 +149,15 @@ namespace VertexMaskForgeDynamicSourceTopologyComposition
 	 * production callers always have a genuine, currently-valid owning FVertexMaskForgePreviewComponentState
 	 * in scope at their own call site -- there is no legitimate "no component state" case to represent
 	 * with a pointer.
+	 *
+	 * M17-TH-DL-B: DynamicSourceTopologyThicknessCachesByLayerId is the exact sibling of the AO parameter
+	 * immediately above, same Model D ownership/lifecycle, for
+	 * VertexMaskForgeThicknessGenerator::GenerateThicknessMaskFromDynamicMesh
+	 * (FVertexMaskForgePreviewComponentState::DynamicSourceTopologyThicknessCachesByLayerId). Thickness is
+	 * corner-domain (like Material Slot/Directional Normal, never Vertex-ID or Normal-Overlay-Element-ID
+	 * domain like Bounding Box/Ambient Occlusion) -- see the .cpp's own Thickness branch for the exact
+	 * NumValidValues==ExpectedCornerCount density requirement this implies for Pass 2's direct, unconditional
+	 * Values[CornerIndex] read.
 	 */
 	bool ComputeComposedColorsRGBSourceTopology(
 		const FVertexMaskForgeWorkingMesh& WorkingMesh,
@@ -145,5 +165,6 @@ namespace VertexMaskForgeDynamicSourceTopologyComposition
 		TConstArrayView<FColor> BaseColors,
 		const FTransform& ComponentTransform,
 		TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache>& DynamicSourceTopologyAOCachesByLayerId,
+		TMap<FGuid, FVertexMaskForgeSourceTopologyThicknessCache>& DynamicSourceTopologyThicknessCachesByLayerId,
 		TArray<FColor>& OutComposedColors);
 }

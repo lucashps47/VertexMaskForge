@@ -578,4 +578,96 @@ bool FVertexMaskForgeDynamicLayerStackHasAnyEnabledLayerOneEnabledTest::RunTest(
 	return true;
 }
 
+// M17-TH-DL-B, 1-4: Thickness is a valid generator type at the stack/data-model level (this was already
+// true before this checkpoint -- EVertexMaskForgeGeneratorType::Thickness and FVertexMaskForgeThicknessParams
+// have existed since before M17-TH-DL-B; this checkpoint only wired the UI/evaluation/cache sides). Proves:
+// assignment succeeds and creates the exact default FVertexMaskForgeThicknessParams; a parameter update
+// preserves GeneratorType/Params coherence; replacing the generator entirely mints a fresh MaskInstanceId.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynamicLayerStackThicknessGeneratorTest, "VertexMaskForge.DynamicLayerStack.ThicknessAcceptedWithDefaultsAndCoherence", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynamicLayerStackThicknessGeneratorTest::RunTest(const FString& Parameters)
+{
+	FVertexMaskForgeDynamicLayerStack Stack;
+	const FGuid LayerId = Stack.AddLayer(TEXT("Thickness Layer"));
+
+	// 1. Thickness is accepted as a valid generator type.
+	TestTrue(TEXT("SetLayerMaskGeneratorType(Thickness) succeeds"), Stack.SetLayerMaskGeneratorType(LayerId, EVertexMaskForgeGeneratorType::Thickness));
+
+	// 2/3. Assigning it creates FVertexMaskForgeThicknessParams with exactly the authoritative defaults.
+	const FVertexMaskForgeGeneratorMaskInstance* Mask = Stack.GetLayerMask(LayerId);
+	TestNotNull(TEXT("Layer has a mask"), Mask);
+	if (!Mask) { return false; }
+	TestTrue(TEXT("GeneratorType == Thickness"), Mask->GeneratorType == EVertexMaskForgeGeneratorType::Thickness);
+	TestTrue(TEXT("Params holds FVertexMaskForgeThicknessParams"), Mask->Params.IsType<FVertexMaskForgeThicknessParams>());
+	const FVertexMaskForgeThicknessParams* ThicknessParams = Mask->Params.TryGet<FVertexMaskForgeThicknessParams>();
+	TestNotNull(TEXT("TryGet<FVertexMaskForgeThicknessParams> succeeds"), ThicknessParams);
+	if (ThicknessParams)
+	{
+		TestEqual(TEXT("Default MinThickness == 0.0"), ThicknessParams->MinThickness, 0.0f);
+		TestEqual(TEXT("Default MaxThickness == 50.0"), ThicknessParams->MaxThickness, 50.0f);
+		TestEqual(TEXT("Default SearchDistance == 100.0"), ThicknessParams->SearchDistance, 100.0f);
+		TestEqual(TEXT("Default Bias == 0.01"), ThicknessParams->Bias, 0.01f);
+		TestEqual(TEXT("Default Blur == 0.0"), ThicknessParams->Blur, 0.0f);
+		TestFalse(TEXT("Default bInvert == false"), ThicknessParams->bInvert);
+	}
+	const FGuid FirstMaskInstanceId = Mask->MaskInstanceId;
+
+	// 4. Updating Thickness params (via SetLayerMaskParams, the same seam SVertexMaskForgePanel::
+	// MutateDynamicThicknessParam uses) preserves GeneratorType/Params coherence -- the layer stays a
+	// coherent Thickness mask, MaskInstanceId unchanged (SetLayerMaskParams never mints a new one).
+	{
+		FVertexMaskForgeGeneratorParams NewParams = Mask->Params;
+		NewParams.Get<FVertexMaskForgeThicknessParams>().MinThickness = 5.0f;
+		NewParams.Get<FVertexMaskForgeThicknessParams>().MaxThickness = 30.0f;
+		NewParams.Get<FVertexMaskForgeThicknessParams>().SearchDistance = 60.0f;
+		NewParams.Get<FVertexMaskForgeThicknessParams>().bInvert = true;
+		TestTrue(TEXT("SetLayerMaskParams succeeds"), Stack.SetLayerMaskParams(LayerId, FirstMaskInstanceId, NewParams));
+
+		const FVertexMaskForgeGeneratorMaskInstance* MaskAfterUpdate = Stack.GetLayerMask(LayerId);
+		TestNotNull(TEXT("Layer still has a mask after update"), MaskAfterUpdate);
+		if (MaskAfterUpdate)
+		{
+			TestTrue(TEXT("GeneratorType still Thickness after update"), MaskAfterUpdate->GeneratorType == EVertexMaskForgeGeneratorType::Thickness);
+			TestTrue(TEXT("Params still FVertexMaskForgeThicknessParams after update"), MaskAfterUpdate->Params.IsType<FVertexMaskForgeThicknessParams>());
+			TestEqual(TEXT("MaskInstanceId unchanged by a params-only update"), MaskAfterUpdate->MaskInstanceId, FirstMaskInstanceId);
+			const FVertexMaskForgeThicknessParams* UpdatedParams = MaskAfterUpdate->Params.TryGet<FVertexMaskForgeThicknessParams>();
+			if (UpdatedParams)
+			{
+				TestEqual(TEXT("MinThickness updated"), UpdatedParams->MinThickness, 5.0f);
+				TestEqual(TEXT("MaxThickness updated"), UpdatedParams->MaxThickness, 30.0f);
+				TestEqual(TEXT("SearchDistance updated"), UpdatedParams->SearchDistance, 60.0f);
+				TestTrue(TEXT("bInvert updated"), UpdatedParams->bInvert);
+			}
+		}
+	}
+
+	// 5. Replacing the generator entirely (Thickness -> Curvature) mints a FRESH MaskInstanceId and resets
+	// Params to Curvature's own defaults -- the old Thickness MaskInstanceId can never be reused to target
+	// the replacement (mirrors SetLayerMaskGeneratorType's own documented "previous instance discarded
+	// outright" contract), so a stale Thickness-editor widget captured against FirstMaskInstanceId can never
+	// mutate the replacement layer.
+	TestTrue(TEXT("SetLayerMaskGeneratorType(Curvature) succeeds"), Stack.SetLayerMaskGeneratorType(LayerId, EVertexMaskForgeGeneratorType::Curvature));
+	const FVertexMaskForgeGeneratorMaskInstance* MaskAfterReplace = Stack.GetLayerMask(LayerId);
+	TestNotNull(TEXT("Layer has a mask after replacement"), MaskAfterReplace);
+	if (MaskAfterReplace)
+	{
+		TestTrue(TEXT("GeneratorType now Curvature"), MaskAfterReplace->GeneratorType == EVertexMaskForgeGeneratorType::Curvature);
+		TestTrue(TEXT("Params now FVertexMaskForgeCurvatureParams"), MaskAfterReplace->Params.IsType<FVertexMaskForgeCurvatureParams>());
+		TestNotEqual(TEXT("MaskInstanceId changed by generator replacement"), MaskAfterReplace->MaskInstanceId, FirstMaskInstanceId);
+
+		// A stale mutation attempt against the OLD (now-orphaned) Thickness MaskInstanceId must be a no-op
+		// -- it must never reach across to mutate the replacement (Curvature) mask.
+		FVertexMaskForgeGeneratorParams StaleThicknessParams = MakeVertexMaskForgeGeneratorParams(EVertexMaskForgeGeneratorType::Thickness);
+		StaleThicknessParams.Get<FVertexMaskForgeThicknessParams>().MinThickness = 999.0f;
+		TestFalse(TEXT("SetLayerMaskParams with the STALE (pre-replacement) MaskInstanceId fails"),
+			Stack.SetLayerMaskParams(LayerId, FirstMaskInstanceId, StaleThicknessParams));
+		const FVertexMaskForgeGeneratorMaskInstance* MaskAfterStaleAttempt = Stack.GetLayerMask(LayerId);
+		if (MaskAfterStaleAttempt)
+		{
+			TestTrue(TEXT("Replacement layer is STILL Curvature -- stale Thickness mutation never crossed over"), MaskAfterStaleAttempt->GeneratorType == EVertexMaskForgeGeneratorType::Curvature);
+		}
+	}
+
+	return true;
+}
+
 #endif // WITH_DEV_AUTOMATION_TESTS

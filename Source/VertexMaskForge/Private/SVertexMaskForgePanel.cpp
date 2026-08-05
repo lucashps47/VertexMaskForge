@@ -1107,13 +1107,14 @@ namespace VertexMaskForgePanel
 	}
 
 	/**
-	 * M16-K.6B; extended M16-K.6D-8C-C, M16-K.6D-8D-C, M16-K.6D-8E-C, M16-K.6D-8G-F: human-readable label
-	 * for one Dynamic Layer row's Generator Type combo option/current value. A null InOption represents
-	 * "None/Unassigned" (mirrors DynamicLayerGeneratorTypeOptions' own element-0-is-null convention). A
-	 * non-null InOption is expected to only ever be one of the values DynamicLayerGeneratorTypeOptions
-	 * currently offers (MaterialSlot, BoundingBox, AmbientOcclusion, DirectionalNormal, Curvature, Noise)
-	 * -- the default case covers any other EVertexMaskForgeGeneratorType defensively (e.g. if a layer's
-	 * Mask was assigned by something other than this combo), without claiming Dynamic support for it.
+	 * M16-K.6B; extended M16-K.6D-8C-C, M16-K.6D-8D-C, M16-K.6D-8E-C, M16-K.6D-8G-F, M17-TH-DL-B: human-
+	 * readable label for one Dynamic Layer row's Generator Type combo option/current value. A null InOption
+	 * represents "None/Unassigned" (mirrors DynamicLayerGeneratorTypeOptions' own element-0-is-null
+	 * convention). A non-null InOption is now one of all seven EVertexMaskForgeGeneratorType enumerators,
+	 * every one of which DynamicLayerGeneratorTypeOptions offers (M17-TH-DL-B added Thickness, the last
+	 * remaining value) -- the default case is retained defensively only (never structurally unreachable,
+	 * since GeneratorType is a plain uint8 enum with no Count/Max sentinel), not because any value is still
+	 * deliberately unsupported.
 	 */
 	static FText GetDynamicLayerGeneratorTypeLabel(const EVertexMaskForgeGeneratorType* InOption)
 	{
@@ -1135,6 +1136,8 @@ namespace VertexMaskForgePanel
 			return LOCTEXT("DynamicLayerGeneratorCurvature", "Curvature");
 		case EVertexMaskForgeGeneratorType::Noise:
 			return LOCTEXT("DynamicLayerGeneratorNoise", "Noise/Grunge");
+		case EVertexMaskForgeGeneratorType::Thickness:
+			return LOCTEXT("DynamicLayerGeneratorThickness", "Thickness");
 		default:
 			return LOCTEXT("DynamicLayerGeneratorUnsupported", "Unsupported");
 		}
@@ -3920,6 +3923,9 @@ TSharedRef<SWidget> SVertexMaskForgePanel::BuildDynamicLayerRow(const FGuid Laye
 								for (const TUniquePtr<FVertexMaskForgeWorkingStateOwner>& StateOwner : Entry->PreviewComponents)
 								{
 									StateOwner->GetVisualSessionStateMutable().DynamicSourceTopologyAOCachesByLayerId.Remove(LayerId);
+									// M17-TH-DL-B: sibling erasure for the Dynamic Thickness cache, same rule
+									// (genuine generator-type transition only, never an idempotent no-op).
+									StateOwner->GetVisualSessionStateMutable().DynamicSourceTopologyThicknessCachesByLayerId.Remove(LayerId);
 								}
 							}
 						}
@@ -4129,7 +4135,8 @@ TSharedRef<SWidget> SVertexMaskForgePanel::BuildDynamicLayerRow(const FGuid Laye
 					|| Mask->GeneratorType == EVertexMaskForgeGeneratorType::AmbientOcclusion
 					|| Mask->GeneratorType == EVertexMaskForgeGeneratorType::DirectionalNormal
 					|| Mask->GeneratorType == EVertexMaskForgeGeneratorType::Curvature
-					|| Mask->GeneratorType == EVertexMaskForgeGeneratorType::Noise)
+					|| Mask->GeneratorType == EVertexMaskForgeGeneratorType::Noise
+					|| Mask->GeneratorType == EVertexMaskForgeGeneratorType::Thickness)
 					? EVisibility::Visible : EVisibility::Collapsed;
 			})
 			.HeaderContent()
@@ -4483,6 +4490,18 @@ TSharedRef<SWidget> SVertexMaskForgePanel::BuildDynamicLayerRow(const FGuid Laye
 			.Padding(FMargin(0.f, 2.f, 0.f, 0.f))
 			[
 				BuildDynamicNoiseLayerParamsBlock(LayerId, MaterialSlotExpectedMaskInstanceId)
+				]
+
+			// M17-TH-DL-B: Thickness configurational editor -- sibling of the blocks above, inside the SAME
+			// "Generator Parameters" expander body. Visible/editable only when this layer's assigned
+			// generator is Thickness (see BuildDynamicThicknessLayerParamsBlock's own doc comment for the
+			// full contract). Source Topology only this checkpoint; Thickness has no Space concept, so like
+			// Curvature/Noise there is no incompatible-state warning.
+			+ SVerticalBox::Slot()
+			.AutoHeight()
+			.Padding(FMargin(0.f, 2.f, 0.f, 0.f))
+			[
+				BuildDynamicThicknessLayerParamsBlock(LayerId, MaterialSlotExpectedMaskInstanceId)
 				]
 			]
 		]
@@ -6269,6 +6288,181 @@ TSharedRef<SWidget> SVertexMaskForgePanel::BuildDynamicNoiseLayerParamsBlock(con
 	];
 }
 
+void SVertexMaskForgePanel::MutateDynamicThicknessParam(
+	const FGuid LayerId, const FGuid ExpectedMaskInstanceId,
+	TFunctionRef<void(FVertexMaskForgeThicknessParams&)> Mutator)
+{
+	// AUDITED (M17-TH-DL-B): mirrors MutateDynamicCurvatureParam's own six-step identity-validated write
+	// path exactly -- mask exists, GeneratorType is still Thickness, Params is still the Thickness payload
+	// type, and MaskInstanceId still matches what THIS widget was built for. Any mismatch (cleared,
+	// reassigned to a different generator, or replaced by a newer instance) is a silent no-op, never a
+	// fallback to another layer or a stale write. This function never touches
+	// DynamicSourceTopologyThicknessCachesByLayerId itself -- cache freshness (raycast vs. remap-only) is
+	// entirely the backend's own responsibility, decided inside GenerateThicknessMaskFromDynamicMesh's own
+	// SearchDistance/Bias comparison (see the .cpp's own Thickness dispatch branch).
+	const FVertexMaskForgeGeneratorMaskInstance* Mask = DynamicLayerStack.GetLayerMask(LayerId);
+	if (!Mask
+		|| Mask->GeneratorType != EVertexMaskForgeGeneratorType::Thickness
+		|| !Mask->Params.IsType<FVertexMaskForgeThicknessParams>()
+		|| Mask->MaskInstanceId != ExpectedMaskInstanceId)
+	{
+		return;
+	}
+	FVertexMaskForgeGeneratorParams NewParams = Mask->Params;
+	Mutator(NewParams.Get<FVertexMaskForgeThicknessParams>());
+	DynamicLayerStack.SetLayerMaskParams(LayerId, ExpectedMaskInstanceId, NewParams);
+	OnDynamicLayerStackMutated();
+}
+
+TSharedRef<SWidget> SVertexMaskForgePanel::BuildDynamicThicknessLayerParamsBlock(const FGuid LayerId, const FGuid ExpectedMaskInstanceId)
+{
+	// AUDITED (M17-TH-DL-B): every Value_Lambda/IsChecked_Lambda below re-resolves LayerId's CURRENT stored
+	// Thickness params fresh on every call (never a cached copy) -- if the layer/mask/params no longer
+	// match (e.g. generator switched away), the accessor falls back to the authoritative default
+	// (MinThickness=0/MaxThickness=50/SearchDistance=100/not inverted -- FVertexMaskForgeThicknessParams'
+	// own default member initializers, MakeVertexMaskForgeGeneratorParams' own construction path) rather
+	// than reading garbage. Read-only; never mutates. Bias and Blur are deliberately never read or exposed
+	// here -- see this function's own header doc comment.
+	auto GetParams = [this, LayerId]() -> FVertexMaskForgeThicknessParams
+	{
+		const FVertexMaskForgeGeneratorMaskInstance* Mask = DynamicLayerStack.GetLayerMask(LayerId);
+		const FVertexMaskForgeThicknessParams* ThicknessParams = Mask ? Mask->Params.TryGet<FVertexMaskForgeThicknessParams>() : nullptr;
+		return ThicknessParams ? *ThicknessParams : FVertexMaskForgeThicknessParams();
+	};
+
+	return SNew(SVerticalBox)
+	.Visibility_Lambda([this, LayerId]()
+	{
+		const FVertexMaskForgeGeneratorMaskInstance* Mask = DynamicLayerStack.GetLayerMask(LayerId);
+		return (Mask && Mask->GeneratorType == EVertexMaskForgeGeneratorType::Thickness) ? EVisibility::Visible : EVisibility::Collapsed;
+	})
+
+	// Min Thickness / Max Thickness -- [0,10000], matching the Legacy widgets' own range exactly (see
+	// SVertexMaskForgePanel.h's ThicknessMinThickness/ThicknessMaxThickness own doc comments). No stronger
+	// Min<=Max coupling is introduced here than the Legacy panel's own controls already perform (neither
+	// currently clamps against the other) -- the backend itself remains tolerant of an inverted pair.
+	+ SVerticalBox::Slot()
+	.AutoHeight()
+	.Padding(FMargin(0.f, 2.f, 0.f, 2.f))
+	[
+		SNew(SHorizontalBox)
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.VAlign(VAlign_Center)
+		[
+			SNew(STextBlock).Text(LOCTEXT("DynamicThicknessMinThicknessLabel", "Min Thickness"))
+		]
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.Padding(FMargin(4.f, 0.f, 12.f, 0.f))
+		[
+			SNew(SSpinBox<float>)
+			.MinDesiredWidth(52.f)
+			.MinValue(0.0f)
+			.MaxValue(10000.0f)
+			.Delta(0.01f)
+			.Value_Lambda([GetParams]() { return GetParams().MinThickness; })
+			.OnValueChanged_Lambda([this, LayerId, ExpectedMaskInstanceId](const float NewValue)
+			{
+				MutateDynamicThicknessParam(LayerId, ExpectedMaskInstanceId, [NewValue](FVertexMaskForgeThicknessParams& Params)
+				{
+					Params.MinThickness = FMath::Clamp(NewValue, 0.0f, 10000.0f);
+				});
+			})
+		]
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.VAlign(VAlign_Center)
+		[
+			SNew(STextBlock).Text(LOCTEXT("DynamicThicknessMaxThicknessLabel", "Max Thickness"))
+		]
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.Padding(FMargin(4.f, 0.f, 0.f, 0.f))
+		[
+			SNew(SSpinBox<float>)
+			.MinDesiredWidth(52.f)
+			.MinValue(0.0f)
+			.MaxValue(10000.0f)
+			.Delta(0.01f)
+			.Value_Lambda([GetParams]() { return GetParams().MaxThickness; })
+			.OnValueChanged_Lambda([this, LayerId, ExpectedMaskInstanceId](const float NewValue)
+			{
+				MutateDynamicThicknessParam(LayerId, ExpectedMaskInstanceId, [NewValue](FVertexMaskForgeThicknessParams& Params)
+				{
+					Params.MaxThickness = FMath::Clamp(NewValue, 0.0f, 10000.0f);
+				});
+			})
+		]
+	]
+
+	// Search Distance -- [0,10000], matching the Legacy widget's own range exactly (see
+	// SVertexMaskForgePanel.h's ThicknessSearchDistance own doc comment). The Legacy panel's own tooltip
+	// claims Search Distance "must be at least Max Thickness -- enforced automatically", but no such
+	// clamp/coupling code exists for that pair in the Legacy panel today (confirmed by direct inspection);
+	// this control therefore matches the ACTUAL current production behavior (tolerant, not enforced), never
+	// a stronger invariant invented for this checkpoint alone.
+	+ SVerticalBox::Slot()
+	.AutoHeight()
+	.Padding(FMargin(0.f, 2.f, 0.f, 2.f))
+	[
+		SNew(SHorizontalBox)
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.VAlign(VAlign_Center)
+		[
+			SNew(STextBlock).Text(LOCTEXT("DynamicThicknessSearchDistanceLabel", "Search Distance"))
+		]
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.Padding(FMargin(4.f, 0.f, 0.f, 0.f))
+		[
+			SNew(SSpinBox<float>)
+			.MinDesiredWidth(52.f)
+			.MinValue(0.0f)
+			.MaxValue(10000.0f)
+			.Delta(0.01f)
+			.Value_Lambda([GetParams]() { return GetParams().SearchDistance; })
+			.OnValueChanged_Lambda([this, LayerId, ExpectedMaskInstanceId](const float NewValue)
+			{
+				MutateDynamicThicknessParam(LayerId, ExpectedMaskInstanceId, [NewValue](FVertexMaskForgeThicknessParams& Params)
+				{
+					Params.SearchDistance = FMath::Clamp(NewValue, 0.0f, 10000.0f);
+				});
+			})
+		]
+	]
+
+	// Invert
+	+ SVerticalBox::Slot()
+	.AutoHeight()
+	.Padding(FMargin(0.f, 2.f, 0.f, 0.f))
+	[
+		SNew(SCheckBox)
+		.IsChecked_Lambda([GetParams]()
+		{
+			return GetParams().bInvert ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
+		})
+		.OnCheckStateChanged_Lambda([this, LayerId, ExpectedMaskInstanceId](const ECheckBoxState NewState)
+		{
+			MutateDynamicThicknessParam(LayerId, ExpectedMaskInstanceId, [NewState](FVertexMaskForgeThicknessParams& Params)
+			{
+				Params.bInvert = (NewState == ECheckBoxState::Checked);
+			});
+		})
+		.Content()
+		[
+			SNew(STextBlock).Text(LOCTEXT("DynamicThicknessInvertLabel", "Invert"))
+		]
+	];
+}
+
 namespace
 {
 	// M16-K.6D-6 (Correction 2): the panel's own drag-drop payload for reordering Dynamic Layers rows --
@@ -6415,6 +6609,9 @@ FReply SVertexMaskForgePanel::OnRemoveDynamicLayerClicked(const FGuid LayerId)
 		for (const TUniquePtr<FVertexMaskForgeWorkingStateOwner>& StateOwner : Entry->PreviewComponents)
 		{
 			StateOwner->GetVisualSessionStateMutable().DynamicSourceTopologyAOCachesByLayerId.Remove(LayerId);
+			// M17-TH-DL-B: sibling erasure for the Dynamic Thickness cache -- mirrors the AO cleanup
+			// immediately above exactly (Remove() is a safe no-op if this LayerId never had an entry).
+			StateOwner->GetVisualSessionStateMutable().DynamicSourceTopologyThicknessCachesByLayerId.Remove(LayerId);
 		}
 	}
 
@@ -6681,15 +6878,15 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 	DynamicLayerFillOptions.Add(MakeShared<EVertexMaskForgeLayerFill>(EVertexMaskForgeLayerFill::White));
 
 	// M16-K.6B; corrected M16-K.6D-6; extended M16-K.6D-8C-C, M16-K.6D-8D-C, M16-K.6D-8E-C, M16-K.6D-8F-C,
-	// M16-K.6D-8G-F: element 0 is a VALID TSharedPtr to an UNSET TOptional (None/Unassigned) -- NOT a null
-	// TSharedPtr, which SListView's own row-generation loop unconditionally skips (see this array's own doc
-	// comment in SVertexMaskForgePanel.h for the confirmed root cause). MaterialSlot, BoundingBox
-	// (M16-K.6D-8B), Ambient Occlusion (M16-K.6D-8G-F -- inserted immediately after Bounding Box, matching
-	// Legacy's own generator-library ordering; the other five generators' relative order is otherwise
-	// unchanged), DirectionalNormal (M16-K.6D-8D-B), Curvature (M16-K.6D-8E-B), and Noise (M16-K.6D-8F-C,
-	// displayed as "Noise/Grunge") are the only six generators offered -- every other
-	// EVertexMaskForgeGeneratorType value (Thickness) is deliberately NOT added here, since the
-	// orchestrator still rejects it outright.
+	// M16-K.6D-8G-F, M17-TH-DL-B: element 0 is a VALID TSharedPtr to an UNSET TOptional (None/Unassigned)
+	// -- NOT a null TSharedPtr, which SListView's own row-generation loop unconditionally skips (see this
+	// array's own doc comment in SVertexMaskForgePanel.h for the confirmed root cause). MaterialSlot,
+	// BoundingBox (M16-K.6D-8B), Ambient Occlusion (M16-K.6D-8G-F -- inserted immediately after Bounding
+	// Box, matching Legacy's own generator-library ordering), DirectionalNormal (M16-K.6D-8D-B), Curvature
+	// (M16-K.6D-8E-B), Noise (M16-K.6D-8F-C, displayed as "Noise/Grunge"), and Thickness (M17-TH-DL-B,
+	// Source Topology only -- placed last, after Noise) are now all seven EVertexMaskForgeGeneratorType
+	// enumerators; every one of them is offered here, and the orchestrator (ComputeComposedColorsRGBSource
+	// Topology) now dispatches every one of them too -- there is no longer an unsupported/rejected value.
 	DynamicLayerGeneratorTypeOptions.Add(MakeShared<TOptional<EVertexMaskForgeGeneratorType>>());
 	DynamicLayerGeneratorTypeOptions.Add(MakeShared<TOptional<EVertexMaskForgeGeneratorType>>(EVertexMaskForgeGeneratorType::MaterialSlot));
 	DynamicLayerGeneratorTypeOptions.Add(MakeShared<TOptional<EVertexMaskForgeGeneratorType>>(EVertexMaskForgeGeneratorType::BoundingBox));
@@ -6697,6 +6894,7 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 	DynamicLayerGeneratorTypeOptions.Add(MakeShared<TOptional<EVertexMaskForgeGeneratorType>>(EVertexMaskForgeGeneratorType::DirectionalNormal));
 	DynamicLayerGeneratorTypeOptions.Add(MakeShared<TOptional<EVertexMaskForgeGeneratorType>>(EVertexMaskForgeGeneratorType::Curvature));
 	DynamicLayerGeneratorTypeOptions.Add(MakeShared<TOptional<EVertexMaskForgeGeneratorType>>(EVertexMaskForgeGeneratorType::Noise));
+	DynamicLayerGeneratorTypeOptions.Add(MakeShared<TOptional<EVertexMaskForgeGeneratorType>>(EVertexMaskForgeGeneratorType::Thickness));
 
 	CurvatureTypeOptions.Add(MakeShared<EVertexMaskForgeCurvatureType>(EVertexMaskForgeCurvatureType::Convex));
 	CurvatureTypeOptions.Add(MakeShared<EVertexMaskForgeCurvatureType>(EVertexMaskForgeCurvatureType::Concave));
@@ -11369,7 +11567,7 @@ void SVertexMaskForgePanel::ApplyPreviewToEntry(
 				// across recompositions exactly as Model D requires.
 				const bool bDynamicComposed = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(
 					WorkingMesh, DynamicLayerStack, StateOwner->GetBaselineColors(), SourceComponent->GetComponentTransform(),
-					State.DynamicSourceTopologyAOCachesByLayerId, DynamicComposedColors);
+					State.DynamicSourceTopologyAOCachesByLayerId, State.DynamicSourceTopologyThicknessCachesByLayerId, DynamicComposedColors);
 				if (!bDynamicComposed)
 				{
 					// AUDITED: an explicit, non-destructive failure -- the orchestrator's own contract

@@ -86,7 +86,8 @@ namespace VertexMaskForgeDynamicAcceptTargetBuilder
 				// same stack/mesh/transform/Baseline, never a copy-preview-colors shortcut.
 				const bool bComposed = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(
 					WorkingMesh, DynamicLayerStack, StateOwner->GetBaselineColors(), SourceComponent->GetComponentTransform(),
-					StateOwner->GetVisualSessionStateMutable().DynamicSourceTopologyAOCachesByLayerId, ComponentColors);
+					StateOwner->GetVisualSessionStateMutable().DynamicSourceTopologyAOCachesByLayerId,
+					StateOwner->GetVisualSessionStateMutable().DynamicSourceTopologyThicknessCachesByLayerId, ComponentColors);
 				if (!bComposed)
 				{
 					OutErrorText = FText::Format(

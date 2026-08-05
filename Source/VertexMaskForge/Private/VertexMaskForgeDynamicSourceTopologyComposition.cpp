@@ -32,6 +32,7 @@
 #include "VertexMaskForgeNoiseGenerator.h"
 #include "VertexMaskForgeRecipeTypes.h"
 #include "VertexMaskForgeSequentialEvaluator.h"
+#include "VertexMaskForgeThicknessGenerator.h"
 #include "VertexMaskForgeWorkingMeshTypes.h"
 
 namespace
@@ -74,6 +75,7 @@ bool VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSo
 	TConstArrayView<FColor> BaseColors,
 	const FTransform& ComponentTransform,
 	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache>& DynamicSourceTopologyAOCachesByLayerId,
+	TMap<FGuid, FVertexMaskForgeSourceTopologyThicknessCache>& DynamicSourceTopologyThicknessCachesByLayerId,
 	TArray<FColor>& OutComposedColors)
 {
 
@@ -510,11 +512,76 @@ bool VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSo
 				bCornerToElementIDBuilt = true;
 			}
 		}
+		else if (Layer.Mask->GeneratorType == EVertexMaskForgeGeneratorType::Thickness)
+		{
+			const FVertexMaskForgeThicknessParams* ThicknessParams = Layer.Mask->Params.TryGet<FVertexMaskForgeThicknessParams>();
+			if (!ThicknessParams)
+			{
+				// Defensive -- mirrors the Material Slot/Bounding Box/Directional Normal/Curvature/Noise/
+				// Ambient Occlusion coherence checks above.
+				return false;
+			}
+
+			// M17-TH-DL-B: resolve THIS layer's own persistent cache entry from the caller-supplied,
+			// per-component map (Model D -- see DynamicSourceTopologyThicknessCachesByLayerId's own doc
+			// comment), then bridge it into the exact ADAPTER shape
+			// GenerateThicknessMaskFromDynamicMesh's own protected public interface requires
+			// (TUniquePtr<FVertexMaskForgeSourceTopologyThicknessCache>&), mirroring the Ambient Occlusion
+			// branch's own adapter above verbatim: move the persistent entry's CURRENT content into a
+			// call-scoped TUniquePtr immediately before the call, let the generator mutate it in place
+			// exactly as it would any other caller's TUniquePtr-owned cache, then move the (possibly
+			// rebuilt) result back into the SAME persistent map entry immediately after -- so cross-call
+			// persistence (SearchDistance/Bias-driven raycast invalidation, geometry/topology-driven tree
+			// invalidation, and reuse of raw distances across Min/Max/Invert-only edits) is fully preserved
+			// through this map exactly as if it were a native TUniquePtr field, never a second/duplicated
+			// cache-validity implementation.
+			FVertexMaskForgeSourceTopologyThicknessCache& PersistentCacheEntry =
+				DynamicSourceTopologyThicknessCachesByLayerId.FindOrAdd(Layer.LayerId);
+			TUniquePtr<FVertexMaskForgeSourceTopologyThicknessCache> TransientCachePtr =
+				MakeUnique<FVertexMaskForgeSourceTopologyThicknessCache>(MoveTemp(PersistentCacheEntry));
+
+			// Fields passed without reinterpretation -- MinThickness/MaxThickness/SearchDistance/Bias/Blur/
+			// bInvert are the SAME raw inputs GenerateThicknessMaskFromDynamicMesh's own public signature
+			// already takes; Min/Max mapping, Invert, no-hit detection, the M9 fallback, and the confidence
+			// gate all remain entirely internal to this one call, never reimplemented or duplicated here.
+			FVertexMaskForgeScalarMask GeneratedMask = VertexMaskForgeThicknessGenerator::GenerateThicknessMaskFromDynamicMesh(
+				TransientCachePtr, WorkingMesh, ThicknessParams->MinThickness, ThicknessParams->MaxThickness,
+				ThicknessParams->SearchDistance, ThicknessParams->Bias, ThicknessParams->Blur, ThicknessParams->bInvert);
+
+			// Always valid after the call (mirrors the Ambient Occlusion branch's own defensive-not-assumed
+			// check above -- the generator allocates on a null/first-use CachePtr and never resets an
+			// already-valid one back to null).
+			if (TransientCachePtr.IsValid())
+			{
+				PersistentCacheEntry = MoveTemp(*TransientCachePtr);
+			}
+
+			if (GeneratedMask.State != EVertexMaskForgeScalarMaskState::Ready
+				|| GeneratedMask.Values.Num() != ExpectedCornerCount
+				|| GeneratedMask.NumValidValues != ExpectedCornerCount)
+			{
+				// Mirrors Directional Normal's own third check exactly, for the identical reason: this
+				// orchestrator's Corner-domain Pass 2 reads Values[CornerIndex] directly and unconditionally
+				// (never a TryGetValue lookup for Corner domain), so an individual corner legitimately left
+				// unwritten (no opposing surface found, even after the backend's own internal M9 fallback/
+				// gate) must fail the WHOLE call rather than silently reading a zero-initialized placeholder
+				// as a real computed value. This preserves the existing sparse-mask contract for Corner-
+				// domain masks without inventing a new validity policy.
+				return false;
+			}
+
+			LayerMasks[LayerIndex].Mask = MoveTemp(GeneratedMask);
+			LayerMasks[LayerIndex].Domain = ELayerMaskDomain::Corner;
+		}
 		else
 		{
 			// Explicit, whole-call failure -- any generator type beyond this checkpoint's own supported
 			// set (Material Slot, Bounding Box Local-space, Directional Normal Local-space, Curvature,
-			// Noise, Ambient Occlusion) never silently skips or treats itself as Fill-only.
+			// Noise, Ambient Occlusion, Thickness Source-Topology) never silently skips or treats itself
+			// as Fill-only. As of M17-TH-DL-B every EVertexMaskForgeGeneratorType enumerator is handled
+			// above -- this branch is retained defensively (never structurally unreachable-by-construction,
+			// since GeneratorType is a plain uint8 enum with no Count/Max sentinel -- see
+			// FVertexMaskForgeDynamicLayerStack::IsValidGeneratorType's own comment) rather than removed.
 			return false;
 		}
 	}

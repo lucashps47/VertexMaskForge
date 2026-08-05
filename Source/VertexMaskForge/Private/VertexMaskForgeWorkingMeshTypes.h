@@ -1156,6 +1156,20 @@ public:
 	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> DynamicSourceTopologyAOCachesByLayerId;
 
 	/**
+	 * M17-TH-DL-B: sibling of DynamicSourceTopologyAOCachesByLayerId above, for the Dynamic Thickness
+	 * backend (VertexMaskForgeThicknessGenerator::GenerateThicknessMaskFromDynamicMesh) -- same Model D
+	 * ownership (one complete, independent FVertexMaskForgeSourceTopologyThicknessCache -- including its
+	 * own retained raycast acceleration tree -- per stable Dynamic Layer Stack LayerId, never MaskInstanceId),
+	 * same lifecycle (erased on permanent layer removal and on a genuine generator-type change away from
+	 * Thickness; otherwise reset only together with BaselineColors/CommittedColors/WorkingColors/AOCache --
+	 * see BaselineColors' own doc comment for every reset point), and the same "dormant until first real
+	 * use" contract: FindOrAdd creates a fresh, cold entry on first use for a LayerId, and
+	 * ComputeComposedColorsRGBSourceTopology's own Thickness dispatch branch (never this field itself)
+	 * decides when the backend's own SearchDistance/Bias freshness comparison invalidates it.
+	 */
+	TMap<FGuid, FVertexMaskForgeSourceTopologyThicknessCache> DynamicSourceTopologyThicknessCachesByLayerId;
+
+	/**
 	 * AUDITED (Nanite source-topology support): transient duplicate used ONLY when this entry is in
 	 * Source-Topology mode, in place of PreviewComponent (a UStaticMeshComponent, which Nanite's
 	 * renderer never reads OverrideVertexColors from). Renders WorkingMesh.Mesh directly (the SAME

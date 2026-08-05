@@ -561,6 +561,36 @@ private:
 	void MutateDynamicNoiseParam(FGuid LayerId, FGuid ExpectedMaskInstanceId, TFunctionRef<void(FVertexMaskForgeNoiseParams&)> Mutator);
 
 	/**
+	 * M17-TH-DL-B: layer-owned, Source-Topology-only Thickness editor -- Min Thickness/Max Thickness/
+	 * Search Distance/Invert only, mirroring BuildDynamicCurvatureLayerParamsBlock's own structure and
+	 * sibling placement inside the "Generator Parameters" expander. Deliberately exposes no Bias, no Blur,
+	 * and no M9 fallback/confidence-gate control of any kind (cone angle, ray count, support tolerance,
+	 * minimum valid values, median support count, confidence threshold, support lead) -- those remain
+	 * entirely internal to VertexMaskForgeThicknessGenerator::GenerateThicknessMaskFromDynamicMesh, never
+	 * reachable from this or any other Dynamic Layer control. Thickness has no Space/World-Local concept
+	 * (Source Topology only, unconditionally), so unlike Bounding Box/Directional Normal there is no
+	 * incompatible-state warning and no per-control IsEnabled_Lambda gate. ExpectedMaskInstanceId is the
+	 * MaskInstanceId this row was built for (captured once by BuildDynamicLayerRow, mirroring
+	 * MaterialSlotExpectedMaskInstanceId's own established role) -- every mutation below validates against
+	 * it, never a freshly re-read id.
+	 */
+	TSharedRef<SWidget> BuildDynamicThicknessLayerParamsBlock(FGuid LayerId, FGuid ExpectedMaskInstanceId);
+
+	/**
+	 * Shared mutation helper for one Dynamic layer's Thickness parameters: resolves LayerId's current mask
+	 * fresh, validates the same six-step identity/coherence contract every other generator's mutation
+	 * callback already establishes (mask exists, GeneratorType == Thickness, Params is the
+	 * FVertexMaskForgeThicknessParams payload type, MaskInstanceId == ExpectedMaskInstanceId) -- on any
+	 * mismatch, a silent no-op. On success: copies the current FVertexMaskForgeThicknessParams, invokes
+	 * Mutator on the copy, calls SetLayerMaskParams with the captured ExpectedMaskInstanceId, then
+	 * OnDynamicLayerStackMutated(). Never retains Mutator or any parameter reference beyond this single
+	 * call, and never touches DynamicSourceTopologyThicknessCachesByLayerId -- cache freshness (raycast vs.
+	 * remap-only) is entirely the backend's own responsibility (see the .cpp's own Thickness dispatch
+	 * branch).
+	 */
+	void MutateDynamicThicknessParam(FGuid LayerId, FGuid ExpectedMaskInstanceId, TFunctionRef<void(FVertexMaskForgeThicknessParams&)> Mutator);
+
+	/**
 	 * M16-K.6D-8F-C.1: ephemeral, panel-owned, per-layer UI-only preference reproducing Legacy's
 	 * bNoiseScaleAxesLocked convenience checkbox for the Dynamic Noise/Grunge inspector -- keyed by
 	 * LayerId (stable across reorder/rename), NEVER by array index, row position, or MaskInstanceId (a
