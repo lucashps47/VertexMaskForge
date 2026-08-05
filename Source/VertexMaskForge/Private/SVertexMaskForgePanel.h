@@ -507,6 +507,34 @@ private:
 	void MutateDynamicCurvatureParam(FGuid LayerId, FGuid ExpectedMaskInstanceId, TFunctionRef<void(FVertexMaskForgeCurvatureParams&)> Mutator);
 
 	/**
+	 * M16-K.6D-8G-F: layer-owned Ambient Occlusion editor -- Samples/Max Distance/Bias (raw generation
+	 * parameters; the AO backend's own persistent cache, established M16-K.6D-8G-C and consumed since
+	 * M16-K.6D-8G-D, detects a change and recomputes -- this widget never invalidates
+	 * DynamicSourceTopologyAOCachesByLayerId itself) and Levels Min/Levels Max/Invert (purely
+	 * compositional post-processing, reusing valid raw AO), mirroring BuildDynamicCurvatureLayerParamsBlock's
+	 * own structure and sibling placement inside the "Generator Parameters" expander. Ambient Occlusion has
+	 * no Local/World-space concept exposed here -- it is unconditionally World-Space (the real per-component
+	 * transform, threaded since M16-K.6D-8G-B, is supplied by the orchestrator's own existing callers, never
+	 * this widget) -- so unlike Bounding Box/Directional Normal there is no incompatible-state warning and no
+	 * per-control IsEnabled_Lambda gate. ExpectedMaskInstanceId is the MaskInstanceId this row was built for
+	 * (captured once by BuildDynamicLayerRow), exactly like every other generator's own block.
+	 */
+	TSharedRef<SWidget> BuildDynamicAmbientOcclusionLayerParamsBlock(FGuid LayerId, FGuid ExpectedMaskInstanceId);
+
+	/**
+	 * Shared mutation helper for one Dynamic layer's Ambient Occlusion parameters: resolves LayerId's
+	 * current mask fresh, validates the same six-step identity/coherence contract every other generator's
+	 * mutation callback already establishes (mask exists, GeneratorType == AmbientOcclusion, Params is the
+	 * FVertexMaskForgeAmbientOcclusionParams payload type, MaskInstanceId == ExpectedMaskInstanceId) -- on
+	 * any mismatch, a silent no-op. On success: copies the current FVertexMaskForgeAmbientOcclusionParams,
+	 * invokes Mutator on the copy, calls SetLayerMaskParams with the captured ExpectedMaskInstanceId, then
+	 * OnDynamicLayerStackMutated(). Never retains Mutator or any parameter reference beyond this single
+	 * call, and never touches DynamicSourceTopologyAOCachesByLayerId -- cache freshness is entirely the
+	 * backend's own responsibility (see the .cpp's own AO dispatch branch).
+	 */
+	void MutateDynamicAmbientOcclusionParam(FGuid LayerId, FGuid ExpectedMaskInstanceId, TFunctionRef<void(FVertexMaskForgeAmbientOcclusionParams&)> Mutator);
+
+	/**
 	 * M16-K.6D-8F-C: layer-owned Noise/Grunge editor -- all 17 authoritative fields (Type, Scale X/Y/Z,
 	 * Offset X/Y/Z, Seed, Octaves, Roughness, Lacunarity, Turbulence Strength, Blur, Multiplier, Levels
 	 * Min/Max, Invert), mirroring BuildDynamicCurvatureLayerParamsBlock's own structure and sibling

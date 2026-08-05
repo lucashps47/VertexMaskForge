@@ -1107,13 +1107,13 @@ namespace VertexMaskForgePanel
 	}
 
 	/**
-	 * M16-K.6B; extended M16-K.6D-8C-C, M16-K.6D-8D-C, M16-K.6D-8E-C: human-readable label for one Dynamic
-	 * Layer row's Generator Type combo option/current value. A null InOption represents "None/Unassigned"
-	 * (mirrors DynamicLayerGeneratorTypeOptions' own element-0-is-null convention). A non-null InOption is
-	 * expected to only ever be MaterialSlot, BoundingBox, DirectionalNormal, or Curvature in this
-	 * checkpoint (the only values DynamicLayerGeneratorTypeOptions offers) -- the default case covers any
-	 * other EVertexMaskForgeGeneratorType defensively (e.g. if a layer's Mask was assigned by something
-	 * other than this combo), without claiming Dynamic support for it.
+	 * M16-K.6B; extended M16-K.6D-8C-C, M16-K.6D-8D-C, M16-K.6D-8E-C, M16-K.6D-8G-F: human-readable label
+	 * for one Dynamic Layer row's Generator Type combo option/current value. A null InOption represents
+	 * "None/Unassigned" (mirrors DynamicLayerGeneratorTypeOptions' own element-0-is-null convention). A
+	 * non-null InOption is expected to only ever be one of the values DynamicLayerGeneratorTypeOptions
+	 * currently offers (MaterialSlot, BoundingBox, AmbientOcclusion, DirectionalNormal, Curvature, Noise)
+	 * -- the default case covers any other EVertexMaskForgeGeneratorType defensively (e.g. if a layer's
+	 * Mask was assigned by something other than this combo), without claiming Dynamic support for it.
 	 */
 	static FText GetDynamicLayerGeneratorTypeLabel(const EVertexMaskForgeGeneratorType* InOption)
 	{
@@ -1127,6 +1127,8 @@ namespace VertexMaskForgePanel
 			return LOCTEXT("DynamicLayerGeneratorMaterialSlot", "Material Slot");
 		case EVertexMaskForgeGeneratorType::BoundingBox:
 			return LOCTEXT("DynamicLayerGeneratorBoundingBox", "Bounding Box");
+		case EVertexMaskForgeGeneratorType::AmbientOcclusion:
+			return LOCTEXT("DynamicLayerGeneratorAmbientOcclusion", "Ambient Occlusion");
 		case EVertexMaskForgeGeneratorType::DirectionalNormal:
 			return LOCTEXT("DynamicLayerGeneratorDirectionalNormal", "Directional Normal");
 		case EVertexMaskForgeGeneratorType::Curvature:
@@ -4124,6 +4126,7 @@ TSharedRef<SWidget> SVertexMaskForgePanel::BuildDynamicLayerRow(const FGuid Laye
 				}
 				return (Mask->GeneratorType == EVertexMaskForgeGeneratorType::MaterialSlot
 					|| Mask->GeneratorType == EVertexMaskForgeGeneratorType::BoundingBox
+					|| Mask->GeneratorType == EVertexMaskForgeGeneratorType::AmbientOcclusion
 					|| Mask->GeneratorType == EVertexMaskForgeGeneratorType::DirectionalNormal
 					|| Mask->GeneratorType == EVertexMaskForgeGeneratorType::Curvature
 					|| Mask->GeneratorType == EVertexMaskForgeGeneratorType::Noise)
@@ -4429,6 +4432,21 @@ TSharedRef<SWidget> SVertexMaskForgePanel::BuildDynamicLayerRow(const FGuid Laye
 			.Padding(FMargin(0.f, 2.f, 0.f, 0.f))
 			[
 				BuildDynamicBoundingBoxLayerParamsBlock(LayerId, MaterialSlotExpectedMaskInstanceId)
+				]
+
+			// M16-K.6D-8G-F: Ambient Occlusion configurational editor -- sibling of the Material Slot and
+			// Bounding Box blocks above, inside the SAME "Generator Parameters" expander body. Visible/
+			// editable only when this layer's assigned generator is AmbientOcclusion (see
+			// BuildDynamicAmbientOcclusionLayerParamsBlock's own doc comment for the full contract). Placed
+			// immediately after Bounding Box, matching Legacy's own generator-library ordering (Bounding
+			// Box, Ambient Occlusion, Curvature, Directional Normal, Noise, Material Slot) -- this expander
+			// body's own placement is purely visual grouping (only one block is ever visible at a time,
+			// gated by GeneratorType), never a functional ordering concern.
+			+ SVerticalBox::Slot()
+			.AutoHeight()
+			.Padding(FMargin(0.f, 2.f, 0.f, 0.f))
+			[
+				BuildDynamicAmbientOcclusionLayerParamsBlock(LayerId, MaterialSlotExpectedMaskInstanceId)
 				]
 
 			// M16-K.6D-8D-C: Directional Normal configurational editor -- sibling of the Material Slot and
@@ -5262,6 +5280,276 @@ TSharedRef<SWidget> SVertexMaskForgePanel::BuildDynamicCurvatureLayerParamsBlock
 		.Content()
 		[
 			SNew(STextBlock).Text(LOCTEXT("DynamicCurvatureInvertLabel", "Invert"))
+		]
+	];
+}
+
+void SVertexMaskForgePanel::MutateDynamicAmbientOcclusionParam(
+	const FGuid LayerId, const FGuid ExpectedMaskInstanceId,
+	TFunctionRef<void(FVertexMaskForgeAmbientOcclusionParams&)> Mutator)
+{
+	// AUDITED (M16-K.6D-8G-F): mirrors MutateDynamicCurvatureParam's own six-step identity-validated write
+	// path exactly -- mask exists, GeneratorType is still AmbientOcclusion, Params is still the Ambient
+	// Occlusion payload type, and MaskInstanceId still matches what THIS widget was built for. Any mismatch
+	// (cleared, reassigned to a different generator, or replaced by a newer instance) is a silent no-op,
+	// never a fallback to another layer or a stale write. Never touches
+	// DynamicSourceTopologyAOCachesByLayerId -- the backend's own dispatch branch (M16-K.6D-8G-D) detects
+	// raw-parameter changes and recomputes on its own; this widget only ever writes the recipe payload.
+	const FVertexMaskForgeGeneratorMaskInstance* Mask = DynamicLayerStack.GetLayerMask(LayerId);
+	if (!Mask
+		|| Mask->GeneratorType != EVertexMaskForgeGeneratorType::AmbientOcclusion
+		|| !Mask->Params.IsType<FVertexMaskForgeAmbientOcclusionParams>()
+		|| Mask->MaskInstanceId != ExpectedMaskInstanceId)
+	{
+		return;
+	}
+	// AUDITED: copies the CURRENT Params (every field byte/value-exact), mutates the copy via Mutator
+	// (including the Levels Min/Max coupled-invariant maintenance the Levels callbacks below perform
+	// entirely inside their own Mutator, exactly like Curvature's own established pattern), then writes
+	// back through the existing stack API in ONE call -- never a second/cached copy of parameters retained
+	// across calls, never a second callback-driven write.
+	FVertexMaskForgeGeneratorParams NewParams = Mask->Params;
+	Mutator(NewParams.Get<FVertexMaskForgeAmbientOcclusionParams>());
+	DynamicLayerStack.SetLayerMaskParams(LayerId, ExpectedMaskInstanceId, NewParams);
+	OnDynamicLayerStackMutated();
+}
+
+TSharedRef<SWidget> SVertexMaskForgePanel::BuildDynamicAmbientOcclusionLayerParamsBlock(const FGuid LayerId, const FGuid ExpectedMaskInstanceId)
+{
+	// AUDITED: every Value_Lambda/IsChecked_Lambda below re-resolves LayerId's CURRENT stored Ambient
+	// Occlusion params fresh on every call (never a cached copy) -- if the layer/mask/params no longer
+	// match (e.g. generator switched away), the accessor falls back to the authoritative committed default
+	// (Samples=16/MaxDistance=100/Bias=0.1/Levels=[0,1]/not inverted -- FVertexMaskForgeAmbientOcclusionParams'
+	// own default member initializers) rather than reading garbage. Read-only; never mutates.
+	auto GetParams = [this, LayerId]() -> FVertexMaskForgeAmbientOcclusionParams
+	{
+		const FVertexMaskForgeGeneratorMaskInstance* Mask = DynamicLayerStack.GetLayerMask(LayerId);
+		const FVertexMaskForgeAmbientOcclusionParams* AOParams = Mask ? Mask->Params.TryGet<FVertexMaskForgeAmbientOcclusionParams>() : nullptr;
+		return AOParams ? *AOParams : FVertexMaskForgeAmbientOcclusionParams();
+	};
+
+	return SNew(SVerticalBox)
+	.Visibility_Lambda([this, LayerId]()
+	{
+		const FVertexMaskForgeGeneratorMaskInstance* Mask = DynamicLayerStack.GetLayerMask(LayerId);
+		return (Mask && Mask->GeneratorType == EVertexMaskForgeGeneratorType::AmbientOcclusion) ? EVisibility::Visible : EVisibility::Collapsed;
+	})
+
+	// Samples -- [8,256], Delta 1, matching Legacy AOSamples' own range/step exactly. RAW generation
+	// parameter: the AO backend's own persistent cache (DynamicSourceTopologyAOCachesByLayerId, keyed by
+	// this layer's stable LayerId) detects this change on the next recomposition and recomputes raw values
+	// -- this control never touches the cache map directly.
+	+ SVerticalBox::Slot()
+	.AutoHeight()
+	.Padding(FMargin(0.f, 2.f, 0.f, 2.f))
+	[
+		SNew(SHorizontalBox)
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.VAlign(VAlign_Center)
+		[
+			SNew(STextBlock)
+			.Text(LOCTEXT("DynamicAOSamplesLabel", "Samples"))
+			.ToolTipText(LOCTEXT("DynamicAOSamplesTooltip",
+				"Number of hemisphere raycast samples per element. Higher values are smoother but slower; "
+				"the live preview always uses this full value."))
+		]
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.Padding(FMargin(4.f, 0.f, 0.f, 0.f))
+		[
+			SNew(SSpinBox<int32>)
+			.MinDesiredWidth(52.f)
+			.MinValue(8)
+			.MaxValue(256)
+			.Delta(1)
+			.ToolTipText(LOCTEXT("DynamicAOSamplesTooltip",
+				"Number of hemisphere raycast samples per element. Higher values are smoother but slower; "
+				"the live preview always uses this full value."))
+			.Value_Lambda([GetParams]() { return GetParams().Samples; })
+			.OnValueChanged_Lambda([this, LayerId, ExpectedMaskInstanceId](const int32 NewValue)
+			{
+				MutateDynamicAmbientOcclusionParam(LayerId, ExpectedMaskInstanceId, [NewValue](FVertexMaskForgeAmbientOcclusionParams& Params)
+				{
+					Params.Samples = FMath::Clamp(NewValue, 8, 256);
+				});
+			})
+		]
+	]
+
+	// Max Distance -- (0.01,10000], Delta 1.0, matching Legacy AOMaxDistance's own range/step exactly. RAW
+	// generation parameter -- see Samples' own comment above for the cache-ownership contract.
+	+ SVerticalBox::Slot()
+	.AutoHeight()
+	.Padding(FMargin(0.f, 2.f, 0.f, 2.f))
+	[
+		SNew(SHorizontalBox)
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.VAlign(VAlign_Center)
+		[
+			SNew(STextBlock).Text(LOCTEXT("DynamicAOMaxDistanceLabel", "Max Distance"))
+		]
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.Padding(FMargin(4.f, 0.f, 0.f, 0.f))
+		[
+			SNew(SSpinBox<float>)
+			.MinDesiredWidth(64.f)
+			.MinValue(0.01f)
+			.MaxValue(10000.0f)
+			.Delta(1.0f)
+			.Value_Lambda([GetParams]() { return GetParams().MaxDistance; })
+			.OnValueChanged_Lambda([this, LayerId, ExpectedMaskInstanceId](const float NewValue)
+			{
+				MutateDynamicAmbientOcclusionParam(LayerId, ExpectedMaskInstanceId, [NewValue](FVertexMaskForgeAmbientOcclusionParams& Params)
+				{
+					Params.MaxDistance = FMath::Clamp(NewValue, 0.01f, 10000.0f);
+				});
+			})
+		]
+	]
+
+	// Bias -- [0.001,10.0], Delta 0.01, matching Legacy AOBias' own range/step exactly. RAW generation
+	// parameter -- see Samples' own comment above for the cache-ownership contract.
+	+ SVerticalBox::Slot()
+	.AutoHeight()
+	.Padding(FMargin(0.f, 2.f, 0.f, 2.f))
+	[
+		SNew(SHorizontalBox)
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.VAlign(VAlign_Center)
+		[
+			SNew(STextBlock).Text(LOCTEXT("DynamicAOBiasLabel", "Bias"))
+		]
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.Padding(FMargin(4.f, 0.f, 0.f, 0.f))
+		[
+			SNew(SSpinBox<float>)
+			.MinDesiredWidth(52.f)
+			.MinValue(0.001f)
+			.MaxValue(10.0f)
+			.Delta(0.01f)
+			.Value_Lambda([GetParams]() { return GetParams().Bias; })
+			.OnValueChanged_Lambda([this, LayerId, ExpectedMaskInstanceId](const float NewValue)
+			{
+				MutateDynamicAmbientOcclusionParam(LayerId, ExpectedMaskInstanceId, [NewValue](FVertexMaskForgeAmbientOcclusionParams& Params)
+				{
+					Params.Bias = FMath::Clamp(NewValue, 0.001f, 10.0f);
+				});
+			})
+		]
+	]
+
+	// Levels Min / Levels Max -- [0,1], Delta 0.01, matching Legacy AOLevelsMin/AOLevelsMax's own
+	// range/step/tooltips exactly. PURELY COMPOSITIONAL (post-processing) -- reuses valid raw AO values,
+	// never touches the cache map, mirrors Curvature's own coupled-invariant maintenance pattern exactly
+	// (the edited field is always assigned first and preserved; the OTHER field is raised/lowered only if
+	// the pair would otherwise become invalid, committed through the SAME single
+	// MutateDynamicAmbientOcclusionParam call).
+	+ SVerticalBox::Slot()
+	.AutoHeight()
+	.Padding(FMargin(0.f, 2.f, 0.f, 2.f))
+	[
+		SNew(SHorizontalBox)
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.VAlign(VAlign_Center)
+		[
+			SNew(STextBlock)
+			.Text(LOCTEXT("DynamicAOLevelsMinLabel", "Levels Min"))
+			.ToolTipText(LOCTEXT("DynamicAOLevelsMinTooltip", "Values at or below this threshold become black."))
+		]
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.Padding(FMargin(4.f, 0.f, 12.f, 0.f))
+		[
+			SNew(SSpinBox<float>)
+			.MinDesiredWidth(52.f)
+			.MinValue(0.0f)
+			.MaxValue(1.0f)
+			.Delta(0.01f)
+			.ToolTipText(LOCTEXT("DynamicAOLevelsMinTooltip", "Values at or below this threshold become black."))
+			.Value_Lambda([GetParams]() { return GetParams().LevelsMin; })
+			.OnValueChanged_Lambda([this, LayerId, ExpectedMaskInstanceId](const float NewValue)
+			{
+				MutateDynamicAmbientOcclusionParam(LayerId, ExpectedMaskInstanceId, [NewValue](FVertexMaskForgeAmbientOcclusionParams& Params)
+				{
+					Params.LevelsMin = FMath::Clamp(NewValue, 0.0f, 1.0f);
+					if (Params.LevelsMin > Params.LevelsMax)
+					{
+						Params.LevelsMax = Params.LevelsMin;
+					}
+				});
+			})
+		]
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.VAlign(VAlign_Center)
+		[
+			SNew(STextBlock)
+			.Text(LOCTEXT("DynamicAOLevelsMaxLabel", "Levels Max"))
+			.ToolTipText(LOCTEXT("DynamicAOLevelsMaxTooltip", "Values at or above this threshold become white."))
+		]
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.Padding(FMargin(4.f, 0.f, 0.f, 0.f))
+		[
+			SNew(SSpinBox<float>)
+			.MinDesiredWidth(52.f)
+			.MinValue(0.0f)
+			.MaxValue(1.0f)
+			.Delta(0.01f)
+			.ToolTipText(LOCTEXT("DynamicAOLevelsMaxTooltip", "Values at or above this threshold become white."))
+			.Value_Lambda([GetParams]() { return GetParams().LevelsMax; })
+			.OnValueChanged_Lambda([this, LayerId, ExpectedMaskInstanceId](const float NewValue)
+			{
+				MutateDynamicAmbientOcclusionParam(LayerId, ExpectedMaskInstanceId, [NewValue](FVertexMaskForgeAmbientOcclusionParams& Params)
+				{
+					Params.LevelsMax = FMath::Clamp(NewValue, 0.0f, 1.0f);
+					if (Params.LevelsMax < Params.LevelsMin)
+					{
+						Params.LevelsMin = Params.LevelsMax;
+					}
+				});
+			})
+		]
+	]
+
+	// Invert -- PURELY COMPOSITIONAL (post-processing), matching Legacy AOInvert's own label/style exactly.
+	// Reuses valid raw AO values, applied exactly once inside the existing AO generator's own
+	// ApplyAOLevelsAndInvert (never in this widget, never twice).
+	+ SVerticalBox::Slot()
+	.AutoHeight()
+	.Padding(FMargin(0.f, 2.f, 0.f, 0.f))
+	[
+		SNew(SCheckBox)
+		.IsChecked_Lambda([GetParams]()
+		{
+			return GetParams().bInvert ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
+		})
+		.OnCheckStateChanged_Lambda([this, LayerId, ExpectedMaskInstanceId](const ECheckBoxState NewState)
+		{
+			MutateDynamicAmbientOcclusionParam(LayerId, ExpectedMaskInstanceId, [NewState](FVertexMaskForgeAmbientOcclusionParams& Params)
+			{
+				Params.bInvert = (NewState == ECheckBoxState::Checked);
+			});
+		})
+		.Content()
+		[
+			SNew(STextBlock).Text(LOCTEXT("DynamicAOInvertLabel", "Invert"))
 		]
 	];
 }
@@ -6392,16 +6680,20 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 	DynamicLayerFillOptions.Add(MakeShared<EVertexMaskForgeLayerFill>(EVertexMaskForgeLayerFill::Black));
 	DynamicLayerFillOptions.Add(MakeShared<EVertexMaskForgeLayerFill>(EVertexMaskForgeLayerFill::White));
 
-	// M16-K.6B; corrected M16-K.6D-6; extended M16-K.6D-8C-C, M16-K.6D-8D-C, M16-K.6D-8E-C, M16-K.6D-8F-C:
-	// element 0 is a VALID TSharedPtr to an UNSET TOptional (None/Unassigned) -- NOT a null TSharedPtr,
-	// which SListView's own row-generation loop unconditionally skips (see this array's own doc comment in
-	// SVertexMaskForgePanel.h for the confirmed root cause). MaterialSlot, BoundingBox (M16-K.6D-8B),
-	// DirectionalNormal (M16-K.6D-8D-B), Curvature (M16-K.6D-8E-B), and Noise (M16-K.6D-8F-C, displayed as
-	// "Noise/Grunge") are the only five generators offered -- every other EVertexMaskForgeGeneratorType
-	// value is deliberately NOT added here, since the orchestrator still rejects any other type outright.
+	// M16-K.6B; corrected M16-K.6D-6; extended M16-K.6D-8C-C, M16-K.6D-8D-C, M16-K.6D-8E-C, M16-K.6D-8F-C,
+	// M16-K.6D-8G-F: element 0 is a VALID TSharedPtr to an UNSET TOptional (None/Unassigned) -- NOT a null
+	// TSharedPtr, which SListView's own row-generation loop unconditionally skips (see this array's own doc
+	// comment in SVertexMaskForgePanel.h for the confirmed root cause). MaterialSlot, BoundingBox
+	// (M16-K.6D-8B), Ambient Occlusion (M16-K.6D-8G-F -- inserted immediately after Bounding Box, matching
+	// Legacy's own generator-library ordering; the other five generators' relative order is otherwise
+	// unchanged), DirectionalNormal (M16-K.6D-8D-B), Curvature (M16-K.6D-8E-B), and Noise (M16-K.6D-8F-C,
+	// displayed as "Noise/Grunge") are the only six generators offered -- every other
+	// EVertexMaskForgeGeneratorType value (Thickness) is deliberately NOT added here, since the
+	// orchestrator still rejects it outright.
 	DynamicLayerGeneratorTypeOptions.Add(MakeShared<TOptional<EVertexMaskForgeGeneratorType>>());
 	DynamicLayerGeneratorTypeOptions.Add(MakeShared<TOptional<EVertexMaskForgeGeneratorType>>(EVertexMaskForgeGeneratorType::MaterialSlot));
 	DynamicLayerGeneratorTypeOptions.Add(MakeShared<TOptional<EVertexMaskForgeGeneratorType>>(EVertexMaskForgeGeneratorType::BoundingBox));
+	DynamicLayerGeneratorTypeOptions.Add(MakeShared<TOptional<EVertexMaskForgeGeneratorType>>(EVertexMaskForgeGeneratorType::AmbientOcclusion));
 	DynamicLayerGeneratorTypeOptions.Add(MakeShared<TOptional<EVertexMaskForgeGeneratorType>>(EVertexMaskForgeGeneratorType::DirectionalNormal));
 	DynamicLayerGeneratorTypeOptions.Add(MakeShared<TOptional<EVertexMaskForgeGeneratorType>>(EVertexMaskForgeGeneratorType::Curvature));
 	DynamicLayerGeneratorTypeOptions.Add(MakeShared<TOptional<EVertexMaskForgeGeneratorType>>(EVertexMaskForgeGeneratorType::Noise));
