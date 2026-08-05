@@ -171,6 +171,134 @@ namespace
 		WorkingMesh.GeometryFingerprint = GeometryFingerprint;
 		return WorkingMesh;
 	}
+
+	// M16-K.6D-8H-E: a small, flat, upward-facing sample island (fan center at (0,0,10) -- CornerIndex 0)
+	// directly above a large, far downward-facing quad -- a clean, unambiguous, non-grazing center-ray HIT
+	// fixture (large target footprint, small sample footprint, so every ray lands well inside the target's
+	// interior, never near an edge or the quad's own diagonal split). Used to prove the M16-K.6D-8H-E
+	// production fallback integration leaves a successful Legacy center-ray result completely unchanged.
+	FVertexMaskForgeWorkingMesh BuildThicknessFallbackCenterHitWorkingMesh(const uint32 GeometryFingerprint)
+	{
+		FVertexMaskForgeWorkingMesh WorkingMesh;
+		WorkingMesh.Mesh = MakeUnique<UE::Geometry::FDynamicMesh3>();
+		UE::Geometry::FDynamicMesh3& Mesh = *WorkingMesh.Mesh;
+		Mesh.EnableAttributes();
+		UE::Geometry::FDynamicMeshNormalOverlay* NormalOverlay = Mesh.Attributes()->PrimaryNormals();
+		auto AddFlatTriangle = [&Mesh, NormalOverlay](int32 A, int32 B, int32 C)
+		{
+			const int32 TID = Mesh.AppendTriangle(A, B, C);
+			const FVector3d N = Mesh.GetTriNormal(TID);
+			const FVector3f Nf(N);
+			const int32 E0 = NormalOverlay->AppendElement(Nf);
+			const int32 E1 = NormalOverlay->AppendElement(Nf);
+			const int32 E2 = NormalOverlay->AppendElement(Nf);
+			NormalOverlay->SetTriangle(TID, UE::Geometry::FIndex3i(E0, E1, E2));
+		};
+
+		// Sample island: small flat quad at Z=10, fan center at (0.3, 0.7, 10) (deliberately off-axis, so the
+		// straight-down ray lands cleanly inside one specific triangle of the target quad below, never on its
+		// own diagonal split) -- CornerIndex 0.
+		{
+			const int32 VCenter = Mesh.AppendVertex(FVector3d(0.3, 0.7, 10.0));
+			const int32 V0 = Mesh.AppendVertex(FVector3d(-0.2, 0.2, 10.0));
+			const int32 V1 = Mesh.AppendVertex(FVector3d(0.8, 0.2, 10.0));
+			const int32 V2 = Mesh.AppendVertex(FVector3d(0.8, 1.2, 10.0));
+			const int32 V3 = Mesh.AppendVertex(FVector3d(-0.2, 1.2, 10.0));
+			AddFlatTriangle(VCenter, V1, V0);
+			AddFlatTriangle(VCenter, V2, V1);
+			AddFlatTriangle(VCenter, V3, V2);
+			AddFlatTriangle(VCenter, V0, V3);
+		}
+		// Target: large downward-facing quad at Z=0, X/Y in [-10,10] -- (0.3,0.7) is well inside its interior.
+		{
+			const int32 V0 = Mesh.AppendVertex(FVector3d(-10.0, -10.0, 0.0));
+			const int32 V1 = Mesh.AppendVertex(FVector3d(10.0, -10.0, 0.0));
+			const int32 V2 = Mesh.AppendVertex(FVector3d(10.0, 10.0, 0.0));
+			const int32 V3 = Mesh.AppendVertex(FVector3d(-10.0, 10.0, 0.0));
+			AddFlatTriangle(V0, V1, V2);
+			AddFlatTriangle(V0, V2, V3);
+		}
+		WorkingMesh.GeometryFingerprint = GeometryFingerprint;
+		return WorkingMesh;
+	}
+
+	// M16-K.6D-8H-E: reconstructs (independently -- never by including or modifying the retained diagnostic
+	// file) the exact geometry already validated by the retained investigation's 8H-C4/D1 checkpoints, AT the
+	// production fallback's own FIXED 30-degree cone angle. True target Thickness=5.0 (quad, Z=-3, X in
+	// [1,10], Y in [-10,10]); distractor Thickness=3.0 (up to 5 discrete square lobes at radius 1.5, Z=-1,
+	// azimuths 180/225/270/315/0 -- the same fixed order the retained diagnostic used); sample island (small
+	// flat fan, center at (0,0,2) -- CornerIndex 0). At Cone=30 the retained investigation already proved the
+	// exact recovery ladder this test exercises through the confidence gate: Coverage 0/1 -> Accept (median
+	// matches the true target); Coverage 2/3 -> Reject (conservative false negative / tie); Coverage 4/5 ->
+	// Reject (MisleadingRecovery correctly blocked).
+	FVertexMaskForgeWorkingMesh BuildThicknessFallbackCoverageWorkingMesh(const uint32 GeometryFingerprint, int32 CoverageParameter)
+	{
+		FVertexMaskForgeWorkingMesh WorkingMesh;
+		WorkingMesh.Mesh = MakeUnique<UE::Geometry::FDynamicMesh3>();
+		UE::Geometry::FDynamicMesh3& Mesh = *WorkingMesh.Mesh;
+		Mesh.EnableAttributes();
+		UE::Geometry::FDynamicMeshNormalOverlay* NormalOverlay = Mesh.Attributes()->PrimaryNormals();
+		auto AddFlatTriangle = [&Mesh, NormalOverlay](int32 A, int32 B, int32 C)
+		{
+			const int32 TID = Mesh.AppendTriangle(A, B, C);
+			const FVector3d N = Mesh.GetTriNormal(TID);
+			const FVector3f Nf(N);
+			const int32 E0 = NormalOverlay->AppendElement(Nf);
+			const int32 E1 = NormalOverlay->AppendElement(Nf);
+			const int32 E2 = NormalOverlay->AppendElement(Nf);
+			NormalOverlay->SetTriangle(TID, UE::Geometry::FIndex3i(E0, E1, E2));
+		};
+		auto AddSquareLobe = [&AddFlatTriangle, &Mesh](double CenterX, double CenterY, double Z, double HalfSize)
+		{
+			const int32 VCenter = Mesh.AppendVertex(FVector3d(CenterX, CenterY, Z));
+			auto CornerAt = [&](double AngleDegrees)
+			{
+				const double Rad = FMath::DegreesToRadians(AngleDegrees);
+				return Mesh.AppendVertex(FVector3d(CenterX + HalfSize * FMath::Cos(Rad), CenterY + HalfSize * FMath::Sin(Rad), Z));
+			};
+			const int32 V0 = CornerAt(22.5), V1 = CornerAt(112.5), V2 = CornerAt(202.5), V3 = CornerAt(292.5);
+			AddFlatTriangle(VCenter, V0, V1);
+			AddFlatTriangle(VCenter, V1, V2);
+			AddFlatTriangle(VCenter, V2, V3);
+			AddFlatTriangle(VCenter, V3, V0);
+		};
+
+		// Sample island: fan center at (0,0,2) -- CornerIndex 0.
+		{
+			const int32 VCenter = Mesh.AppendVertex(FVector3d(0.0, 0.0, 2.0));
+			const int32 V0 = Mesh.AppendVertex(FVector3d(-0.5, -0.5, 2.0));
+			const int32 V1 = Mesh.AppendVertex(FVector3d(0.5, -0.5, 2.0));
+			const int32 V2 = Mesh.AppendVertex(FVector3d(0.5, 0.5, 2.0));
+			const int32 V3 = Mesh.AppendVertex(FVector3d(-0.5, 0.5, 2.0));
+			AddFlatTriangle(VCenter, V1, V0);
+			AddFlatTriangle(VCenter, V2, V1);
+			AddFlatTriangle(VCenter, V3, V2);
+			AddFlatTriangle(VCenter, V0, V3);
+		}
+		// True target: Thickness=5.0 -- never touched by CoverageParameter.
+		{
+			const int32 V0 = Mesh.AppendVertex(FVector3d(1.0, -10.0, -3.0));
+			const int32 V1 = Mesh.AppendVertex(FVector3d(10.0, -10.0, -3.0));
+			const int32 V2 = Mesh.AppendVertex(FVector3d(10.0, 10.0, -3.0));
+			const int32 V3 = Mesh.AppendVertex(FVector3d(1.0, 10.0, -3.0));
+			AddFlatTriangle(V0, V1, V2);
+			AddFlatTriangle(V0, V2, V3);
+		}
+		// Distractor lobes: Thickness=3.0, up to CoverageParameter, fixed azimuth order {180,225,270,315,0}.
+		const double R = 1.5;
+		const double HalfSize = 0.4;
+		const TArray<FVector2D> LobeDirections = {
+			FVector2D(0.0, -1.0), FVector2D(-0.70710678, -0.70710678), FVector2D(-1.0, 0.0),
+			FVector2D(-0.70710678, 0.70710678), FVector2D(0.0, 1.0)
+		};
+		const int32 NumLobes = FMath::Clamp(CoverageParameter, 0, LobeDirections.Num());
+		for (int32 i = 0; i < NumLobes; ++i)
+		{
+			AddSquareLobe(LobeDirections[i].X * R, LobeDirections[i].Y * R, -1.0, HalfSize);
+		}
+		WorkingMesh.GeometryFingerprint = GeometryFingerprint;
+		return WorkingMesh;
+	}
 }
 
 // A. Geometric encapsulation: mutating GeneratorState (via the real generator entry points) never touches
@@ -1120,6 +1248,146 @@ bool FVertexMaskForgeWorkingMeshDomainSplitGeneratorCacheMatrixTest::RunTest(con
 		FVertexMaskForgeGeneratorState SiblingGeneratorState;
 		TestTrue(TEXT("Noise: sibling GeneratorState never touched by the calls above"), SiblingGeneratorState.NoiseRawCache.IsEmpty());
 		TestEqual(TEXT("Noise: sibling fingerprint stays at default"), SiblingGeneratorState.NoiseCacheFingerprint, (uint32)0);
+	}
+
+	return true;
+}
+
+// M16-K.6D-8H-E, item 1: a successful Legacy center-ray hit is returned COMPLETELY UNCHANGED by the
+// production integration -- BuildThicknessFallbackCenterHitWorkingMesh's straight-down ray from CornerIndex 0
+// travels EXACTLY 10 world units (biased origin at Z=9.99, hit at Z=0, MeasuredThickness=9.99+0.01=10.0
+// exactly), an analytically exact value with zero dependency on the fallback/gate code ever running. Item 2
+// (no secondary queries on a center hit) and item 12 (center hit costs exactly one query) are proven
+// STRUCTURALLY, not by instrumentation: ComputeThicknessValueWithFallback (VertexMaskForgeThicknessGenerator.cpp)
+// returns CenterResult immediately, at the top of the function, whenever CenterResult.bHasValue is true --
+// the fallback's ray-firing loop is unreachable code on that path, a compile-time/control-flow guarantee, not
+// a runtime measurement -- the same class of proof the retained 8H-D1 diagnostic used for its own "gate adds
+// zero ray queries" claim (there: the gate function's own signature takes only a TArray<double>, so it cannot
+// issue ray queries; here: an unconditional early return before the fallback's own ray-firing loop).
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeWorkingMeshDomainSplitThicknessFallbackCenterHitUnaffectedTest, "VertexMaskForge.WorkingMeshDomainSplit.ThicknessFallbackCenterHitUnaffected", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeWorkingMeshDomainSplitThicknessFallbackCenterHitUnaffectedTest::RunTest(const FString& Parameters)
+{
+	const FVertexMaskForgeWorkingMesh WorkingMesh = BuildThicknessFallbackCenterHitWorkingMesh(/*GeometryFingerprint=*/700);
+
+	TUniquePtr<FVertexMaskForgeSourceTopologyThicknessCache> CachePtr;
+	const FVertexMaskForgeScalarMask Mask = VertexMaskForgeThicknessGenerator::GenerateThicknessMaskFromDynamicMesh(
+		CachePtr, WorkingMesh, /*RawMinThickness=*/0.0f, /*RawMaxThickness=*/20.0f,
+		/*RawSearchDistance=*/100.0f, /*RawBias=*/0.01f, /*Blur=*/0.0f, /*bInvert=*/false);
+
+	TestTrue(TEXT("Thickness mask State == Ready"), Mask.State == EVertexMaskForgeScalarMaskState::Ready);
+	if (TestTrue(TEXT("CornerIndex 0 (sample island fan center) has a value -- center ray hit"), Mask.bHasValue.IsValidIndex(0) && Mask.bHasValue[0]))
+	{
+		// Expected RawMaskValue = 1 - Clamp((RawDistance-Min)/(Max-Min), 0, 1) = 1 - (10.0-0)/20 = 0.5 exactly.
+		TestEqual(TEXT("Corner 0 value == 0.5 exactly (RawDistance=10.0, Min=0, Max=20) -- unaffected by the fallback/gate"), Mask.Values[0], 0.5f, 1e-4f);
+	}
+
+	// Determinism: repeated calls against a fresh cache must reproduce the identical center-hit value.
+	TUniquePtr<FVertexMaskForgeSourceTopologyThicknessCache> RepeatCachePtr;
+	const FVertexMaskForgeScalarMask MaskRepeat = VertexMaskForgeThicknessGenerator::GenerateThicknessMaskFromDynamicMesh(
+		RepeatCachePtr, WorkingMesh, /*RawMinThickness=*/0.0f, /*RawMaxThickness=*/20.0f,
+		/*RawSearchDistance=*/100.0f, /*RawBias=*/0.01f, /*Blur=*/0.0f, /*bInvert=*/false);
+	if (TestTrue(TEXT("Repeat: CornerIndex 0 has a value"), MaskRepeat.bHasValue.IsValidIndex(0) && MaskRepeat.bHasValue[0]))
+	{
+		TestEqual(TEXT("Repeat call reproduces the identical center-hit value (determinism)"), MaskRepeat.Values[0], Mask.Values[0], 1e-6f);
+	}
+
+	return true;
+}
+
+// M16-K.6D-8H-E, items 3-10/13-16: the production conservative M9 fallback + fixed confidence gate, exercised
+// through the REAL production entry point (GenerateThicknessMaskFromDynamicMesh) against the same
+// Coverage-swept center-excluding fixture already validated by the retained 8H-C4/D1 diagnostic at Cone=30
+// (the production fallback's own fixed cone angle). CornerIndex 0 (the sample island's own fan center) is
+// the only corner asserted on; its center ray is proven to miss by construction (the fixture's true target
+// and distractor lobes are all placed OFF the center trajectory, mirroring the retained diagnostic's own
+// proof) at every Coverage level.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeWorkingMeshDomainSplitThicknessFallbackGateTest, "VertexMaskForge.WorkingMeshDomainSplit.ThicknessFallbackGate", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeWorkingMeshDomainSplitThicknessFallbackGateTest::RunTest(const FString& Parameters)
+{
+	const float Min = 0.0f, Max = 10.0f, Search = 100.0f, Bias = 0.01f;
+
+	auto RunOneCoverage = [&](int32 Coverage) -> FVertexMaskForgeScalarMask
+	{
+		const FVertexMaskForgeWorkingMesh WorkingMesh = BuildThicknessFallbackCoverageWorkingMesh(/*GeometryFingerprint=*/701, Coverage);
+		TUniquePtr<FVertexMaskForgeSourceTopologyThicknessCache> CachePtr;
+		return VertexMaskForgeThicknessGenerator::GenerateThicknessMaskFromDynamicMesh(
+			CachePtr, WorkingMesh, Min, Max, Search, Bias, /*Blur=*/0.0f, /*bInvert=*/false);
+	};
+
+	// Coverage 0 (3:0) and Coverage 1 (3:1): strong support -- the gate accepts, recovering the true target's
+	// own Thickness=5.0 (RawMaskValue = 1 - (5.0-0)/10 = 0.5 exactly).
+	for (const int32 Coverage : { 0, 1 })
+	{
+		const FVertexMaskForgeScalarMask Mask = RunOneCoverage(Coverage);
+		TestTrue(*FString::Printf(TEXT("[Coverage=%d] Mask State == Ready"), Coverage), Mask.State == EVertexMaskForgeScalarMaskState::Ready);
+		if (TestTrue(*FString::Printf(TEXT("[Coverage=%d] CornerIndex 0 recovered a value (gate Accept)"), Coverage),
+			Mask.bHasValue.IsValidIndex(0) && Mask.bHasValue[0]))
+		{
+			TestEqual(*FString::Printf(TEXT("[Coverage=%d] Recovered value == 0.5 (true target Thickness=5.0)"), Coverage), Mask.Values[0], 0.5f, 1e-3f);
+		}
+	}
+
+	// Coverage 2 (3:2), Coverage 3 (3:3 tie): the gate conservatively rejects -- CornerIndex 0 preserves the
+	// existing center-miss/no-hit output (bHasValue stays false), never a fabricated or substituted value.
+	for (const int32 Coverage : { 2, 3 })
+	{
+		const FVertexMaskForgeScalarMask Mask = RunOneCoverage(Coverage);
+		TestTrue(*FString::Printf(TEXT("[Coverage=%d] Mask State == Ready"), Coverage), Mask.State == EVertexMaskForgeScalarMaskState::Ready);
+		if (Mask.bHasValue.IsValidIndex(0))
+		{
+			TestFalse(*FString::Printf(TEXT("[Coverage=%d] CornerIndex 0 has NO value -- gate conservatively rejects, existing no-hit output preserved"), Coverage), Mask.bHasValue[0]);
+		}
+	}
+
+	// Coverage 4 (3:4) and Coverage 5 (3:5): the exact MisleadingRecovery majority demonstrated by the
+	// retained C4 diagnostic -- the gate must reject it, using the existing no-hit output, never the
+	// distractor's own Thickness=3.0.
+	for (const int32 Coverage : { 4, 5 })
+	{
+		const FVertexMaskForgeScalarMask Mask = RunOneCoverage(Coverage);
+		TestTrue(*FString::Printf(TEXT("[Coverage=%d] Mask State == Ready"), Coverage), Mask.State == EVertexMaskForgeScalarMaskState::Ready);
+		if (Mask.bHasValue.IsValidIndex(0))
+		{
+			TestFalse(*FString::Printf(TEXT("[Coverage=%d] CornerIndex 0 has NO value -- MisleadingRecovery rejected by the gate, never the distractor's Thickness=3.0"), Coverage), Mask.bHasValue[0]);
+		}
+	}
+
+	// Determinism (3x) on the two most decision-critical configurations: strong accept (Coverage=1) and
+	// rejected MisleadingRecovery (Coverage=4).
+	for (const int32 Coverage : { 1, 4 })
+	{
+		const FVertexMaskForgeScalarMask Run1 = RunOneCoverage(Coverage);
+		const FVertexMaskForgeScalarMask Run2 = RunOneCoverage(Coverage);
+		const FVertexMaskForgeScalarMask Run3 = RunOneCoverage(Coverage);
+		const bool bHasValueIdentical = Run1.bHasValue.IsValidIndex(0) && Run2.bHasValue.IsValidIndex(0) && Run3.bHasValue.IsValidIndex(0)
+			&& (Run1.bHasValue[0] == Run2.bHasValue[0]) && (Run1.bHasValue[0] == Run3.bHasValue[0]);
+		TestTrue(*FString::Printf(TEXT("[Coverage=%d] bHasValue[0] identical across 3 runs"), Coverage), bHasValueIdentical);
+		if (bHasValueIdentical && Run1.bHasValue[0])
+		{
+			TestEqual(*FString::Printf(TEXT("[Coverage=%d] Value[0] identical across 3 runs (run1 vs run2)"), Coverage), Run1.Values[0], Run2.Values[0], 1e-6f);
+			TestEqual(*FString::Printf(TEXT("[Coverage=%d] Value[0] identical across 3 runs (run1 vs run3)"), Coverage), Run1.Values[0], Run3.Values[0], 1e-6f);
+		}
+	}
+
+	// Search Distance: every secondary ray uses the SAME RayMaxDistance as the center ray (see
+	// ComputeThicknessValueWithFallback, which passes the caller's own RayMaxDistance through unchanged to
+	// FireThicknessRayRaw for every ring direction) -- a real, otherwise-unreachable Search Distance violation
+	// would surface as an accepted value inconsistent with the fixture's own known Thickness values (5.0/3.0),
+	// which every branch above already checks. A deliberately tiny Search Distance (shorter than even the
+	// true target's own Thickness=5.0) must therefore leave CornerIndex 0 without a value at every Coverage.
+	{
+		// NOTE: SanitizeThicknessParams (VertexMaskForgeThicknessGenerator.cpp) enforces Search >= Max by
+		// construction (Search = Max3(Search, Max, ...)) -- Max itself must also be lowered below the true
+		// target's Thickness=5.0, or the sanitizer would silently raise Search back up past it.
+		const FVertexMaskForgeWorkingMesh WorkingMesh = BuildThicknessFallbackCoverageWorkingMesh(/*GeometryFingerprint=*/701, /*CoverageParameter=*/1);
+		TUniquePtr<FVertexMaskForgeSourceTopologyThicknessCache> CachePtr;
+		const FVertexMaskForgeScalarMask Mask = VertexMaskForgeThicknessGenerator::GenerateThicknessMaskFromDynamicMesh(
+			CachePtr, WorkingMesh, /*RawMinThickness=*/0.0f, /*RawMaxThickness=*/2.0f, /*RawSearchDistance=*/2.0f, Bias, /*Blur=*/0.0f, /*bInvert=*/false);
+		TestTrue(TEXT("[ShortSearchDistance] Mask State == Ready"), Mask.State == EVertexMaskForgeScalarMaskState::Ready);
+		if (Mask.bHasValue.IsValidIndex(0))
+		{
+			TestFalse(TEXT("[ShortSearchDistance=2.0, Max=2.0] CornerIndex 0 has NO value -- both center and every secondary ray correctly respect the same shortened Search Distance"), Mask.bHasValue[0]);
+		}
 	}
 
 	return true;

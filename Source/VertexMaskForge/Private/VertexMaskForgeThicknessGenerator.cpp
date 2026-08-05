@@ -120,19 +120,20 @@ namespace
 		int32 NumOrientationRejectedCandidates = 0;
 	};
 
+	/** Raw result of firing a single ray (any direction) through the shared candidate-acceptance policy --
+	 *  extracted from the original single-direction ComputeThicknessRawValue (M16-K.6D-8H-E) so the SAME
+	 *  hit-search/orientation logic can be reused both for the Legacy center ray and for the conservative
+	 *  fallback's secondary cone rays, with zero behavioral change to the center-ray path (verified by the
+	 *  retained 45-test diagnostic and the existing generator/cache tests continuing to pass unmodified). */
+	struct FThicknessRawHit
+	{
+		bool bHit = false;
+		double Distance = 0.0;
+		int32 TriangleId = INDEX_NONE;
+		int32 NumOrientationRejectedCandidates = 0;
+	};
+
 	/**
-	 * Core Thickness raycast (V2-G), shared verbatim by both non-Nanite and Source-Topology domains --
-	 * both operate on a plain UE::Geometry::FDynamicMesh3+FDynamicMeshAABBTree3, so this function has no
-	 * domain-specific logic at all.
-	 *
-	 * SELF-HIT (corrective audit, closes the "HitT stays pinned near Bias" bug): Origin is offset INSIDE
-	 * the mesh (P - N*EffectiveBias, not +N*EffectiveBias -- offsetting outward makes the ray immediately
-	 * re-strike its own origin face at t~=Bias, independent of the true opposite-wall distance), and
-	 * every triangle incident to any vertex sharing Origin's exact position (ExcludedTriangleIDs, from
-	 * BuildThicknessIncidentTriangleExclusion) is excluded via TriangleFilterF -- not just the single
-	 * source triangle, since a wedge/hard-edge corner touches several triangles at that exact point that
-	 * could each produce a spurious near-zero hit even with the inward offset.
-	 *
 	 * HITS: FindAllHitTriangles (not FindNearestHitTriangle) within RayMaxDistance, sorted by Distance
 	 * ascending then TriangleId ascending (deterministic tie-break), so the search continues past a
 	 * rejected candidate to the next -- a self-intersecting or wrong-orientation hit can never hide a
@@ -141,33 +142,19 @@ namespace
 	 * ORIENTATION: Dot(HitGeometricNormal, RayDirection) > OrientationEpsilon -- HitGeometricNormal is
 	 * Mesh.GetTriNormal(HitTriangleId), the TRIANGLE's geometric normal, never an interpolated/tangent-
 	 * space/overlay normal. A hit failing this increments NumOrientationRejectedCandidates and the search
-	 * continues -- it never contaminates MeasuredThickness.
-	 *
-	 * MEASUREMENT: MeasuredThickness = HitT + EffectiveBias -- reconstructs the segment skipped by the
-	 * inward offset. EffectiveBias never appears anywhere else; it cannot artistically shift the result.
+	 * continues -- it never contaminates the result.
 	 */
-	FThicknessRaycastResult ComputeThicknessRawValue(
+	FThicknessRawHit FireThicknessRayRaw(
 		const UE::Geometry::FDynamicMesh3& Mesh,
 		const UE::Geometry::FDynamicMeshAABBTree3& Tree,
-		const FVector3d& OriginSurfacePosition,
-		const FVector3d& OriginNormal,
-		const double EffectiveBias,
+		const FVector3d& Origin,
+		const FVector3d& Direction,
 		const double RayMaxDistance,
 		const TArray<int32>& ExcludedTriangleIDs)
 	{
 		using namespace UE::Geometry;
 
-		FThicknessRaycastResult Result;
-
-		FVector3d N = OriginNormal;
-		if (N.ContainsNaN() || N.IsNearlyZero() || !N.Normalize())
-		{
-			Result.bOriginNormalInvalid = true;
-			return Result;
-		}
-
-		const FVector3d Origin = OriginSurfacePosition - N * EffectiveBias;
-		const FVector3d Direction = -N;
+		FThicknessRawHit Result;
 		const FRay3d Ray(Origin, Direction, /*bDirectionIsNormalized=*/true);
 
 		IMeshSpatial::FQueryOptions Options;
@@ -180,7 +167,7 @@ namespace
 		TArray<MeshIntersection::FHitIntersectionResult> Hits;
 		if (!Tree.FindAllHitTriangles(Ray, Hits, Options) || Hits.IsEmpty())
 		{
-			return Result;   // no hit within RayMaxDistance -- bHasValue stays false
+			return Result;   // no hit within RayMaxDistance -- bHit stays false
 		}
 
 		Hits.Sort([](const MeshIntersection::FHitIntersectionResult& A, const MeshIntersection::FHitIntersectionResult& B)
@@ -207,12 +194,213 @@ namespace
 				continue;
 			}
 
-			Result.bHasValue = true;
-			Result.MeasuredThickness = static_cast<float>(Hit.Distance + EffectiveBias);
+			Result.bHit = true;
+			Result.Distance = Hit.Distance;
+			Result.TriangleId = Hit.TriangleId;
 			return Result;
 		}
 
-		return Result;   // every candidate rejected (orientation) -- bHasValue stays false
+		return Result;   // every candidate rejected (orientation) -- bHit stays false
+	}
+
+	/**
+	 * Core Thickness raycast (V2-G), shared verbatim by both non-Nanite and Source-Topology domains --
+	 * both operate on a plain UE::Geometry::FDynamicMesh3+FDynamicMeshAABBTree3, so this function has no
+	 * domain-specific logic at all. Unchanged behavior from before M16-K.6D-8H-E: this is exactly the
+	 * Legacy single center-ray path (Direction=-N), now expressed via the shared FireThicknessRayRaw.
+	 *
+	 * SELF-HIT (corrective audit, closes the "HitT stays pinned near Bias" bug): Origin is offset INSIDE
+	 * the mesh (P - N*EffectiveBias, not +N*EffectiveBias -- offsetting outward makes the ray immediately
+	 * re-strike its own origin face at t~=Bias, independent of the true opposite-wall distance), and
+	 * every triangle incident to any vertex sharing Origin's exact position (ExcludedTriangleIDs, from
+	 * BuildThicknessIncidentTriangleExclusion) is excluded via TriangleFilterF -- not just the single
+	 * source triangle, since a wedge/hard-edge corner touches several triangles at that exact point that
+	 * could each produce a spurious near-zero hit even with the inward offset.
+	 *
+	 * MEASUREMENT: MeasuredThickness = HitT + EffectiveBias -- reconstructs the segment skipped by the
+	 * inward offset. EffectiveBias never appears anywhere else; it cannot artistically shift the result.
+	 */
+	FThicknessRaycastResult ComputeThicknessRawValue(
+		const UE::Geometry::FDynamicMesh3& Mesh,
+		const UE::Geometry::FDynamicMeshAABBTree3& Tree,
+		const FVector3d& OriginSurfacePosition,
+		const FVector3d& OriginNormal,
+		const double EffectiveBias,
+		const double RayMaxDistance,
+		const TArray<int32>& ExcludedTriangleIDs)
+	{
+		FThicknessRaycastResult Result;
+
+		FVector3d N = OriginNormal;
+		if (N.ContainsNaN() || N.IsNearlyZero() || !N.Normalize())
+		{
+			Result.bOriginNormalInvalid = true;
+			return Result;
+		}
+
+		const FVector3d Origin = OriginSurfacePosition - N * EffectiveBias;
+		const FVector3d Direction = -N;
+		const FThicknessRawHit Hit = FireThicknessRayRaw(Mesh, Tree, Origin, Direction, RayMaxDistance, ExcludedTriangleIDs);
+		Result.NumOrientationRejectedCandidates = Hit.NumOrientationRejectedCandidates;
+		if (Hit.bHit)
+		{
+			Result.bHasValue = true;
+			Result.MeasuredThickness = static_cast<float>(Hit.Distance + EffectiveBias);
+		}
+		return Result;
+	}
+
+	// --- Conservative M9 fallback + fixed confidence gate (M16-K.6D-8H-E) ---------------------------
+	//
+	// Ported from the retained, test-only investigation (checkpoints 8H-B..D1) with NO redesign: same
+	// deterministic tangent basis, same ring-ray directions/ordering, same projected-distance formula, same
+	// pure median, same fixed confidence-gate contract and thresholds. Runs ONLY when the Legacy center ray
+	// (ComputeThicknessRawValue above) misses with a VALID origin normal -- a center hit is returned
+	// completely unchanged, at the existing cost of exactly one ray query; an invalid origin normal still
+	// short-circuits before any ray is fired, exactly as before (nothing to build a cone from).
+	//
+	// This is a heuristic, conservative RECOVERY mechanism, not a guarantee that a coherent consensus
+	// belongs to the semantically intended surface (see 8H-D1's own [3,3,3] limit case) -- gate rejection
+	// preserves the EXACT existing center-miss/no-hit output, never fabricates or substitutes a value.
+
+	constexpr double ThicknessFallbackConeAngleDegrees = 30.0;
+	constexpr int32 ThicknessFallbackNumSecondaryRays = 8;
+	constexpr double ThicknessFallbackSupportTolerance = 1e-4;
+
+	/** Deterministic tangent basis (ported verbatim from BuildDeterministicTangentBasis_TestOnly, 8H-C4). */
+	void BuildThicknessFallbackTangentBasis(const FVector3d& Dir, FVector3d& OutTangent, FVector3d& OutBitangent)
+	{
+		FVector3d Reference(0, 0, 1);
+		if (FMath::Abs(FVector3d::DotProduct(Dir, Reference)) > 0.99)
+		{
+			Reference = FVector3d(1, 0, 0);
+		}
+		OutTangent = FVector3d::CrossProduct(Reference, Dir).GetSafeNormal();
+		OutBitangent = FVector3d::CrossProduct(Dir, OutTangent).GetSafeNormal();
+	}
+
+	/** Deterministic ring-ray directions (ported verbatim from BuildRingRayDirections_TestOnly, 8H-C4). */
+	TArray<FVector3d> BuildThicknessFallbackRingDirections(const FVector3d& CenterDir, double ConeAngleDegrees, int32 NumRingRays)
+	{
+		TArray<FVector3d> Result;
+		if (NumRingRays <= 0 || ConeAngleDegrees <= 0.0) { return Result; }
+		FVector3d Tangent, Bitangent;
+		BuildThicknessFallbackTangentBasis(CenterDir, Tangent, Bitangent);
+		const double ThetaRad = FMath::DegreesToRadians(ConeAngleDegrees);
+		const double CosTheta = FMath::Cos(ThetaRad), SinTheta = FMath::Sin(ThetaRad);
+		for (int32 i = 0; i < NumRingRays; ++i)
+		{
+			const double Phi = (2.0 * PI * i) / NumRingRays;
+			const FVector3d Dir = (CenterDir * CosTheta) + (Tangent * FMath::Cos(Phi) + Bitangent * FMath::Sin(Phi)) * SinTheta;
+			Result.Add(Dir.GetSafeNormal());
+		}
+		return Result;
+	}
+
+	/** One scalar-equivalence group (ported verbatim from FSupportGroup/GroupBySupport_TestOnly, 8H-D1). */
+	struct FThicknessSupportGroup { double Value; int32 Count; };
+
+	TArray<FThicknessSupportGroup> GroupThicknessValuesBySupport(const TArray<double>& Values, double Tolerance)
+	{
+		TArray<FThicknessSupportGroup> Groups;
+		for (const double V : Values)
+		{
+			bool bFound = false;
+			for (FThicknessSupportGroup& G : Groups)
+			{
+				if (FMath::IsNearlyEqual(G.Value, V, Tolerance)) { ++G.Count; bFound = true; break; }
+			}
+			if (!bFound) { Groups.Add(FThicknessSupportGroup{ V, 1 }); }
+		}
+		return Groups;
+	}
+
+	/** Fixed Median-Support Confidence Gate (ported verbatim from EvaluateFixedMedianSupportConfidenceGate_TestOnly,
+	 *  8H-D1). Thresholds are fixed backend policy, not exposed in UI, and were never tuned against this
+	 *  checkpoint's own results. Depends only on the scalar projected-distance values -- never on triangle
+	 *  IDs, surface-family labels, expected thickness, or any other semantic/mesh-specific knowledge. */
+	bool EvaluateThicknessFallbackConfidenceGate(const TArray<double>& SortedValidValues, double& OutMedianValue)
+	{
+		OutMedianValue = 0.0;
+		const int32 ValidValueCount = SortedValidValues.Num();
+		if (ValidValueCount == 0) { return false; }
+
+		OutMedianValue = SortedValidValues[ValidValueCount / 2];
+
+		const TArray<FThicknessSupportGroup> Groups = GroupThicknessValuesBySupport(SortedValidValues, ThicknessFallbackSupportTolerance);
+		int32 MedianSupportCount = 0, RunnerUpSupportCount = 0;
+		for (const FThicknessSupportGroup& G : Groups)
+		{
+			if (FMath::IsNearlyEqual(G.Value, OutMedianValue, ThicknessFallbackSupportTolerance)) { MedianSupportCount = G.Count; }
+			else { RunnerUpSupportCount = FMath::Max(RunnerUpSupportCount, G.Count); }
+		}
+		const double Confidence = static_cast<double>(MedianSupportCount) / static_cast<double>(ValidValueCount);
+		const int32 SupportLead = MedianSupportCount - RunnerUpSupportCount;
+
+		constexpr double TwoThirds = 2.0 / 3.0;
+		const bool bConfidenceOK = (Confidence > TwoThirds) || FMath::IsNearlyEqual(Confidence, TwoThirds, 1e-9);
+		return (ValidValueCount >= 3) && (MedianSupportCount >= 3) && bConfidenceOK && (SupportLead >= 2);
+	}
+
+	/**
+	 * Conservative M9 fallback wrapper (M16-K.6D-8H-E). Center ray behavior is completely unchanged: on a
+	 * center hit, this returns ComputeThicknessRawValue's own result verbatim, at the existing 1-query cost.
+	 * Only on a center miss WITH a valid origin normal does it fire the 8 secondary cone rays (30 degree
+	 * half-angle, same origin/bias/exclusion/Search Distance semantics as the center ray) and apply the
+	 * fixed confidence gate to their pure median. Gate acceptance returns a recovered value (bHasValue=true,
+	 * MeasuredThickness=median); gate rejection (or center bOriginNormalInvalid, or center orientation-only
+	 * miss with insufficient secondary support) returns the EXACT SAME miss result ComputeThicknessRawValue
+	 * would have produced -- never a fabricated or substituted value.
+	 */
+	FThicknessRaycastResult ComputeThicknessValueWithFallback(
+		const UE::Geometry::FDynamicMesh3& Mesh,
+		const UE::Geometry::FDynamicMeshAABBTree3& Tree,
+		const FVector3d& OriginSurfacePosition,
+		const FVector3d& OriginNormal,
+		const double EffectiveBias,
+		const double RayMaxDistance,
+		const TArray<int32>& ExcludedTriangleIDs)
+	{
+		const FThicknessRaycastResult CenterResult = ComputeThicknessRawValue(
+			Mesh, Tree, OriginSurfacePosition, OriginNormal, EffectiveBias, RayMaxDistance, ExcludedTriangleIDs);
+
+		if (CenterResult.bHasValue || CenterResult.bOriginNormalInvalid)
+		{
+			return CenterResult;   // center hit: unchanged, 1 query. Invalid normal: nothing to build a cone from.
+		}
+
+		FVector3d N = OriginNormal;
+		N.Normalize();   // already proven valid (non-NaN, non-zero) by CenterResult.bOriginNormalInvalid==false above
+		const FVector3d CenterDir = -N;
+		const FVector3d BiasedOrigin = OriginSurfacePosition - N * EffectiveBias;
+
+		const TArray<FVector3d> RingDirs = BuildThicknessFallbackRingDirections(CenterDir, ThicknessFallbackConeAngleDegrees, ThicknessFallbackNumSecondaryRays);
+		TArray<double> ValidProjectedDistances;
+		ValidProjectedDistances.Reserve(RingDirs.Num());
+		for (const FVector3d& RingDir : RingDirs)
+		{
+			const FThicknessRawHit Hit = FireThicknessRayRaw(Mesh, Tree, BiasedOrigin, RingDir, RayMaxDistance, ExcludedTriangleIDs);
+			if (Hit.bHit)
+			{
+				// Validated projected-distance formula (8H-C report): the Bias restoration term is required
+				// because the biased origin is offset along CenterDir, never along the (possibly oblique)
+				// ring ray's own direction.
+				const double ProjectedDistance = Hit.Distance * FVector3d::DotProduct(RingDir, CenterDir) + EffectiveBias;
+				ValidProjectedDistances.Add(ProjectedDistance);
+			}
+		}
+		ValidProjectedDistances.Sort();
+
+		double MedianValue = 0.0;
+		if (EvaluateThicknessFallbackConfidenceGate(ValidProjectedDistances, MedianValue))
+		{
+			FThicknessRaycastResult FallbackResult = CenterResult;   // preserves bOriginNormalInvalid=false, NumOrientationRejectedCandidates from the center query
+			FallbackResult.bHasValue = true;
+			FallbackResult.MeasuredThickness = static_cast<float>(MedianValue);
+			return FallbackResult;
+		}
+
+		return CenterResult;   // gate rejected (or insufficient/no secondary hits): exact existing miss output, never fabricated
 	}
 
 	/** Effective (post-sanitization) Thickness parameters, always in double -- see SanitizeThicknessParams. */
@@ -460,7 +648,7 @@ namespace VertexMaskForgeThicknessGenerator
 				}
 
 				const TArray<int32> Excluded = BuildThicknessIncidentTriangleExclusion(LocalMesh, Buckets, i);
-				const FThicknessRaycastResult RaycastResult = ComputeThicknessRawValue(
+				const FThicknessRaycastResult RaycastResult = ComputeThicknessValueWithFallback(
 					LocalMesh, Tree, FVector3d(Cache.SnapshotPositions[i]), FVector3d(TangentZ),
 					Params.Bias, Params.RayMaxDistance, Excluded);
 
@@ -668,7 +856,7 @@ namespace VertexMaskForgeThicknessGenerator
 					const int32 OriginLocalVertexID = VertexIdToLocalIndex[VertTri[Corner]];
 
 					const TArray<int32> Excluded = BuildThicknessIncidentTriangleExclusion(LocalMesh, Buckets, OriginLocalVertexID);
-					const FThicknessRaycastResult RaycastResult = ComputeThicknessRawValue(
+					const FThicknessRaycastResult RaycastResult = ComputeThicknessValueWithFallback(
 						LocalMesh, Tree, Origin, FVector3d(LocalNormal3f), Params.Bias, Params.RayMaxDistance, Excluded);
 
 					if (RaycastResult.bOriginNormalInvalid)
