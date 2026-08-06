@@ -90,23 +90,30 @@ enum class EVertexMaskForgeOperationState : uint8
 };
 
 /**
- * M16-K.6D-1: which pipeline's semantically composed colors the preview currently shows -- Legacy
- * (the fixed 7-generator `GeneratorState`/`GeneratorLayerOrder` path, feeding `WorkingColors`) or
- * Dynamic (`FVertexMaskForgeDynamicLayerStack`'s composition, via the M16-K.6D-4 orchestrator, as of
- * M16-K.6D-5). This answers exactly one question: which pipeline's output is shown. It is not
- * Preview Mode (a display-only reduction of whichever pipeline's output is already selected -- see
- * EVertexMaskForgePreviewMode), not Channel Filter, not an inference from Dynamic layer/assignment/
- * result-store existence, not tab/section expansion state, and not the last-edited control. See
- * ADR-011 (Docs/VertexMaskForgeDecisionLog.md) for the full contract this enum codifies.
+ * M18 (TECHNICAL DEBT, retained deliberately -- see the checkpoint's own architecture audit): before
+ * this checkpoint, this answered "which pipeline's semantically composed colors does the preview show
+ * -- the old fixed 7-generator Legacy pipeline, or the newer Dynamic Layers one." Layers is now the
+ * SOLE artist-facing workflow: the Legacy generator UI and the Legacy/Dynamic selector widget were both
+ * removed, `SVertexMaskForgePanel::PreviewSource` now defaults to (and can never be set away from)
+ * `Dynamic`, and every OTHER production read of this enum (OnDynamicLayerStackMutated,
+ * RecomputeOperationState, AcceptPendingChanges) was collapsed to its unconditional Layers-only body
+ * during the same checkpoint. The single remaining read, deep inside `ApplyPreviewToEntry`'s
+ * Source-Topology branch, was intentionally NOT collapsed -- the Legacy composition code it guards is a
+ * large (~340 line), deeply nested, dual-domain block sharing indentation/scope with render-vertex-only
+ * Legacy logic below it; removing it safely would require a broader, higher-risk restructuring of that
+ * one function than this UI-consolidation checkpoint's own scope justifies. That Legacy branch is
+ * PROVABLY UNREACHABLE today: `PreviewSource` has no remaining write site anywhere in production code
+ * (its own combo box and change handler were deleted), so the guarding `if (PreviewSource == Dynamic)`
+ * is always true. Retained here as documented dead code behind a permanently-true condition, not as a
+ * second live workflow -- removing it outright remains valid, lower-risk future cleanup.
  */
 enum class EVertexMaskForgePreviewSource : uint8
 {
-	/** The fixed 7-generator pipeline. Default -- see SVertexMaskForgePanel::PreviewSource. */
+	/** Dead since M18 -- no write site reaches this value anymore; kept only so the enum's shape (and
+	 *  the unreachable Legacy composition branch it still guards in ApplyPreviewToEntry) compiles. */
 	Legacy,
 
-	/** FVertexMaskForgeDynamicLayerStack's composition, presentation-only (M16-K.6D-5) -- see
-	 *  SVertexMaskForgePanel::PreviewSource's own doc comment for the exact wiring and isolation
-	 *  contract. Selecting this value never makes the Dynamic result Accept-eligible. */
+	/** The only value ever assigned, from SVertexMaskForgePanel::PreviewSource's own default onward. */
 	Dynamic,
 };
 
@@ -862,10 +869,6 @@ private:
 	 *  normal discrete-parameter path so the composed Preview picks up the new Values immediately. */
 	void OnAOInvertChanged(ECheckBoxState NewState);
 
-	/** Describes which layer(s) currently participate in the composition stack -- e.g. "Bounding Box +
-	 *  Ambient Occlusion", "Bounding Box only", "Ambient Occlusion only", "None". */
-	FText GetActiveMaskSourceText() const;
-
 	TSharedRef<SWidget> OnGenerateAOBlendModeRow(TSharedPtr<EVertexMaskForgeBlendMode> InOption) const;
 
 	/** Pure composition -- same treatment as OnBlendModeSelectionChanged (Bounding Box's own Blend
@@ -1406,30 +1409,10 @@ private:
 	 *  valid) -- e.g. no opposite surface found, degenerate geometry, Source-Topology mapping invalid. */
 	FText GetThicknessMaskDiagnosticText() const;
 
-	// --- Fill White / Fill Black utility masks ----------------------------------------------
-
-	FReply OnFillWhiteClicked();
-	FReply OnFillBlackClicked();
-
-	/**
-	 * Shared implementation for both Fill buttons: cancels any pending live-update debounce first (a
-	 * Fill must never be overwritten moments later by a stale regeneration), then, for every
-	 * SelectedMeshes entry that passes the SAME entry-level validity gating as live generation
-	 * (WorkingMesh Ready, resolvable Static Mesh, valid LOD 0 render data), generates a dense
-	 * constant-valued mask (VertexMaskForgePanel::GenerateConstantMask) and assigns it to that
-	 * entry's mask. An entry that fails validation here is left COMPLETELY UNTOUCHED (its previous
-	 * mask, if any, is preserved) rather than reset to Unavailable -- per the explicit "preserve the
-	 * last valid Preview on failure" requirement. Ends with UpdateAllPreviews(), which recomposes/
-	 * reapplies the transient Preview (reusing the exact same ApplyPreviewToEntry/UpdateWorkingColors
-	 * path as every other mask) and marks Pending Changes via RecomputeOperationState(). Fill White/
-	 * Black are explicit, standalone actions on the current base -- they are never required to make a
-	 * live parameter change visible, and never repair/resize any buffer that live generation itself
-	 * should already have prepared.
-	 */
-	void RunConstantFill(float ConstantValue, EVertexMaskForgeScalarMaskSource Source, const FText& SuccessMessage);
-
-	/** Enabled only when at least one selected entry has a Ready working mesh, and not while Applying. */
-	bool CanRunFill() const;
+	// M18: the old Fill White/Fill Black global utility-mask buttons (OnFillWhiteClicked/
+	// OnFillBlackClicked/RunConstantFill/CanRunFill) were removed -- they belonged to the Legacy
+	// workflow (RunConstantFill wrote into Entry->GeneratorState, never read by Layers composition).
+	// Per-layer Fill Value remains, unaffected.
 
 	FText GetMaskActionStatusText() const { return LastMaskActionStatusText; }
 
@@ -1505,42 +1488,29 @@ private:
 	 */
 	bool bUseUnifiedBounds = false;
 
-	// --- Preview (Preview Mode + Channel Filter) --------------------------------------------
+	// --- Preview (Preview Mode) --------------------------------------------------------------
+	// M18: the Legacy/Dynamic Preview Source combo (OnGeneratePreviewSourceRow/
+	// OnPreviewSourceSelectionChanged/GetPreviewSourceButtonText) and the global Channel Filter
+	// (GetChannelFilterR/G/BState/OnChannelFilterR/G/BChanged) were removed -- Layers is the sole
+	// workflow (see EVertexMaskForgePreviewSource's own doc comment), and per-layer R/G/B channel
+	// controls replace the global filter. Preview Mode remains.
 
 	TSharedRef<SWidget> OnGeneratePreviewModeRow(TSharedPtr<EVertexMaskForgePreviewMode> InOption) const;
 	void OnPreviewModeSelectionChanged(TSharedPtr<EVertexMaskForgePreviewMode> NewSelection, ESelectInfo::Type SelectInfo);
 	FText GetPreviewModeButtonText() const;
 
-	/**
-	 * M16-K.6D-5: the minimal Preview Source control -- Legacy/Dynamic, mirroring the Preview Mode
-	 * combo's own shape exactly (OnGenerateWidget/OnSelectionChanged/button-text triple). Selecting a
-	 * new value writes PreviewSource (the sole authority -- see its own doc comment) and immediately
-	 * requests a refresh via RecomposeWorkingColors(), exactly like every other compositional control
-	 * in this panel.
-	 */
-	TSharedRef<SWidget> OnGeneratePreviewSourceRow(TSharedPtr<EVertexMaskForgePreviewSource> InOption) const;
-	void OnPreviewSourceSelectionChanged(TSharedPtr<EVertexMaskForgePreviewSource> NewSelection, ESelectInfo::Type SelectInfo);
-	FText GetPreviewSourceButtonText() const;
-
-	ECheckBoxState GetChannelFilterRState() const { return bChannelFilterR ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; }
-	void OnChannelFilterRChanged(ECheckBoxState NewState);
-	ECheckBoxState GetChannelFilterGState() const { return bChannelFilterG ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; }
-	void OnChannelFilterGChanged(ECheckBoxState NewState);
-	ECheckBoxState GetChannelFilterBState() const { return bChannelFilterB ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; }
-	void OnChannelFilterBChanged(ECheckBoxState NewState);
-
 	FText GetPreviewStatusText() const;
 
 	/**
 	 * Applies or restores preview visualization for every selected entry, based on the current
-	 * CurrentPreviewMode / Channel Filter / each entry's BoundingBoxMask state. Idempotent and
-	 * side-effect-free with respect to the mask itself -- never generates or invalidates it.
+	 * CurrentPreviewMode and each entry's layer-stack composition. Idempotent and side-effect-free
+	 * with respect to the mask itself -- never generates or invalidates it.
 	 *
-	 * bCommit (audited, Channel Filter toggle fix): forwarded unchanged to ApplyPreviewToEntry /
-	 * UpdateWorkingColors -- true ONLY for an explicit Fill White/Black action (promotes the
-	 * freshly-composed WorkingColors to CommittedColors); false for every other trigger (live
-	 * regeneration, Channel Filter toggle, Preview Mode change, RefreshSelection, mask invalidation)
-	 * so none of those can silently consolidate a transient edit. See
+	 * bCommit: forwarded unchanged to ApplyPreviewToEntry / UpdateWorkingColors -- true only when a
+	 * caller explicitly wants to promote the freshly-composed WorkingColors to CommittedColors (the
+	 * Fill White/Black global actions that used this are gone, M18); false for every live-regeneration
+	 * trigger (parameter change, Preview Mode change, RefreshSelection, mask invalidation) so none of
+	 * those can silently consolidate a transient edit. See
 	 * FVertexMaskForgePreviewComponentState::CommittedColors' own doc comment for the full contract.
 	 */
 	void UpdateAllPreviews(bool bCommit);
@@ -1722,27 +1692,19 @@ private:
 	TArray<TSharedPtr<EVertexMaskForgePreviewMode>> PreviewModeOptions;
 	TSharedPtr<SComboBox<TSharedPtr<EVertexMaskForgePreviewMode>>> PreviewModeComboBox;
 
-	/** M16-K.6D-5: options/widget for the minimal Preview Source combo -- mirrors PreviewModeOptions/
-	 *  PreviewModeComboBox's own pattern exactly. Populated once in Construct(). */
-	TArray<TSharedPtr<EVertexMaskForgePreviewSource>> PreviewSourceOptions;
-	TSharedPtr<SComboBox<TSharedPtr<EVertexMaskForgePreviewSource>>> PreviewSourceComboBox;
-
 	/**
-	 * M16-K.6D-1/M16-K.6D-5: the sole authority for which pipeline's composed colors ApplyPreviewToEntry
-	 * shows -- see EVertexMaskForgePreviewSource's own doc comment and ADR-011 for the full contract.
-	 * Owner: this panel; lifetime: this panel instance's own, exactly like CurrentPreviewMode above.
-	 * Default Legacy. As of M16-K.6D-5, ApplyPreviewToEntry's Source-Topology branch reads this live,
-	 * every call, to select between the unchanged Legacy composition path and a Dynamic path that calls
-	 * VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology and feeds
-	 * its caller-owned, transitory output directly to the same M16-K.6D-2 visual-only seam -- never
-	 * ApplyComposedColorsRGB, never WorkingColors/SourceTopologyWorkingColors, never Accept-eligible
-	 * (see CanAcceptChanges()/AcceptPendingChanges(), both gated on PreviewSource == Legacy). Only the
-	 * Preview Source combo (OnPreviewSourceSelectionChanged) ever writes Dynamic; only an explicit user
-	 * action changes it. The Render Vertex domain and every Dynamic generator other than Material Slot
-	 * remain unconnected -- see Docs/VertexMaskForgeArchitecture.md for the full current contract.
+	 * M18: kept only because ApplyPreviewToEntry's Source-Topology branch still guards its now-dead
+	 * Legacy composition code with a read of this field -- see EVertexMaskForgePreviewSource's own doc
+	 * comment for the full technical-debt justification. No combo box, options array, or other write
+	 * site exists anymore anywhere in production code; this can never become anything but Dynamic.
+	 * Default (and only reachable value): Dynamic.
 	 */
-	EVertexMaskForgePreviewSource PreviewSource = EVertexMaskForgePreviewSource::Legacy;
+	EVertexMaskForgePreviewSource PreviewSource = EVertexMaskForgePreviewSource::Dynamic;
 
+	// M18: bChannelFilterR/G/B are kept at their default (true) only because the same dead Legacy
+	// composition branch above still reads them -- no checkbox or write site exists anymore. Per-layer
+	// R/G/B channel controls (FVertexMaskForgeDynamicLayerStack::SetLayerChannelFilter) are the real,
+	// live mechanism now.
 	bool bChannelFilterR = true;
 	bool bChannelFilterG = true;
 	bool bChannelFilterB = true;

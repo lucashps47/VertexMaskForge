@@ -1047,21 +1047,6 @@ namespace VertexMaskForgePanel
 		}
 	}
 
-	/** M16-K.6D-5: label helper for the minimal Preview Source combo -- mirrors GetPreviewModeLabel's own
-	 *  shape exactly. */
-	static FText GetPreviewSourceLabel(const EVertexMaskForgePreviewSource Source)
-	{
-		switch (Source)
-		{
-		case EVertexMaskForgePreviewSource::Legacy:
-			return LOCTEXT("PreviewSourceLegacy", "Legacy");
-		case EVertexMaskForgePreviewSource::Dynamic:
-			return LOCTEXT("PreviewSourceDynamic", "Dynamic");
-		default:
-			return FText::GetEmpty();
-		}
-	}
-
 	static FText GetBlendModeLabel(const EVertexMaskForgeBlendMode Mode)
 	{
 		switch (Mode)
@@ -1127,7 +1112,9 @@ namespace VertexMaskForgePanel
 		case EVertexMaskForgeGeneratorType::MaterialSlot:
 			return LOCTEXT("DynamicLayerGeneratorMaterialSlot", "Material Slot");
 		case EVertexMaskForgeGeneratorType::BoundingBox:
-			return LOCTEXT("DynamicLayerGeneratorBoundingBox", "Bounding Box");
+			// M18: artist-facing rename only (Substance Painter vocabulary alignment) -- the internal
+			// enumerator/generator name/cache identity/serialized value are all unchanged.
+			return LOCTEXT("DynamicLayerGeneratorPosition", "Position");
 		case EVertexMaskForgeGeneratorType::AmbientOcclusion:
 			return LOCTEXT("DynamicLayerGeneratorAmbientOcclusion", "Ambient Occlusion");
 		case EVertexMaskForgeGeneratorType::DirectionalNormal:
@@ -3497,63 +3484,8 @@ FText SVertexMaskForgePanel::GetNoiseBlendModeButtonText() const
 	return VertexMaskForgePanel::GetBlendModeLabel(NoiseBlendMode);
 }
 
-FText SVertexMaskForgePanel::GetActiveMaskSourceText() const
-{
-	bool bAnyAxisEnabled = false;
-	for (const FVertexMaskForgeAxisMaskParams& Params : BoundingBoxAxisParams)
-	{
-		if (Params.bEnabled)
-		{
-			bAnyAxisEnabled = true;
-			break;
-		}
-	}
-
-	TArray<FText, TInlineAllocator<7>> ActiveLayerNames;
-	if (bAnyAxisEnabled)
-	{
-		ActiveLayerNames.Add(LOCTEXT("ActiveLayerBBox", "Bounding Box"));
-	}
-	if (bAOEnabled)
-	{
-		ActiveLayerNames.Add(LOCTEXT("ActiveLayerAO", "Ambient Occlusion"));
-	}
-	if (bCurvatureEnabled)
-	{
-		ActiveLayerNames.Add(LOCTEXT("ActiveLayerCurvature", "Curvature"));
-	}
-	if (bDirectionalNormalMaskEnabled)
-	{
-		ActiveLayerNames.Add(LOCTEXT("ActiveLayerDirectionalNormal", "Directional Normal"));
-	}
-	if (bNoiseEnabled)
-	{
-		ActiveLayerNames.Add(LOCTEXT("ActiveLayerNoise", "Noise"));
-	}
-	if (bMaterialSlotMaskEnabled)
-	{
-		ActiveLayerNames.Add(LOCTEXT("ActiveLayerMaterialSlot", "Material Slot Mask"));
-	}
-	if (bThicknessMaskEnabled)
-	{
-		ActiveLayerNames.Add(LOCTEXT("ActiveLayerThickness", "Thickness"));
-	}
-
-	if (ActiveLayerNames.IsEmpty())
-	{
-		return LOCTEXT("ActiveMaskSourceNone", "Active layers: None -- enable a Bounding Box axis, Ambient Occlusion, Curvature, Directional Normal, Noise, Thickness, or Material Slot Mask");
-	}
-
-	TArray<FString> LayerStrings;
-	LayerStrings.Reserve(ActiveLayerNames.Num());
-	for (const FText& Name : ActiveLayerNames)
-	{
-		LayerStrings.Add(Name.ToString());
-	}
-	return FText::Format(
-		LOCTEXT("ActiveMaskSourceListFormat", "Active layers: {0}"),
-		FText::FromString(FString::Join(LayerStrings, TEXT(" + "))));
-}
+// M18: GetActiveMaskSourceText (the Legacy-only "Active layers: ..." readout) was removed along with
+// its widget -- see the Layers section's own doc comment above.
 
 // ==================================================================================================
 // M16-K.4: Dynamic Layers UI Prototype -- domain-only, deliberately disconnected from composition/
@@ -3567,14 +3499,10 @@ FText SVertexMaskForgePanel::GetActiveMaskSourceText() const
 
 void SVertexMaskForgePanel::OnDynamicLayerStackMutated()
 {
-	// See this function's own header doc comment: a no-op unless the Dynamic pipeline is currently being
-	// previewed, exactly mirroring how every Legacy compositional control's live-update already behaves
-	// -- ApplyPreviewToEntry re-reads PreviewSource/DynamicLayerStack live on every RecomposeWorkingColors
-	// call, so this is a complete, correct refresh request, never a partial one.
-	if (PreviewSource == EVertexMaskForgePreviewSource::Dynamic)
-	{
-		RecomposeWorkingColors();
-	}
+	// M18: Layers is now the sole workflow, so every mutation always requests a refresh -- the earlier
+	// "no-op unless PreviewSource == Dynamic" gate (from when Legacy and Dynamic were separate, selectable
+	// pipelines) is gone along with PreviewSource itself.
+	RecomposeWorkingColors();
 }
 
 void SVertexMaskForgePanel::RebuildDynamicLayersList()
@@ -3596,7 +3524,7 @@ void SVertexMaskForgePanel::RebuildDynamicLayersList()
 			.Padding(FMargin(2.f))
 			[
 				SNew(STextBlock)
-				.Text(LOCTEXT("NoDynamicLayers", "No dynamic layers"))
+				.Text(LOCTEXT("NoDynamicLayers", "No layers"))
 				.ColorAndOpacity(FSlateColor::UseSubduedForeground())
 			];
 		return;
@@ -4206,8 +4134,14 @@ TSharedRef<SWidget> SVertexMaskForgePanel::BuildDynamicLayerRow(const FGuid Laye
 					.OptionsSource(&(*MaterialSlotPickerOptions))
 					.IsEnabled_Lambda([this]()
 					{
+						// M18.1: also require bMaterialSlotResolutionValid -- see this generator's own
+						// "resolution invalid" inline feedback message below for the full root-cause
+						// rationale (previously checked only IsEmpty(), so a mesh with unresolvable/
+						// duplicate/missing Material Slot names looked fully editable here even though
+						// GenerateMaterialSlotMaskFromDynamicMesh always rejects it, silently failing the
+						// whole Dynamic composition call every time regardless of Preview Mode).
 						const FVertexMaskForgeWorkingMesh* WorkingMesh = GetSingleAssetWorkingMeshForDynamicMaterialSlot();
-						return WorkingMesh && !WorkingMesh->MaterialSlotOptions.IsEmpty();
+						return WorkingMesh && !WorkingMesh->MaterialSlotOptions.IsEmpty() && WorkingMesh->bMaterialSlotResolutionValid;
 					})
 					.OnComboBoxOpening_Lambda([this, MaterialSlotPickerOptions]()
 					{
@@ -4311,7 +4245,7 @@ TSharedRef<SWidget> SVertexMaskForgePanel::BuildDynamicLayerRow(const FGuid Laye
 						}))
 					[
 						SNew(STextBlock)
-						.ToolTipText(LOCTEXT("DynamicLayerMaterialSlotPickerTooltip", "Which material slot this layer's Material Slot mask selects (prototype -- assignment only; not yet generated, composed, or previewed)."))
+						.ToolTipText(LOCTEXT("DynamicLayerMaterialSlotPickerTooltip", "Which material slot this layer's Material Slot mask selects."))
 						.Text_Lambda([this, LayerId]() -> FText
 						{
 							const FVertexMaskForgeGeneratorMaskInstance* Mask = DynamicLayerStack.GetLayerMask(LayerId);
@@ -4345,11 +4279,12 @@ TSharedRef<SWidget> SVertexMaskForgePanel::BuildDynamicLayerRow(const FGuid Laye
 				.VAlign(VAlign_Center)
 				[
 					SNew(SCheckBox)
-					.ToolTipText(LOCTEXT("DynamicLayerMaterialSlotInvertTooltip", "Invert coverage (prototype -- assignment only; not yet generated, composed, or previewed)."))
+					.ToolTipText(LOCTEXT("DynamicLayerMaterialSlotInvertTooltip", "Invert coverage."))
 					.IsEnabled_Lambda([this]()
 					{
+						// M18.1: mirrors the picker's own IsEnabled_Lambda above -- see its comment.
 						const FVertexMaskForgeWorkingMesh* WorkingMesh = GetSingleAssetWorkingMeshForDynamicMaterialSlot();
-						return WorkingMesh && !WorkingMesh->MaterialSlotOptions.IsEmpty();
+						return WorkingMesh && !WorkingMesh->MaterialSlotOptions.IsEmpty() && WorkingMesh->bMaterialSlotResolutionValid;
 					})
 					.IsChecked_Lambda([this, LayerId]()
 					{
@@ -4387,9 +4322,10 @@ TSharedRef<SWidget> SVertexMaskForgePanel::BuildDynamicLayerRow(const FGuid Laye
 				]
 			]
 
-			// Inline feedback for the two gate-failure cases that are independent of the picker/checkbox
-			// above (which stay visible but disabled in both). Exactly one message is visible at a time;
-			// neither is visible when exactly one asset with at least one slot is selected.
+			// Inline feedback for the gate-failure cases that are independent of the picker/checkbox
+			// above (which stay visible but disabled in all of them). Exactly one message is visible at
+			// a time; none are visible when exactly one asset with at least one resolvable slot is
+			// selected.
 			+ SVerticalBox::Slot()
 			.AutoHeight()
 			.Padding(FMargin(0.f, 2.f, 0.f, 0.f))
@@ -4426,7 +4362,33 @@ TSharedRef<SWidget> SVertexMaskForgePanel::BuildDynamicLayerRow(const FGuid Laye
 					return (WorkingMesh && WorkingMesh->MaterialSlotOptions.IsEmpty()) ? EVisibility::Visible : EVisibility::Collapsed;
 				})
 				.Text(LOCTEXT("DynamicLayerMaterialSlotNoSlots", "The selected Static Mesh asset has no material slots."))
-				]
+			]
+
+			// M18.1 (root-cause correction): a mesh whose Material Slots could not be resolved
+			// unambiguously (duplicate or missing imported slot names -- WorkingMesh.
+			// bMaterialSlotResolutionValid, set by BuildMaterialSlotLookups) previously produced NO
+			// feedback at all here -- the picker/Invert above looked fully editable, but
+			// GenerateMaterialSlotMaskFromDynamicMesh's own precheck (VertexMaskForgeMaterialSlotGenerator.cpp)
+			// always rejects this case, failing the whole Dynamic composition call every time regardless
+			// of Preview Mode -- exactly the "stays on Original Material, no visible effect" symptom.
+			// Mirrors Legacy's own established diagnostic wording (GetMaterialSlotMaskDiagnosticText,
+			// dead code since M18) -- never a new validity policy, just surfacing the SAME established
+			// unavailable/error contract the generator has always enforced.
+			+ SVerticalBox::Slot()
+			.AutoHeight()
+			.Padding(FMargin(0.f, 2.f, 0.f, 0.f))
+			[
+				SNew(STextBlock)
+				.AutoWrapText(true)
+				.ColorAndOpacity(FSlateColor::UseSubduedForeground())
+				.Visibility_Lambda([this]()
+				{
+					const FVertexMaskForgeWorkingMesh* WorkingMesh = GetSingleAssetWorkingMeshForDynamicMaterialSlot();
+					return (WorkingMesh && !WorkingMesh->MaterialSlotOptions.IsEmpty() && !WorkingMesh->bMaterialSlotResolutionValid)
+						? EVisibility::Visible : EVisibility::Collapsed;
+				})
+				.Text(LOCTEXT("DynamicLayerMaterialSlotResolutionInvalid", "Material Slot unavailable: one or more Material Slots could not be resolved unambiguously (duplicate or missing slot names). Preview/Accept for this layer are blocked."))
+			]
 			]
 
 			// M16-K.6D-8C-C: Bounding Box configurational editor -- sibling of the Material Slot block
@@ -6931,10 +6893,6 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 	PreviewModeOptions.Add(MakeShared<EVertexMaskForgePreviewMode>(EVertexMaskForgePreviewMode::BlueChannel));
 	PreviewModeOptions.Add(MakeShared<EVertexMaskForgePreviewMode>(EVertexMaskForgePreviewMode::AlphaChannel));
 
-	// M16-K.6D-5: mirrors PreviewModeOptions' own population pattern exactly -- Legacy first == default.
-	PreviewSourceOptions.Add(MakeShared<EVertexMaskForgePreviewSource>(EVertexMaskForgePreviewSource::Legacy));
-	PreviewSourceOptions.Add(MakeShared<EVertexMaskForgePreviewSource>(EVertexMaskForgePreviewSource::Dynamic));
-
 	// Order matches the required dropdown order exactly (Copy first == default).
 	BlendModeOptions.Add(MakeShared<EVertexMaskForgeBlendMode>(EVertexMaskForgeBlendMode::Copy));
 	BlendModeOptions.Add(MakeShared<EVertexMaskForgeBlendMode>(EVertexMaskForgeBlendMode::Add));
@@ -6961,20 +6919,22 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 	// M16-K.6B; corrected M16-K.6D-6; extended M16-K.6D-8C-C, M16-K.6D-8D-C, M16-K.6D-8E-C, M16-K.6D-8F-C,
 	// M16-K.6D-8G-F, M17-TH-DL-B: element 0 is a VALID TSharedPtr to an UNSET TOptional (None/Unassigned)
 	// -- NOT a null TSharedPtr, which SListView's own row-generation loop unconditionally skips (see this
-	// array's own doc comment in SVertexMaskForgePanel.h for the confirmed root cause). MaterialSlot,
-	// BoundingBox (M16-K.6D-8B), Ambient Occlusion (M16-K.6D-8G-F -- inserted immediately after Bounding
-	// Box, matching Legacy's own generator-library ordering), DirectionalNormal (M16-K.6D-8D-B), Curvature
-	// (M16-K.6D-8E-B), Noise (M16-K.6D-8F-C, displayed as "Noise/Grunge"), and Thickness (M17-TH-DL-B,
-	// Source Topology only -- placed last, after Noise) are now all seven EVertexMaskForgeGeneratorType
-	// enumerators; every one of them is offered here, and the orchestrator (ComputeComposedColorsRGBSource
-	// Topology) now dispatches every one of them too -- there is no longer an unsupported/rejected value.
+	// array's own doc comment in SVertexMaskForgePanel.h for the confirmed root cause). All seven
+	// EVertexMaskForgeGeneratorType enumerators are offered; the orchestrator dispatches every one of
+	// them too, so there is no unsupported/rejected value.
+	//
+	// M18: the seven real entries are ordered ALPHABETICALLY BY ARTIST-FACING LABEL (never by enum
+	// numeric value, which has no presentation/compatibility meaning here) -- Ambient Occlusion,
+	// Curvature, Directional Normal, Material Slot, Noise/Grunge, Position (artist-facing name for
+	// BoundingBox -- see GetDynamicLayerGeneratorTypeLabel), Thickness. This is the single authoritative
+	// list every generator picker in the panel reads from; there is no second list to keep in sync.
 	DynamicLayerGeneratorTypeOptions.Add(MakeShared<TOptional<EVertexMaskForgeGeneratorType>>());
-	DynamicLayerGeneratorTypeOptions.Add(MakeShared<TOptional<EVertexMaskForgeGeneratorType>>(EVertexMaskForgeGeneratorType::MaterialSlot));
-	DynamicLayerGeneratorTypeOptions.Add(MakeShared<TOptional<EVertexMaskForgeGeneratorType>>(EVertexMaskForgeGeneratorType::BoundingBox));
 	DynamicLayerGeneratorTypeOptions.Add(MakeShared<TOptional<EVertexMaskForgeGeneratorType>>(EVertexMaskForgeGeneratorType::AmbientOcclusion));
-	DynamicLayerGeneratorTypeOptions.Add(MakeShared<TOptional<EVertexMaskForgeGeneratorType>>(EVertexMaskForgeGeneratorType::DirectionalNormal));
 	DynamicLayerGeneratorTypeOptions.Add(MakeShared<TOptional<EVertexMaskForgeGeneratorType>>(EVertexMaskForgeGeneratorType::Curvature));
+	DynamicLayerGeneratorTypeOptions.Add(MakeShared<TOptional<EVertexMaskForgeGeneratorType>>(EVertexMaskForgeGeneratorType::DirectionalNormal));
+	DynamicLayerGeneratorTypeOptions.Add(MakeShared<TOptional<EVertexMaskForgeGeneratorType>>(EVertexMaskForgeGeneratorType::MaterialSlot));
 	DynamicLayerGeneratorTypeOptions.Add(MakeShared<TOptional<EVertexMaskForgeGeneratorType>>(EVertexMaskForgeGeneratorType::Noise));
+	DynamicLayerGeneratorTypeOptions.Add(MakeShared<TOptional<EVertexMaskForgeGeneratorType>>(EVertexMaskForgeGeneratorType::BoundingBox));
 	DynamicLayerGeneratorTypeOptions.Add(MakeShared<TOptional<EVertexMaskForgeGeneratorType>>(EVertexMaskForgeGeneratorType::Thickness));
 
 	CurvatureTypeOptions.Add(MakeShared<EVertexMaskForgeCurvatureType>(EVertexMaskForgeCurvatureType::Convex));
@@ -7062,27 +7022,16 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 				SNew(SSeparator)
 			]
 
-			// AUDITED (UI reorganization checkpoint): "Active layers" moved here from inside the
-			// Ambient Occlusion Mask panel -- it reports the GLOBAL composition stack (Bounding Box
-			// and/or Ambient Occlusion, whichever are currently active), not something owned by AO
-			// specifically, so it now reads as a neutral, panel-agnostic status line above both mask
-			// panels instead of implying it belongs to AO alone. Same widget/binding as before
-			// (GetActiveMaskSourceText, unchanged, still purely a live readout -- no new state), same
-			// subdued/secondary text style, no border/background of its own, single occurrence only.
-			+ SVerticalBox::Slot()
-			.AutoHeight()
-			.Padding(FMargin(0.f, 0.f, 0.f, 8.f))
-			[
-				SNew(STextBlock)
-				.Text(this, &SVertexMaskForgePanel::GetActiveMaskSourceText)
-				.ColorAndOpacity(FSlateColor::UseSubduedForeground())
-			]
+			// M18: the "Active layers" readout (GetActiveMaskSourceText) was removed -- it reported only
+			// the old Legacy composition stack (Bounding Box/AO/Curvature/.../Thickness enabled flags),
+			// which can no longer be set by any UI, so it would only ever have shown "Active layers:
+			// None -- enable a Bounding Box axis, ..." forever. The Layers section's own status line
+			// (GetMaskActionStatusText/GetPreviewStatusText below) is the live, accurate readout now.
 
-			// AUDITED (M16-K.4): "Dynamic Layers" -- backed entirely by DynamicLayerStack, the
-			// M16-K.3A/K.3B domain -- explicitly disconnected from composition/preview (see the
-			// "Prototype" caption below and DynamicLayerStack's own doc comment). No production call
-			// (RecomposeWorkingColors, UpdateAllPreviews, generator invalidation, etc.) is ever made
-			// from any control in this section.
+			// M18: "Layers" -- backed entirely by DynamicLayerStack, now the SOLE artist-facing workflow
+			// (the old Legacy fixed-generator UI and the Legacy/Dynamic PreviewSource selector were both
+			// removed in this checkpoint). This section's stack IS what Preview/Accept use -- the earlier
+			// "Prototype/disconnected" framing no longer applies and has been removed.
 			+ SVerticalBox::Slot()
 			.AutoHeight()
 			.Padding(FMargin(0.f, 0.f, 0.f, 12.f))
@@ -7103,7 +7052,7 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 						.VAlign(VAlign_Center)
 						[
 							SNew(STextBlock)
-							.Text(LOCTEXT("DynamicLayersSectionTitle", "Dynamic Layers"))
+							.Text(LOCTEXT("DynamicLayersSectionTitle", "Layers"))
 							.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
 						]
 
@@ -7113,20 +7062,10 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 						[
 							SNew(SButton)
 							.ContentPadding(FMargin(8.f, 1.f))
-							.ToolTipText(LOCTEXT("AddDynamicLayerTooltip", "Add a new, empty (Fill=None) dynamic layer at the end of the list."))
+							.ToolTipText(LOCTEXT("AddDynamicLayerTooltip", "Add a new, empty (Fill=None) layer at the end of the list."))
 							.Text(LOCTEXT("AddDynamicLayerButton", "+ Add Layer"))
 							.OnClicked(FOnClicked::CreateLambda([this]() { return OnAddDynamicLayerClicked(); }))
 						]
-					]
-
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					.Padding(FMargin(0.f, 0.f, 0.f, 4.f))
-					[
-						SNew(STextBlock)
-						.Text(LOCTEXT("DynamicLayersPrototypeNotice", "Prototype -- not applied to preview yet"))
-						.Font(FCoreStyle::GetDefaultFontStyle("Italic", 8))
-						.ColorAndOpacity(FSlateColor::UseSubduedForeground())
 					]
 
 					+ SVerticalBox::Slot()
@@ -7144,2347 +7083,9 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 				]
 			]
 
-			+ SVerticalBox::Slot()
-			.AutoHeight()
-			[
-				SNew(SExpandableArea)
-				.InitiallyCollapsed(true)
-				.Padding(FMargin(8.f))
-				.HeaderContent()
-				[
-					SNew(STextBlock)
-					.Text(LOCTEXT("BBoxMaskSectionTitle", "Bounding Box"))
-					.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
-				]
-				.BodyContent()
-				[
-					SNew(SVerticalBox)
-
-					// Blend Mode + Opacity: apply to this Bounding Box Mask layer's composition with the
-					// input Vertex Color, AFTER the mask itself is generated from Local X/Y/Z below --
-					// see ComposeMaskLayer's doc comment for the exact order. Placed above Local X/Y/Z
-					// since they configure the OUTPUT stage of the same layer, not another axis.
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					.Padding(FMargin(0.f, 0.f, 0.f, 2.f))
-					[
-						SNew(SHorizontalBox)
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
-						[
-							SNew(STextBlock).Text(LOCTEXT("BlendModeLabel", "Blend Mode:"))
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						[
-							SAssignNew(BlendModeComboBox, SComboBox<TSharedPtr<EVertexMaskForgeBlendMode>>)
-							.OptionsSource(&BlendModeOptions)
-							.InitiallySelectedItem(BlendModeOptions[0])
-							.OnGenerateWidget(this, &SVertexMaskForgePanel::OnGenerateBlendModeRow)
-							.OnSelectionChanged(this, &SVertexMaskForgePanel::OnBlendModeSelectionChanged)
-							[
-								SNew(STextBlock)
-								.Text(this, &SVertexMaskForgePanel::GetBlendModeButtonText)
-							]
-						]
-					]
-
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					.Padding(FMargin(0.f, 0.f, 0.f, 6.f))
-					[
-						SNew(SHorizontalBox)
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
-						[
-							SNew(STextBlock).Text(LOCTEXT("OpacityLabel", "Opacity:"))
-						]
-
-						// Slider (fills remaining width, "largura proporcional ao painel") + a compact
-						// editable numeric field alongside it -- two independent views of the SAME
-						// BoundingBoxOpacity value, each firing its OWN OnValueChanged only from its OWN
-						// user interaction, so a single drag/edit can never double-fire and cause two
-						// redundant recompositions for one change.
-						+ SHorizontalBox::Slot()
-						.FillWidth(1.f)
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 8.f, 0.f))
-						[
-							SNew(SSlider)
-							.MinValue(0.0f)
-							.MaxValue(1.0f)
-							.Value_Lambda([this]() { return BoundingBoxOpacity; })
-							.OnValueChanged_Lambda([this](const float NewValue)
-							{
-								BoundingBoxOpacity = FMath::Clamp(NewValue, 0.0f, 1.0f);
-								RecomposeWorkingColors();
-							})
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						[
-							SNew(SSpinBox<float>)
-							.MinDesiredWidth(52.f)
-							.MinValue(0.0f)
-							.MaxValue(1.0f)
-							.Delta(0.01f)
-							.MinFractionalDigits(2)
-							.MaxFractionalDigits(2)
-							.Value_Lambda([this]() { return BoundingBoxOpacity; })
-							.OnValueChanged_Lambda([this](const float NewValue)
-							{
-								BoundingBoxOpacity = FMath::Clamp(NewValue, 0.0f, 1.0f);
-								RecomposeWorkingColors();
-							})
-						]
-					]
-
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					[
-						BuildBoundingBoxAxisRow(EVertexMaskForgeBoundsAxis::X, LOCTEXT("AxisTitleX", "Local X"))
-					]
-
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					[
-						BuildBoundingBoxAxisRow(EVertexMaskForgeBoundsAxis::Y, LOCTEXT("AxisTitleY", "Local Y"))
-					]
-
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					[
-						BuildBoundingBoxAxisRow(EVertexMaskForgeBoundsAxis::Z, LOCTEXT("AxisTitleZ", "Local Z"))
-					]
-
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					.HAlign(HAlign_Left)
-					.Padding(FMargin(0.f, 6.f, 0.f, 0.f))
-					[
-						SNew(SHorizontalBox)
-
-						// AUDITED (live-preview migration): Unified Bounds stays here, unchanged, since it
-						// is a Bounding-Box-specific parameter, not a preview/update control.
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						[
-							SNew(SCheckBox)
-							.IsChecked(this, &SVertexMaskForgePanel::GetUnifiedBoundsState)
-							.OnCheckStateChanged(this, &SVertexMaskForgePanel::OnUnifiedBoundsChanged)
-							.ToolTipText(LOCTEXT("UnifiedBoundsTooltip", "Evaluate all selected meshes within one shared bounding-box domain across X, Y, and Z."))
-							.Content()
-							[
-								SNew(STextBlock)
-								.Text(LOCTEXT("UnifiedBoundsLabel", "Unified Bounds"))
-							]
-						]
-					]
-				]
-			]
-
-			// Ambient Occlusion Mask: the tool's second spatial mask source, composed together with
-			// Bounding Box rather than replacing it (see bAOEnabled's own doc comment). Placed
-			// immediately BELOW the Bounding Box Mask panel above.
-			//
-			// AUDITED (UI reorganization checkpoint): now a collapsible SExpandableArea, matching
-			// Bounding Box exactly -- same header style/pattern, same InitiallyCollapsed(true) default.
-			// The header shows ONLY the title (matching Bounding Box's header exactly); Enable moved
-			// into the body's first row (it is a mask PARAMETER, not always-visible chrome -- collapsing
-			// the area must never look like it disabled the layer, and it doesn't: bAOEnabled is
-			// untouched by expand/collapse either way). "Active layers" moved out entirely -- see the
-			// new top-level status line above the Bounding Box panel.
-			+ SVerticalBox::Slot()
-			.AutoHeight()
-			.Padding(FMargin(0.f, 12.f, 0.f, 0.f))
-			[
-				SNew(SExpandableArea)
-				.InitiallyCollapsed(true)
-				.Padding(FMargin(8.f))
-				.HeaderContent()
-				[
-					SNew(STextBlock)
-					.Text(LOCTEXT("AOSectionTitle", "Ambient Occlusion"))
-					.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
-				]
-				.BodyContent()
-				[
-					SNew(SVerticalBox)
-
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					.Padding(FMargin(0.f, 0.f, 0.f, 6.f))
-					[
-						SNew(SCheckBox)
-						.IsChecked(this, &SVertexMaskForgePanel::GetAOEnableState)
-						.OnCheckStateChanged(this, &SVertexMaskForgePanel::OnAOEnableChanged)
-						.Content()
-						[
-							SNew(STextBlock)
-							.Text(LOCTEXT("AOEnableLabel", "Enable"))
-						]
-					]
-
-					// AUDITED (composition-stack checkpoint): Blend Mode + Opacity, same Slate
-					// controls/dimensions/alignment/labels/tooltips/limits as Bounding Box's own (see
-					// the Bounding Box Mask section above) -- independent AOBlendMode/AOOpacity state,
-					// same BlendModeOptions list (shared enum, shared GetBlendModeLabel), same
-					// ApplyMaskBlendMode/BlendMaskValue formulas via ComposeMaskStack -- never a
-					// duplicate/parallel blend implementation.
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					.Padding(FMargin(0.f, 0.f, 0.f, 2.f))
-					[
-						SNew(SHorizontalBox)
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
-						[
-							SNew(STextBlock).Text(LOCTEXT("AOBlendModeLabel", "Blend Mode:"))
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						[
-							SAssignNew(AOBlendModeComboBox, SComboBox<TSharedPtr<EVertexMaskForgeBlendMode>>)
-							.OptionsSource(&BlendModeOptions)
-							.InitiallySelectedItem(BlendModeOptions[0])
-							.OnGenerateWidget(this, &SVertexMaskForgePanel::OnGenerateAOBlendModeRow)
-							.OnSelectionChanged(this, &SVertexMaskForgePanel::OnAOBlendModeSelectionChanged)
-							[
-								SNew(STextBlock)
-								.Text(this, &SVertexMaskForgePanel::GetAOBlendModeButtonText)
-							]
-						]
-					]
-
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					.Padding(FMargin(0.f, 0.f, 0.f, 6.f))
-					[
-						SNew(SHorizontalBox)
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
-						[
-							SNew(STextBlock).Text(LOCTEXT("AOOpacityLabel", "Opacity:"))
-						]
-
-						+ SHorizontalBox::Slot()
-						.FillWidth(1.f)
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 8.f, 0.f))
-						[
-							SNew(SSlider)
-							.MinValue(0.0f)
-							.MaxValue(1.0f)
-							.Value_Lambda([this]() { return AOOpacity; })
-							.OnValueChanged_Lambda([this](const float NewValue)
-							{
-								AOOpacity = FMath::Clamp(NewValue, 0.0f, 1.0f);
-								RecomposeWorkingColors();
-							})
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						[
-							SNew(SSpinBox<float>)
-							.MinDesiredWidth(52.f)
-							.MinValue(0.0f)
-							.MaxValue(1.0f)
-							.Delta(0.01f)
-							.MinFractionalDigits(2)
-							.MaxFractionalDigits(2)
-							.Value_Lambda([this]() { return AOOpacity; })
-							.OnValueChanged_Lambda([this](const float NewValue)
-							{
-								AOOpacity = FMath::Clamp(NewValue, 0.0f, 1.0f);
-								RecomposeWorkingColors();
-							})
-						]
-					]
-
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					.Padding(FMargin(0.f, 0.f, 0.f, 4.f))
-					[
-						SNew(SHorizontalBox)
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
-						[
-							SNew(SCheckBox)
-							.IsChecked(this, &SVertexMaskForgePanel::GetAOInvertState)
-							.OnCheckStateChanged(this, &SVertexMaskForgePanel::OnAOInvertChanged)
-							.Content()
-							[
-								SNew(STextBlock)
-								.Text(LOCTEXT("AOInvertLabel", "Invert"))
-							]
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(12.f, 0.f, 4.f, 0.f))
-						[
-							SNew(STextBlock)
-							.Text(LOCTEXT("AOSamplesLabel", "Samples"))
-							.ToolTipText(LOCTEXT("AOSamplesTooltip",
-								"Number of hemisphere raycast samples per vertex. Higher values are smoother "
-								"but slower; the live preview always uses this full value."))
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						[
-							SNew(SSpinBox<int32>)
-							.MinDesiredWidth(52.f)
-							.MinValue(8)
-							.MaxValue(256)
-							.Delta(1)
-							.ToolTipText(LOCTEXT("AOSamplesTooltip",
-								"Number of hemisphere raycast samples per vertex. Higher values are smoother "
-								"but slower; the live preview always uses this full value."))
-							.Value_Lambda([this]() { return AOSamples; })
-							.OnValueChanged_Lambda([this](const int32 NewValue)
-							{
-								AOSamples = FMath::Clamp(NewValue, 8, 256);
-								InvalidateAODerivedMask();
-								ScheduleAutoUpdatePreview();
-							})
-						]
-					]
-
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					[
-						SNew(SHorizontalBox)
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
-						[
-							SNew(STextBlock).Text(LOCTEXT("AOMaxDistanceLabel", "Max Distance"))
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 12.f, 0.f))
-						[
-							SNew(SSpinBox<float>)
-							.MinDesiredWidth(64.f)
-							.MinValue(0.01f)
-							.MaxValue(10000.0f)
-							.Delta(1.0f)
-							.Value_Lambda([this]() { return AOMaxDistance; })
-							.OnValueChanged_Lambda([this](const float NewValue)
-							{
-								AOMaxDistance = FMath::Clamp(NewValue, 0.01f, 10000.0f);
-								InvalidateAODerivedMask();
-								ScheduleAutoUpdatePreview();
-							})
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
-						[
-							SNew(STextBlock).Text(LOCTEXT("AOBiasLabel", "Bias"))
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						[
-							SNew(SSpinBox<float>)
-							.MinDesiredWidth(52.f)
-							.MinValue(0.001f)
-							.MaxValue(10.0f)
-							.Delta(0.01f)
-							.Value_Lambda([this]() { return AOBias; })
-							.OnValueChanged_Lambda([this](const float NewValue)
-							{
-								AOBias = FMath::Clamp(NewValue, 0.001f, 10.0f);
-								InvalidateAODerivedMask();
-								ScheduleAutoUpdatePreview();
-							})
-						]
-					]
-
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					.Padding(FMargin(0.f, 4.f, 0.f, 0.f))
-					[
-						SNew(SHorizontalBox)
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
-						[
-							SNew(STextBlock)
-							.Text(LOCTEXT("AOLevelsMinLabel", "Levels Min"))
-							.ToolTipText(LOCTEXT("AOLevelsMinTooltip", "Values at or below this threshold become black."))
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 12.f, 0.f))
-						[
-							SNew(SSpinBox<float>)
-							.MinDesiredWidth(52.f)
-							.MinValue(0.0f)
-							.MaxValue(1.0f)
-							.Delta(0.01f)
-							.ToolTipText(LOCTEXT("AOLevelsMinTooltip", "Values at or below this threshold become black."))
-							.Value_Lambda([this]() { return AOLevelsMin; })
-							.OnValueChanged_Lambda([this](const float NewValue)
-							{
-								AOLevelsMin = FMath::Clamp(NewValue, 0.0f, 1.0f);
-								OnAOLevelsChanged();
-							})
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
-						[
-							SNew(STextBlock)
-							.Text(LOCTEXT("AOLevelsMaxLabel", "Levels Max"))
-							.ToolTipText(LOCTEXT("AOLevelsMaxTooltip", "Values at or above this threshold become white."))
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						[
-							SNew(SSpinBox<float>)
-							.MinDesiredWidth(52.f)
-							.MinValue(0.0f)
-							.MaxValue(1.0f)
-							.Delta(0.01f)
-							.ToolTipText(LOCTEXT("AOLevelsMaxTooltip", "Values at or above this threshold become white."))
-							.Value_Lambda([this]() { return AOLevelsMax; })
-							.OnValueChanged_Lambda([this](const float NewValue)
-							{
-								AOLevelsMax = FMath::Clamp(NewValue, 0.0f, 1.0f);
-								OnAOLevelsChanged();
-							})
-						]
-					]
-				]
-			]
-
-			// Curvature Mask: the tool's third, independent, optional composition-stack layer -- same
-			// collapsible panel pattern as Bounding Box/Ambient Occlusion above (SExpandableArea, header
-			// title only, Enable moved into the body's first row -- same rationale as AO's own doc note).
-			+ SVerticalBox::Slot()
-			.AutoHeight()
-			.Padding(FMargin(0.f, 12.f, 0.f, 0.f))
-			[
-				SNew(SExpandableArea)
-				.InitiallyCollapsed(true)
-				.Padding(FMargin(8.f))
-				.HeaderContent()
-				[
-					SNew(STextBlock)
-					.Text(LOCTEXT("CurvatureSectionTitle", "Curvature"))
-					.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
-				]
-				.BodyContent()
-				[
-					SNew(SVerticalBox)
-
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					.Padding(FMargin(0.f, 0.f, 0.f, 6.f))
-					[
-						SNew(SCheckBox)
-						.IsChecked(this, &SVertexMaskForgePanel::GetCurvatureEnableState)
-						.OnCheckStateChanged(this, &SVertexMaskForgePanel::OnCurvatureEnableChanged)
-						.Content()
-						[
-							SNew(STextBlock)
-							.Text(LOCTEXT("CurvatureEnableLabel", "Enable"))
-						]
-					]
-
-					// Blend Mode + Opacity: same Slate controls/dimensions/alignment/labels/tooltips/
-					// limits as Bounding Box/Ambient Occlusion's own (see those sections above) --
-					// independent CurvatureBlendMode/CurvatureOpacity state, same BlendModeOptions list,
-					// same ComposeMaskStack formulas.
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					.Padding(FMargin(0.f, 0.f, 0.f, 2.f))
-					[
-						SNew(SHorizontalBox)
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
-						[
-							SNew(STextBlock).Text(LOCTEXT("CurvatureBlendModeLabel", "Blend Mode:"))
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						[
-							SAssignNew(CurvatureBlendModeComboBox, SComboBox<TSharedPtr<EVertexMaskForgeBlendMode>>)
-							.OptionsSource(&BlendModeOptions)
-							.InitiallySelectedItem(BlendModeOptions[0])
-							.OnGenerateWidget(this, &SVertexMaskForgePanel::OnGenerateCurvatureBlendModeRow)
-							.OnSelectionChanged(this, &SVertexMaskForgePanel::OnCurvatureBlendModeSelectionChanged)
-							[
-								SNew(STextBlock)
-								.Text(this, &SVertexMaskForgePanel::GetCurvatureBlendModeButtonText)
-							]
-						]
-					]
-
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					.Padding(FMargin(0.f, 0.f, 0.f, 6.f))
-					[
-						SNew(SHorizontalBox)
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
-						[
-							SNew(STextBlock).Text(LOCTEXT("CurvatureOpacityLabel", "Opacity:"))
-						]
-
-						+ SHorizontalBox::Slot()
-						.FillWidth(1.f)
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 8.f, 0.f))
-						[
-							SNew(SSlider)
-							.MinValue(0.0f)
-							.MaxValue(1.0f)
-							.Value_Lambda([this]() { return CurvatureOpacity; })
-							.OnValueChanged_Lambda([this](const float NewValue)
-							{
-								CurvatureOpacity = FMath::Clamp(NewValue, 0.0f, 1.0f);
-								RecomposeWorkingColors();
-							})
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						[
-							SNew(SSpinBox<float>)
-							.MinDesiredWidth(52.f)
-							.MinValue(0.0f)
-							.MaxValue(1.0f)
-							.Delta(0.01f)
-							.MinFractionalDigits(2)
-							.MaxFractionalDigits(2)
-							.Value_Lambda([this]() { return CurvatureOpacity; })
-							.OnValueChanged_Lambda([this](const float NewValue)
-							{
-								CurvatureOpacity = FMath::Clamp(NewValue, 0.0f, 1.0f);
-								RecomposeWorkingColors();
-							})
-						]
-					]
-
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					.Padding(FMargin(0.f, 0.f, 0.f, 6.f))
-					[
-						SNew(SHorizontalBox)
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
-						[
-							SNew(STextBlock).Text(LOCTEXT("CurvatureTypeLabel", "Curvature Type:"))
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						[
-							SAssignNew(CurvatureTypeComboBox, SComboBox<TSharedPtr<EVertexMaskForgeCurvatureType>>)
-							.OptionsSource(&CurvatureTypeOptions)
-							.InitiallySelectedItem(CurvatureTypeOptions[1])
-							.OnGenerateWidget(this, &SVertexMaskForgePanel::OnGenerateCurvatureTypeRow)
-							.OnSelectionChanged(this, &SVertexMaskForgePanel::OnCurvatureTypeSelectionChanged)
-							.ToolTipText(LOCTEXT("CurvatureTypeTooltip",
-								"Convex: only outward edges/bulges. Concave: only cavities/creases. Both: both signs, without cancelling out."))
-							[
-								SNew(STextBlock)
-								.Text(this, &SVertexMaskForgePanel::GetCurvatureTypeButtonText)
-							]
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(12.f, 0.f, 0.f, 0.f))
-						[
-							SNew(SCheckBox)
-							.IsChecked(this, &SVertexMaskForgePanel::GetCurvatureInvertState)
-							.OnCheckStateChanged(this, &SVertexMaskForgePanel::OnCurvatureInvertChanged)
-							.Content()
-							[
-								SNew(STextBlock)
-								.Text(LOCTEXT("CurvatureInvertLabel", "Invert"))
-							]
-						]
-					]
-
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					.Padding(FMargin(0.f, 0.f, 0.f, 4.f))
-					[
-						SNew(SHorizontalBox)
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
-						[
-							SNew(STextBlock).Text(LOCTEXT("CurvatureMultiplierLabel", "Multiplier"))
-						]
-
-						+ SHorizontalBox::Slot()
-						.FillWidth(1.f)
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 8.f, 0.f))
-						[
-							SNew(SSlider)
-							.MinValue(0.0f)
-							.MaxValue(10.0f)
-							.Value_Lambda([this]() { return CurvatureMultiplier; })
-							.OnValueChanged_Lambda([this](const float NewValue)
-							{
-								CurvatureMultiplier = FMath::Max(NewValue, 0.0f);
-								OnCurvatureParamChanged();
-							})
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						[
-							SNew(SSpinBox<float>)
-							.MinDesiredWidth(52.f)
-							.MinValue(0.0f)
-							.MaxValue(10.0f)
-							.Delta(0.01f)
-							.Value_Lambda([this]() { return CurvatureMultiplier; })
-							.OnValueChanged_Lambda([this](const float NewValue)
-							{
-								CurvatureMultiplier = FMath::Max(NewValue, 0.0f);
-								OnCurvatureParamChanged();
-							})
-						]
-					]
-
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					.Padding(FMargin(0.f, 0.f, 0.f, 4.f))
-					[
-						SNew(SHorizontalBox)
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
-						[
-							SNew(STextBlock)
-							.Text(LOCTEXT("CurvatureBlurLabel", "Blur"))
-							.ToolTipText(LOCTEXT("CurvatureBlurTooltip",
-								"Topological smoothing of the Curvature mask. Whole number = full iterations; fractional part blends toward one more."))
-						]
-
-						+ SHorizontalBox::Slot()
-						.FillWidth(1.f)
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 8.f, 0.f))
-						[
-							SNew(SSlider)
-							.MinValue(0.0f)
-							.MaxValue(10.0f)
-							.Value_Lambda([this]() { return CurvatureBlur; })
-							.OnValueChanged_Lambda([this](const float NewValue)
-							{
-								CurvatureBlur = FMath::Clamp(NewValue, 0.0f, 10.0f);
-								OnCurvatureParamChanged();
-							})
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						[
-							SNew(SSpinBox<float>)
-							.MinDesiredWidth(52.f)
-							.MinValue(0.0f)
-							.MaxValue(10.0f)
-							.Delta(0.01f)
-							.Value_Lambda([this]() { return CurvatureBlur; })
-							.OnValueChanged_Lambda([this](const float NewValue)
-							{
-								CurvatureBlur = FMath::Clamp(NewValue, 0.0f, 10.0f);
-								OnCurvatureParamChanged();
-							})
-						]
-					]
-
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					[
-						SNew(SHorizontalBox)
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
-						[
-							SNew(STextBlock)
-							.Text(LOCTEXT("CurvatureLevelsMinLabel", "Levels Min"))
-							.ToolTipText(LOCTEXT("CurvatureLevelsMinTooltip", "Values at or below this threshold become black."))
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 12.f, 0.f))
-						[
-							SNew(SSpinBox<float>)
-							.MinDesiredWidth(52.f)
-							.MinValue(0.0f)
-							.MaxValue(1.0f)
-							.Delta(0.01f)
-							.ToolTipText(LOCTEXT("CurvatureLevelsMinTooltip", "Values at or below this threshold become black."))
-							.Value_Lambda([this]() { return CurvatureLevelsMin; })
-							.OnValueChanged_Lambda([this](const float NewValue)
-							{
-								CurvatureLevelsMin = FMath::Clamp(NewValue, 0.0f, 1.0f);
-								OnCurvatureParamChanged();
-							})
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
-						[
-							SNew(STextBlock)
-							.Text(LOCTEXT("CurvatureLevelsMaxLabel", "Levels Max"))
-							.ToolTipText(LOCTEXT("CurvatureLevelsMaxTooltip", "Values at or above this threshold become white."))
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						[
-							SNew(SSpinBox<float>)
-							.MinDesiredWidth(52.f)
-							.MinValue(0.0f)
-							.MaxValue(1.0f)
-							.Delta(0.01f)
-							.ToolTipText(LOCTEXT("CurvatureLevelsMaxTooltip", "Values at or above this threshold become white."))
-							.Value_Lambda([this]() { return CurvatureLevelsMax; })
-							.OnValueChanged_Lambda([this](const float NewValue)
-							{
-								CurvatureLevelsMax = FMath::Clamp(NewValue, 0.0f, 1.0f);
-								OnCurvatureParamChanged();
-							})
-						]
-					]
-				]
-			]
-
-			// Directional Normal Mask (V2-E): the tool's independent, optional composition-stack layer
-			// positioned visually between Curvature and Noise -- same collapsible panel pattern as
-			// Bounding Box/Ambient Occlusion/Curvature above. (Its EVertexMaskForgeScalarMaskSource enum
-			// value is appended AFTER Material Slot for numeric stability -- visual position and enum
-			// declaration order are deliberately independent, see that enum's own doc comment.)
-			+ SVerticalBox::Slot()
-			.AutoHeight()
-			.Padding(FMargin(0.f, 12.f, 0.f, 0.f))
-			[
-				SNew(SExpandableArea)
-				.InitiallyCollapsed(true)
-				.Padding(FMargin(8.f))
-				.HeaderContent()
-				[
-					SNew(STextBlock)
-					.Text(LOCTEXT("DirectionalNormalMaskSectionTitle", "Directional Normal"))
-					.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
-				]
-				.BodyContent()
-				[
-					SNew(SVerticalBox)
-
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					.Padding(FMargin(0.f, 0.f, 0.f, 6.f))
-					[
-						SNew(SCheckBox)
-						.IsChecked(this, &SVertexMaskForgePanel::GetDirectionalNormalMaskEnableState)
-						.OnCheckStateChanged(this, &SVertexMaskForgePanel::OnDirectionalNormalMaskEnableChanged)
-						.Content()
-						[
-							SNew(STextBlock)
-							.Text(LOCTEXT("DirectionalNormalMaskEnableLabel", "Enable"))
-						]
-					]
-
-					// Blend Mode + Blend: same Slate controls/dimensions/alignment/labels/tooltips/limits
-					// as the other layers' own (see those sections above). Purely compositional -- changing
-					// either only calls RecomposeWorkingColors(), never regenerates the raw mask.
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					.Padding(FMargin(0.f, 0.f, 0.f, 2.f))
-					[
-						SNew(SHorizontalBox)
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
-						[
-							SNew(STextBlock).Text(LOCTEXT("DirectionalNormalMaskBlendModeLabel", "Blend Mode:"))
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						[
-							SAssignNew(DirectionalNormalMaskBlendModeComboBox, SComboBox<TSharedPtr<EVertexMaskForgeBlendMode>>)
-							.OptionsSource(&BlendModeOptions)
-							.InitiallySelectedItem(BlendModeOptions[0])
-							.OnGenerateWidget(this, &SVertexMaskForgePanel::OnGenerateDirectionalNormalMaskBlendModeRow)
-							.OnSelectionChanged(this, &SVertexMaskForgePanel::OnDirectionalNormalMaskBlendModeSelectionChanged)
-							[
-								SNew(STextBlock)
-								.Text(this, &SVertexMaskForgePanel::GetDirectionalNormalMaskBlendModeButtonText)
-							]
-						]
-					]
-
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					.Padding(FMargin(0.f, 0.f, 0.f, 6.f))
-					[
-						SNew(SHorizontalBox)
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
-						[
-							SNew(STextBlock).Text(LOCTEXT("DirectionalNormalMaskOpacityLabel", "Opacity:"))
-						]
-
-						+ SHorizontalBox::Slot()
-						.FillWidth(1.f)
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 8.f, 0.f))
-						[
-							SNew(SSlider)
-							.MinValue(0.0f)
-							.MaxValue(1.0f)
-							.Value_Lambda([this]() { return DirectionalNormalMaskOpacity; })
-							.OnValueChanged_Lambda([this](const float NewValue)
-							{
-								DirectionalNormalMaskOpacity = FMath::Clamp(NewValue, 0.0f, 1.0f);
-								RecomposeWorkingColors();
-							})
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						[
-							SNew(SSpinBox<float>)
-							.MinDesiredWidth(52.f)
-							.MinValue(0.0f)
-							.MaxValue(1.0f)
-							.Delta(0.01f)
-							.MinFractionalDigits(2)
-							.MaxFractionalDigits(2)
-							.Value_Lambda([this]() { return DirectionalNormalMaskOpacity; })
-							.OnValueChanged_Lambda([this](const float NewValue)
-							{
-								DirectionalNormalMaskOpacity = FMath::Clamp(NewValue, 0.0f, 1.0f);
-								RecomposeWorkingColors();
-							})
-						]
-					]
-
-					// Space: Local vs. World.
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					.Padding(FMargin(0.f, 0.f, 0.f, 6.f))
-					[
-						SNew(SHorizontalBox)
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
-						[
-							SNew(STextBlock)
-							.Text(LOCTEXT("NormalSpaceLabel", "Space:"))
-							.ToolTipText(LOCTEXT("NormalSpaceTooltip",
-								"Local Space evaluates normals in the Static Mesh asset's own space -- the same result for every instance, unaffected by Actor/Component rotation. "
-								"World Space evaluates normals using the selected component's transform. The generated colors are saved to the Static Mesh asset and therefore affect every instance of that asset."))
-						]
-
-						+ SHorizontalBox::Slot()
-						.FillWidth(1.f)
-						.VAlign(VAlign_Center)
-						[
-							SAssignNew(NormalSpaceComboBox, SComboBox<TSharedPtr<EVertexMaskForgeNormalSpace>>)
-							.OptionsSource(&NormalSpaceOptions)
-							.OnGenerateWidget(this, &SVertexMaskForgePanel::OnGenerateNormalSpaceRow)
-							.OnSelectionChanged(this, &SVertexMaskForgePanel::OnNormalSpaceSelectionChanged)
-							.ToolTipText(LOCTEXT("NormalSpaceTooltip",
-								"Local Space evaluates normals in the Static Mesh asset's own space -- the same result for every instance, unaffected by Actor/Component rotation. "
-								"World Space evaluates normals using the selected component's transform. The generated colors are saved to the Static Mesh asset and therefore affect every instance of that asset."))
-							[
-								SNew(STextBlock)
-								.Text(this, &SVertexMaskForgePanel::GetNormalSpaceButtonText)
-							]
-						]
-					]
-
-					// Direction: the six principal axes.
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					.Padding(FMargin(0.f, 0.f, 0.f, 6.f))
-					[
-						SNew(SHorizontalBox)
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
-						[
-							SNew(STextBlock).Text(LOCTEXT("NormalDirectionLabel", "Direction:"))
-						]
-
-						+ SHorizontalBox::Slot()
-						.FillWidth(1.f)
-						.VAlign(VAlign_Center)
-						[
-							SAssignNew(NormalDirectionComboBox, SComboBox<TSharedPtr<EVertexMaskForgeNormalDirection>>)
-							.OptionsSource(&NormalDirectionOptions)
-							.OnGenerateWidget(this, &SVertexMaskForgePanel::OnGenerateNormalDirectionRow)
-							.OnSelectionChanged(this, &SVertexMaskForgePanel::OnNormalDirectionSelectionChanged)
-							[
-								SNew(STextBlock)
-								.Text(this, &SVertexMaskForgePanel::GetNormalDirectionButtonText)
-							]
-						]
-					]
-
-					// Angle (degrees, 0-180).
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					.Padding(FMargin(0.f, 0.f, 0.f, 2.f))
-					[
-						SNew(SHorizontalBox)
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
-						[
-							SNew(STextBlock)
-							.Text(LOCTEXT("DirectionalNormalAngleLabel", "Angle"))
-							.ToolTipText(LOCTEXT("DirectionalNormalAngleTooltip", "Cone half-angle, in degrees, from the selected Direction. 0 = only exact alignment; 180 = full coverage."))
-						]
-
-						+ SHorizontalBox::Slot()
-						.FillWidth(1.f)
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 8.f, 0.f))
-						[
-							SNew(SSlider)
-							.MinValue(0.0f)
-							.MaxValue(180.0f)
-							.Value_Lambda([this]() { return DirectionalNormalAngle; })
-							.OnValueChanged_Lambda([this](const float NewValue)
-							{
-								DirectionalNormalAngle = FMath::Clamp(NewValue, 0.0f, 180.0f);
-								OnDirectionalNormalMaskGenerativeParamChanged();
-							})
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						[
-							SNew(SSpinBox<float>)
-							.MinDesiredWidth(52.f)
-							.MinValue(0.0f)
-							.MaxValue(180.0f)
-							.Delta(0.1f)
-							.Value_Lambda([this]() { return DirectionalNormalAngle; })
-							.OnValueChanged_Lambda([this](const float NewValue)
-							{
-								DirectionalNormalAngle = FMath::Clamp(NewValue, 0.0f, 180.0f);
-								OnDirectionalNormalMaskGenerativeParamChanged();
-							})
-						]
-					]
-
-					// Falloff (degrees, 0-180, internally clamped to [0, Angle] at generation time).
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					.Padding(FMargin(0.f, 0.f, 0.f, 6.f))
-					[
-						SNew(SHorizontalBox)
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
-						[
-							SNew(STextBlock)
-							.Text(LOCTEXT("DirectionalNormalFalloffLabel", "Falloff"))
-							.ToolTipText(LOCTEXT("DirectionalNormalFalloffTooltip", "Smooth transition width, in degrees, ending exactly at Angle. Internally clamped to [0, Angle] -- never causes a division by zero."))
-						]
-
-						+ SHorizontalBox::Slot()
-						.FillWidth(1.f)
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 8.f, 0.f))
-						[
-							SNew(SSlider)
-							.MinValue(0.0f)
-							.MaxValue(180.0f)
-							.Value_Lambda([this]() { return DirectionalNormalFalloff; })
-							.OnValueChanged_Lambda([this](const float NewValue)
-							{
-								DirectionalNormalFalloff = FMath::Clamp(NewValue, 0.0f, 180.0f);
-								OnDirectionalNormalMaskGenerativeParamChanged();
-							})
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						[
-							SNew(SSpinBox<float>)
-							.MinDesiredWidth(52.f)
-							.MinValue(0.0f)
-							.MaxValue(180.0f)
-							.Delta(0.1f)
-							.Value_Lambda([this]() { return DirectionalNormalFalloff; })
-							.OnValueChanged_Lambda([this](const float NewValue)
-							{
-								DirectionalNormalFalloff = FMath::Clamp(NewValue, 0.0f, 180.0f);
-								OnDirectionalNormalMaskGenerativeParamChanged();
-							})
-						]
-					]
-
-					// Blur: topological smoothing of the raw Directional Normal Mask, applied BEFORE Invert --
-					// same widget/range/default/tooltip pattern as Curvature's own Blur (see that section
-					// above and ApplyAdjacencyTopologicalBlur's doc comment for why the underlying adjacency
-					// must differ by domain even though the algorithm and UI are identical).
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					.Padding(FMargin(0.f, 0.f, 0.f, 4.f))
-					[
-						SNew(SHorizontalBox)
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
-						[
-							SNew(STextBlock)
-							.Text(LOCTEXT("DirectionalNormalBlurLabel", "Blur"))
-							.ToolTipText(LOCTEXT("DirectionalNormalBlurTooltip",
-								"Topological smoothing of the Directional Normal Mask, applied before Invert. Whole number = full iterations; fractional part blends toward one more."))
-						]
-
-						+ SHorizontalBox::Slot()
-						.FillWidth(1.f)
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 8.f, 0.f))
-						[
-							SNew(SSlider)
-							.MinValue(0.0f)
-							.MaxValue(10.0f)
-							.Value_Lambda([this]() { return DirectionalNormalBlur; })
-							.OnValueChanged_Lambda([this](const float NewValue)
-							{
-								DirectionalNormalBlur = FMath::Clamp(NewValue, 0.0f, 10.0f);
-								OnDirectionalNormalMaskGenerativeParamChanged();
-							})
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						[
-							SNew(SSpinBox<float>)
-							.MinDesiredWidth(52.f)
-							.MinValue(0.0f)
-							.MaxValue(10.0f)
-							.Delta(0.01f)
-							.Value_Lambda([this]() { return DirectionalNormalBlur; })
-							.OnValueChanged_Lambda([this](const float NewValue)
-							{
-								DirectionalNormalBlur = FMath::Clamp(NewValue, 0.0f, 10.0f);
-								OnDirectionalNormalMaskGenerativeParamChanged();
-							})
-						]
-					]
-
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					.Padding(FMargin(0.f, 0.f, 0.f, 6.f))
-					[
-						SNew(SCheckBox)
-						.IsChecked(this, &SVertexMaskForgePanel::GetDirectionalNormalMaskInvertState)
-						.OnCheckStateChanged(this, &SVertexMaskForgePanel::OnDirectionalNormalMaskInvertChanged)
-						.Content()
-						[
-							SNew(STextBlock)
-							.Text(LOCTEXT("DirectionalNormalMaskInvertLabel", "Invert"))
-						]
-					]
-
-					// Diagnostic: World-Space multi-instance conflict / degenerate transform reasons --
-					// empty (renders nothing) when available and valid.
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					[
-						SNew(STextBlock)
-						.Text(this, &SVertexMaskForgePanel::GetDirectionalNormalMaskDiagnosticText)
-						.ColorAndOpacity(FSlateColor::UseSubduedForeground())
-						.AutoWrapText(true)
-					]
-				]
-			]
-
-			// Thickness Mask (V2-G): the tool's independent, optional composition-stack layer positioned
-			// visually between Directional Normal and Noise -- same collapsible panel pattern, same
-			// Enable -> Blend Mode -> Opacity -> [generative params] -> Blur -> Invert -> diagnostic
-			// layout as Directional Normal above. Asset Local Space ONLY -- no Space seletor.
-			+ SVerticalBox::Slot()
-			.AutoHeight()
-			.Padding(FMargin(0.f, 12.f, 0.f, 0.f))
-			[
-				SNew(SExpandableArea)
-				.InitiallyCollapsed(true)
-				.Padding(FMargin(8.f))
-				.HeaderContent()
-				[
-					SNew(STextBlock)
-					.Text(LOCTEXT("ThicknessMaskSectionTitle", "Thickness"))
-					.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
-				]
-				.BodyContent()
-				[
-					SNew(SVerticalBox)
-
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					.Padding(FMargin(0.f, 0.f, 0.f, 6.f))
-					[
-						SNew(SCheckBox)
-						.IsChecked(this, &SVertexMaskForgePanel::GetThicknessMaskEnableState)
-						.OnCheckStateChanged(this, &SVertexMaskForgePanel::OnThicknessMaskEnableChanged)
-						.Content()
-						[
-							SNew(STextBlock)
-							.Text(LOCTEXT("ThicknessMaskEnableLabel", "Enable"))
-						]
-					]
-
-					// Blend Mode + Opacity: same pattern as every other generator, at the top after Enable.
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					.Padding(FMargin(0.f, 0.f, 0.f, 2.f))
-					[
-						SNew(SHorizontalBox)
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
-						[
-							SNew(STextBlock).Text(LOCTEXT("ThicknessMaskBlendModeLabel", "Blend Mode:"))
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						[
-							SAssignNew(ThicknessMaskBlendModeComboBox, SComboBox<TSharedPtr<EVertexMaskForgeBlendMode>>)
-							.OptionsSource(&BlendModeOptions)
-							.InitiallySelectedItem(BlendModeOptions[0])
-							.OnGenerateWidget(this, &SVertexMaskForgePanel::OnGenerateThicknessMaskBlendModeRow)
-							.OnSelectionChanged(this, &SVertexMaskForgePanel::OnThicknessMaskBlendModeSelectionChanged)
-							[
-								SNew(STextBlock)
-								.Text(this, &SVertexMaskForgePanel::GetThicknessMaskBlendModeButtonText)
-							]
-						]
-					]
-
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					.Padding(FMargin(0.f, 0.f, 0.f, 6.f))
-					[
-						SNew(SHorizontalBox)
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
-						[
-							SNew(STextBlock).Text(LOCTEXT("ThicknessMaskOpacityLabel", "Opacity:"))
-						]
-
-						+ SHorizontalBox::Slot()
-						.FillWidth(1.f)
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 8.f, 0.f))
-						[
-							SNew(SSlider)
-							.MinValue(0.0f)
-							.MaxValue(1.0f)
-							.Value_Lambda([this]() { return ThicknessMaskOpacity; })
-							.OnValueChanged_Lambda([this](const float NewValue)
-							{
-								ThicknessMaskOpacity = FMath::Clamp(NewValue, 0.0f, 1.0f);
-								RecomposeWorkingColors();
-							})
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						[
-							SNew(SSpinBox<float>)
-							.MinDesiredWidth(52.f)
-							.MinValue(0.0f)
-							.MaxValue(1.0f)
-							.Delta(0.01f)
-							.MinFractionalDigits(2)
-							.MaxFractionalDigits(2)
-							.Value_Lambda([this]() { return ThicknessMaskOpacity; })
-							.OnValueChanged_Lambda([this](const float NewValue)
-							{
-								ThicknessMaskOpacity = FMath::Clamp(NewValue, 0.0f, 1.0f);
-								RecomposeWorkingColors();
-							})
-						]
-					]
-
-					// Min Thickness (renormalizes only -- never triggers a new raycast).
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					.Padding(FMargin(0.f, 0.f, 0.f, 2.f))
-					[
-						SNew(SHorizontalBox)
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
-						[
-							SNew(STextBlock)
-							.Text(LOCTEXT("ThicknessMinLabel", "Min Thickness"))
-							.ToolTipText(LOCTEXT("ThicknessMinTooltip", "Measured thickness at or below this value reads as white. Local-space units."))
-						]
-
-						+ SHorizontalBox::Slot()
-						.FillWidth(1.f)
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 8.f, 0.f))
-						[
-							SNew(SSlider)
-							.MinValue(0.0f)
-							.MaxValue(10000.0f)
-							.Value_Lambda([this]() { return ThicknessMinThickness; })
-							.OnValueChanged_Lambda([this](const float NewValue)
-							{
-								ThicknessMinThickness = FMath::Clamp(NewValue, 0.0f, 10000.0f);
-								OnThicknessPostProcessParamChanged();
-							})
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						[
-							SNew(SSpinBox<float>)
-							.MinDesiredWidth(52.f)
-							.MinValue(0.0f)
-							.MaxValue(10000.0f)
-							.Delta(0.1f)
-							.Value_Lambda([this]() { return ThicknessMinThickness; })
-							.OnValueChanged_Lambda([this](const float NewValue)
-							{
-								ThicknessMinThickness = FMath::Clamp(NewValue, 0.0f, 10000.0f);
-								OnThicknessPostProcessParamChanged();
-							})
-						]
-					]
-
-					// Max Thickness (renormalizes only -- never triggers a new raycast).
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					.Padding(FMargin(0.f, 0.f, 0.f, 2.f))
-					[
-						SNew(SHorizontalBox)
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
-						[
-							SNew(STextBlock)
-							.Text(LOCTEXT("ThicknessMaxLabel", "Max Thickness"))
-							.ToolTipText(LOCTEXT("ThicknessMaxTooltip", "Measured thickness at or above this value reads as black (still a valid measurement, distinct from Search Distance). Local-space units."))
-						]
-
-						+ SHorizontalBox::Slot()
-						.FillWidth(1.f)
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 8.f, 0.f))
-						[
-							SNew(SSlider)
-							.MinValue(0.0f)
-							.MaxValue(10000.0f)
-							.Value_Lambda([this]() { return ThicknessMaxThickness; })
-							.OnValueChanged_Lambda([this](const float NewValue)
-							{
-								ThicknessMaxThickness = FMath::Clamp(NewValue, 0.0f, 10000.0f);
-								OnThicknessPostProcessParamChanged();
-							})
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						[
-							SNew(SSpinBox<float>)
-							.MinDesiredWidth(52.f)
-							.MinValue(0.0f)
-							.MaxValue(10000.0f)
-							.Delta(0.1f)
-							.Value_Lambda([this]() { return ThicknessMaxThickness; })
-							.OnValueChanged_Lambda([this](const float NewValue)
-							{
-								ThicknessMaxThickness = FMath::Clamp(NewValue, 0.0f, 10000.0f);
-								OnThicknessPostProcessParamChanged();
-							})
-						]
-					]
-
-					// Search Distance (triggers a new raycast -- distinct from Max Thickness).
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					.Padding(FMargin(0.f, 0.f, 0.f, 2.f))
-					[
-						SNew(SHorizontalBox)
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
-						[
-							SNew(STextBlock)
-							.Text(LOCTEXT("ThicknessSearchLabel", "Search Distance"))
-							.ToolTipText(LOCTEXT("ThicknessSearchTooltip", "Maximum physical raycast distance from the origin surface. Must be at least Max Thickness -- enforced automatically. Local-space units."))
-						]
-
-						+ SHorizontalBox::Slot()
-						.FillWidth(1.f)
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 8.f, 0.f))
-						[
-							SNew(SSlider)
-							.MinValue(0.0f)
-							.MaxValue(10000.0f)
-							.Value_Lambda([this]() { return ThicknessSearchDistance; })
-							.OnValueChanged_Lambda([this](const float NewValue)
-							{
-								ThicknessSearchDistance = FMath::Clamp(NewValue, 0.0f, 10000.0f);
-								OnThicknessRaycastParamChanged();
-							})
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						[
-							SNew(SSpinBox<float>)
-							.MinDesiredWidth(52.f)
-							.MinValue(0.0f)
-							.MaxValue(10000.0f)
-							.Delta(0.1f)
-							.Value_Lambda([this]() { return ThicknessSearchDistance; })
-							.OnValueChanged_Lambda([this](const float NewValue)
-							{
-								ThicknessSearchDistance = FMath::Clamp(NewValue, 0.0f, 10000.0f);
-								OnThicknessRaycastParamChanged();
-							})
-						]
-					]
-
-					// Bias (triggers a new raycast).
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					.Padding(FMargin(0.f, 0.f, 0.f, 6.f))
-					[
-						SNew(SHorizontalBox)
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
-						[
-							SNew(STextBlock)
-							.Text(LOCTEXT("ThicknessBiasLabel", "Bias"))
-							.ToolTipText(LOCTEXT("ThicknessBiasTooltip", "Ray origin offset into the mesh, used only to avoid self-hit; reconstructed out of the measured distance so it never shifts the result artistically."))
-						]
-
-						+ SHorizontalBox::Slot()
-						.FillWidth(1.f)
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 8.f, 0.f))
-						[
-							SNew(SSlider)
-							.MinValue(0.001f)
-							.MaxValue(10.0f)
-							.Value_Lambda([this]() { return ThicknessBias; })
-							.OnValueChanged_Lambda([this](const float NewValue)
-							{
-								ThicknessBias = FMath::Clamp(NewValue, 0.001f, 10.0f);
-								OnThicknessRaycastParamChanged();
-							})
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						[
-							SNew(SSpinBox<float>)
-							.MinDesiredWidth(52.f)
-							.MinValue(0.001f)
-							.MaxValue(10.0f)
-							.Delta(0.001f)
-							.Value_Lambda([this]() { return ThicknessBias; })
-							.OnValueChanged_Lambda([this](const float NewValue)
-							{
-								ThicknessBias = FMath::Clamp(NewValue, 0.001f, 10.0f);
-								OnThicknessRaycastParamChanged();
-							})
-						]
-					]
-
-					// Blur: same widget/range/default/tooltip pattern as Directional Normal's own Blur.
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					.Padding(FMargin(0.f, 0.f, 0.f, 4.f))
-					[
-						SNew(SHorizontalBox)
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
-						[
-							SNew(STextBlock)
-							.Text(LOCTEXT("ThicknessBlurLabel", "Blur"))
-							.ToolTipText(LOCTEXT("ThicknessBlurTooltip",
-								"Topological smoothing of the normalized Thickness mask, applied before Invert. Whole number = full iterations; fractional part blends toward one more."))
-						]
-
-						+ SHorizontalBox::Slot()
-						.FillWidth(1.f)
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 8.f, 0.f))
-						[
-							SNew(SSlider)
-							.MinValue(0.0f)
-							.MaxValue(10.0f)
-							.Value_Lambda([this]() { return ThicknessBlur; })
-							.OnValueChanged_Lambda([this](const float NewValue)
-							{
-								ThicknessBlur = FMath::Clamp(NewValue, 0.0f, 10.0f);
-								OnThicknessPostProcessParamChanged();
-							})
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						[
-							SNew(SSpinBox<float>)
-							.MinDesiredWidth(52.f)
-							.MinValue(0.0f)
-							.MaxValue(10.0f)
-							.Delta(0.01f)
-							.Value_Lambda([this]() { return ThicknessBlur; })
-							.OnValueChanged_Lambda([this](const float NewValue)
-							{
-								ThicknessBlur = FMath::Clamp(NewValue, 0.0f, 10.0f);
-								OnThicknessPostProcessParamChanged();
-							})
-						]
-					]
-
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					.Padding(FMargin(0.f, 0.f, 0.f, 6.f))
-					[
-						SNew(SCheckBox)
-						.IsChecked(this, &SVertexMaskForgePanel::GetThicknessMaskInvertState)
-						.OnCheckStateChanged(this, &SVertexMaskForgePanel::OnThicknessMaskInvertChanged)
-						.Content()
-						[
-							SNew(STextBlock)
-							.Text(LOCTEXT("ThicknessMaskInvertLabel", "Invert"))
-						]
-					]
-
-					// Diagnostic: no-hit / invalid-geometry / degenerate reasons -- empty when fully valid.
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					[
-						SNew(STextBlock)
-						.Text(this, &SVertexMaskForgePanel::GetThicknessMaskDiagnosticText)
-						.ColorAndOpacity(FSlateColor::UseSubduedForeground())
-						.AutoWrapText(true)
-					]
-				]
-			]
-
-			// Noise Mask (V1): the tool's fourth, independent, optional composition-stack layer -- same
-			// collapsible panel pattern as Bounding Box/Ambient Occlusion/Curvature above.
-			+ SVerticalBox::Slot()
-			.AutoHeight()
-			.Padding(FMargin(0.f, 12.f, 0.f, 0.f))
-			[
-				SNew(SExpandableArea)
-				.InitiallyCollapsed(true)
-				.Padding(FMargin(8.f))
-				.HeaderContent()
-				[
-					SNew(STextBlock)
-					.Text(LOCTEXT("NoiseSectionTitle", "Noise"))
-					.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
-				]
-				.BodyContent()
-				[
-					SNew(SVerticalBox)
-
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					.Padding(FMargin(0.f, 0.f, 0.f, 6.f))
-					[
-						SNew(SCheckBox)
-						.IsChecked(this, &SVertexMaskForgePanel::GetNoiseEnableState)
-						.OnCheckStateChanged(this, &SVertexMaskForgePanel::OnNoiseEnableChanged)
-						.Content()
-						[
-							SNew(STextBlock)
-							.Text(LOCTEXT("NoiseEnableLabel", "Enable"))
-						]
-					]
-
-					// Blend Mode + Opacity: same Slate controls/dimensions/alignment/labels/tooltips/
-					// limits as the other three layers' own (see those sections above).
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					.Padding(FMargin(0.f, 0.f, 0.f, 2.f))
-					[
-						SNew(SHorizontalBox)
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
-						[
-							SNew(STextBlock).Text(LOCTEXT("NoiseBlendModeLabel", "Blend Mode:"))
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						[
-							SAssignNew(NoiseBlendModeComboBox, SComboBox<TSharedPtr<EVertexMaskForgeBlendMode>>)
-							.OptionsSource(&BlendModeOptions)
-							.InitiallySelectedItem(BlendModeOptions[0])
-							.OnGenerateWidget(this, &SVertexMaskForgePanel::OnGenerateNoiseBlendModeRow)
-							.OnSelectionChanged(this, &SVertexMaskForgePanel::OnNoiseBlendModeSelectionChanged)
-							[
-								SNew(STextBlock)
-								.Text(this, &SVertexMaskForgePanel::GetNoiseBlendModeButtonText)
-							]
-						]
-					]
-
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					.Padding(FMargin(0.f, 0.f, 0.f, 6.f))
-					[
-						SNew(SHorizontalBox)
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
-						[
-							SNew(STextBlock).Text(LOCTEXT("NoiseOpacityLabel", "Opacity:"))
-						]
-
-						+ SHorizontalBox::Slot()
-						.FillWidth(1.f)
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 8.f, 0.f))
-						[
-							SNew(SSlider)
-							.MinValue(0.0f)
-							.MaxValue(1.0f)
-							.Value_Lambda([this]() { return NoiseOpacity; })
-							.OnValueChanged_Lambda([this](const float NewValue)
-							{
-								NoiseOpacity = FMath::Clamp(NewValue, 0.0f, 1.0f);
-								RecomposeWorkingColors();
-							})
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						[
-							SNew(SSpinBox<float>)
-							.MinDesiredWidth(52.f)
-							.MinValue(0.0f)
-							.MaxValue(1.0f)
-							.Delta(0.01f)
-							.MinFractionalDigits(2)
-							.MaxFractionalDigits(2)
-							.Value_Lambda([this]() { return NoiseOpacity; })
-							.OnValueChanged_Lambda([this](const float NewValue)
-							{
-								NoiseOpacity = FMath::Clamp(NewValue, 0.0f, 1.0f);
-								RecomposeWorkingColors();
-							})
-						]
-					]
-
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					.Padding(FMargin(0.f, 0.f, 0.f, 6.f))
-					[
-						SNew(SHorizontalBox)
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
-						[
-							SNew(STextBlock).Text(LOCTEXT("NoiseTypeLabel", "Noise Type:"))
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						[
-							SAssignNew(NoiseTypeComboBox, SComboBox<TSharedPtr<EVertexMaskForgeNoiseType>>)
-							.OptionsSource(&NoiseTypeOptions)
-							.InitiallySelectedItem(NoiseTypeOptions[1])
-							.OnGenerateWidget(this, &SVertexMaskForgePanel::OnGenerateNoiseTypeRow)
-							.OnSelectionChanged(this, &SVertexMaskForgePanel::OnNoiseTypeSelectionChanged)
-							.ToolTipText(LOCTEXT("NoiseTypeTooltip",
-								"Perlin: a single noise octave. Fractal Perlin (FBM): several octaves summed for more detail."))
-							[
-								SNew(STextBlock)
-								.Text(this, &SVertexMaskForgePanel::GetNoiseTypeButtonText)
-							]
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(12.f, 0.f, 0.f, 0.f))
-						[
-							SNew(SCheckBox)
-							.IsChecked(this, &SVertexMaskForgePanel::GetNoiseInvertState)
-							.OnCheckStateChanged(this, &SVertexMaskForgePanel::OnNoiseInvertChanged)
-							.Content()
-							[
-								SNew(STextBlock)
-								.Text(LOCTEXT("NoiseInvertLabel", "Invert"))
-							]
-						]
-					]
-
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					.Padding(FMargin(0.f, 0.f, 0.f, 4.f))
-					[
-						SNew(SHorizontalBox)
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
-						[
-							SNew(STextBlock).Text(LOCTEXT("NoiseScaleLabel", "Scale"))
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
-						[
-							SNew(SSpinBox<float>)
-							.MinDesiredWidth(52.f)
-							.MinValue(0.001f)
-							.MaxValue(1000.0f)
-							.Delta(0.01f)
-							.ToolTipText(LOCTEXT("NoiseScaleXTooltip", "Frequency multiplier along local X. 1.0 is approximately one noise unit per meter."))
-							.Value_Lambda([this]() { return NoiseScaleX; })
-							.OnValueChanged(this, &SVertexMaskForgePanel::OnNoiseScaleXChanged)
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
-						[
-							SNew(SSpinBox<float>)
-							.MinDesiredWidth(52.f)
-							.MinValue(0.001f)
-							.MaxValue(1000.0f)
-							.Delta(0.01f)
-							.ToolTipText(LOCTEXT("NoiseScaleYTooltip", "Frequency multiplier along local Y."))
-							.IsEnabled_Lambda([this]() { return !bNoiseScaleAxesLocked; })
-							.Value_Lambda([this]() { return NoiseScaleY; })
-							.OnValueChanged_Lambda([this](const float NewValue)
-							{
-								NoiseScaleY = FMath::Max(NewValue, 0.001f);
-								OnNoiseGenerativeParamChanged();
-							})
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 8.f, 0.f))
-						[
-							SNew(SSpinBox<float>)
-							.MinDesiredWidth(52.f)
-							.MinValue(0.001f)
-							.MaxValue(1000.0f)
-							.Delta(0.01f)
-							.ToolTipText(LOCTEXT("NoiseScaleZTooltip", "Frequency multiplier along local Z."))
-							.IsEnabled_Lambda([this]() { return !bNoiseScaleAxesLocked; })
-							.Value_Lambda([this]() { return NoiseScaleZ; })
-							.OnValueChanged_Lambda([this](const float NewValue)
-							{
-								NoiseScaleZ = FMath::Max(NewValue, 0.001f);
-								OnNoiseGenerativeParamChanged();
-							})
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						[
-							SNew(SCheckBox)
-							.ToolTipText(LOCTEXT("NoiseScaleAxesLockedTooltip", "Use Scale X for all three axes."))
-							.IsChecked(this, &SVertexMaskForgePanel::GetNoiseScaleAxesLockState)
-							.OnCheckStateChanged(this, &SVertexMaskForgePanel::OnNoiseScaleAxesLockChanged)
-							[
-								SNew(STextBlock)
-								.Text(LOCTEXT("NoiseScaleAxesLockedLabel", "Lock Axes"))
-							]
-						]
-					]
-
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					.Padding(FMargin(0.f, 0.f, 0.f, 4.f))
-					[
-						SNew(SHorizontalBox)
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
-						[
-							SNew(STextBlock).Text(LOCTEXT("NoiseOffsetLabel", "Offset"))
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
-						[
-							SNew(SSpinBox<float>)
-							.MinDesiredWidth(52.f)
-							.MinValue(-100000.0f)
-							.MaxValue(100000.0f)
-							.Delta(0.1f)
-							.ToolTipText(LOCTEXT("NoiseOffsetXTooltip", "Domain offset along X, in noise space."))
-							.Value_Lambda([this]() { return NoiseOffsetX; })
-							.OnValueChanged_Lambda([this](const float NewValue)
-							{
-								NoiseOffsetX = NewValue;
-								OnNoiseGenerativeParamChanged();
-							})
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
-						[
-							SNew(SSpinBox<float>)
-							.MinDesiredWidth(52.f)
-							.MinValue(-100000.0f)
-							.MaxValue(100000.0f)
-							.Delta(0.1f)
-							.ToolTipText(LOCTEXT("NoiseOffsetYTooltip", "Domain offset along Y, in noise space."))
-							.Value_Lambda([this]() { return NoiseOffsetY; })
-							.OnValueChanged_Lambda([this](const float NewValue)
-							{
-								NoiseOffsetY = NewValue;
-								OnNoiseGenerativeParamChanged();
-							})
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						[
-							SNew(SSpinBox<float>)
-							.MinDesiredWidth(52.f)
-							.MinValue(-100000.0f)
-							.MaxValue(100000.0f)
-							.Delta(0.1f)
-							.ToolTipText(LOCTEXT("NoiseOffsetZTooltip", "Domain offset along Z, in noise space."))
-							.Value_Lambda([this]() { return NoiseOffsetZ; })
-							.OnValueChanged_Lambda([this](const float NewValue)
-							{
-								NoiseOffsetZ = NewValue;
-								OnNoiseGenerativeParamChanged();
-							})
-						]
-					]
-
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					.Padding(FMargin(0.f, 0.f, 0.f, 4.f))
-					[
-						SNew(SHorizontalBox)
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
-						[
-							SNew(STextBlock).Text(LOCTEXT("NoiseSeedLabel", "Seed"))
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 12.f, 0.f))
-						[
-							SNew(SSpinBox<int32>)
-							.MinDesiredWidth(64.f)
-							.MinValue(-2147483647)
-							.MaxValue(2147483647)
-							.Delta(1)
-							.Value_Lambda([this]() { return NoiseSeed; })
-							.OnValueChanged_Lambda([this](const int32 NewValue)
-							{
-								NoiseSeed = NewValue;
-								OnNoiseGenerativeParamChanged();
-							})
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
-						[
-							SNew(STextBlock)
-							.Text(LOCTEXT("NoiseMultiplierLabel", "Multiplier"))
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 12.f, 0.f))
-						[
-							SNew(SSpinBox<float>)
-							.MinDesiredWidth(52.f)
-							.MinValue(0.0f)
-							.MaxValue(10.0f)
-							.Delta(0.01f)
-							.Value_Lambda([this]() { return NoiseMultiplier; })
-							.OnValueChanged_Lambda([this](const float NewValue)
-							{
-								NoiseMultiplier = FMath::Max(NewValue, 0.0f);
-								OnNoiseArtisticParamChanged();
-							})
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
-						[
-							SNew(STextBlock)
-							.Text(LOCTEXT("NoiseBlurLabel", "Blur"))
-							.ToolTipText(LOCTEXT("NoiseBlurTooltip", "Smooths the procedural noise field before Multiplier and Levels are applied."))
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						[
-							SNew(SSpinBox<float>)
-							.MinDesiredWidth(52.f)
-							.MinValue(0.0f)
-							.MaxValue(1.0f)
-							.Delta(0.01f)
-							.ToolTipText(LOCTEXT("NoiseBlurTooltip", "Smooths the procedural noise field before Multiplier and Levels are applied."))
-							.Value_Lambda([this]() { return NoiseBlur; })
-							.OnValueChanged_Lambda([this](const float NewValue)
-							{
-								NoiseBlur = FMath::Clamp(NewValue, 0.0f, 1.0f);
-								OnNoiseGenerativeParamChanged();
-							})
-						]
-					]
-
-					// FBM-only controls -- always visible in V1 (no dynamic show/hide by Noise Type),
-					// but disabled (IsEnabled) when Noise Type is Perlin since ComputeRawNoiseValue
-					// never reads them in that branch.
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					.Padding(FMargin(0.f, 0.f, 0.f, 4.f))
-					[
-						SNew(SHorizontalBox)
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
-						[
-							SNew(STextBlock)
-							.Text(LOCTEXT("NoiseOctavesLabel", "Octaves"))
-							.ToolTipText(LOCTEXT("NoiseOctavesTooltip", "Multi-octave types only (Fractal Perlin, Billow, Ridged, Turbulence)."))
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 12.f, 0.f))
-						[
-							SNew(SSpinBox<int32>)
-							.MinDesiredWidth(44.f)
-							.MinValue(1)
-							.MaxValue(8)
-							.Delta(1)
-							.IsEnabled_Lambda([this]() { return UsesFractalParameters(); })
-							.Value_Lambda([this]() { return NoiseOctaves; })
-							.OnValueChanged_Lambda([this](const int32 NewValue)
-							{
-								NoiseOctaves = FMath::Clamp(NewValue, 1, 8);
-								OnNoiseGenerativeParamChanged();
-							})
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
-						[
-							SNew(STextBlock)
-							.Text(LOCTEXT("NoiseRoughnessLabel", "Roughness"))
-							.ToolTipText(LOCTEXT("NoiseRoughnessTooltip", "Per-octave amplitude multiplier. Multi-octave types only."))
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 12.f, 0.f))
-						[
-							SNew(SSpinBox<float>)
-							.MinDesiredWidth(52.f)
-							.MinValue(0.0f)
-							.MaxValue(1.0f)
-							.Delta(0.01f)
-							.IsEnabled_Lambda([this]() { return UsesFractalParameters(); })
-							.Value_Lambda([this]() { return NoiseRoughness; })
-							.OnValueChanged_Lambda([this](const float NewValue)
-							{
-								NoiseRoughness = FMath::Clamp(NewValue, 0.0f, 1.0f);
-								OnNoiseGenerativeParamChanged();
-							})
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
-						[
-							SNew(STextBlock)
-							.Text(LOCTEXT("NoiseLacunarityLabel", "Lacunarity"))
-							.ToolTipText(LOCTEXT("NoiseLacunarityTooltip", "Per-octave frequency multiplier. Multi-octave types only."))
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						[
-							SNew(SSpinBox<float>)
-							.MinDesiredWidth(52.f)
-							.MinValue(1.0f)
-							.MaxValue(10.0f)
-							.Delta(0.01f)
-							.IsEnabled_Lambda([this]() { return UsesFractalParameters(); })
-							.Value_Lambda([this]() { return NoiseLacunarity; })
-							.OnValueChanged_Lambda([this](const float NewValue)
-							{
-								NoiseLacunarity = FMath::Max(NewValue, 1.0f);
-								OnNoiseGenerativeParamChanged();
-							})
-						]
-					]
-
-					// Turbulence-only control -- always visible (no dynamic show/hide by Noise Type),
-					// but disabled (IsEnabled) unless Noise Type is Turbulence, same contract as the
-					// Octaves/Roughness/Lacunarity row above.
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					.Padding(FMargin(0.f, 0.f, 0.f, 4.f))
-					[
-						SNew(SHorizontalBox)
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
-						[
-							SNew(STextBlock)
-							.Text(LOCTEXT("NoiseTurbulenceStrengthLabel", "Turbulence Strength"))
-							.ToolTipText(LOCTEXT("NoiseTurbulenceStrengthTooltip", "Domain-warp displacement strength, in noise space. Turbulence only."))
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						[
-							SNew(SSpinBox<float>)
-							.MinDesiredWidth(52.f)
-							.MinValue(0.0f)
-							.MaxValue(5.0f)
-							.Delta(0.01f)
-							.IsEnabled_Lambda([this]() { return NoiseType == EVertexMaskForgeNoiseType::Turbulence; })
-							.Value_Lambda([this]() { return NoiseTurbulenceStrength; })
-							.OnValueChanged_Lambda([this](const float NewValue)
-							{
-								NoiseTurbulenceStrength = FMath::Clamp(NewValue, 0.0f, 5.0f);
-								OnNoiseGenerativeParamChanged();
-							})
-						]
-					]
-
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					[
-						SNew(SHorizontalBox)
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
-						[
-							SNew(STextBlock)
-							.Text(LOCTEXT("NoiseLevelsMinLabel", "Levels Min"))
-							.ToolTipText(LOCTEXT("NoiseLevelsMinTooltip", "Values at or below this threshold become black."))
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 12.f, 0.f))
-						[
-							SNew(SSpinBox<float>)
-							.MinDesiredWidth(52.f)
-							.MinValue(0.0f)
-							.MaxValue(1.0f)
-							.Delta(0.01f)
-							.ToolTipText(LOCTEXT("NoiseLevelsMinTooltip", "Values at or below this threshold become black."))
-							.Value_Lambda([this]() { return NoiseLevelsMin; })
-							.OnValueChanged_Lambda([this](const float NewValue)
-							{
-								NoiseLevelsMin = FMath::Clamp(NewValue, 0.0f, 1.0f);
-								OnNoiseArtisticParamChanged();
-							})
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
-						[
-							SNew(STextBlock)
-							.Text(LOCTEXT("NoiseLevelsMaxLabel", "Levels Max"))
-							.ToolTipText(LOCTEXT("NoiseLevelsMaxTooltip", "Values at or above this threshold become white."))
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						[
-							SNew(SSpinBox<float>)
-							.MinDesiredWidth(52.f)
-							.MinValue(0.0f)
-							.MaxValue(1.0f)
-							.Delta(0.01f)
-							.ToolTipText(LOCTEXT("NoiseLevelsMaxTooltip", "Values at or above this threshold become white."))
-							.Value_Lambda([this]() { return NoiseLevelsMax; })
-							.OnValueChanged_Lambda([this](const float NewValue)
-							{
-								NoiseLevelsMax = FMath::Clamp(NewValue, 0.0f, 1.0f);
-								OnNoiseArtisticParamChanged();
-							})
-						]
-					]
-				]
-			]
-
-			// Material Slot Mask (V2-D): the tool's fifth, independent, optional composition-stack layer
-			// -- same collapsible panel pattern as Bounding Box/Ambient Occlusion/Curvature/Noise above.
-			// V1 SCOPE: requires exactly one selected mesh -- see IsMaterialSlotMaskAvailableForSelection.
-			+ SVerticalBox::Slot()
-			.AutoHeight()
-			.Padding(FMargin(0.f, 12.f, 0.f, 0.f))
-			[
-				SNew(SExpandableArea)
-				.InitiallyCollapsed(true)
-				.Padding(FMargin(8.f))
-				.HeaderContent()
-				[
-					SNew(STextBlock)
-					.Text(LOCTEXT("MaterialSlotMaskSectionTitle", "Material Slot"))
-					.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
-				]
-				.BodyContent()
-				[
-					SNew(SVerticalBox)
-
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					.Padding(FMargin(0.f, 0.f, 0.f, 6.f))
-					[
-						SNew(SCheckBox)
-						.IsChecked(this, &SVertexMaskForgePanel::GetMaterialSlotMaskEnableState)
-						.OnCheckStateChanged(this, &SVertexMaskForgePanel::OnMaterialSlotMaskEnableChanged)
-						.Content()
-						[
-							SNew(STextBlock)
-							.Text(LOCTEXT("MaterialSlotMaskEnableLabel", "Enable"))
-						]
-					]
-
-					// Blend Mode + Opacity: same Slate controls/dimensions/alignment/labels/tooltips/
-					// limits as the other four layers' own (see those sections above).
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					.Padding(FMargin(0.f, 0.f, 0.f, 2.f))
-					[
-						SNew(SHorizontalBox)
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
-						[
-							SNew(STextBlock).Text(LOCTEXT("MaterialSlotMaskBlendModeLabel", "Blend Mode:"))
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						[
-							SAssignNew(MaterialSlotMaskBlendModeComboBox, SComboBox<TSharedPtr<EVertexMaskForgeBlendMode>>)
-							.OptionsSource(&BlendModeOptions)
-							.InitiallySelectedItem(BlendModeOptions[0])
-							.OnGenerateWidget(this, &SVertexMaskForgePanel::OnGenerateMaterialSlotMaskBlendModeRow)
-							.OnSelectionChanged(this, &SVertexMaskForgePanel::OnMaterialSlotMaskBlendModeSelectionChanged)
-							[
-								SNew(STextBlock)
-								.Text(this, &SVertexMaskForgePanel::GetMaterialSlotMaskBlendModeButtonText)
-							]
-						]
-					]
-
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					.Padding(FMargin(0.f, 0.f, 0.f, 6.f))
-					[
-						SNew(SHorizontalBox)
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
-						[
-							SNew(STextBlock).Text(LOCTEXT("MaterialSlotMaskOpacityLabel", "Opacity:"))
-						]
-
-						+ SHorizontalBox::Slot()
-						.FillWidth(1.f)
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 8.f, 0.f))
-						[
-							SNew(SSlider)
-							.MinValue(0.0f)
-							.MaxValue(1.0f)
-							.Value_Lambda([this]() { return MaterialSlotMaskOpacity; })
-							.OnValueChanged_Lambda([this](const float NewValue)
-							{
-								MaterialSlotMaskOpacity = FMath::Clamp(NewValue, 0.0f, 1.0f);
-								RecomposeWorkingColors();
-							})
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						[
-							SNew(SSpinBox<float>)
-							.MinDesiredWidth(52.f)
-							.MinValue(0.0f)
-							.MaxValue(1.0f)
-							.Delta(0.01f)
-							.MinFractionalDigits(2)
-							.MaxFractionalDigits(2)
-							.Value_Lambda([this]() { return MaterialSlotMaskOpacity; })
-							.OnValueChanged_Lambda([this](const float NewValue)
-							{
-								MaterialSlotMaskOpacity = FMath::Clamp(NewValue, 0.0f, 1.0f);
-								RecomposeWorkingColors();
-							})
-						]
-					]
-
-					// Material Slot dropdown + Invert -- disabled entirely when the V1 single-mesh scope
-					// requirement is not met (see IsMaterialSlotMaskAvailableForSelection), same visual
-					// "disabled, not hidden" convention as every other conditionally-relevant control in
-					// this panel (e.g. Octaves/Roughness/Lacunarity under Noise).
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					.Padding(FMargin(0.f, 0.f, 0.f, 6.f))
-					[
-						SNew(SHorizontalBox)
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 4.f, 0.f))
-						[
-							SNew(STextBlock).Text(LOCTEXT("MaterialSlotLabel", "Material Slot:"))
-						]
-
-						+ SHorizontalBox::Slot()
-						.FillWidth(1.f)
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 12.f, 0.f))
-						[
-							SAssignNew(MaterialSlotComboBox, SComboBox<TSharedPtr<FVertexMaskForgeMaterialSlotInfo>>)
-							.IsEnabled_Lambda([this]() { return IsMaterialSlotMaskAvailableForSelection(); })
-							.OptionsSource(&MaterialSlotOptions)
-							.OnGenerateWidget(this, &SVertexMaskForgePanel::OnGenerateMaterialSlotRow)
-							.OnSelectionChanged(this, &SVertexMaskForgePanel::OnMaterialSlotSelectionChanged)
-							[
-								SNew(STextBlock)
-								.Text(this, &SVertexMaskForgePanel::GetMaterialSlotButtonText)
-							]
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						[
-							SNew(SCheckBox)
-							.IsEnabled_Lambda([this]() { return IsMaterialSlotMaskAvailableForSelection(); })
-							.IsChecked(this, &SVertexMaskForgePanel::GetMaterialSlotMaskInvertState)
-							.OnCheckStateChanged(this, &SVertexMaskForgePanel::OnMaterialSlotMaskInvertChanged)
-							.Content()
-							[
-								SNew(STextBlock)
-								.Text(LOCTEXT("MaterialSlotMaskInvertLabel", "Invert"))
-							]
-						]
-					]
-
-					// Diagnostic: single-mesh-scope / unresolved-mapping reasons Material Slot Mask may
-					// currently be unavailable -- empty (renders nothing) when available and valid.
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					[
-						SNew(STextBlock)
-						.Text(this, &SVertexMaskForgePanel::GetMaterialSlotMaskDiagnosticText)
-						.ColorAndOpacity(FSlateColor::UseSubduedForeground())
-						.AutoWrapText(true)
-					]
-				]
-			]
-
-			// AUDITED (pre-modularization UI/defaults pass): moved here, immediately below the Material
-			// Slot section and directly above Preview Mode -- the sole entry point into an editing
-			// session now sits next to session-level controls (Preview Mode/Fill) rather than above every
+			// AUDITED (pre-modularization UI/defaults pass): moved here, immediately below the Layers
+			// section and directly above Preview Mode -- the sole entry point into an editing
+			// session now sits next to session-level controls (Preview Mode) rather than above every
 			// generator panel. Disabled while already editing (CanEditVertexMask) so a repeated click can
 			// never start a second, overlapping session. Same widget/callback/tooltip/enablement as
 			// before -- moved, not recreated.
@@ -9526,35 +7127,15 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 				[
 					SNew(SVerticalBox)
 
+					// M18: the Legacy/Dynamic Preview Source selector, the global Channel Filter, and the
+					// Fill White/Fill Black buttons were all removed -- Layers is now the sole workflow, so
+					// there is no mode to pick, per-layer R/G/B channels replace the global filter, and
+					// per-layer Fill Value replaces the global constant-fill actions. Preview Mode remains.
 					+ SVerticalBox::Slot()
 					.AutoHeight()
 					.Padding(FMargin(0.f, 0.f, 0.f, 4.f))
 					[
 						SNew(SHorizontalBox)
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						[
-							SNew(STextBlock)
-							.Text(LOCTEXT("PreviewSourceLabel", "Preview Source"))
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(4.f, 0.f, 12.f, 0.f))
-						[
-							SAssignNew(PreviewSourceComboBox, SComboBox<TSharedPtr<EVertexMaskForgePreviewSource>>)
-							.OptionsSource(&PreviewSourceOptions)
-							.InitiallySelectedItem(PreviewSourceOptions[0])
-							.OnGenerateWidget(this, &SVertexMaskForgePanel::OnGeneratePreviewSourceRow)
-							.OnSelectionChanged(this, &SVertexMaskForgePanel::OnPreviewSourceSelectionChanged)
-							[
-								SNew(STextBlock)
-								.Text(this, &SVertexMaskForgePanel::GetPreviewSourceButtonText)
-							]
-						]
 
 						+ SHorizontalBox::Slot()
 						.AutoWidth()
@@ -9579,27 +7160,6 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 								.Text(this, &SVertexMaskForgePanel::GetPreviewModeButtonText)
 							]
 						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						[
-							SNew(SButton)
-							.Text(LOCTEXT("FillWhite", "Fill White"))
-							.OnClicked(this, &SVertexMaskForgePanel::OnFillWhiteClicked)
-							.IsEnabled(this, &SVertexMaskForgePanel::CanRunFill)
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(6.f, 0.f, 0.f, 0.f))
-						[
-							SNew(SButton)
-							.Text(LOCTEXT("FillBlack", "Fill Black"))
-							.OnClicked(this, &SVertexMaskForgePanel::OnFillBlackClicked)
-							.IsEnabled(this, &SVertexMaskForgePanel::CanRunFill)
-						]
 					]
 
 					+ SVerticalBox::Slot()
@@ -9610,66 +7170,6 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 						.Text(this, &SVertexMaskForgePanel::GetMaskActionStatusText)
 						.ColorAndOpacity(FSlateColor::UseSubduedForeground())
 						.AutoWrapText(true)
-					]
-
-					+ SVerticalBox::Slot()
-					.AutoHeight()
-					.Padding(FMargin(0.f, 0.f, 0.f, 4.f))
-					[
-						SNew(SHorizontalBox)
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(0.f, 0.f, 8.f, 0.f))
-						[
-							SNew(STextBlock)
-							.Text(LOCTEXT("ChannelFilterLabel", "Channel Filter"))
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						[
-							SNew(SCheckBox)
-							.IsChecked(this, &SVertexMaskForgePanel::GetChannelFilterRState)
-							.OnCheckStateChanged(this, &SVertexMaskForgePanel::OnChannelFilterRChanged)
-							.Content()
-							[
-								SNew(STextBlock)
-								.Text(LOCTEXT("ChannelFilterR", "R"))
-							]
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(8.f, 0.f, 0.f, 0.f))
-						[
-							SNew(SCheckBox)
-							.IsChecked(this, &SVertexMaskForgePanel::GetChannelFilterGState)
-							.OnCheckStateChanged(this, &SVertexMaskForgePanel::OnChannelFilterGChanged)
-							.Content()
-							[
-								SNew(STextBlock)
-								.Text(LOCTEXT("ChannelFilterG", "G"))
-							]
-						]
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(FMargin(8.f, 0.f, 0.f, 0.f))
-						[
-							SNew(SCheckBox)
-							.IsChecked(this, &SVertexMaskForgePanel::GetChannelFilterBState)
-							.OnCheckStateChanged(this, &SVertexMaskForgePanel::OnChannelFilterBChanged)
-							.Content()
-							[
-								SNew(STextBlock)
-								.Text(LOCTEXT("ChannelFilterB", "B"))
-							]
-						]
 					]
 
 					// AUDITED (live-preview migration): every parameter change regenerates/republishes the
@@ -10305,139 +7805,6 @@ void SVertexMaskForgePanel::RecomposeWorkingColors()
 	UpdateAllPreviews(/*bCommit=*/false);
 }
 
-bool SVertexMaskForgePanel::CanRunFill() const
-{
-	if (OperationState == EVertexMaskForgeOperationState::Applying)
-	{
-		return false;
-	}
-
-	for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
-	{
-		if (Entry.IsValid() && Entry->MeshOwner->GetWorkingMesh().State == EVertexMaskForgeWorkingMeshState::Ready)
-		{
-			return true;
-		}
-	}
-	return false;
-}
-
-void SVertexMaskForgePanel::RunConstantFill(
-	const float ConstantValue, const EVertexMaskForgeScalarMaskSource Source, const FText& SuccessMessage)
-{
-	// A pending live-update debounce must never overwrite this explicit Fill moments later.
-	if (GEditor)
-	{
-		GEditor->GetTimerManager()->ClearTimer(AutoUpdateDebounceTimerHandle);
-	}
-
-	LastOperationErrorText = FText::GetEmpty();
-	LastMaskActionStatusText = FText::GetEmpty();
-
-	int32 NumReady = 0;
-	int32 NumFailed = 0;
-	FString FirstFailedAssetName;
-
-	for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
-	{
-		if (!Entry.IsValid())
-		{
-			continue;
-		}
-		const FVertexMaskForgeWorkingMesh& WorkingMesh = Entry->MeshOwner->GetWorkingMesh();
-
-		// Same entry-level validity gating as live generation -- but a failure
-		// here leaves the entry's existing mask COMPLETELY UNTOUCHED (preserve the last valid
-		// Preview), rather than resetting it to Unavailable.
-		if (WorkingMesh.State != EVertexMaskForgeWorkingMeshState::Ready)
-		{
-			++NumFailed;
-			if (FirstFailedAssetName.IsEmpty())
-			{
-				FirstFailedAssetName = Entry->AssetName;
-			}
-			continue;
-		}
-
-		const UStaticMesh* Mesh = Entry->Mesh.LoadSynchronous();
-		if (!IsValid(Mesh) || !Mesh->HasValidRenderData(/*bCheckLODForVerts=*/true, /*LODIndex=*/0))
-		{
-			++NumFailed;
-			if (FirstFailedAssetName.IsEmpty())
-			{
-				FirstFailedAssetName = Entry->AssetName;
-			}
-			continue;
-		}
-
-		const FStaticMeshRenderData* RenderData = Mesh->GetRenderData();
-		if (!RenderData || !RenderData->LODResources.IsValidIndex(0))
-		{
-			++NumFailed;
-			if (FirstFailedAssetName.IsEmpty())
-			{
-				FirstFailedAssetName = Entry->AssetName;
-			}
-			continue;
-		}
-
-		// AUDITED (Nanite source-topology support): a Source-Topology entry's Fill mask is built in the
-		// corner domain (3 * TriangleCount), matching UpdateWorkingColorsSourceTopology's own domain --
-		// never RenderData->LODResources[0] (the reduced Nanite fallback).
-		FVertexMaskForgeScalarMask NewMask = Entry->bUseSourceTopology
-			? VertexMaskForgePanel::GenerateConstantMaskForCornerDomain(WorkingMesh.Mesh->TriangleCount() * 3, ConstantValue, Source)
-			: VertexMaskForgePanel::GenerateConstantMask(RenderData->LODResources[0], ConstantValue, Source);
-		if (NewMask.State != EVertexMaskForgeScalarMaskState::Ready)
-		{
-			++NumFailed;
-			if (FirstFailedAssetName.IsEmpty())
-			{
-				FirstFailedAssetName = Entry->AssetName;
-			}
-			continue;
-		}
-
-		Entry->GeneratorState.BoundingBoxMask = MoveTemp(NewMask);
-		++NumReady;
-	}
-
-	if (NumReady > 0 && NumFailed == 0)
-	{
-		LastMaskActionStatusText = SuccessMessage;
-	}
-	else if (NumReady > 0)
-	{
-		LastMaskActionStatusText = FText::Format(
-			LOCTEXT("FillPartialFormat", "{0} ({1} mesh(es) could not be filled and kept their previous Preview.)"),
-			SuccessMessage, FText::AsNumber(NumFailed));
-	}
-	else
-	{
-		LastOperationErrorText = LOCTEXT("FillNothingEligible", "Fill: no eligible selected mesh could be filled (no valid render data).");
-	}
-
-	UE_LOG(LogVertexMaskForge, Log, TEXT("Vertex Mask Forge: Fill (%s): %d ready; %d failed/preserved"),
-		Source == EVertexMaskForgeScalarMaskSource::ConstantWhite ? TEXT("White") : TEXT("Black"), NumReady, NumFailed);
-
-	// Recomposes/reapplies via the exact same ApplyPreviewToEntry/UpdateWorkingColors path as every
-	// other mask, and marks Pending Changes via RecomputeOperationState() at the end. bCommit=true:
-	// Fill is an explicit, equivalent-to-generated action -- it consolidates into CommittedColors
-	// exactly like a fresh generation, so a later toggle in another channel can never erase it.
-	UpdateAllPreviews(/*bCommit=*/true);
-}
-
-FReply SVertexMaskForgePanel::OnFillWhiteClicked()
-{
-	RunConstantFill(1.0f, EVertexMaskForgeScalarMaskSource::ConstantWhite, LOCTEXT("FillWhiteReady", "White fill preview ready."));
-	return FReply::Handled();
-}
-
-FReply SVertexMaskForgePanel::OnFillBlackClicked()
-{
-	RunConstantFill(0.0f, EVertexMaskForgeScalarMaskSource::ConstantBlack, LOCTEXT("FillBlackReady", "Black fill preview ready."));
-	return FReply::Handled();
-}
-
 void SVertexMaskForgePanel::OnUnifiedBoundsChanged(const ECheckBoxState NewState)
 {
 	bUseUnifiedBounds = (NewState == ECheckBoxState::Checked);
@@ -10844,55 +8211,11 @@ FText SVertexMaskForgePanel::GetPreviewModeButtonText() const
 	return VertexMaskForgePanel::GetPreviewModeLabel(CurrentPreviewMode);
 }
 
-TSharedRef<SWidget> SVertexMaskForgePanel::OnGeneratePreviewSourceRow(TSharedPtr<EVertexMaskForgePreviewSource> InOption) const
-{
-	return SNew(STextBlock)
-		.Text(InOption.IsValid() ? VertexMaskForgePanel::GetPreviewSourceLabel(*InOption) : FText::GetEmpty());
-}
-
-void SVertexMaskForgePanel::OnPreviewSourceSelectionChanged(TSharedPtr<EVertexMaskForgePreviewSource> NewSelection, ESelectInfo::Type SelectInfo)
-{
-	if (!NewSelection.IsValid() || *NewSelection == PreviewSource)
-	{
-		return;
-	}
-
-	// M16-K.6D-5: the ONLY write site for PreviewSource anywhere in production code -- an explicit,
-	// user-driven combo selection, exactly as ADR-011 requires (never inferred from Dynamic Layer Stack
-	// contents, generation success, or any other state). Immediately requests a refresh through the
-	// exact same choke point every other compositional control already uses -- ApplyPreviewToEntry's own
-	// Source-Topology branch reads PreviewSource live, every call, so switching Dynamic -> Legacy here
-	// re-runs and re-shows the unchanged Legacy composition, and Legacy -> Dynamic computes and shows the
-	// Dynamic orchestrator's output, with no special-cased "restore" path needed in either direction.
-	PreviewSource = *NewSelection;
-	RecomposeWorkingColors();
-}
-
-FText SVertexMaskForgePanel::GetPreviewSourceButtonText() const
-{
-	return VertexMaskForgePanel::GetPreviewSourceLabel(PreviewSource);
-}
-
-void SVertexMaskForgePanel::OnChannelFilterRChanged(const ECheckBoxState NewState)
-{
-	bChannelFilterR = (NewState == ECheckBoxState::Checked);
-	// AUDITED (Channel Filter toggle fix): bCommit=false -- toggling the Channel Filter never
-	// consolidates; WorkingColors rebuilds from CommittedColors, so unchecking a channel immediately
-	// reverts it to its last consolidated state (see UpdateWorkingColors' own doc comment).
-	UpdateAllPreviews(/*bCommit=*/false);
-}
-
-void SVertexMaskForgePanel::OnChannelFilterGChanged(const ECheckBoxState NewState)
-{
-	bChannelFilterG = (NewState == ECheckBoxState::Checked);
-	UpdateAllPreviews(/*bCommit=*/false);
-}
-
-void SVertexMaskForgePanel::OnChannelFilterBChanged(const ECheckBoxState NewState)
-{
-	bChannelFilterB = (NewState == ECheckBoxState::Checked);
-	UpdateAllPreviews(/*bCommit=*/false);
-}
+// M18: OnGeneratePreviewSourceRow/OnPreviewSourceSelectionChanged/GetPreviewSourceButtonText (the
+// Legacy/Dynamic Preview Source combo) and OnChannelFilterR/G/BChanged (the global Channel Filter
+// checkboxes) were removed along with their widgets -- Layers is the sole workflow now (see
+// EVertexMaskForgePreviewSource's own doc comment) and per-layer R/G/B channel controls replace the
+// global filter.
 
 FText SVertexMaskForgePanel::GetPreviewStatusText() const
 {
@@ -11040,49 +8363,25 @@ void SVertexMaskForgePanel::RecomputeOperationState()
 	// selects presentation (see ApplyPreviewToEntry's bUseOriginalMaterials) and must never affect
 	// whether pending changes exist. bHasPending is therefore now computed identically regardless of
 	// CurrentPreviewMode.
-	bool bHasPending = false;
-	if (PreviewSource == EVertexMaskForgePreviewSource::Dynamic)
+	// M18: Layers is now the sole workflow -- the earlier Legacy GeneratorState.*.Ready branch is gone
+	// along with PreviewSource. Pending-ness is a shallow UI-eligibility signal only: at least one
+	// selected entry has a live PreviewComponent (the normal session/selection prerequisite) AND the
+	// layer stack has at least one enabled layer (FVertexMaskForgeDynamicLayerStack::HasAnyEnabledLayer()
+	// -- deliberately NOT just !DynamicLayerStack.IsEmpty(), since a non-empty stack with every layer
+	// disabled must also read as non-pending). Authoritative validation (unsupported generator, stale
+	// topology, a masked layer that fails to compose) is never performed here -- that is solely
+	// VertexMaskForgeDynamicAcceptTargetBuilder::BuildSourceTopologyAcceptTargets' own responsibility,
+	// invoked only when Accept is actually pressed.
+	bool bHasSelection = false;
+	for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
 	{
-		// AUDITED (M16-K.6D-7B): the Legacy GeneratorState.*.Ready gate below is exclusively Legacy's own
-		// -- it must never be consulted while Dynamic is active (a mask generated earlier under Legacy
-		// must not spuriously mark a Dynamic session Pending, and vice versa). Dynamic pending-ness is a
-		// shallow UI-eligibility signal only: at least one selected entry has a live PreviewComponent (the
-		// same normal session/selection prerequisite every source shares) AND the Dynamic stack has at
-		// least one enabled layer (FVertexMaskForgeDynamicLayerStack::HasAnyEnabledLayer() -- deliberately
-		// NOT just !DynamicLayerStack.IsEmpty(), since a non-empty stack with every layer disabled must
-		// also read as non-pending). Authoritative validation (unsupported generator, stale topology, a
-		// masked layer that fails to compose) is never performed here -- that is solely
-		// VertexMaskForgeDynamicAcceptTargetBuilder::BuildSourceTopologyAcceptTargets' own responsibility,
-		// invoked only when Accept is actually pressed (see AcceptPendingChanges()'s Dynamic branch).
-		bool bHasSelection = false;
-		for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
+		if (Entry.IsValid() && !Entry->PreviewComponents.IsEmpty())
 		{
-			if (Entry.IsValid() && !Entry->PreviewComponents.IsEmpty())
-			{
-				bHasSelection = true;
-				break;
-			}
-		}
-		bHasPending = bHasSelection && DynamicLayerStack.HasAnyEnabledLayer();
-	}
-	else
-	{
-		for (const TSharedPtr<FVertexMaskForgeSelectedMesh>& Entry : SelectedMeshes)
-		{
-			if (Entry.IsValid() && !Entry->PreviewComponents.IsEmpty()
-				&& (Entry->GeneratorState.BoundingBoxMask.State == EVertexMaskForgeScalarMaskState::Ready
-					|| Entry->GeneratorState.AmbientOcclusionMask.State == EVertexMaskForgeScalarMaskState::Ready
-					|| Entry->GeneratorState.CurvatureMask.State == EVertexMaskForgeScalarMaskState::Ready
-					|| Entry->GeneratorState.NoiseMask.State == EVertexMaskForgeScalarMaskState::Ready
-					|| Entry->GeneratorState.MaterialSlotMask.State == EVertexMaskForgeScalarMaskState::Ready
-					|| Entry->GeneratorState.DirectionalNormalMask.State == EVertexMaskForgeScalarMaskState::Ready
-					|| Entry->GeneratorState.ThicknessMask.State == EVertexMaskForgeScalarMaskState::Ready))
-			{
-				bHasPending = true;
-				break;
-			}
+			bHasSelection = true;
+			break;
 		}
 	}
+	const bool bHasPending = bHasSelection && DynamicLayerStack.HasAnyEnabledLayer();
 
 	OperationState = bHasPending ? EVertexMaskForgeOperationState::PendingChanges : EVertexMaskForgeOperationState::Idle;
 }
@@ -11181,66 +8480,25 @@ bool SVertexMaskForgePanel::AcceptPendingChanges()
 
 	UE_LOG(LogVertexMaskForge, Log, TEXT("Vertex Mask Forge: Accept started (%d selected entries)."), SelectedMeshes.Num());
 
-	// AUDITED (V2-E corrective pass, transform freshness): Directional Normal Mask's World Space per-
-	// component result is only ever recomputed live inside ApplyPreviewToEntry -- if the user moved a
-	// component's Actor faster than the debounced live regeneration could catch up,
-	// WorkingColors could still reflect a STALE transform at the moment Accept is
-	// clicked. A synchronous, non-committing recomposition pass HERE (the exact same call every other
-	// live-recompose path already uses) guarantees WorkingColors reflects the CURRENT live component
-	// transform(s) before a single byte is read for persistence -- reusing 100% existing, already-
-	// audited machinery (ApplyPreviewToEntry recomputes Directional Normal Mask fresh per component in
-	// World Space every single call; Local Space and every other generator are entirely unaffected,
-	// since this never invalidates any raw cache, only recomposes from what is already cached).
-	if (PreviewSource == EVertexMaskForgePreviewSource::Legacy
-		&& bDirectionalNormalMaskEnabled && DirectionalNormalSpace == EVertexMaskForgeNormalSpace::World)
-	{
-		UpdateAllPreviews(/*bCommit=*/false);
-	}
-
-	// AUDITED (M16-K.6D-7B): source-aware target construction -- Targets (render-vertex) and Legacy's own
-	// two builders are reachable ONLY from the Legacy branch; Dynamic's ONLY accept-target source is
-	// VertexMaskForgeDynamicAcceptTargetBuilder::BuildSourceTopologyAcceptTargets (ADR-011 -- Dynamic's
-	// composed result must never reach VertexMaskForgeAcceptTargetBuilder's own two functions, which read
-	// Legacy's WorkingColors/SourceTopologyWorkingColors verbatim). Dynamic is Source-Topology only (see
-	// FVertexMaskForgeSelectedMesh::bUseSourceTopology's own doc comment), so Targets stays empty for a
-	// Dynamic Accept -- reusing the exact same combined "nothing eligible" / "confirm N assets" / write
-	// section below unmodified, since it already treats Targets/SourceTopologyTargets generically. Both
-	// branches fully validate (all-or-nothing) before any transaction opens or any write occurs.
+	// M18: Layers is now the sole workflow -- the earlier Legacy-only World-Space Directional Normal
+	// pre-Accept resync guard is gone along with PreviewSource and the Legacy generator UI that produced
+	// bDirectionalNormalMaskEnabled/DirectionalNormalSpace as panel-level state.
+	//
+	// AUDITED (M16-K.6D-7B): Targets (render-vertex) stays empty -- Layers' ONLY accept-target source is
+	// VertexMaskForgeDynamicAcceptTargetBuilder::BuildSourceTopologyAcceptTargets (ADR-011); Layers is
+	// Source-Topology only (see FVertexMaskForgeSelectedMesh::bUseSourceTopology's own doc comment).
+	// Targets is retained (always empty) so the combined "nothing eligible" / "confirm N assets" / write
+	// section below, which already treats Targets/SourceTopologyTargets generically, needs no further
+	// changes.
 	TArray<VertexMaskForgeAcceptTargetBuilder::FAcceptTarget> Targets;
 	TArray<VertexMaskForgeAcceptTargetBuilder::FSourceTopologyAcceptTarget> SourceTopologyTargets;
 	FText ErrorText;
-	if (PreviewSource == EVertexMaskForgePreviewSource::Dynamic)
+	if (!VertexMaskForgeDynamicAcceptTargetBuilder::BuildSourceTopologyAcceptTargets(SelectedMeshes, DynamicLayerStack, SourceTopologyTargets, ErrorText))
 	{
-		if (!VertexMaskForgeDynamicAcceptTargetBuilder::BuildSourceTopologyAcceptTargets(SelectedMeshes, DynamicLayerStack, SourceTopologyTargets, ErrorText))
-		{
-			OperationState = EVertexMaskForgeOperationState::Failed;
-			LastOperationErrorText = ErrorText;
-			UE_LOG(LogVertexMaskForge, Warning, TEXT("Vertex Mask Forge: Accept (Dynamic) blocked: %s"), *ErrorText.ToString());
-			return false;
-		}
-	}
-	else
-	{
-		// AUDITED (Nanite source-topology support): preflight BOTH domains BEFORE writing either one --
-		// if EITHER fails, nothing is modified (the whole point of validating fully before the first
-		// Modify() call). BuildAcceptTargets/BuildSourceTopologyAcceptTargets never produce overlapping
-		// targets for the same asset (an entry is exclusively one domain or the other -- see
-		// FVertexMaskForgeSelectedMesh::bUseSourceTopology), so there is no cross-domain collision to
-		// reconcile, only a combined "nothing eligible at all" / "confirm N assets total" presentation.
-		if (!VertexMaskForgeAcceptTargetBuilder::BuildAcceptTargets(SelectedMeshes, bDirectionalNormalMaskEnabled, DirectionalNormalSpace, Targets, ErrorText))
-		{
-			OperationState = EVertexMaskForgeOperationState::Failed;
-			LastOperationErrorText = ErrorText;
-			UE_LOG(LogVertexMaskForge, Warning, TEXT("Vertex Mask Forge: Accept blocked: %s"), *ErrorText.ToString());
-			return false;
-		}
-		if (!VertexMaskForgeAcceptTargetBuilder::BuildSourceTopologyAcceptTargets(SelectedMeshes, bDirectionalNormalMaskEnabled, DirectionalNormalSpace, SourceTopologyTargets, ErrorText))
-		{
-			OperationState = EVertexMaskForgeOperationState::Failed;
-			LastOperationErrorText = ErrorText;
-			UE_LOG(LogVertexMaskForge, Warning, TEXT("Vertex Mask Forge: Accept blocked: %s"), *ErrorText.ToString());
-			return false;
-		}
+		OperationState = EVertexMaskForgeOperationState::Failed;
+		LastOperationErrorText = ErrorText;
+		UE_LOG(LogVertexMaskForge, Warning, TEXT("Vertex Mask Forge: Accept blocked: %s"), *ErrorText.ToString());
+		return false;
 	}
 	if (Targets.IsEmpty() && SourceTopologyTargets.IsEmpty())
 	{
@@ -11608,15 +8866,13 @@ void SVertexMaskForgePanel::ApplyPreviewToEntry(
 		// rule.
 		if (Entry->bUseSourceTopology)
 		{
-			// AUDITED (M16-K.6D-5): the ONLY functional read of PreviewSource anywhere in production
-			// code -- the sole decision point between the two pipelines, resolved fresh on every call
-			// (never cached), exactly like CurrentPreviewMode/bChannelFilterR/G/B elsewhere in this
-			// function. Deliberately placed BEFORE any Legacy per-component generator work (Bounding
-			// Box/AO/Directional Normal World-Space re-evaluation, Layers construction, bAnyLayerFailed)
-			// below -- Dynamic composition is structurally independent of Legacy generator/layer state,
-			// so a degenerate/failed Legacy per-component result (e.g. World Space Bounding Box) must
-			// never block or affect the Dynamic branch, and vice versa. The Legacy code below this
-			// block is byte-for-byte UNCHANGED from before this checkpoint.
+			// M18 (TECHNICAL DEBT -- see EVertexMaskForgePreviewSource's own doc comment): the ONLY
+			// remaining functional read of PreviewSource anywhere in production code. PreviewSource has
+			// no write site left (its combo box was removed and defaults permanently to Dynamic), so
+			// this condition is now provably always true and the Legacy composition code below it
+			// (byte-for-byte unchanged from before this checkpoint) is unreachable dead code, deliberately
+			// retained rather than excised -- removing it safely would require restructuring this deeply
+			// nested, dual-domain function beyond this UI-consolidation checkpoint's own scope.
 			if (PreviewSource == EVertexMaskForgePreviewSource::Dynamic)
 			{
 				// AUDITED: EnsureBaselineCaptured is idempotent (a no-op once already initialized, see
@@ -11653,28 +8909,25 @@ void SVertexMaskForgePanel::ApplyPreviewToEntry(
 				{
 					// AUDITED: an explicit, non-destructive failure -- the orchestrator's own contract
 					// guarantees DynamicComposedColors was never touched, so nothing here reads a
-					// partial result. PreviewSource itself is NEVER reverted to Legacy on this failure
-					// (ADR-011/this checkpoint's own explicit "no automatic fallback" requirement) --
-					// the component instead falls back to its REAL, original appearance (never a stale
-					// Legacy WorkingColors, never a white/black placeholder), and the status line
-					// reports the failure factually so the user can see Dynamic is still selected.
+					// partial result. The component instead falls back to its REAL, original appearance
+					// (never a stale WorkingColors, never a white/black placeholder), and the status
+					// line reports the failure factually.
 					LastOperationErrorText = LOCTEXT("DynamicPreviewComposeFailed",
-						"Dynamic Preview: composition failed for one or more components (unsupported layer, or invalid input) -- showing the original appearance instead.");
+						"Preview: composition failed for one or more components (unsupported layer, or invalid input) -- showing the original appearance instead.");
 					VertexMaskForgePanel::RestorePreviewVisualOnly(State, ActorHideStates);
 					continue;
 				}
 
-				// AUDITED: feeds the exact same M16-K.6D-2 visual-only seam the Legacy branch below
-				// uses -- Preview Mode/Channel Filter (via the seam's own DeriveValidatedSourceTopology
-				// PreviewColors) apply identically to whichever pipeline is selected, per PreviewSource's
-				// own doc comment. Never ApplyComposedColorsRGB, never WorkingColors/
-				// SourceTopologyWorkingColors, never BuildAcceptTargets -- this is presentation only.
+				// AUDITED: feeds the M16-K.6D-2 visual-only seam -- Preview Mode (via the seam's own
+				// DeriveValidatedSourceTopologyPreviewColors) is the only display transform applied here.
+				// Never ApplyComposedColorsRGB, never WorkingColors/SourceTopologyWorkingColors, never
+				// BuildAcceptTargets -- this is presentation only.
 				if (!VertexMaskForgePanel::ApplySuppliedSourceTopologyPreviewColors(
 					State, *WorkingMesh.Mesh, DynamicComposedColors, CurrentPreviewMode,
 					DebugMaterial, bUseOriginalMaterials, ActorHideStates))
 				{
 					LastOperationErrorText = LOCTEXT("DynamicPreviewSeamFailed",
-						"Dynamic Preview: could not apply the composed result to the viewport for one or more components.");
+						"Preview: could not apply the composed result to the viewport for one or more components.");
 					VertexMaskForgePanel::RestorePreviewVisualOnly(State, ActorHideStates);
 				}
 				continue;

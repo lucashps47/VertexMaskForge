@@ -7,6 +7,7 @@
 
 #if WITH_DEV_AUTOMATION_TESTS
 
+#include "Algo/AllOf.h"
 #include "DynamicMesh/DynamicMesh3.h"
 #include "DynamicMesh/DynamicMeshAttributeSet.h"
 #include "Misc/AutomationTest.h"
@@ -989,6 +990,57 @@ bool FVertexMaskForgeDynSrcTopoCompGeneratorFailureTest::RunTest(const FString& 
 	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, OutThicknessCaches, Out);
 
 	TestFalse(TEXT("Fails when the underlying Material Slot generator is Unavailable"), bSucceeded);
+
+	return true;
+}
+
+// M18.1 (root-cause regression): a mesh whose Material Slots could not be resolved unambiguously
+// (WorkingMesh.bMaterialSlotResolutionValid == false -- duplicate/missing imported slot names, set by
+// SVertexMaskForgePanel::BuildMaterialSlotLookups) fails the whole call cleanly, exactly like the
+// out-of-range-index case above -- never corrupting Out, never a partial/fabricated result. This is the
+// exact backend condition the Dynamic Layers Material Slot UI previously gave NO feedback for (the
+// picker looked fully editable, but every evaluation silently failed, regardless of Preview Mode) --
+// M18.1's own correction adds the missing UI diagnostic; this test proves the backend contract it
+// surfaces was already correct and remains unchanged. A structurally identical mesh with
+// bMaterialSlotResolutionValid left at its default (true) succeeds, proving this ONE field is what
+// gates the difference -- not slot count, not cardinality, not the generator algorithm itself.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompMaterialSlotResolutionInvalidTest, "VertexMaskForge.DynamicSourceTopologyComposition.MaterialSlotResolutionInvalidFailsWholeCallCleanly", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynSrcTopoCompMaterialSlotResolutionInvalidTest::RunTest(const FString& Parameters)
+{
+	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
+
+	// --- Control: bMaterialSlotResolutionValid left at its default (true) -- succeeds. ---
+	{
+		FVertexMaskForgeWorkingMesh WorkingMesh = BuildOrchestratorFixtureWorkingMesh(0, 1, /*NumSlotOptions=*/2);
+		TestTrue(TEXT("Control fixture defaults bMaterialSlotResolutionValid to true"), WorkingMesh.bMaterialSlotResolutionValid);
+		FVertexMaskForgeDynamicLayerStack Stack;
+		AddMaterialSlotLayer(Stack, TEXT("Layer"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f, /*SelectedSlotIndex=*/0);
+		TArray<FColor> Out;
+		TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+		TMap<FGuid, FVertexMaskForgeSourceTopologyThicknessCache> OutThicknessCaches;
+		const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(
+			WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, OutThicknessCaches, Out);
+		TestTrue(TEXT("Control (resolution valid): composition succeeds"), bSucceeded);
+	}
+
+	// --- The actual root-cause scenario: same fixture, bMaterialSlotResolutionValid forced false. ---
+	{
+		FVertexMaskForgeWorkingMesh WorkingMesh = BuildOrchestratorFixtureWorkingMesh(0, 1, /*NumSlotOptions=*/2);
+		WorkingMesh.bMaterialSlotResolutionValid = false;
+		FVertexMaskForgeDynamicLayerStack Stack;
+		AddMaterialSlotLayer(Stack, TEXT("Layer"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f, /*SelectedSlotIndex=*/0);
+		TArray<FColor> Out = { FColor(9, 9, 9, 9) }; // sentinel, wrong size on purpose
+		TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+		TMap<FGuid, FVertexMaskForgeSourceTopologyThicknessCache> OutThicknessCaches;
+		const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(
+			WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, OutThicknessCaches, Out);
+		TestFalse(TEXT("Resolution-invalid mesh: whole call fails cleanly (the exact production symptom's backend cause)"), bSucceeded);
+		TestEqual(TEXT("Out left completely untouched on failure -- never corrupted"), Out.Num(), 1);
+		if (Out.Num() == 1)
+		{
+			TestEqual(TEXT("Sentinel value itself is untouched"), Out[0], FColor(9, 9, 9, 9));
+		}
+	}
 
 	return true;
 }
@@ -3939,6 +3991,162 @@ bool FVertexMaskForgeDynSrcTopoCompThicknessLevelsTest::RunTest(const FString& P
 		if (FMath::Abs(InvertedRaisedMin[i].R - ExpectedByte) > 1) { bMatchesLevelsAfterInvert = false; }
 	}
 	TestTrue(TEXT("Output matches Levels-applied-AFTER-Invert exactly, proving the established processing order and no double application"), bMatchesLevelsAfterInvert);
+
+	return true;
+}
+
+// M18.2 (root-cause regression): two enabled layers writing the same channel, both Copy at Opacity=1 --
+// the visually upper layer (LAST in DynamicLayerStack.GetLayers(), per RebuildDynamicLayersList's own
+// established reversed-render contract) must have COMPLETE authority, never an interpolated mixture.
+// Uses AddFillOnlyLayer (no mask -- EffectiveMask implicitly 1.0, so PaintValue == FillValue exactly,
+// 0.0 or 1.0, unambiguous) through the real production ComputeComposedColorsRGBSourceTopology and the
+// real FVertexMaskForgeDynamicLayerStack ordering/mutation API -- never a hand-reversed test vector.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompCopyPriorityTest, "VertexMaskForge.DynamicSourceTopologyComposition.CopyFullOpacityUpperLayerCompletePriority", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynSrcTopoCompCopyPriorityTest::RunTest(const FString& Parameters)
+{
+	const FVertexMaskForgeWorkingMesh WorkingMesh = BuildOrchestratorFixtureWorkingMesh(0, 1);
+	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
+
+	auto Evaluate = [&](FVertexMaskForgeDynamicLayerStack& Stack, TArray<FColor>& OutColors) -> bool
+	{
+		TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+		TMap<FGuid, FVertexMaskForgeSourceTopologyThicknessCache> OutThicknessCaches;
+		return VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(
+			WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, OutThicknessCaches, OutColors);
+	};
+
+	// --- Case A: Lower=Black(0), Upper=White(1), both Copy/Opacity=1 -- expect R=255 (upper wins whole). ---
+	{
+		FVertexMaskForgeDynamicLayerStack Stack;
+		AddFillOnlyLayer(Stack, TEXT("Lower"), EVertexMaskForgeLayerFill::Black, EVertexMaskForgeBlendMode::Copy, 1.0f);
+		const FGuid UpperId = AddFillOnlyLayer(Stack, TEXT("Upper"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f);
+		TArray<FColor> Out;
+		TestTrue(TEXT("Case A evaluates"), Evaluate(Stack, Out));
+		TestTrue(TEXT("Case A: every corner R == 255 (upper White completely replaces lower Black)"),
+			Out.Num() == 6 && Algo::AllOf(Out, [](const FColor& C) { return C.R == 255; }));
+
+		// --- Order case: moving Upper to array index 0 (visually BOTTOM, per RebuildDynamicLayersList's
+		//     reversed-render contract) must flip the result to R==0 -- proven via the REAL MoveLayer API,
+		//     never a hand-reversed test vector.
+		Stack.MoveLayer(UpperId, 0);
+		TArray<FColor> OutReordered;
+		TestTrue(TEXT("Case A (reordered) evaluates"), Evaluate(Stack, OutReordered));
+		TestTrue(TEXT("Case A reordered: Upper moved to array index 0 (visually bottom) -- Lower (now last/top) wins, R == 0"),
+			OutReordered.Num() == 6 && Algo::AllOf(OutReordered, [](const FColor& C) { return C.R == 0; }));
+
+		// --- Moving back restores the original result.
+		Stack.MoveLayer(UpperId, 1);
+		TArray<FColor> OutRestored;
+		TestTrue(TEXT("Case A (restored) evaluates"), Evaluate(Stack, OutRestored));
+		TestTrue(TEXT("Case A restored: R == 255 again"),
+			OutRestored.Num() == 6 && Algo::AllOf(OutRestored, [](const FColor& C) { return C.R == 255; }));
+	}
+
+	// --- Case B: Lower=White(1), Upper=Black(0), both Copy/Opacity=1 -- expect R=0 (upper wins whole).
+	//     Essential: a broken mask-weighted interpolation could accidentally pass Case A alone. ---
+	{
+		FVertexMaskForgeDynamicLayerStack Stack;
+		AddFillOnlyLayer(Stack, TEXT("Lower"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f);
+		AddFillOnlyLayer(Stack, TEXT("Upper"), EVertexMaskForgeLayerFill::Black, EVertexMaskForgeBlendMode::Copy, 1.0f);
+		TArray<FColor> Out;
+		TestTrue(TEXT("Case B evaluates"), Evaluate(Stack, Out));
+		TestTrue(TEXT("Case B: every corner R == 0 (upper Black completely replaces lower White, never averaged)"),
+			Out.Num() == 6 && Algo::AllOf(Out, [](const FColor& C) { return C.R == 0; }));
+	}
+
+	// --- Case D: Upper Opacity=0.5 -- proves the correction does NOT turn Copy into unconditional
+	//     replacement; partial opacity still interpolates exactly once. Lower=Black(0), Upper=White(1),
+	//     Opacity=0.5 -> lerp(0,1,0.5) == 0.5 -> byte 128 (within +-1 rounding tolerance). ---
+	{
+		FVertexMaskForgeDynamicLayerStack Stack;
+		AddFillOnlyLayer(Stack, TEXT("Lower"), EVertexMaskForgeLayerFill::Black, EVertexMaskForgeBlendMode::Copy, 1.0f);
+		AddFillOnlyLayer(Stack, TEXT("Upper"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 0.5f);
+		TArray<FColor> Out;
+		TestTrue(TEXT("Case D evaluates"), Evaluate(Stack, Out));
+		bool bAllHalfway = Out.Num() == 6;
+		for (const FColor& C : Out) { if (FMath::Abs(C.R - 128) > 1) { bAllHalfway = false; } }
+		TestTrue(TEXT("Case D: Opacity=0.5 still interpolates exactly once (R ~= 128), proving partial opacity remains intentional"), bAllHalfway);
+	}
+
+	// --- Three-layer case: topmost enabled layer wins; disabling/deleting it reveals the next one. ---
+	{
+		FVertexMaskForgeDynamicLayerStack Stack;
+		AddFillOnlyLayer(Stack, TEXT("Bottom"), EVertexMaskForgeLayerFill::Black, EVertexMaskForgeBlendMode::Copy, 1.0f);
+		const FGuid MiddleId = AddFillOnlyLayer(Stack, TEXT("Middle"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f);
+		const FGuid TopId = AddFillOnlyLayer(Stack, TEXT("Top"), EVertexMaskForgeLayerFill::Black, EVertexMaskForgeBlendMode::Copy, 1.0f);
+
+		TArray<FColor> Out;
+		TestTrue(TEXT("Three-layer evaluates"), Evaluate(Stack, Out));
+		TestTrue(TEXT("Three-layer: topmost enabled (Top, Black) wins -- R == 0"),
+			Out.Num() == 6 && Algo::AllOf(Out, [](const FColor& C) { return C.R == 0; }));
+
+		Stack.SetLayerEnabled(TopId, false);
+		TArray<FColor> OutTopDisabled;
+		TestTrue(TEXT("Three-layer (Top disabled) evaluates"), Evaluate(Stack, OutTopDisabled));
+		TestTrue(TEXT("Disabling Top reveals Middle (White) -- R == 255"),
+			OutTopDisabled.Num() == 6 && Algo::AllOf(OutTopDisabled, [](const FColor& C) { return C.R == 255; }));
+
+		Stack.RemoveLayer(MiddleId);
+		TArray<FColor> OutMiddleDeleted;
+		TestTrue(TEXT("Three-layer (Top disabled, Middle deleted) evaluates"), Evaluate(Stack, OutMiddleDeleted));
+		TestTrue(TEXT("Deleting Middle (with Top still disabled) reveals Bottom (Black) -- R == 0"),
+			OutMiddleDeleted.Num() == 6 && Algo::AllOf(OutMiddleDeleted, [](const FColor& C) { return C.R == 0; }));
+	}
+
+	// --- A top layer not writing to a channel cannot overwrite that channel. ---
+	{
+		FVertexMaskForgeDynamicLayerStack Stack;
+		AddFillOnlyLayer(Stack, TEXT("Lower"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f);
+		const FGuid UpperId = AddFillOnlyLayer(Stack, TEXT("Upper"), EVertexMaskForgeLayerFill::Black, EVertexMaskForgeBlendMode::Copy, 1.0f);
+		Stack.SetLayerChannelFilter(UpperId, /*bAffectRed=*/false, /*bAffectGreen=*/true, /*bAffectBlue=*/true);
+		TArray<FColor> Out;
+		TestTrue(TEXT("Channel-gated evaluates"), Evaluate(Stack, Out));
+		TestTrue(TEXT("Upper does not write R -- Lower's White R survives (R == 255)"),
+			Out.Num() == 6 && Algo::AllOf(Out, [](const FColor& C) { return C.R == 255; }));
+		TestTrue(TEXT("Upper DOES write G/B -- Black (0) wins there"),
+			Out.Num() == 6 && Algo::AllOf(Out, [](const FColor& C) { return C.G == 0 && C.B == 0; }));
+	}
+
+	return true;
+}
+
+// M18.2 (Phase 4, generator-backed reproduction): two overlapping Material Slot layers with DIFFERENT
+// slot selections, both Copy/Opacity=1, both writing R -- proves the evaluator receives genuinely
+// DISTINCT lower/upper paint values from the SAME generator type and the upper one still wins completely
+// per corner (never mixed), ruling out any generator-specific caching/state-sharing defect for Material
+// Slot specifically (it is stateless -- recomputed fresh from WorkingMesh every call, no persistent or
+// within-call cache to bleed between layers).
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompCopyPriorityTwoMaterialSlotLayersTest, "VertexMaskForge.DynamicSourceTopologyComposition.CopyFullOpacityPriorityTwoMaterialSlotLayers", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynSrcTopoCompCopyPriorityTwoMaterialSlotLayersTest::RunTest(const FString& Parameters)
+{
+	// Tri0 (corners 0-2) -> slot 0; Tri1 (corners 3-5) -> slot 1.
+	const FVertexMaskForgeWorkingMesh WorkingMesh = BuildOrchestratorFixtureWorkingMesh(0, 1);
+	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
+
+	FVertexMaskForgeDynamicLayerStack Stack;
+	// Lower: selects slot 0 -> corners 0-2 = White(255), corners 3-5 = Black(0).
+	AddMaterialSlotLayer(Stack, TEXT("Lower"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f, /*SelectedSlotIndex=*/0);
+	// Upper: selects slot 1 -> corners 0-2 = Black(0), corners 3-5 = White(255). Genuinely distinct from Lower.
+	AddMaterialSlotLayer(Stack, TEXT("Upper"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f, /*SelectedSlotIndex=*/1);
+
+	TArray<FColor> Out;
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+	TMap<FGuid, FVertexMaskForgeSourceTopologyThicknessCache> OutThicknessCaches;
+	TestTrue(TEXT("Evaluates"), VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(
+		WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, OutThicknessCaches, Out));
+
+	if (!TestEqual(TEXT("Out.Num() == 6"), Out.Num(), 6)) { return false; }
+	// Expected: upper (slot 1) completely wins every corner -- corners 0-2 = Black(0), corners 3-5 = White(255).
+	// The exact INVERSE of Lower alone -- if this instead came out as some blend (e.g. all mid-gray, or
+	// Lower's own pattern unchanged), that would prove a real cross-layer bleed for this generator.
+	for (int32 Index = 0; Index < 3; ++Index)
+	{
+		TestEqual(*FString::Printf(TEXT("Corner %d (slot 0 region): upper's Black wins completely"), Index), Out[Index].R, uint8(0));
+	}
+	for (int32 Index = 3; Index < 6; ++Index)
+	{
+		TestEqual(*FString::Printf(TEXT("Corner %d (slot 1 region): upper's White wins completely"), Index), Out[Index].R, uint8(255));
+	}
 
 	return true;
 }
