@@ -275,7 +275,7 @@ bool FVertexMaskForgeDynamicLayerStack::SetLayerEnabled(const FGuid& LayerId, co
 	return true;
 }
 
-bool FVertexMaskForgeDynamicLayerStack::SetLayerChannelFilter(const FGuid& LayerId, const bool bAffectRed, const bool bAffectGreen, const bool bAffectBlue)
+bool FVertexMaskForgeDynamicLayerStack::SetLayerChannelFilter(const FGuid& LayerId, const bool bAffectRed, const bool bAffectGreen, const bool bAffectBlue, const bool bAffectAlpha)
 {
 	FVertexMaskForgeLayer* Layer = FindLayerByIdMutable(LayerId);
 	if (!Layer)
@@ -286,6 +286,7 @@ bool FVertexMaskForgeDynamicLayerStack::SetLayerChannelFilter(const FGuid& Layer
 	Layer->bAffectRed = bAffectRed;
 	Layer->bAffectGreen = bAffectGreen;
 	Layer->bAffectBlue = bAffectBlue;
+	Layer->bAffectAlpha = bAffectAlpha;
 	return true;
 }
 

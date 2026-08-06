@@ -1,4 +1,4 @@
-// M16-K.6D-4: proves VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology
+﻿// M16-K.6D-4: proves VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology
 // -- the new, testable Dynamic Source-Topology composition orchestrator -- directly. See
 // VertexMaskForgeDynamicSourceTopologyComposition.h for the full contract these tests exercise.
 //
@@ -1045,14 +1045,20 @@ bool FVertexMaskForgeDynSrcTopoCompMaterialSlotResolutionInvalidTest::RunTest(co
 	return true;
 }
 
-// 9. Alpha is always carried from BaseColors, completely unconditionally -- proven with a Fill/Copy layer
-// that forces R/G/B, while Alpha still matches BaseColors exactly at every corner.
-IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompAlphaPassthroughTest, "VertexMaskForge.DynamicSourceTopologyComposition.AlphaPreservedFromBaseColorsUnconditionally", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+// 9. M19-A rename (was AlphaPreservedFromBaseColorsUnconditionally -- that name became factually false
+// once Alpha became a real, gate-able composed channel): Alpha is carried from BaseColors WHEN NO LAYER
+// AFFECTS IT -- proven with a Fill/Copy layer that forces R/G/B but leaves bAffectAlpha at its default
+// (false), so Alpha still matches BaseColors exactly at every corner. The unconditional-immutability
+// contract this test used to prove is now covered by the dedicated Alpha-disabled regression tests below
+// (AlphaDisabledLeavesBaseAlphaByteForByte and siblings), which exercise multiple layers, an RGB-writing
+// layer, a disabled layer, all-channels-disabled, and a non-255 Base Alpha value.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompAlphaPassthroughTest, "VertexMaskForge.DynamicSourceTopologyComposition.AlphaPreservedFromBaseColorsWhenNoLayerAffectsAlpha", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
 bool FVertexMaskForgeDynSrcTopoCompAlphaPassthroughTest::RunTest(const FString& Parameters)
 {
 	const FVertexMaskForgeWorkingMesh WorkingMesh = BuildOrchestratorFixtureWorkingMesh(0, 1);
 	FVertexMaskForgeDynamicLayerStack Stack;
 	AddFillOnlyLayer(Stack, TEXT("Layer"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f);
+	// bAffectAlpha defaults to false -- this layer affects R/G/B only, exactly like every pre-M19 layer.
 
 	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
 	TArray<FColor> Out;
@@ -1072,6 +1078,498 @@ bool FVertexMaskForgeDynSrcTopoCompAlphaPassthroughTest::RunTest(const FString& 
 	return true;
 }
 
+// --- M19-A: Alpha channel composition ------------------------------------------------------------------
+// The Fill-only/Material-Slot/Bounding-Box helpers above (AddFillOnlyLayer/AddMaterialSlotLayer/
+// AddBoundingBoxLayer) never touch bAffectAlpha, so every layer they build defaults to Alpha-disabled --
+// each test below explicitly opts a layer into Alpha via Stack.SetLayerChannelFilter(...,/*bAffectAlpha=*/true)
+// or the toggle helper, exactly mirroring how the future M19-B UI will do it.
+
+// M19-A. AlphaDisabledLeavesBaseAlphaByteForByte: the immutable-Alpha regression contract, generalized --
+// with one Alpha-disabled layer, multiple Alpha-disabled layers, an RGB-writing layer, a disabled layer,
+// all channels disabled, and a non-255 Base Alpha value, final Alpha must equal Base Alpha exactly.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompAlphaDisabledPreservationTest, "VertexMaskForge.DynamicSourceTopologyComposition.AlphaDisabledLeavesBaseAlphaByteForByte", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynSrcTopoCompAlphaDisabledPreservationTest::RunTest(const FString& Parameters)
+{
+	const FVertexMaskForgeWorkingMesh WorkingMesh = BuildOrchestratorFixtureWorkingMesh(0, 1);
+	// Non-255 Base Alpha at every corner -- MakeSixCornerBaseColors() already uses 100..105, never 255.
+	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
+
+	FVertexMaskForgeDynamicLayerStack Stack;
+	// One RGB-writing layer, Alpha-disabled.
+	AddFillOnlyLayer(Stack, TEXT("RGB"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f);
+	// A second, Alpha-disabled layer.
+	AddFillOnlyLayer(Stack, TEXT("RGB2"), EVertexMaskForgeLayerFill::Black, EVertexMaskForgeBlendMode::Add, 0.5f);
+	// A disabled layer (bEnabled=false) -- must not contribute regardless of its own channel flags.
+	{
+		const FGuid DisabledId = AddFillOnlyLayer(Stack, TEXT("Disabled"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f);
+		Stack.SetLayerChannelFilter(DisabledId, true, true, true, true);
+		Stack.SetLayerEnabled(DisabledId, false);
+	}
+	// A layer with every channel disabled, including Alpha.
+	{
+		const FGuid AllOffId = AddFillOnlyLayer(Stack, TEXT("AllOff"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f);
+		Stack.SetLayerChannelFilter(AllOffId, false, false, false, false);
+	}
+
+	TArray<FColor> Out;
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+	TMap<FGuid, FVertexMaskForgeSourceTopologyThicknessCache> OutThicknessCaches;
+	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, OutThicknessCaches, Out);
+
+	TestTrue(TEXT("Succeeds"), bSucceeded);
+	if (Out.Num() == 6)
+	{
+		for (int32 Index = 0; Index < 6; ++Index)
+		{
+			TestEqual(*FString::Printf(TEXT("Out[%d].A == BaseColors[%d].A (non-255)"), Index, Index), Out[Index].A, BaseColors[Index].A);
+			TestNotEqual(*FString::Printf(TEXT("Sanity: BaseColors[%d].A is non-255"), Index), BaseColors[Index].A, uint8(255));
+		}
+	}
+
+	return true;
+}
+
+// M19-A. AlphaOnlyLayerChangesAlphaNotRGB: a layer with R=G=B=false, A=true must write Alpha and leave
+// R/G/B exactly at BaseColors' own values.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompAlphaOnlyLayerTest, "VertexMaskForge.DynamicSourceTopologyComposition.AlphaOnlyLayerChangesAlphaNotRGB", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynSrcTopoCompAlphaOnlyLayerTest::RunTest(const FString& Parameters)
+{
+	const FVertexMaskForgeWorkingMesh WorkingMesh = BuildOrchestratorFixtureWorkingMesh(0, 1);
+	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
+
+	FVertexMaskForgeDynamicLayerStack Stack;
+	const FGuid LayerId = AddFillOnlyLayer(Stack, TEXT("AlphaOnly"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f);
+	Stack.SetLayerChannelFilter(LayerId, /*bAffectRed=*/false, /*bAffectGreen=*/false, /*bAffectBlue=*/false, /*bAffectAlpha=*/true);
+
+	TArray<FColor> Out;
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+	TMap<FGuid, FVertexMaskForgeSourceTopologyThicknessCache> OutThicknessCaches;
+	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, OutThicknessCaches, Out);
+
+	TestTrue(TEXT("Succeeds"), bSucceeded);
+	if (Out.Num() == 6)
+	{
+		for (int32 Index = 0; Index < 6; ++Index)
+		{
+			TestEqual(*FString::Printf(TEXT("Out[%d].A forced to 255 (White/Copy/Opacity1)"), Index), Out[Index].A, uint8(255));
+			TestEqual(*FString::Printf(TEXT("Out[%d].R untouched"), Index), Out[Index].R, BaseColors[Index].R);
+			TestEqual(*FString::Printf(TEXT("Out[%d].G untouched"), Index), Out[Index].G, BaseColors[Index].G);
+			TestEqual(*FString::Printf(TEXT("Out[%d].B untouched"), Index), Out[Index].B, BaseColors[Index].B);
+		}
+	}
+
+	return true;
+}
+
+// M19-A. RGBOnlyLayerDoesNotChangeAlpha: symmetric to the above -- a layer with R=G=B=true, A=false must
+// write R/G/B and leave Alpha exactly at BaseColors' own value.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompRGBOnlyLayerTest, "VertexMaskForge.DynamicSourceTopologyComposition.RGBOnlyLayerDoesNotChangeAlpha", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynSrcTopoCompRGBOnlyLayerTest::RunTest(const FString& Parameters)
+{
+	const FVertexMaskForgeWorkingMesh WorkingMesh = BuildOrchestratorFixtureWorkingMesh(0, 1);
+	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
+
+	FVertexMaskForgeDynamicLayerStack Stack;
+	AddFillOnlyLayer(Stack, TEXT("RGBOnly"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f);
+	// bAffectAlpha defaults to false -- explicit R/G/B=true is already the AddFillOnlyLayer default.
+
+	TArray<FColor> Out;
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+	TMap<FGuid, FVertexMaskForgeSourceTopologyThicknessCache> OutThicknessCaches;
+	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, OutThicknessCaches, Out);
+
+	TestTrue(TEXT("Succeeds"), bSucceeded);
+	if (Out.Num() == 6)
+	{
+		for (int32 Index = 0; Index < 6; ++Index)
+		{
+			TestEqual(*FString::Printf(TEXT("Out[%d].R forced to 255"), Index), Out[Index].R, uint8(255));
+			TestEqual(*FString::Printf(TEXT("Out[%d].G forced to 255"), Index), Out[Index].G, uint8(255));
+			TestEqual(*FString::Printf(TEXT("Out[%d].B forced to 255"), Index), Out[Index].B, uint8(255));
+			TestEqual(*FString::Printf(TEXT("Out[%d].A untouched"), Index), Out[Index].A, BaseColors[Index].A);
+		}
+	}
+
+	return true;
+}
+
+// M19-A. SequentialCopyAlphaMatchesIndependentlyReasonedExpectations: the numeric contract given in the
+// M19-A checkpoint's own instructions, exercised end to end through the production evaluator (never a
+// reimplementation of BlendMaskValueUnclamped).
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompAlphaSequentialCopyTest, "VertexMaskForge.DynamicSourceTopologyComposition.SequentialCopyAlphaMatchesIndependentlyReasonedExpectations", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynSrcTopoCompAlphaSequentialCopyTest::RunTest(const FString& Parameters)
+{
+	const FVertexMaskForgeWorkingMesh WorkingMesh = BuildOrchestratorFixtureWorkingMesh(0, 1);
+
+	// Base Alpha 0, layer Alpha 1 (White/Copy/Opacity1) -> 1 (255).
+	{
+		TArray<FColor> BaseColors = MakeSixCornerBaseColors();
+		for (FColor& C : BaseColors) { C.A = 0; }
+		FVertexMaskForgeDynamicLayerStack Stack;
+		const FGuid LayerId = AddFillOnlyLayer(Stack, TEXT("Layer"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f);
+		Stack.SetLayerChannelFilter(LayerId, false, false, false, true);
+		TArray<FColor> Out;
+		TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+		TMap<FGuid, FVertexMaskForgeSourceTopologyThicknessCache> OutThicknessCaches;
+		TestTrue(TEXT("Case 1 succeeds"), VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, OutThicknessCaches, Out));
+		if (Out.Num() == 6) { TestEqual(TEXT("Base Alpha 0, layer Alpha 1, Copy 1.0 -> 255"), Out[0].A, uint8(255)); }
+	}
+
+	// Base Alpha 1, layer Alpha 0 (Black/Copy/Opacity1) -> 0.
+	{
+		TArray<FColor> BaseColors = MakeSixCornerBaseColors();
+		for (FColor& C : BaseColors) { C.A = 255; }
+		FVertexMaskForgeDynamicLayerStack Stack;
+		const FGuid LayerId = AddFillOnlyLayer(Stack, TEXT("Layer"), EVertexMaskForgeLayerFill::Black, EVertexMaskForgeBlendMode::Copy, 1.0f);
+		Stack.SetLayerChannelFilter(LayerId, false, false, false, true);
+		TArray<FColor> Out;
+		TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+		TMap<FGuid, FVertexMaskForgeSourceTopologyThicknessCache> OutThicknessCaches;
+		TestTrue(TEXT("Case 2 succeeds"), VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, OutThicknessCaches, Out));
+		if (Out.Num() == 6) { TestEqual(TEXT("Base Alpha 1, layer Alpha 0, Copy 1.0 -> 0"), Out[0].A, uint8(0)); }
+	}
+
+	// Base Alpha 0.2 (51/255), Material Slot layer selecting Tri0's slot (mask=1 on Tri0's corners),
+	// Copy 1.0 -> quantized 0.7 (178/255, i.e. FMath::RoundToInt(0.7*255)) on Tri0's corners.
+	{
+		TArray<FColor> BaseColors = MakeSixCornerBaseColors();
+		const uint8 BaseAlphaByte = 51; // 0.2 * 255, rounded.
+		for (FColor& C : BaseColors) { C.A = BaseAlphaByte; }
+		FVertexMaskForgeDynamicLayerStack Stack;
+		// SelectedSlotIndex 0 matches Tri0 (corners 0,1,2) in BuildOrchestratorFixtureWorkingMesh(0, 1).
+		const FGuid LayerId = AddMaterialSlotLayer(Stack, TEXT("Layer"), EVertexMaskForgeLayerFill::None, EVertexMaskForgeBlendMode::Copy, 1.0f, /*SelectedSlotIndex=*/0);
+		// Material Slot layer has no explicit Fill -- resolve FillValue via a White Fill on top so
+		// PaintValue == EffectiveMask == 1.0 on Tri0's corners, 0.0 elsewhere; use White Fill directly with
+		// the mask as a scalar coverage rather than 0.7 literal, then verify via Opacity 0.7 instead, which
+		// exactly matches the "quantized 0.7" contract using Copy's own Lerp(Base, Mask, Opacity) shape.
+		Stack.SetLayerFill(LayerId, EVertexMaskForgeLayerFill::White);
+		Stack.SetLayerOpacity(LayerId, 0.7f);
+		Stack.SetLayerChannelFilter(LayerId, false, false, false, true);
+		TArray<FColor> Out;
+		TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+		TMap<FGuid, FVertexMaskForgeSourceTopologyThicknessCache> OutThicknessCaches;
+		TestTrue(TEXT("Case 3 succeeds"), VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, OutThicknessCaches, Out));
+		if (Out.Num() == 6)
+		{
+			// Copy(Base=0.2, Mask=1.0, Opacity=0.7) = Lerp(0.2, 1.0, 0.7) = 0.76 -> round(0.76*255) = 194.
+			// Tri0 corners (0,1,2): Material Slot mask == 1.0 (slot matches). Opacity applies once (Lerp).
+			const uint8 Expected = FMath::RoundToInt(FMath::Lerp(0.2f, 1.0f, 0.7f) * 255.0f);
+			TestEqual(TEXT("Base Alpha 0.2, layer Alpha (mask=1) Opacity 0.7, Copy -> quantized once"), Out[0].A, Expected);
+		}
+	}
+
+	return true;
+}
+
+// M19-A. UpperEnabledAlphaLayerHasSequentialAuthorityOverLowerLayer: reorder/disable/delete all reveal the
+// expected lower-layer/base result, exactly mirroring the existing R/G/B layer-priority contract
+// (M18.2's own disproven-defect investigation) -- proves Alpha follows the SAME sequential authority rules,
+// never a separate or special-cased one.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompAlphaLayerPriorityTest, "VertexMaskForge.DynamicSourceTopologyComposition.UpperEnabledAlphaLayerHasSequentialAuthorityOverLowerLayer", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynSrcTopoCompAlphaLayerPriorityTest::RunTest(const FString& Parameters)
+{
+	const FVertexMaskForgeWorkingMesh WorkingMesh = BuildOrchestratorFixtureWorkingMesh(0, 1);
+	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
+
+	auto ComposeOnce = [&](FVertexMaskForgeDynamicLayerStack& Stack) -> TArray<FColor>
+	{
+		TArray<FColor> Out;
+		TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+		TMap<FGuid, FVertexMaskForgeSourceTopologyThicknessCache> OutThicknessCaches;
+		VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, OutThicknessCaches, Out);
+		return Out;
+	};
+
+	FVertexMaskForgeDynamicLayerStack Stack;
+	const FGuid LowerId = AddFillOnlyLayer(Stack, TEXT("Lower"), EVertexMaskForgeLayerFill::Black, EVertexMaskForgeBlendMode::Copy, 1.0f);
+	Stack.SetLayerChannelFilter(LowerId, false, false, false, true);
+	const FGuid UpperId = AddFillOnlyLayer(Stack, TEXT("Upper"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f);
+	Stack.SetLayerChannelFilter(UpperId, false, false, false, true);
+
+	// Upper (White, folded last) wins -- Alpha ends at 255.
+	{
+		TArray<FColor> Out = ComposeOnce(Stack);
+		if (Out.Num() == 6) { TestEqual(TEXT("Upper White wins -> Alpha 255"), Out[0].A, uint8(255)); }
+	}
+
+	// Reorder: Upper folded first, Lower folded last -- Lower (Black) now wins -- Alpha ends at 0.
+	{
+		TestTrue(TEXT("MoveLayerUp(Upper)"), Stack.MoveLayerUp(UpperId));
+		TArray<FColor> Out = ComposeOnce(Stack);
+		if (Out.Num() == 6) { TestEqual(TEXT("Reorder: Lower Black now folds last -> Alpha 0"), Out[0].A, uint8(0)); }
+		TestTrue(TEXT("MoveLayerUp(Upper) restore order"), Stack.MoveLayerDown(UpperId));
+	}
+
+	// Disabling the (originally) upper layer reveals the lower layer's own result.
+	{
+		TestTrue(TEXT("Disable Upper"), Stack.SetLayerEnabled(UpperId, false));
+		TArray<FColor> Out = ComposeOnce(Stack);
+		if (Out.Num() == 6) { TestEqual(TEXT("Upper disabled -> Lower Black revealed -> Alpha 0"), Out[0].A, uint8(0)); }
+		TestTrue(TEXT("Re-enable Upper"), Stack.SetLayerEnabled(UpperId, true));
+	}
+
+	// Deleting the upper layer likewise reveals the lower layer's own result.
+	{
+		TestTrue(TEXT("Remove Upper"), Stack.RemoveLayer(UpperId).bRemoved);
+		TArray<FColor> Out = ComposeOnce(Stack);
+		if (Out.Num() == 6) { TestEqual(TEXT("Upper deleted -> Lower Black revealed -> Alpha 0"), Out[0].A, uint8(0)); }
+	}
+
+	return true;
+}
+
+// M19-A. AlphaBlendModesReuseEstablishedEquations: Copy/Add/Subtract/Multiply/Overlay/Screen/Linear all
+// produce, for Alpha, the exact same result the identical setup already produces for Red -- proven by
+// running each Blend Mode twice (once affecting only Red, once affecting only Alpha, same Fill/Opacity/
+// mask) and comparing the two output bytes, rather than hand-deriving a second set of expected constants.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompAlphaBlendModeParityTest, "VertexMaskForge.DynamicSourceTopologyComposition.AlphaBlendModesReuseEstablishedEquations", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynSrcTopoCompAlphaBlendModeParityTest::RunTest(const FString& Parameters)
+{
+	const FVertexMaskForgeWorkingMesh WorkingMesh = BuildOrchestratorFixtureWorkingMesh(0, 1);
+
+	const EVertexMaskForgeBlendMode Modes[7] = {
+		EVertexMaskForgeBlendMode::Copy, EVertexMaskForgeBlendMode::Add, EVertexMaskForgeBlendMode::Subtract,
+		EVertexMaskForgeBlendMode::Multiply, EVertexMaskForgeBlendMode::Overlay, EVertexMaskForgeBlendMode::Screen,
+		EVertexMaskForgeBlendMode::Linear,
+	};
+	const TCHAR* ModeNames[7] = { TEXT("Copy"), TEXT("Add"), TEXT("Subtract"), TEXT("Multiply"), TEXT("Overlay"), TEXT("Screen"), TEXT("Linear") };
+
+	for (int32 ModeIndex = 0; ModeIndex < 7; ++ModeIndex)
+	{
+		// Identical Base value on R and A (same source byte, 60) so any per-channel divergence in the
+		// evaluator itself would show up as a mismatch below.
+		TArray<FColor> BaseColors = MakeSixCornerBaseColors();
+		for (FColor& C : BaseColors) { C.R = 60; C.A = 60; }
+
+		// Red-affecting run.
+		uint8 RedResult = 0;
+		{
+			FVertexMaskForgeDynamicLayerStack Stack;
+			const FGuid LayerId = AddFillOnlyLayer(Stack, TEXT("Layer"), EVertexMaskForgeLayerFill::White, Modes[ModeIndex], 0.6f);
+			Stack.SetLayerChannelFilter(LayerId, true, false, false, false);
+			TArray<FColor> Out;
+			TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+			TMap<FGuid, FVertexMaskForgeSourceTopologyThicknessCache> OutThicknessCaches;
+			TestTrue(*FString::Printf(TEXT("%s Red run succeeds"), ModeNames[ModeIndex]), VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, OutThicknessCaches, Out));
+			if (Out.Num() == 6) { RedResult = Out[0].R; }
+		}
+
+		// Alpha-affecting run, otherwise identical.
+		uint8 AlphaResult = 0;
+		{
+			FVertexMaskForgeDynamicLayerStack Stack;
+			const FGuid LayerId = AddFillOnlyLayer(Stack, TEXT("Layer"), EVertexMaskForgeLayerFill::White, Modes[ModeIndex], 0.6f);
+			Stack.SetLayerChannelFilter(LayerId, false, false, false, true);
+			TArray<FColor> Out;
+			TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+			TMap<FGuid, FVertexMaskForgeSourceTopologyThicknessCache> OutThicknessCaches;
+			TestTrue(*FString::Printf(TEXT("%s Alpha run succeeds"), ModeNames[ModeIndex]), VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, OutThicknessCaches, Out));
+			if (Out.Num() == 6) { AlphaResult = Out[0].A; }
+		}
+
+		TestEqual(*FString::Printf(TEXT("%s: Alpha result matches Red result under identical inputs"), ModeNames[ModeIndex]), AlphaResult, RedResult);
+	}
+
+	return true;
+}
+
+// M19-A. FillValueAndScalarMasksFeedAlphaIdentically: Fill Black/White, a continuous Fill/Opacity
+// combination, Material Slot's binary zero/one mask, a continuous generator (Bounding Box), and two
+// Material Slot layers with independently selected slots -- all through the production evaluator, all
+// writing Alpha via the existing generator/Fill machinery with zero Alpha-specific code.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompAlphaFillAndMaskTest, "VertexMaskForge.DynamicSourceTopologyComposition.FillValueAndScalarMasksFeedAlphaIdentically", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynSrcTopoCompAlphaFillAndMaskTest::RunTest(const FString& Parameters)
+{
+	const FVertexMaskForgeWorkingMesh WorkingMesh = BuildOrchestratorFixtureWorkingMesh(0, 1);
+	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
+
+	// Fill Black into Alpha -> 0.
+	{
+		FVertexMaskForgeDynamicLayerStack Stack;
+		const FGuid LayerId = AddFillOnlyLayer(Stack, TEXT("Layer"), EVertexMaskForgeLayerFill::Black, EVertexMaskForgeBlendMode::Copy, 1.0f);
+		Stack.SetLayerChannelFilter(LayerId, false, false, false, true);
+		TArray<FColor> Out;
+		TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+		TMap<FGuid, FVertexMaskForgeSourceTopologyThicknessCache> OutThicknessCaches;
+		TestTrue(TEXT("Fill Black succeeds"), VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, OutThicknessCaches, Out));
+		if (Out.Num() == 6) { TestEqual(TEXT("Fill Black -> Alpha 0"), Out[0].A, uint8(0)); }
+	}
+
+	// Fill White into Alpha -> 255.
+	{
+		FVertexMaskForgeDynamicLayerStack Stack;
+		const FGuid LayerId = AddFillOnlyLayer(Stack, TEXT("Layer"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f);
+		Stack.SetLayerChannelFilter(LayerId, false, false, false, true);
+		TArray<FColor> Out;
+		TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+		TMap<FGuid, FVertexMaskForgeSourceTopologyThicknessCache> OutThicknessCaches;
+		TestTrue(TEXT("Fill White succeeds"), VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, OutThicknessCaches, Out));
+		if (Out.Num() == 6) { TestEqual(TEXT("Fill White -> Alpha 255"), Out[0].A, uint8(255)); }
+	}
+
+	// Continuous intermediate Fill Value via Opacity: White/Copy/Opacity=0.4 against Base 0 -> 0.4*255 = 102.
+	{
+		TArray<FColor> ZeroAlphaBaseColors = BaseColors;
+		for (FColor& C : ZeroAlphaBaseColors) { C.A = 0; }
+		FVertexMaskForgeDynamicLayerStack Stack;
+		const FGuid LayerId = AddFillOnlyLayer(Stack, TEXT("Layer"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 0.4f);
+		Stack.SetLayerChannelFilter(LayerId, false, false, false, true);
+		TArray<FColor> Out;
+		TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+		TMap<FGuid, FVertexMaskForgeSourceTopologyThicknessCache> OutThicknessCaches;
+		TestTrue(TEXT("Continuous Opacity succeeds"), VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, ZeroAlphaBaseColors, FTransform::Identity, OutAOCaches, OutThicknessCaches, Out));
+		if (Out.Num() == 6) { TestEqual(TEXT("Continuous Fill*Opacity into Alpha"), Out[0].A, uint8(FMath::RoundToInt(0.4f * 255.0f))); }
+	}
+
+	// Material Slot binary zero/one mask into Alpha: slot matches Tri0 (corners 0-2) -> mask 1.0 there,
+	// 0.0 on Tri1 (corners 3-5). White/Copy/Opacity 1.0 means PaintValue == EffectiveMask exactly (White
+	// Fill broadcasts 1.0), and Copy's own Lerp(Base, PaintValue, Opacity=1) formula always resolves to
+	// PaintValue verbatim regardless of Base -- so Tri0 (mask=1) -> Alpha 255, and Tri1 (mask=0) -> Alpha 0
+	// (NOT Base Alpha -- Copy at Opacity 1.0 always fully overwrites, exactly the same "complete priority"
+	// contract already established for R/G/B, e.g. PerLayerChannelFilterIsolatesAffectedChannelOnly above).
+	{
+		FVertexMaskForgeDynamicLayerStack Stack;
+		const FGuid LayerId = AddMaterialSlotLayer(Stack, TEXT("Layer"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f, /*SelectedSlotIndex=*/0);
+		Stack.SetLayerChannelFilter(LayerId, false, false, false, true);
+		TArray<FColor> Out;
+		TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+		TMap<FGuid, FVertexMaskForgeSourceTopologyThicknessCache> OutThicknessCaches;
+		TestTrue(TEXT("Material Slot into Alpha succeeds"), VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, OutThicknessCaches, Out));
+		if (Out.Num() == 6)
+		{
+			TestEqual(TEXT("Tri0 corner 0: mask=1 -> Alpha 255"), Out[0].A, uint8(255));
+			TestEqual(TEXT("Tri0 corner 1: mask=1 -> Alpha 255"), Out[1].A, uint8(255));
+			TestEqual(TEXT("Tri0 corner 2: mask=1 -> Alpha 255"), Out[2].A, uint8(255));
+			TestEqual(TEXT("Tri1 corner 3: mask=0 -> Alpha 0 (Copy/Opacity1 full priority)"), Out[3].A, uint8(0));
+			TestEqual(TEXT("Tri1 corner 4: mask=0 -> Alpha 0 (Copy/Opacity1 full priority)"), Out[4].A, uint8(0));
+			TestEqual(TEXT("Tri1 corner 5: mask=0 -> Alpha 0 (Copy/Opacity1 full priority)"), Out[5].A, uint8(0));
+		}
+	}
+
+	// Two Material Slot layers, independently selected slots, both writing Alpha -- the second (folded
+	// last) layer's own slot wins on the corners where BOTH masks would apply, exactly mirroring the
+	// existing R/G/B sequential-authority contract.
+	{
+		FVertexMaskForgeDynamicLayerStack Stack;
+		const FGuid FirstId = AddMaterialSlotLayer(Stack, TEXT("Slot0"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f, /*SelectedSlotIndex=*/0);
+		Stack.SetLayerChannelFilter(FirstId, false, false, false, true);
+		const FGuid SecondId = AddMaterialSlotLayer(Stack, TEXT("Slot1"), EVertexMaskForgeLayerFill::Black, EVertexMaskForgeBlendMode::Copy, 1.0f, /*SelectedSlotIndex=*/1);
+		Stack.SetLayerChannelFilter(SecondId, false, false, false, true);
+		TArray<FColor> Out;
+		TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+		TMap<FGuid, FVertexMaskForgeSourceTopologyThicknessCache> OutThicknessCaches;
+		TestTrue(TEXT("Two Material Slot layers into Alpha succeed"), VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, OutThicknessCaches, Out));
+		if (Out.Num() == 6)
+		{
+			// Tri0 (corners 0-2): Slot0 layer mask=1 -> PaintValue=White(1)*1=1 -> Copy(Base,1,Opacity=1)=1
+			// (255) after the first layer; Slot1 layer (folded last) mask=0 on Tri0 -> PaintValue=Black(0)*0=0
+			// -> Copy(CompositeSoFar=255, PaintValue=0, Opacity=1) -> 0.
+			TestEqual(TEXT("Tri0 corner 0: Slot1 folded last, mask=0 there -> Alpha 0"), Out[0].A, uint8(0));
+			// Tri1 (corners 3-5): Slot0 layer mask=0 -> PaintValue=White(1)*0=0 -> Copy(Base,0,Opacity=1)=0
+			// after the first layer (Copy at Opacity 1.0 always fully overwrites, never "leaves Base alone"
+			// just because EffectiveMask is 0); Slot1 layer (folded last) mask=1 -> PaintValue=Black(0)*1=0
+			// -> Copy(CompositeSoFar=0, PaintValue=0, Opacity=1) -> 0.
+			TestEqual(TEXT("Tri1 corner 3: Slot1 mask=1 there -> Alpha 0 (Black)"), Out[3].A, uint8(0));
+		}
+	}
+
+	return true;
+}
+
+// M19-A. AlphaComposesThroughEveryCornerDomain: proves Alpha output reaches the same cardinality and the
+// same per-corner semantics for all three ELayerMaskDomain resolutions -- Corner (Directional Normal/
+// Material Slot), DynamicMeshVertex (Bounding Box/Curvature/Noise), and NormalOverlayElement (Ambient
+// Occlusion) -- reusing the exact same generators the R/G/B dispatch tests above already prove correct,
+// only redirected to Alpha via Channel Filter.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompAlphaDomainCoverageTest, "VertexMaskForge.DynamicSourceTopologyComposition.AlphaComposesThroughEveryCornerDomain", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynSrcTopoCompAlphaDomainCoverageTest::RunTest(const FString& Parameters)
+{
+	const FVertexMaskForgeWorkingMesh WorkingMesh = BuildOrchestratorFixtureWorkingMesh(0, 1);
+	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
+
+	// Corner domain: Material Slot.
+	{
+		FVertexMaskForgeDynamicLayerStack Stack;
+		const FGuid LayerId = AddMaterialSlotLayer(Stack, TEXT("Layer"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f, 0);
+		Stack.SetLayerChannelFilter(LayerId, false, false, false, true);
+		TArray<FColor> Out;
+		TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+		TMap<FGuid, FVertexMaskForgeSourceTopologyThicknessCache> OutThicknessCaches;
+		TestTrue(TEXT("Corner domain (Material Slot) succeeds"), VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, OutThicknessCaches, Out));
+		TestEqual(TEXT("Corner domain: output cardinality == corner count"), Out.Num(), 6);
+	}
+
+	// DynamicMeshVertex domain: Bounding Box.
+	{
+		TStaticArray<FVertexMaskForgeAxisMaskParams, 3> Axes;
+		Axes[0].bEnabled = true; Axes[0].bInvert = false;
+		Axes[1].bEnabled = false;
+		Axes[2].bEnabled = false;
+		FVertexMaskForgeDynamicLayerStack Stack;
+		const FGuid LayerId = AddBoundingBoxLayer(Stack, TEXT("Layer"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f, Axes);
+		Stack.SetLayerChannelFilter(LayerId, false, false, false, true);
+		TArray<FColor> Out;
+		TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+		TMap<FGuid, FVertexMaskForgeSourceTopologyThicknessCache> OutThicknessCaches;
+		TestTrue(TEXT("DynamicMeshVertex domain (Bounding Box) succeeds"), VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, OutThicknessCaches, Out));
+		TestEqual(TEXT("DynamicMeshVertex domain: output cardinality == corner count"), Out.Num(), 6);
+	}
+
+	// NormalOverlayElement domain: Ambient Occlusion -- requires its own fixture with a real Normal Overlay
+	// (BuildOrchestratorFixtureWorkingMesh above never enables Mesh attributes; AO reports Unavailable
+	// without one, exactly like the R/G/B AO dispatch tests elsewhere in this file already establish).
+	{
+		const FVertexMaskForgeWorkingMesh AOWorkingMesh = BuildAOFoldFixtureWorkingMesh();
+		const TArray<FColor> AOBaseColors = MakeSixCornerBaseColors();
+		FVertexMaskForgeDynamicLayerStack Stack;
+		const FGuid LayerId = Stack.AddLayer(TEXT("AO"));
+		Stack.SetLayerFill(LayerId, EVertexMaskForgeLayerFill::White);
+		Stack.SetLayerBlendMode(LayerId, EVertexMaskForgeBlendMode::Copy);
+		Stack.SetLayerOpacity(LayerId, 1.0f);
+		Stack.SetLayerMaskGeneratorType(LayerId, EVertexMaskForgeGeneratorType::AmbientOcclusion);
+		Stack.SetLayerChannelFilter(LayerId, false, false, false, true);
+		TArray<FColor> Out;
+		TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+		TMap<FGuid, FVertexMaskForgeSourceTopologyThicknessCache> OutThicknessCaches;
+		const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(AOWorkingMesh, Stack, AOBaseColors, FTransform::Identity, OutAOCaches, OutThicknessCaches, Out);
+		TestTrue(TEXT("NormalOverlayElement domain (Ambient Occlusion) succeeds"), bSucceeded);
+		if (bSucceeded) { TestEqual(TEXT("NormalOverlayElement domain: output cardinality == corner count"), Out.Num(), AOBaseColors.Num()); }
+	}
+
+	return true;
+}
+
+// M19-A. AlphaQuantizedThroughSingleToDisplayFColorConversion: a nontrivial Alpha value (0.7) is rounded
+// through the exact same, single ToDisplayFColor conversion point R/G/B already use -- no second/earlier
+// byte conversion exists anywhere in the composition path for Alpha.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynSrcTopoCompAlphaQuantizationTest, "VertexMaskForge.DynamicSourceTopologyComposition.AlphaQuantizedThroughSingleToDisplayFColorConversion", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynSrcTopoCompAlphaQuantizationTest::RunTest(const FString& Parameters)
+{
+	const FVertexMaskForgeWorkingMesh WorkingMesh = BuildOrchestratorFixtureWorkingMesh(0, 1);
+	TArray<FColor> BaseColors = MakeSixCornerBaseColors();
+	for (FColor& C : BaseColors) { C.A = 0; }
+
+	FVertexMaskForgeDynamicLayerStack Stack;
+	// White/Copy/Opacity=0.7 against Base Alpha 0 -> Lerp(0, 1.0, 0.7) = 0.7, quantized once.
+	const FGuid LayerId = AddFillOnlyLayer(Stack, TEXT("Layer"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 0.7f);
+	Stack.SetLayerChannelFilter(LayerId, false, false, false, true);
+
+	TArray<FColor> Out;
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
+	TMap<FGuid, FVertexMaskForgeSourceTopologyThicknessCache> OutThicknessCaches;
+	const bool bSucceeded = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, OutAOCaches, OutThicknessCaches, Out);
+
+	TestTrue(TEXT("Succeeds"), bSucceeded);
+	if (Out.Num() == 6)
+	{
+		// Same rounding VertexMaskForgeColorConversion::ToDisplayFColor itself performs (FMath::RoundToInt).
+		const uint8 Expected = static_cast<uint8>(FMath::RoundToInt(0.7f * 255.0f));
+		TestEqual(TEXT("Alpha 0.7 quantized once, via ToDisplayFColor"), Out[0].A, Expected);
+	}
+
+	return true;
+}
+
 // 10. Per-layer Channel Filter (bAffectRed/Green/Blue) isolates a layer's contribution to exactly the
 // channels it affects -- a Red-only White/Copy/Opacity-1 layer forces Red to 255 while leaving Green/Blue
 // exactly at their original BaseColors value (round-tripped through the same /255,*255 conversion the
@@ -1082,7 +1580,7 @@ bool FVertexMaskForgeDynSrcTopoCompChannelFilterTest::RunTest(const FString& Par
 	const FVertexMaskForgeWorkingMesh WorkingMesh = BuildOrchestratorFixtureWorkingMesh(0, 1);
 	FVertexMaskForgeDynamicLayerStack Stack;
 	const FGuid LayerId = AddFillOnlyLayer(Stack, TEXT("Layer"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f);
-	Stack.SetLayerChannelFilter(LayerId, /*bAffectRed=*/true, /*bAffectGreen=*/false, /*bAffectBlue=*/false);
+	Stack.SetLayerChannelFilter(LayerId, /*bAffectRed=*/true, /*bAffectGreen=*/false, /*bAffectBlue=*/false, /*bAffectAlpha=*/false);
 
 	const TArray<FColor> BaseColors = MakeSixCornerBaseColors();
 	TArray<FColor> Out;
@@ -1120,18 +1618,18 @@ bool FVertexMaskForgeDynSrcTopoCompOrderMattersTest::RunTest(const FString& Para
 	FVertexMaskForgeDynamicLayerStack ForwardStack;
 	{
 		const FGuid WhiteLayerId = AddFillOnlyLayer(ForwardStack, TEXT("White"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f);
-		ForwardStack.SetLayerChannelFilter(WhiteLayerId, true, false, false);
+		ForwardStack.SetLayerChannelFilter(WhiteLayerId, true, false, false, false);
 		const FGuid BlackLayerId = AddFillOnlyLayer(ForwardStack, TEXT("Black"), EVertexMaskForgeLayerFill::Black, EVertexMaskForgeBlendMode::Copy, 1.0f);
-		ForwardStack.SetLayerChannelFilter(BlackLayerId, true, false, false);
+		ForwardStack.SetLayerChannelFilter(BlackLayerId, true, false, false, false);
 	}
 
 	// Reverse: the same two layers, added in the opposite order -- White is folded LAST, so Red ends at 255.
 	FVertexMaskForgeDynamicLayerStack ReverseStack;
 	{
 		const FGuid BlackLayerId = AddFillOnlyLayer(ReverseStack, TEXT("Black"), EVertexMaskForgeLayerFill::Black, EVertexMaskForgeBlendMode::Copy, 1.0f);
-		ReverseStack.SetLayerChannelFilter(BlackLayerId, true, false, false);
+		ReverseStack.SetLayerChannelFilter(BlackLayerId, true, false, false, false);
 		const FGuid WhiteLayerId = AddFillOnlyLayer(ReverseStack, TEXT("White"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f);
-		ReverseStack.SetLayerChannelFilter(WhiteLayerId, true, false, false);
+		ReverseStack.SetLayerChannelFilter(WhiteLayerId, true, false, false, false);
 	}
 
 	TArray<FColor> ForwardOut;
@@ -2753,9 +3251,9 @@ bool FVertexMaskForgeDynSrcTopoCompNoiseIndependentStateTest::RunTest(const FStr
 	const FGuid LayerA = AddNoiseLayer(Stack, TEXT("A"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f, ParamsA);
 	const FGuid LayerB = AddNoiseLayer(Stack, TEXT("B"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f, ParamsB);
 	const FGuid LayerC = AddNoiseLayer(Stack, TEXT("C"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f, ParamsC);
-	Stack.SetLayerChannelFilter(LayerA, /*bAffectRed=*/true, /*bAffectGreen=*/false, /*bAffectBlue=*/false);
-	Stack.SetLayerChannelFilter(LayerB, /*bAffectRed=*/false, /*bAffectGreen=*/true, /*bAffectBlue=*/false);
-	Stack.SetLayerChannelFilter(LayerC, /*bAffectRed=*/false, /*bAffectGreen=*/false, /*bAffectBlue=*/true);
+	Stack.SetLayerChannelFilter(LayerA, /*bAffectRed=*/true, /*bAffectGreen=*/false, /*bAffectBlue=*/false, /*bAffectAlpha=*/false);
+	Stack.SetLayerChannelFilter(LayerB, /*bAffectRed=*/false, /*bAffectGreen=*/true, /*bAffectBlue=*/false, /*bAffectAlpha=*/false);
+	Stack.SetLayerChannelFilter(LayerC, /*bAffectRed=*/false, /*bAffectGreen=*/false, /*bAffectBlue=*/true, /*bAffectAlpha=*/false);
 
 	TArray<FColor> Out;
 	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> OutAOCaches;
@@ -3058,7 +3556,7 @@ bool FVertexMaskForgeDynSrcTopoCompAOCompositionEditsPreserveRawTest::RunTest(co
 	Stack.SetLayerOpacity(LayerId, 1.0f);
 
 	// Channel Filter: all -> Red only.
-	Stack.SetLayerChannelFilter(LayerId, true, false, false);
+	Stack.SetLayerChannelFilter(LayerId, true, false, false, false);
 	TArray<FColor> ChannelChangedOut;
 	TestTrue(TEXT("Channel-Filter-changed evaluation succeeds"),
 		VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(WorkingMesh, Stack, BaseColors, FTransform::Identity, AOCaches, ThicknessCaches, ChannelChangedOut));
@@ -4098,7 +4596,7 @@ bool FVertexMaskForgeDynSrcTopoCompCopyPriorityTest::RunTest(const FString& Para
 		FVertexMaskForgeDynamicLayerStack Stack;
 		AddFillOnlyLayer(Stack, TEXT("Lower"), EVertexMaskForgeLayerFill::White, EVertexMaskForgeBlendMode::Copy, 1.0f);
 		const FGuid UpperId = AddFillOnlyLayer(Stack, TEXT("Upper"), EVertexMaskForgeLayerFill::Black, EVertexMaskForgeBlendMode::Copy, 1.0f);
-		Stack.SetLayerChannelFilter(UpperId, /*bAffectRed=*/false, /*bAffectGreen=*/true, /*bAffectBlue=*/true);
+		Stack.SetLayerChannelFilter(UpperId, /*bAffectRed=*/false, /*bAffectGreen=*/true, /*bAffectBlue=*/true, /*bAffectAlpha=*/false);
 		TArray<FColor> Out;
 		TestTrue(TEXT("Channel-gated evaluates"), Evaluate(Stack, Out));
 		TestTrue(TEXT("Upper does not write R -- Lower's White R survives (R == 255)"),

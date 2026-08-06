@@ -1,4 +1,4 @@
-// M16-K.5B: automation tests for FVertexMaskForgeGeneratorMaskInstance identity/ownership and the three
+﻿// M16-K.5B: automation tests for FVertexMaskForgeGeneratorMaskInstance identity/ownership and the three
 // new FVertexMaskForgeDynamicLayerStack mutators (SetLayerMaskGeneratorType/ClearLayerMask/GetLayerMask).
 // Nothing here constructs SVertexMaskForgePanel, touches VertexMaskForgeDynamicLayerEvaluator's real
 // production behavior beyond the one dedicated inertness proof (EvaluatorIgnoresMaskInstance), or reads/
@@ -444,14 +444,14 @@ bool FVertexMaskForgeGeneratorMaskInstanceEvaluatorInertTest::RunTest(const FStr
 	StackWithoutMask.SetLayerFill(IdA, EVertexMaskForgeLayerFill::White);
 	StackWithoutMask.SetLayerBlendMode(IdA, EVertexMaskForgeBlendMode::Overlay);
 	StackWithoutMask.SetLayerOpacity(IdA, 0.6f);
-	StackWithoutMask.SetLayerChannelFilter(IdA, true, false, true);
+	StackWithoutMask.SetLayerChannelFilter(IdA, true, false, true, false);
 
 	FVertexMaskForgeDynamicLayerStack StackWithMask;
 	const FGuid IdB = StackWithMask.AddLayer(TEXT("Layer"));
 	StackWithMask.SetLayerFill(IdB, EVertexMaskForgeLayerFill::White);
 	StackWithMask.SetLayerBlendMode(IdB, EVertexMaskForgeBlendMode::Overlay);
 	StackWithMask.SetLayerOpacity(IdB, 0.6f);
-	StackWithMask.SetLayerChannelFilter(IdB, true, false, true);
+	StackWithMask.SetLayerChannelFilter(IdB, true, false, true, false);
 	StackWithMask.SetLayerMaskGeneratorType(IdB, EVertexMaskForgeGeneratorType::Curvature); // The only difference.
 
 	const FVector4f Base(0.3f, 0.4f, 0.5f, 0.9f);

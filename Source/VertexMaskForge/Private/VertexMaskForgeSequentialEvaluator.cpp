@@ -39,6 +39,18 @@ namespace VertexMaskForgeSequentialEvaluator
 			VertexMaskForgeMaskStackComposer::BlendMaskValueUnclamped(CompositeBelow.Z, PaintValue.Z, Mode, LayerOpacity));
 	}
 
+	FVector4f EvaluateFillLayerStep(const FVector4f& CompositeBelow, const FVector4f& PaintValue, const EVertexMaskForgeBlendMode Mode, const float LayerOpacity)
+	{
+		// Same primitive as the three-channel overload above, applied independently per channel including
+		// Alpha (W) -- no independent or duplicated blend math. AUDITED (M19-A): deliberately UNCLAMPED --
+		// see this function's own header doc comment.
+		return FVector4f(
+			VertexMaskForgeMaskStackComposer::BlendMaskValueUnclamped(CompositeBelow.X, PaintValue.X, Mode, LayerOpacity),
+			VertexMaskForgeMaskStackComposer::BlendMaskValueUnclamped(CompositeBelow.Y, PaintValue.Y, Mode, LayerOpacity),
+			VertexMaskForgeMaskStackComposer::BlendMaskValueUnclamped(CompositeBelow.Z, PaintValue.Z, Mode, LayerOpacity),
+			VertexMaskForgeMaskStackComposer::BlendMaskValueUnclamped(CompositeBelow.W, PaintValue.W, Mode, LayerOpacity));
+	}
+
 	FVector3f EvaluateFillLayers(const FVector3f& BaseValue, const TConstArrayView<FVertexMaskForgeLayerEvaluationInput> Inputs)
 	{
 		// AUDITED (M16-J final): an empty stack returns BaseValue verbatim, UNCLAMPED -- BaseValue is

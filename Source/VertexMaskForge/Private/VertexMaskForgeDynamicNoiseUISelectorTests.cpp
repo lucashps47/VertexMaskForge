@@ -1,4 +1,4 @@
-// M16-K.6D-8F-C: Dynamic Noise/Grunge production UI -- domain-level tests for the exact read/mutate
+﻿// M16-K.6D-8F-C: Dynamic Noise/Grunge production UI -- domain-level tests for the exact read/mutate
 // sequences BuildDynamicNoiseLayerParamsBlock/MutateDynamicNoiseParam perform against
 // FVertexMaskForgeDynamicLayerStack (the same production API the panel calls).
 //
@@ -301,7 +301,7 @@ bool FVertexMaskForgeDynamicNoiseUIGenericLayerPropertiesPreservedTest::RunTest(
 	Stack.SetLayerBlendMode(Id, EVertexMaskForgeBlendMode::Multiply);
 	Stack.SetLayerOpacity(Id, 0.42f);
 	Stack.SetLayerEnabled(Id, false);
-	Stack.SetLayerChannelFilter(Id, true, false, true);
+	Stack.SetLayerChannelFilter(Id, true, false, true, false);
 
 	for (int32 Iteration = 0; Iteration < 5; ++Iteration)
 	{
@@ -680,7 +680,7 @@ bool FVertexMaskForgeDynamicNoiseUILockAxesUnrelatedFieldsUnaffectedTest::RunTes
 	Stack.SetLayerBlendMode(Id, EVertexMaskForgeBlendMode::Screen);
 	Stack.SetLayerOpacity(Id, 0.66f);
 	Stack.SetLayerEnabled(Id, false);
-	Stack.SetLayerChannelFilter(Id, false, true, false);
+	Stack.SetLayerChannelFilter(Id, false, true, false, false);
 
 	MutateNoiseParamLikeUI(Stack, Id, InstanceId, [](FVertexMaskForgeNoiseParams& P) { VertexMaskForgePanel::ApplyDynamicNoiseScaleXEdit(P, 4.0f, /*bAxesLocked=*/true); });
 

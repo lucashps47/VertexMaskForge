@@ -1,4 +1,4 @@
-// M16-K.6D-7A: automated coverage for VertexMaskForgeDynamicAcceptTargetBuilder::BuildSourceTopologyAcceptTargets
+﻿// M16-K.6D-7A: automated coverage for VertexMaskForgeDynamicAcceptTargetBuilder::BuildSourceTopologyAcceptTargets
 // -- the non-panel Dynamic Source-Topology accept-target construction seam. See
 // VertexMaskForgeDynamicAcceptTargetBuilder.h for the full module contract this file verifies.
 //
@@ -145,7 +145,7 @@ namespace
 		Stack.SetLayerFill(LayerId, EVertexMaskForgeLayerFill::White);
 		Stack.SetLayerBlendMode(LayerId, EVertexMaskForgeBlendMode::Copy);
 		Stack.SetLayerOpacity(LayerId, 1.0f);
-		Stack.SetLayerChannelFilter(LayerId, true, true, true);
+		Stack.SetLayerChannelFilter(LayerId, true, true, true, false);
 		Stack.SetLayerMaskGeneratorType(LayerId, EVertexMaskForgeGeneratorType::MaterialSlot);
 
 		const FVertexMaskForgeGeneratorMaskInstance* MaskInstance = Stack.GetLayerMask(LayerId);
@@ -167,7 +167,7 @@ namespace
 		Stack.SetLayerFill(LayerId, EVertexMaskForgeLayerFill::White);
 		Stack.SetLayerBlendMode(LayerId, EVertexMaskForgeBlendMode::Copy);
 		Stack.SetLayerOpacity(LayerId, 1.0f);
-		Stack.SetLayerChannelFilter(LayerId, true, true, true);
+		Stack.SetLayerChannelFilter(LayerId, true, true, true, false);
 		return LayerId;
 	}
 
@@ -239,7 +239,7 @@ namespace
 		Stack.SetLayerFill(LayerId, EVertexMaskForgeLayerFill::White);
 		Stack.SetLayerBlendMode(LayerId, EVertexMaskForgeBlendMode::Copy);
 		Stack.SetLayerOpacity(LayerId, 1.0f);
-		Stack.SetLayerChannelFilter(LayerId, true, true, true);
+		Stack.SetLayerChannelFilter(LayerId, true, true, true, false);
 		Stack.SetLayerMaskGeneratorType(LayerId, EVertexMaskForgeGeneratorType::AmbientOcclusion);
 
 		const FVertexMaskForgeGeneratorMaskInstance* MaskInstance = Stack.GetLayerMask(LayerId);
@@ -300,6 +300,61 @@ bool FVertexMaskForgeDynamicAcceptTargetBuilderValidComponentTest::RunTest(const
 		TestEqual(*FString::Printf(TEXT("FinalColors[%d] byte-exact against orchestrator"), Index), Targets[0].FinalColors[Index], ExpectedColors[Index]);
 		TestEqual(*FString::Printf(TEXT("FinalColors[%d].A matches Baseline Alpha"), Index), Targets[0].FinalColors[Index].A, Baseline[Index].A);
 	}
+	return true;
+}
+
+// M19-A. AlphaEnabledLayerMatchesOrchestratorAndDiffersFromBaseline: a nontrivial composed Alpha (produced
+// by a layer that explicitly affects Alpha), proving Accept's FinalColors.A byte-exact matches a direct
+// orchestrator call (the same "WorkingColors == Accept" parity every other channel already proves), that
+// the result actually DIFFERS from Baseline Alpha (proving Accept did not silently fall back to a
+// passthrough), and that RGB remains equivalent between the two calls with no Accept-side Alpha
+// correction anywhere in the builder.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynamicAcceptTargetBuilderAlphaParityTest, "VertexMaskForge.DynamicAcceptTargetBuilder.AlphaEnabledLayerMatchesOrchestratorAndDiffersFromBaseline", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynamicAcceptTargetBuilderAlphaParityTest::RunTest(const FString& Parameters)
+{
+	FDynamicAcceptFixtureAsset Asset;
+	const TArray<FColor> Baseline = MakeDefaultBaseline();
+	const TSharedPtr<FVertexMaskForgeSelectedMesh> Entry = MakeValidEntry(Asset, Baseline, *this);
+
+	FVertexMaskForgeDynamicLayerStack Stack;
+	const FGuid LayerId = AddEnabledMaterialSlotWhiteLayer(Stack, /*SelectedSlotIndex=*/0);
+	// Opt this layer into Alpha, on top of its existing RGB ownership -- White/Copy/Opacity1/mask=1 on
+	// Tri0's corners forces Alpha to 255 there, a clean divergence from Baseline's own 100..105 range.
+	TestTrue(TEXT("Enable Alpha on the layer"), Stack.SetLayerChannelFilter(LayerId, true, true, true, true));
+
+	TArray<VertexMaskForgeAcceptTargetBuilder::FSourceTopologyAcceptTarget> Targets;
+	FText ErrorText;
+	const bool bBuilt = VertexMaskForgeDynamicAcceptTargetBuilder::BuildSourceTopologyAcceptTargets({ Entry }, Stack, Targets, ErrorText);
+	TestTrue(TEXT("BuildSourceTopologyAcceptTargets succeeds"), bBuilt);
+	TestEqual(TEXT("Targets.Num() == 1"), Targets.Num(), 1);
+	if (!bBuilt || Targets.Num() != 1)
+	{
+		return false;
+	}
+
+	// Direct orchestrator call, same inputs -- this IS WorkingColors' own production seam (Preview and
+	// Accept always re-derive through this identical function; see this module's own header contract).
+	TArray<FColor> ExpectedColors;
+	TMap<FGuid, FVertexMaskForgeSourceTopologyAOCache> ExpectedColorsAOCaches;
+	TMap<FGuid, FVertexMaskForgeSourceTopologyThicknessCache> ExpectedColorsThicknessCaches;
+	const bool bComposed = VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSourceTopology(
+		Entry->MeshOwner->GetWorkingMesh(), Stack, Baseline, FTransform::Identity, ExpectedColorsAOCaches, ExpectedColorsThicknessCaches, ExpectedColors);
+	TestTrue(TEXT("Direct orchestrator call succeeds"), bComposed);
+
+	TestEqual(TEXT("FinalColors.Num() == ExpectedColors.Num()"), Targets[0].FinalColors.Num(), ExpectedColors.Num());
+	if (Targets[0].FinalColors.Num() != ExpectedColors.Num())
+	{
+		return false;
+	}
+	for (int32 Index = 0; Index < ExpectedColors.Num(); ++Index)
+	{
+		TestEqual(*FString::Printf(TEXT("FinalColors[%d].A byte-exact against orchestrator (WorkingColors == Accept)"), Index), Targets[0].FinalColors[Index].A, ExpectedColors[Index].A);
+		TestEqual(*FString::Printf(TEXT("FinalColors[%d].R/G/B byte-exact against orchestrator"), Index), Targets[0].FinalColors[Index], ExpectedColors[Index]);
+	}
+	// Tri0 corners (0,1,2): mask=1 -> Alpha composed to 255, provably different from Baseline (100/101/102).
+	TestEqual(TEXT("Composed Alpha on corner 0 == 255 (White/Copy/Opacity1, mask=1)"), Targets[0].FinalColors[0].A, uint8(255));
+	TestNotEqual(TEXT("Composed Alpha on corner 0 differs from Baseline Alpha (no silent passthrough)"), Targets[0].FinalColors[0].A, Baseline[0].A);
+
 	return true;
 }
 
@@ -449,7 +504,7 @@ bool FVertexMaskForgeDynamicAcceptTargetBuilderMultiLayerParityTest::RunTest(con
 	Stack.SetLayerFill(LayerA, EVertexMaskForgeLayerFill::White);
 	Stack.SetLayerBlendMode(LayerA, EVertexMaskForgeBlendMode::Multiply);
 	Stack.SetLayerOpacity(LayerA, 0.5f);
-	Stack.SetLayerChannelFilter(LayerA, true, true, false);
+	Stack.SetLayerChannelFilter(LayerA, true, true, false, false);
 	Stack.SetLayerMaskGeneratorType(LayerA, EVertexMaskForgeGeneratorType::MaterialSlot);
 	if (const FVertexMaskForgeGeneratorMaskInstance* MaskA = Stack.GetLayerMask(LayerA))
 	{
@@ -464,7 +519,7 @@ bool FVertexMaskForgeDynamicAcceptTargetBuilderMultiLayerParityTest::RunTest(con
 	Stack.SetLayerFill(LayerB, EVertexMaskForgeLayerFill::Black);
 	Stack.SetLayerBlendMode(LayerB, EVertexMaskForgeBlendMode::Overlay);
 	Stack.SetLayerOpacity(LayerB, 0.25f);
-	Stack.SetLayerChannelFilter(LayerB, false, false, true);
+	Stack.SetLayerChannelFilter(LayerB, false, false, true, false);
 
 	// Reorder: B before A.
 	const bool bMoved = Stack.MoveLayer(LayerB, 0);
@@ -529,11 +584,13 @@ bool FVertexMaskForgeDynamicAcceptTargetBuilderDivergentComponentsTest::RunTest(
 	const TSharedPtr<FVertexMaskForgeSelectedMesh> Entry = MakeValidEntry(Asset, Baseline, *this);
 
 	// A second component on the SAME asset, but with a DIFFERENT captured Baseline -- diverges once
-	// composed. The configured layer below (Copy blend, Opacity 1.0, all channels) fully overwrites RGB
-	// with PaintValue regardless of Baseline RGB, so an RGB-only divergence would NOT survive
-	// composition; Alpha is the one channel the orchestrator always passes through from Baseline
-	// unmodified, so it is the divergence this fixture must use to produce different FINAL composed
-	// output (see ComputeComposedColorsRGBSourceTopology's own `FinalColor.W = BaseColor.W` contract).
+	// composed. The configured layer below (Copy blend, Opacity 1.0, RGB channels only -- see
+	// AddEnabledMaterialSlotWhiteLayer's own bAffectAlpha=false) fully overwrites RGB with PaintValue
+	// regardless of Baseline RGB, so an RGB-only divergence would NOT survive composition; Alpha is the
+	// one channel THIS layer leaves untouched (bAffectAlpha=false, M19-A's default), so it is the
+	// divergence this fixture must use to produce different FINAL composed output -- see
+	// FVertexMaskForgeLayer::bAffectAlpha's own doc comment, not an unconditional orchestrator-wide
+	// guarantee (a layer that DOES affect Alpha would compose it like any other channel).
 	TArray<FColor> DivergentBaseline = Baseline;
 	DivergentBaseline[0].A = 250;
 
@@ -628,7 +685,7 @@ bool FVertexMaskForgeDynamicAcceptTargetBuilderUnsupportedGeneratorTest::RunTest
 	Stack.SetLayerFill(LayerId, EVertexMaskForgeLayerFill::White);
 	Stack.SetLayerBlendMode(LayerId, EVertexMaskForgeBlendMode::Copy);
 	Stack.SetLayerOpacity(LayerId, 1.0f);
-	Stack.SetLayerChannelFilter(LayerId, true, true, true);
+	Stack.SetLayerChannelFilter(LayerId, true, true, true, false);
 	Stack.SetLayerMaskGeneratorType(LayerId, EVertexMaskForgeGeneratorType::BoundingBox);
 
 	TArray<VertexMaskForgeAcceptTargetBuilder::FSourceTopologyAcceptTarget> Targets;

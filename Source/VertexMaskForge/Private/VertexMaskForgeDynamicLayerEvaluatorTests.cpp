@@ -1,4 +1,4 @@
-// M16-K.3B: automation tests for VertexMaskForgeDynamicLayerEvaluator -- the pure composition core for
+﻿// M16-K.3B: automation tests for VertexMaskForgeDynamicLayerEvaluator -- the pure composition core for
 // FVertexMaskForgeDynamicLayerStack. Nothing here constructs SVertexMaskForgePanel, touches the active
 // production composition path (ComposeGeneratorLayersSequential/ComputeComposedColorsRGB*), or reads
 // GeneratorLayerOrder -- GeneratorLayerOrder remains the sole production order owner; this evaluator is
@@ -351,7 +351,7 @@ bool FVertexMaskForgeDynamicLayerEvaluatorChannelFilterSingleTest::RunTest(const
 		Stack.SetLayerFill(Id, EVertexMaskForgeLayerFill::White);
 		Stack.SetLayerBlendMode(Id, EVertexMaskForgeBlendMode::Copy);
 		Stack.SetLayerOpacity(Id, 1.0f);
-		Stack.SetLayerChannelFilter(Id, true, false, false);
+		Stack.SetLayerChannelFilter(Id, true, false, false, false);
 		TestTrue(TEXT("Red only changes; Green/Blue/Alpha preserved"), ColorsNearlyEqual(VertexMaskForgeDynamicLayerEvaluator::EvaluateColor(Base, Stack), FVector4f(1.0f, 0.3f, 0.4f, 0.9f)));
 	}
 	{
@@ -360,7 +360,7 @@ bool FVertexMaskForgeDynamicLayerEvaluatorChannelFilterSingleTest::RunTest(const
 		Stack.SetLayerFill(Id, EVertexMaskForgeLayerFill::White);
 		Stack.SetLayerBlendMode(Id, EVertexMaskForgeBlendMode::Copy);
 		Stack.SetLayerOpacity(Id, 1.0f);
-		Stack.SetLayerChannelFilter(Id, false, true, false);
+		Stack.SetLayerChannelFilter(Id, false, true, false, false);
 		TestTrue(TEXT("Green only changes; Red/Blue/Alpha preserved"), ColorsNearlyEqual(VertexMaskForgeDynamicLayerEvaluator::EvaluateColor(Base, Stack), FVector4f(0.2f, 1.0f, 0.4f, 0.9f)));
 	}
 	{
@@ -369,7 +369,7 @@ bool FVertexMaskForgeDynamicLayerEvaluatorChannelFilterSingleTest::RunTest(const
 		Stack.SetLayerFill(Id, EVertexMaskForgeLayerFill::White);
 		Stack.SetLayerBlendMode(Id, EVertexMaskForgeBlendMode::Copy);
 		Stack.SetLayerOpacity(Id, 1.0f);
-		Stack.SetLayerChannelFilter(Id, false, false, true);
+		Stack.SetLayerChannelFilter(Id, false, false, true, false);
 		TestTrue(TEXT("Blue only changes; Red/Green/Alpha preserved"), ColorsNearlyEqual(VertexMaskForgeDynamicLayerEvaluator::EvaluateColor(Base, Stack), FVector4f(0.2f, 0.3f, 1.0f, 0.9f)));
 	}
 
@@ -386,7 +386,7 @@ bool FVertexMaskForgeDynamicLayerEvaluatorChannelFilterAllDisabledTest::RunTest(
 	Stack.SetLayerFill(Id, EVertexMaskForgeLayerFill::White);
 	Stack.SetLayerBlendMode(Id, EVertexMaskForgeBlendMode::Copy);
 	Stack.SetLayerOpacity(Id, 1.0f);
-	Stack.SetLayerChannelFilter(Id, false, false, false);
+	Stack.SetLayerChannelFilter(Id, false, false, false, false);
 
 	const FVector4f Base(0.2f, 0.3f, 0.4f, 0.9f);
 	const FVector4f Result = VertexMaskForgeDynamicLayerEvaluator::EvaluateColor(Base, Stack);
@@ -540,13 +540,13 @@ bool FVertexMaskForgeDynamicLayerEvaluatorChannelsIndependentTest::RunTest(const
 	Stack.SetLayerFill(RedLayer, EVertexMaskForgeLayerFill::White);
 	Stack.SetLayerBlendMode(RedLayer, EVertexMaskForgeBlendMode::Copy);
 	Stack.SetLayerOpacity(RedLayer, 1.0f);
-	Stack.SetLayerChannelFilter(RedLayer, true, false, false);
+	Stack.SetLayerChannelFilter(RedLayer, true, false, false, false);
 
 	const FGuid GreenLayer = Stack.AddLayer(TEXT("GreenLayer"));
 	Stack.SetLayerFill(GreenLayer, EVertexMaskForgeLayerFill::Black);
 	Stack.SetLayerBlendMode(GreenLayer, EVertexMaskForgeBlendMode::Copy);
 	Stack.SetLayerOpacity(GreenLayer, 1.0f);
-	Stack.SetLayerChannelFilter(GreenLayer, false, true, false);
+	Stack.SetLayerChannelFilter(GreenLayer, false, true, false, false);
 
 	const FVector4f Base(0.5f, 0.5f, 0.5f, 1.0f);
 	const FVector4f Result = VertexMaskForgeDynamicLayerEvaluator::EvaluateColor(Base, Stack);
@@ -593,7 +593,7 @@ bool FVertexMaskForgeDynamicLayerEvaluatorDoesNotMutateStackTest::RunTest(const 
 	Stack.SetLayerFill(A, EVertexMaskForgeLayerFill::White);
 	Stack.SetLayerBlendMode(A, EVertexMaskForgeBlendMode::Overlay);
 	Stack.SetLayerOpacity(A, 0.4f);
-	Stack.SetLayerChannelFilter(A, true, false, true);
+	Stack.SetLayerChannelFilter(A, true, false, true, false);
 
 	const FGuid B = Stack.AddLayer(TEXT("B"));
 	Stack.SetLayerFill(B, EVertexMaskForgeLayerFill::Black);

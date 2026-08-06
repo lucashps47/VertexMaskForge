@@ -119,6 +119,27 @@ namespace VertexMaskForgeSequentialEvaluator
 	FVector3f EvaluateFillLayerStep(const FVector3f& CompositeBelow, const FVector3f& PaintValue, EVertexMaskForgeBlendMode Mode, float LayerOpacity);
 
 	/**
+	 * M19-A: four-channel sibling of EvaluateFillLayerStep above, covering Alpha (W) alongside R/G/B (X/Y/Z)
+	 * -- LayerOutput = BlendMaskValueUnclamped(CompositeBelow, PaintValue, Mode, LayerOpacity), applied
+	 * independently per channel, all four channels reusing VertexMaskForgeMaskStackComposer::
+	 * BlendMaskValueUnclamped verbatim (the SAME primitive the three-channel overload above already calls
+	 * -- no independent or duplicated Alpha blend math exists anywhere in this module). Deliberately a
+	 * SEPARATE overload rather than a widened FVector3f -> FVector4f signature on the existing function:
+	 * the three-channel EvaluateFillLayerStep/EvaluateFillLayers/FVertexMaskForgeLayerEvaluationInput are
+	 * also called by VertexMaskForgeGeneratorLayerBridge::ComposeGeneratorLayersSequential and
+	 * VertexMaskForgeFillLayerResolution::EvaluateFillLayerFromKeyedResults -- both operate on the separate,
+	 * fixed-slot Recipe/Mask Stack model (VertexMaskForgePanel::FVertexMaskForgeMaskLayerParams /
+	 * FVertexMaskForgeFillLayer), unrelated to the Dynamic Layers/Source Topology Alpha contract this
+	 * checkpoint (M19-A) implements. Widening the shared three-channel function in place would force
+	 * mechanical, out-of-scope changes onto those two unrelated production call sites; this overload keeps
+	 * their FVector3f contract completely untouched while still sharing the one real blend primitive.
+	 * Deliberately NOT clamped here -- same per-step/final-only clamp split as every other evaluator
+	 * primitive in this module; the caller (ComputeComposedColorsRGBSourceTopology's own Pass 2 fold)
+	 * clamps once, at the end of each corner, exactly like it already does for R/G/B.
+	 */
+	FVector4f EvaluateFillLayerStep(const FVector4f& CompositeBelow, const FVector4f& PaintValue, EVertexMaskForgeBlendMode Mode, float LayerOpacity);
+
+	/**
 	 * Evaluates a full ordered sequence of Fill Layers: starts from BaseValue, then, per ENABLED entry,
 	 * strictly in array order: PaintValue = FillValue * EffectiveMask (component-wise -- a white FillValue
 	 * (1,1,1) makes PaintValue literally equal to the broadcast EffectiveMask scalar; a black FillValue

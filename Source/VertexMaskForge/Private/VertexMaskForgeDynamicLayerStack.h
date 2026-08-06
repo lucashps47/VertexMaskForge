@@ -151,10 +151,12 @@ public:
 	/** Sets bEnabled. Only an unknown LayerId can fail (a bool has no invalid state of its own). */
 	bool SetLayerEnabled(const FGuid& LayerId, bool bEnabled);
 
-	/** Sets all three per-layer Channel Filter bits together. Accepts any combination, including all
-	 *  false (a compositionally no-op layer, still a valid stack state -- see EvaluateColor's own
-	 *  contract). Only an unknown LayerId can fail. */
-	bool SetLayerChannelFilter(const FGuid& LayerId, bool bAffectRed, bool bAffectGreen, bool bAffectBlue);
+	/** Sets all four per-layer Channel Filter bits together. Accepts any combination, including all
+	 *  false (a compositionally no-op layer, still a valid stack state -- see
+	 *  ComputeComposedColorsRGBSourceTopology's own contract). Only an unknown LayerId can fail. M19-A:
+	 *  extended from three booleans (R/G/B) to four (R/G/B/A) -- every caller must now pass bAffectAlpha
+	 *  explicitly; there is no default that implicitly preserves a prior value. */
+	bool SetLayerChannelFilter(const FGuid& LayerId, bool bAffectRed, bool bAffectGreen, bool bAffectBlue, bool bAffectAlpha);
 
 	/**
 	 * M16-K.5B: assigns or replaces the layer's procedural mask generator instance -- the ONLY way this

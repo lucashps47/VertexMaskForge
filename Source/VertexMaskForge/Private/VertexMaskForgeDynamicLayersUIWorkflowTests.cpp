@@ -49,7 +49,7 @@ bool FVertexMaskForgeDynamicLayersUIChannelPreservationTest::RunTest(const FStri
 	{
 		const FVertexMaskForgeLayer* Layer = Stack.FindLayerById(Id);
 		TestNotNull(TEXT("Layer found"), Layer);
-		const bool bResult = Stack.SetLayerChannelFilter(Id, /*NewRed=*/false, Layer->bAffectGreen, Layer->bAffectBlue);
+		const bool bResult = Stack.SetLayerChannelFilter(Id, /*NewRed=*/false, Layer->bAffectGreen, Layer->bAffectBlue, Layer->bAffectAlpha);
 		TestTrue(TEXT("SetLayerChannelFilter(R=false) succeeds"), bResult);
 	}
 	{
@@ -62,7 +62,7 @@ bool FVertexMaskForgeDynamicLayersUIChannelPreservationTest::RunTest(const FStri
 	// Toggle G off the same way -- R (already false) and B (true) must both be preserved.
 	{
 		const FVertexMaskForgeLayer* Layer = Stack.FindLayerById(Id);
-		Stack.SetLayerChannelFilter(Id, Layer->bAffectRed, /*NewGreen=*/false, Layer->bAffectBlue);
+		Stack.SetLayerChannelFilter(Id, Layer->bAffectRed, /*NewGreen=*/false, Layer->bAffectBlue, Layer->bAffectAlpha);
 	}
 	{
 		const FVertexMaskForgeLayer* Layer = Stack.FindLayerById(Id);
@@ -74,7 +74,7 @@ bool FVertexMaskForgeDynamicLayersUIChannelPreservationTest::RunTest(const FStri
 	// Toggle B off -- all three now false, which must be permitted (compositionally no-op layer, still valid).
 	{
 		const FVertexMaskForgeLayer* Layer = Stack.FindLayerById(Id);
-		Stack.SetLayerChannelFilter(Id, Layer->bAffectRed, Layer->bAffectGreen, /*NewBlue=*/false);
+		Stack.SetLayerChannelFilter(Id, Layer->bAffectRed, Layer->bAffectGreen, /*NewBlue=*/false, Layer->bAffectAlpha);
 	}
 	{
 		const FVertexMaskForgeLayer* Layer = Stack.FindLayerById(Id);
@@ -142,7 +142,7 @@ bool FVertexMaskForgeDynamicLayersUIStaleCallbackTest::RunTest(const FString& Pa
 	TestFalse(TEXT("SetLayerBlendMode on removed id"), Stack.SetLayerBlendMode(Removed, EVertexMaskForgeBlendMode::Add));
 	TestFalse(TEXT("SetLayerOpacity on removed id"), Stack.SetLayerOpacity(Removed, 0.5f));
 	TestFalse(TEXT("SetLayerEnabled on removed id"), Stack.SetLayerEnabled(Removed, false));
-	TestFalse(TEXT("SetLayerChannelFilter on removed id"), Stack.SetLayerChannelFilter(Removed, false, false, false));
+	TestFalse(TEXT("SetLayerChannelFilter on removed id"), Stack.SetLayerChannelFilter(Removed, false, false, false, false));
 	TestFalse(TEXT("RenameLayer on removed id"), Stack.RenameLayer(Removed, TEXT("Ghost")));
 	TestFalse(TEXT("MoveLayerUp on removed id"), Stack.MoveLayerUp(Removed));
 	TestFalse(TEXT("MoveLayerDown on removed id"), Stack.MoveLayerDown(Removed));

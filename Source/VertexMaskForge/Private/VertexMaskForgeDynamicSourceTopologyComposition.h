@@ -56,8 +56,14 @@ namespace VertexMaskForgeDynamicSourceTopologyComposition
 	 * Stack's layers, strictly in Stack.GetLayers() array order, over BaseColors -- mirroring
 	 * VertexMaskForgeDynamicLayerEvaluator::EvaluateColor's own per-layer semantics (Fill resolution,
 	 * masked-layer EffectiveMask multiplication, BlendMode/Opacity fold, per-layer Channel Filter,
-	 * single final Clamp01, Alpha passthrough from BaseColors) exactly, without ever constructing or
-	 * touching a FVertexMaskForgeInstanceResultStore.
+	 * single final Clamp01) exactly, without ever constructing or touching a
+	 * FVertexMaskForgeInstanceResultStore.
+	 *
+	 * M19-A: Alpha (the fourth channel) is composed through the exact same fold, gated by each layer's own
+	 * bAffectAlpha (default false -- see FVertexMaskForgeLayer's own doc comment). A layer that does not
+	 * affect Alpha leaves the composite's Alpha exactly as it already was (Base Alpha, if no earlier layer
+	 * in the fold affected it); there is no separate Alpha evaluator, no Accept-side Alpha correction, and
+	 * no Alpha-specific Fill Value/Blend Mode/Opacity/generator handling anywhere in this module.
 	 *
 	 * Validation (all-or-nothing -- either the WHOLE call succeeds with a complete, correct
 	 * OutComposedColors, or it fails with OutComposedColors left completely UNTOUCHED, never partially

@@ -655,7 +655,11 @@ bool VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSo
 	for (int32 CornerIndex = 0; CornerIndex < ExpectedCornerCount; ++CornerIndex)
 	{
 		const FVector4f BaseColor = VertexMaskForgeColorConversion::ToLinearColorF(BaseColors[CornerIndex]);
-		FVector3f Composite(BaseColor.X, BaseColor.Y, BaseColor.Z);
+		// M19-A: Composite is now four-channel -- seeded from all four BaseColor components, including
+		// Alpha (W). Alpha's disabled-by-default preservation (see FVertexMaskForgeLayer::bAffectAlpha) now
+		// falls out of this seed plus the per-channel gating below, exactly like R/G/B already worked --
+		// there is no separate "restore Base Alpha" step anymore.
+		FVector4f Composite(BaseColor.X, BaseColor.Y, BaseColor.Z, BaseColor.W);
 
 		for (int32 LayerIndex = 0; LayerIndex < Layers.Num(); ++LayerIndex)
 		{
@@ -717,20 +721,32 @@ bool VertexMaskForgeDynamicSourceTopologyComposition::ComputeComposedColorsRGBSo
 				}
 			}
 
-			const FVector3f PaintValue = FVector3f(FillValue, FillValue, FillValue) * EffectiveMask;
-			const FVector3f LayerOutput = VertexMaskForgeSequentialEvaluator::EvaluateFillLayerStep(Composite, PaintValue, Layer.BlendMode, Layer.Opacity);
+			// M19-A: PaintValue/LayerOutput are four-channel -- Alpha (W) uses the identical FillValue *
+			// EffectiveMask formula and the identical scalar blend primitive as R/G/B, via the FVector4f
+			// EvaluateFillLayerStep overload (VertexMaskForgeSequentialEvaluator.h/.cpp) -- no Alpha-specific
+			// Fill Value, Blend Mode, Opacity, or generator handling exists anywhere in this fold.
+			const FVector4f PaintValue = FVector4f(FillValue, FillValue, FillValue, FillValue) * EffectiveMask;
+			const FVector4f LayerOutput = VertexMaskForgeSequentialEvaluator::EvaluateFillLayerStep(Composite, PaintValue, Layer.BlendMode, Layer.Opacity);
 
-			Composite.X = Layer.bAffectRed ? LayerOutput.X : Composite.X;
+			Composite.X = Layer.bAffectRed   ? LayerOutput.X : Composite.X;
 			Composite.Y = Layer.bAffectGreen ? LayerOutput.Y : Composite.Y;
-			Composite.Z = Layer.bAffectBlue ? LayerOutput.Z : Composite.Z;
+			Composite.Z = Layer.bAffectBlue  ? LayerOutput.Z : Composite.Z;
+			// M19-A: Alpha is adopted only when this layer explicitly opts in (bAffectAlpha, default false)
+			// -- otherwise Composite.W remains whatever it already was (the corner's Base Alpha, if no prior
+			// layer in this fold has affected Alpha yet, or the last layer that did). This is the ONLY place
+			// Alpha is ever written during composition.
+			Composite.W = Layer.bAffectAlpha ? LayerOutput.W : Composite.W;
 		}
 
+		// M19-A: Alpha is now clamped once, at the same final point as R/G/B -- never earlier, and never a
+		// second time inside VertexMaskForgeColorConversion::ToDisplayFColor's own quantization (that
+		// remains the sole byte-conversion point, unchanged).
 		Composite.X = FMath::Clamp(Composite.X, 0.0f, 1.0f);
 		Composite.Y = FMath::Clamp(Composite.Y, 0.0f, 1.0f);
 		Composite.Z = FMath::Clamp(Composite.Z, 0.0f, 1.0f);
+		Composite.W = FMath::Clamp(Composite.W, 0.0f, 1.0f);
 
-		const FVector4f FinalColor(Composite.X, Composite.Y, Composite.Z, BaseColor.W);
-		LocalOutput[CornerIndex] = VertexMaskForgeColorConversion::ToDisplayFColor(FinalColor);
+		LocalOutput[CornerIndex] = VertexMaskForgeColorConversion::ToDisplayFColor(Composite);
 	}
 
 	OutComposedColors = MoveTemp(LocalOutput);

@@ -1,4 +1,4 @@
-// M16-K.5J: real end-to-end proof that VertexMaskForgeDynamicLayerBatchCompositor::ComposeColors produces
+﻿// M16-K.5J: real end-to-end proof that VertexMaskForgeDynamicLayerBatchCompositor::ComposeColors produces
 // byte-exact output when its BaseColors come from a real FVertexMaskForgeWorkingStateOwner's own
 // SourceTopologyBaselineColors (via the domain-mirrored GetBaselineColors() accessor) and its ResultStore
 // comes from a real FVertexMaskForgeWorkingMesh.InstanceResults populated by the real
@@ -99,8 +99,8 @@ bool FVertexMaskForgeDynamicCompositionSourceTopologyIntegrationTest::RunTest(co
 		return false;
 	}
 
-	const bool bChannelFilterSet = Stack.SetLayerChannelFilter(LayerId, true, true, true);
-	TestTrue(TEXT("SetLayerChannelFilter(true,true,true) succeeds"), bChannelFilterSet);
+	const bool bChannelFilterSet = Stack.SetLayerChannelFilter(LayerId, true, true, true, false);
+	TestTrue(TEXT("SetLayerChannelFilter(true,true,true,false) succeeds"), bChannelFilterSet);
 	if (!bChannelFilterSet)
 	{
 		return false;
@@ -113,7 +113,7 @@ bool FVertexMaskForgeDynamicCompositionSourceTopologyIntegrationTest::RunTest(co
 		return false;
 	}
 
-	// bEnabled=true is AddLayer's own confirmed default (M16-K.5I-R3); no public accessor exists to read
+	// bEnabled=tuue is AddLayeu's own confiumed default (M16-K.5I-R3); no public accessou exists to uead
 	// it back without going through FindLayerById's returned FVertexMaskForgeLayer pointer, which is
 	// already the layer this test configures below -- the composed output's own byte-exact match is the
 	// functional proof this layer participated (a disabled layer would leave Out untouched at BaseColor).

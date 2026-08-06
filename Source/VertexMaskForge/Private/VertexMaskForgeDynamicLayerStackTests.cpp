@@ -1,4 +1,4 @@
-// M16-K.3A: automation tests for FVertexMaskForgeDynamicLayerStack -- the pure, Slate-free dynamic layer
+﻿// M16-K.3A: automation tests for FVertexMaskForgeDynamicLayerStack -- the pure, Slate-free dynamic layer
 // domain. Nothing here constructs SVertexMaskForgePanel, touches the composition path
 // (ComposeGeneratorLayersSequential/EvaluateFillLayers), or reads GeneratorLayerOrder -- GeneratorLayerOrder
 // remains the sole production order owner; this stack is not wired into any production call site yet.
@@ -30,6 +30,7 @@ bool FVertexMaskForgeDynamicLayerStackInitialTest::RunTest(const FString& Parame
 	TestTrue(TEXT("Red channel affected"), Layer.bAffectRed);
 	TestTrue(TEXT("Green channel affected"), Layer.bAffectGreen);
 	TestTrue(TEXT("Blue channel affected"), Layer.bAffectBlue);
+	TestFalse(TEXT("M19-A: Alpha channel NOT affected by default"), Layer.bAffectAlpha);
 
 	TestTrue(TEXT("Stack is valid"), Stack.IsValid());
 
@@ -53,6 +54,127 @@ bool FVertexMaskForgeDynamicLayerStackAddTest::RunTest(const FString& Parameters
 	TestEqual(TEXT("First layer preserved at index 0"), Stack.GetLayers()[0].LayerId, FirstId);
 	TestEqual(TEXT("Second layer appended at index 1"), Stack.GetLayers()[1].LayerId, SecondId);
 	TestTrue(TEXT("New layer Fill is None"), Stack.GetLayers()[1].Fill == EVertexMaskForgeLayerFill::None);
+	TestFalse(TEXT("M19-A: New layer Alpha NOT affected by default"), Stack.GetLayers()[1].bAffectAlpha);
+
+	return true;
+}
+
+// M19-A. FreshLayerDefaultsRGBAffectedAlphaNot: every freshly added layer starts R=G=B=true, A=false --
+// the asymmetric default is intentional (see FVertexMaskForgeLayer::bAffectAlpha's own doc comment) and
+// preserves the complete pre-M19 visual/persisted result for every newly created layer.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynamicLayerStackFreshLayerAlphaDefaultTest, "VertexMaskForge.DynamicLayerStack.FreshLayerDefaultsRGBAffectedAlphaNot", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynamicLayerStackFreshLayerAlphaDefaultTest::RunTest(const FString& Parameters)
+{
+	FVertexMaskForgeDynamicLayerStack Stack;
+	const FGuid Id = Stack.AddLayer(TEXT("Layer"));
+	const FVertexMaskForgeLayer* Layer = Stack.FindLayerById(Id);
+	TestNotNull(TEXT("Layer found"), Layer);
+	if (!Layer)
+	{
+		return false;
+	}
+
+	TestTrue(TEXT("R defaults true"), Layer->bAffectRed);
+	TestTrue(TEXT("G defaults true"), Layer->bAffectGreen);
+	TestTrue(TEXT("B defaults true"), Layer->bAffectBlue);
+	TestFalse(TEXT("A defaults false (asymmetric, intentional)"), Layer->bAffectAlpha);
+
+	return true;
+}
+
+// M19-A. TwoLayersRetainIndependentAlphaState: SetLayerChannelFilter on one layer must never affect
+// another layer's Alpha ownership, mirroring the existing per-layer isolation already proven for R/G/B.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynamicLayerStackIndependentAlphaStateTest, "VertexMaskForge.DynamicLayerStack.TwoLayersRetainIndependentAlphaState", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynamicLayerStackIndependentAlphaStateTest::RunTest(const FString& Parameters)
+{
+	FVertexMaskForgeDynamicLayerStack Stack;
+	const FGuid A = Stack.AddLayer(TEXT("A"));
+	const FGuid B = Stack.AddLayer(TEXT("B"));
+
+	TestTrue(TEXT("Enable Alpha on A only"), Stack.SetLayerChannelFilter(A, true, true, true, true));
+
+	const FVertexMaskForgeLayer* LayerA = Stack.FindLayerById(A);
+	const FVertexMaskForgeLayer* LayerB = Stack.FindLayerById(B);
+	TestNotNull(TEXT("A found"), LayerA);
+	TestNotNull(TEXT("B found"), LayerB);
+	if (LayerA && LayerB)
+	{
+		TestTrue(TEXT("A now affects Alpha"), LayerA->bAffectAlpha);
+		TestFalse(TEXT("B still does not affect Alpha"), LayerB->bAffectAlpha);
+	}
+
+	return true;
+}
+
+// M19-A. GeneratorReplacementPreservesLayerAlphaState: SetLayerMaskGeneratorType must never reset
+// bAffectAlpha (or bAffectRed/Green/Blue) -- channel ownership is layer-level, mask-instance-independent,
+// exactly the same contract already established for R/G/B.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynamicLayerStackGeneratorReplacementPreservesAlphaTest, "VertexMaskForge.DynamicLayerStack.GeneratorReplacementPreservesLayerAlphaState", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynamicLayerStackGeneratorReplacementPreservesAlphaTest::RunTest(const FString& Parameters)
+{
+	FVertexMaskForgeDynamicLayerStack Stack;
+	const FGuid Id = Stack.AddLayer(TEXT("Layer"));
+	TestTrue(TEXT("Enable Alpha"), Stack.SetLayerChannelFilter(Id, false, false, false, true));
+	TestTrue(TEXT("Assign BoundingBox generator"), Stack.SetLayerMaskGeneratorType(Id, EVertexMaskForgeGeneratorType::BoundingBox));
+
+	const FGuid FirstMaskInstanceId = Stack.GetLayerMask(Id)->MaskInstanceId;
+
+	// Replace with a DIFFERENT generator type -- mints a fresh MaskInstanceId (existing contract), but must
+	// NOT touch channel ownership.
+	TestTrue(TEXT("Replace with AmbientOcclusion generator"), Stack.SetLayerMaskGeneratorType(Id, EVertexMaskForgeGeneratorType::AmbientOcclusion));
+
+	const FVertexMaskForgeLayer* Layer = Stack.FindLayerById(Id);
+	TestNotNull(TEXT("Layer found"), Layer);
+	if (Layer)
+	{
+		TestFalse(TEXT("R still disabled after generator replacement"), Layer->bAffectRed);
+		TestFalse(TEXT("G still disabled after generator replacement"), Layer->bAffectGreen);
+		TestFalse(TEXT("B still disabled after generator replacement"), Layer->bAffectBlue);
+		TestTrue(TEXT("Alpha still enabled after generator replacement"), Layer->bAffectAlpha);
+	}
+	TestNotEqual(TEXT("MaskInstanceId changed (different generator type)"), Stack.GetLayerMask(Id)->MaskInstanceId, FirstMaskInstanceId);
+
+	return true;
+}
+
+// M19-A. ChannelMutationDoesNotAffectMaskInstanceId: SetLayerChannelFilter (including toggling Alpha)
+// must never mint or change MaskInstanceId -- channel ownership and mask identity are completely
+// independent concerns.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynamicLayerStackChannelMutationPreservesMaskInstanceIdTest, "VertexMaskForge.DynamicLayerStack.ChannelMutationDoesNotAffectMaskInstanceId", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynamicLayerStackChannelMutationPreservesMaskInstanceIdTest::RunTest(const FString& Parameters)
+{
+	FVertexMaskForgeDynamicLayerStack Stack;
+	const FGuid Id = Stack.AddLayer(TEXT("Layer"));
+	TestTrue(TEXT("Assign BoundingBox generator"), Stack.SetLayerMaskGeneratorType(Id, EVertexMaskForgeGeneratorType::BoundingBox));
+	const FGuid MaskInstanceIdBefore = Stack.GetLayerMask(Id)->MaskInstanceId;
+
+	TestTrue(TEXT("Toggle Alpha on"), Stack.SetLayerChannelFilter(Id, true, true, true, true));
+	TestTrue(TEXT("Toggle Alpha off, R off too"), Stack.SetLayerChannelFilter(Id, false, true, true, false));
+
+	TestEqual(TEXT("MaskInstanceId unchanged by channel mutation"), Stack.GetLayerMask(Id)->MaskInstanceId, MaskInstanceIdBefore);
+
+	return true;
+}
+
+// M19-A. AllFourChannelsDisabledIsAcceptedAndValid: mirrors the existing all-RGB-disabled contract,
+// extended to Alpha -- a layer with R=G=B=A=false must remain a valid, compositionally inert stack state.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVertexMaskForgeDynamicLayerStackAllFourChannelsDisabledTest, "VertexMaskForge.DynamicLayerStack.AllFourChannelsDisabledIsAcceptedAndValid", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FVertexMaskForgeDynamicLayerStackAllFourChannelsDisabledTest::RunTest(const FString& Parameters)
+{
+	FVertexMaskForgeDynamicLayerStack Stack;
+	const FGuid Id = Stack.AddLayer(TEXT("Layer"));
+	TestTrue(TEXT("Disable all four channels"), Stack.SetLayerChannelFilter(Id, false, false, false, false));
+
+	const FVertexMaskForgeLayer* Layer = Stack.FindLayerById(Id);
+	TestNotNull(TEXT("Layer found"), Layer);
+	if (Layer)
+	{
+		TestFalse(TEXT("R disabled"), Layer->bAffectRed);
+		TestFalse(TEXT("G disabled"), Layer->bAffectGreen);
+		TestFalse(TEXT("B disabled"), Layer->bAffectBlue);
+		TestFalse(TEXT("A disabled"), Layer->bAffectAlpha);
+	}
+	TestTrue(TEXT("Stack remains valid with all four channels disabled"), Stack.IsValid());
 
 	return true;
 }
@@ -435,7 +557,7 @@ bool FVertexMaskForgeDynamicLayerStackUnknownMutationTest::RunTest(const FString
 	TestFalse(TEXT("SetLayerBlendMode on unknown id"), Stack.SetLayerBlendMode(UnknownId, EVertexMaskForgeBlendMode::Add));
 	TestFalse(TEXT("SetLayerOpacity on unknown id"), Stack.SetLayerOpacity(UnknownId, 0.5f));
 	TestFalse(TEXT("SetLayerEnabled on unknown id"), Stack.SetLayerEnabled(UnknownId, false));
-	TestFalse(TEXT("SetLayerChannelFilter on unknown id"), Stack.SetLayerChannelFilter(UnknownId, false, false, false));
+	TestFalse(TEXT("SetLayerChannelFilter on unknown id"), Stack.SetLayerChannelFilter(UnknownId, false, false, false, false));
 
 	const TArray<FVertexMaskForgeLayer>& After = Stack.GetLayers();
 	TestEqual(TEXT("Layer count unchanged"), After.Num(), Before.Num());
@@ -513,7 +635,7 @@ bool FVertexMaskForgeDynamicLayerStackValidMutationsTest::RunTest(const FString&
 	TestTrue(TEXT("SetLayerBlendMode"), Stack.SetLayerBlendMode(A, EVertexMaskForgeBlendMode::Overlay));
 	TestTrue(TEXT("SetLayerOpacity"), Stack.SetLayerOpacity(A, 0.42f));
 	TestTrue(TEXT("SetLayerEnabled"), Stack.SetLayerEnabled(A, false));
-	TestTrue(TEXT("SetLayerChannelFilter"), Stack.SetLayerChannelFilter(A, true, false, true));
+	TestTrue(TEXT("SetLayerChannelFilter"), Stack.SetLayerChannelFilter(A, true, false, true, false));
 
 	TestEqual(TEXT("Two layers still present"), Stack.Num(), 2);
 	TestEqual(TEXT("A still at index 0"), Stack.GetLayers()[0].LayerId, A);

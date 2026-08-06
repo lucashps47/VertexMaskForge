@@ -3964,9 +3964,9 @@ TSharedRef<SWidget> SVertexMaskForgePanel::BuildDynamicLayerRow(const FGuid Laye
 					// was, unchanged from M16-K.4A/K.4B.
 					const bool bAltDown = FSlateApplication::Get().GetModifierKeys().IsAltDown();
 					const FVertexMaskForgeDynamicLayerChannelToggleResult Result = ResolveDynamicLayerChannelToggle(
-						Layer->bAffectRed, Layer->bAffectGreen, Layer->bAffectBlue,
+						Layer->bAffectRed, Layer->bAffectGreen, Layer->bAffectBlue, Layer->bAffectAlpha,
 						EVertexMaskForgeDynamicLayerChannel::Red, NewState == ECheckBoxState::Checked, bAltDown);
-					DynamicLayerStack.SetLayerChannelFilter(LayerId, Result.bAffectRed, Result.bAffectGreen, Result.bAffectBlue);
+					DynamicLayerStack.SetLayerChannelFilter(LayerId, Result.bAffectRed, Result.bAffectGreen, Result.bAffectBlue, Result.bAffectAlpha);
 					OnDynamicLayerStackMutated();
 				})
 				.Content()
@@ -3996,9 +3996,9 @@ TSharedRef<SWidget> SVertexMaskForgePanel::BuildDynamicLayerRow(const FGuid Laye
 					}
 					const bool bAltDown = FSlateApplication::Get().GetModifierKeys().IsAltDown();
 					const FVertexMaskForgeDynamicLayerChannelToggleResult Result = ResolveDynamicLayerChannelToggle(
-						Layer->bAffectRed, Layer->bAffectGreen, Layer->bAffectBlue,
+						Layer->bAffectRed, Layer->bAffectGreen, Layer->bAffectBlue, Layer->bAffectAlpha,
 						EVertexMaskForgeDynamicLayerChannel::Green, NewState == ECheckBoxState::Checked, bAltDown);
-					DynamicLayerStack.SetLayerChannelFilter(LayerId, Result.bAffectRed, Result.bAffectGreen, Result.bAffectBlue);
+					DynamicLayerStack.SetLayerChannelFilter(LayerId, Result.bAffectRed, Result.bAffectGreen, Result.bAffectBlue, Result.bAffectAlpha);
 					OnDynamicLayerStackMutated();
 				})
 				.Content()
@@ -4027,14 +4027,52 @@ TSharedRef<SWidget> SVertexMaskForgePanel::BuildDynamicLayerRow(const FGuid Laye
 					}
 					const bool bAltDown = FSlateApplication::Get().GetModifierKeys().IsAltDown();
 					const FVertexMaskForgeDynamicLayerChannelToggleResult Result = ResolveDynamicLayerChannelToggle(
-						Layer->bAffectRed, Layer->bAffectGreen, Layer->bAffectBlue,
+						Layer->bAffectRed, Layer->bAffectGreen, Layer->bAffectBlue, Layer->bAffectAlpha,
 						EVertexMaskForgeDynamicLayerChannel::Blue, NewState == ECheckBoxState::Checked, bAltDown);
-					DynamicLayerStack.SetLayerChannelFilter(LayerId, Result.bAffectRed, Result.bAffectGreen, Result.bAffectBlue);
+					DynamicLayerStack.SetLayerChannelFilter(LayerId, Result.bAffectRed, Result.bAffectGreen, Result.bAffectBlue, Result.bAffectAlpha);
 					OnDynamicLayerStackMutated();
 				})
 				.Content()
 				[
 					SNew(STextBlock).Text(LOCTEXT("DynamicLayerAffectBlueLabel", "B"))
+				]
+			]
+
+			// M19-B: Alpha Channel Filter checkbox -- same widget type, dimensions, spacing, alignment, and
+			// style as R/G/B above (a direct copy of the B block, adapted only for bAffectAlpha/Alpha), same
+			// LayerId-resolved-fresh-every-call pattern (no captured index), same stale-widget guard (null
+			// check on FindLayerById), same ResolveDynamicLayerChannelToggle/SetLayerChannelFilter/
+			// OnDynamicLayerStackMutated call chain already made four-channel-capable by M19-A. No Alpha
+			// Fill Value, Blend Mode, Opacity, or generator control is added here -- this is channel
+			// ownership only, exactly like R/G/B.
+			+ SHorizontalBox::Slot()
+			.AutoWidth()
+			.VAlign(VAlign_Center)
+			[
+				SNew(SCheckBox)
+				.ToolTipText(LOCTEXT("DynamicLayerAffectAlphaTooltip", "Affect Alpha Channel\nAlt-click to solo channel"))
+				.IsChecked_Lambda([this, LayerId]()
+				{
+					const FVertexMaskForgeLayer* Layer = DynamicLayerStack.FindLayerById(LayerId);
+					return (Layer && Layer->bAffectAlpha) ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
+				})
+				.OnCheckStateChanged_Lambda([this, LayerId](const ECheckBoxState NewState)
+				{
+					const FVertexMaskForgeLayer* Layer = DynamicLayerStack.FindLayerById(LayerId);
+					if (!Layer)
+					{
+						return;
+					}
+					const bool bAltDown = FSlateApplication::Get().GetModifierKeys().IsAltDown();
+					const FVertexMaskForgeDynamicLayerChannelToggleResult Result = ResolveDynamicLayerChannelToggle(
+						Layer->bAffectRed, Layer->bAffectGreen, Layer->bAffectBlue, Layer->bAffectAlpha,
+						EVertexMaskForgeDynamicLayerChannel::Alpha, NewState == ECheckBoxState::Checked, bAltDown);
+					DynamicLayerStack.SetLayerChannelFilter(LayerId, Result.bAffectRed, Result.bAffectGreen, Result.bAffectBlue, Result.bAffectAlpha);
+					OnDynamicLayerStackMutated();
+				})
+				.Content()
+				[
+					SNew(STextBlock).Text(LOCTEXT("DynamicLayerAffectAlphaLabel", "A"))
 				]
 			]
 		]
@@ -6689,7 +6727,7 @@ FSlateColor SVertexMaskForgePanel::GetDynamicLayerChannelTint(const FGuid LayerI
 	// Diagnostic starting point per this checkpoint's own instruction (0.15); raise moderately (~0.18-0.30)
 	// only after manual visual confirmation that the WhiteBrush fix above is proven correct.
 	constexpr float TintAlpha = 0.15f;
-	const EVertexMaskForgeDynamicLayerChannelTint Tint = ResolveDynamicLayerChannelTint(Layer->bAffectRed, Layer->bAffectGreen, Layer->bAffectBlue);
+	const EVertexMaskForgeDynamicLayerChannelTint Tint = ResolveDynamicLayerChannelTint(Layer->bAffectRed, Layer->bAffectGreen, Layer->bAffectBlue, Layer->bAffectAlpha);
 	if (Tint == EVertexMaskForgeDynamicLayerChannelTint::Default)
 	{
 		return DefaultAppearance;

@@ -132,14 +132,22 @@ struct FVertexMaskForgeLayer
 	 *  checkpoint's evaluator, because this checkpoint does not touch the evaluator at all. */
 	float Opacity = 1.0f;
 
-	/** Per-layer Channel Filter -- explicit defaults, all channels affected. Mirrors the panel's existing
-	 *  global bChannelFilterR/G/B bools (SVertexMaskForgePanel.h), now per-layer instead of per-panel; see
-	 *  the M16-K.3R audit's Channel Filter migration plan for how these two are meant to coexist during
-	 *  the transition. Alpha is deliberately NOT represented here -- Alpha is not an editable channel
-	 *  anywhere in this plugin (see M16-K.3R audit section 22) and this checkpoint does not change that. */
+	/** Per-layer Channel Filter -- explicit defaults, all RGB channels affected. Mirrors the panel's
+	 *  existing global bChannelFilterR/G/B bools (SVertexMaskForgePanel.h), now per-layer instead of
+	 *  per-panel; see the M16-K.3R audit's Channel Filter migration plan for how these two are meant to
+	 *  coexist during the transition. */
 	bool bAffectRed = true;
 	bool bAffectGreen = true;
 	bool bAffectBlue = true;
+
+	/** M19-A: per-layer Alpha ownership, the fourth Channel Filter bit. Defaults to false -- unlike
+	 *  bAffectRed/Green/Blue, a freshly added layer does NOT affect Alpha by default. This is intentional
+	 *  and asymmetric: every pre-M19 layer, and every layer created before the artist explicitly opts in
+	 *  via the future M19-B UI, must leave Alpha exactly as untouched as it was before Alpha became a real
+	 *  composed channel (see VertexMaskForgeDynamicSourceTopologyComposition.cpp's Pass 2 fold). The
+	 *  artist-facing checkbox and Alt+click isolation for this bit are deferred to M19-B; this checkpoint
+	 *  only makes the bit real and wires it through composition. */
+	bool bAffectAlpha = false;
 
 	/** M16-K.5B: this layer's optional procedural mask generator instance -- owned exclusively by value,
 	 *  by this layer (never a pointer/reference, never a second parallel container elsewhere). Unset
@@ -160,21 +168,20 @@ struct FVertexMaskForgeLayer
  * function is a thin wrapper that resolves a layer by LayerId and maps this enum to the actual
  * presentation FSlateColor/alpha (a UI concern, kept out of this Slate-free header).
  *
- * Exactly one active channel (bAffect* true, the other two false) resolves to that channel's own value;
- * zero, two, or three active channels resolve to Default -- never a combined/blended color. This is pure
- * derivation from the three flags only; it has no knowledge of FVertexMaskForgeLayer, FGuid,
- * FVertexMaskForgeDynamicLayerStack, or any domain identity -- purely a function of (bool, bool, bool).
+ * Exactly one active channel (bAffect* true, the other three false) resolves to that channel's own value;
+ * zero, two, three, or four active channels resolve to Default -- never a combined/blended color. This is
+ * pure derivation from the four flags only; it has no knowledge of FVertexMaskForgeLayer, FGuid,
+ * FVertexMaskForgeDynamicLayerStack, or any domain identity -- purely a function of (bool, bool, bool, bool).
  *
- * Alpha-channel support does not exist in the layer domain yet (see FVertexMaskForgeLayer's own Channel
- * Filter doc comment) -- this enum has no White/Alpha case. FUTURE DECISION (documented here, not
- * implemented): once an Alpha channel is added to the domain, an Alpha-only layer (R=G=B=false, A=true)
- * should resolve to a white tint, analogous to how exactly-one-of-RGB resolves to that channel's color
- * today; every other combination that includes Alpha alongside any RGB channel should still resolve to
- * Default, exactly like today's RGB-only combinations do.
+ * M19-B: implements the FUTURE DECISION this enum's own comment previously only documented -- an
+ * Alpha-only layer (R=G=B=false, A=true) resolves to White, analogous to how exactly-one-of-RGB resolves
+ * to that channel's color; every other combination that includes Alpha alongside any RGB channel (or
+ * alongside another disabled/enabled mix) still resolves to Default, exactly like every other non-exclusive
+ * RGB combination already did.
  */
 enum class EVertexMaskForgeDynamicLayerChannelTint : uint8
 {
-	/** Zero, two, or three of R/G/B active -- the row's normal, untinted appearance. */
+	/** Zero, two, three, or four of R/G/B/A active -- the row's normal, untinted appearance. */
 	Default,
 
 	/** Exactly R active. */
@@ -185,12 +192,15 @@ enum class EVertexMaskForgeDynamicLayerChannelTint : uint8
 
 	/** Exactly B active. */
 	Blue,
+
+	/** Exactly A active (R=G=B=false, A=true). */
+	White,
 };
 
 /** Pure derivation -- see EVertexMaskForgeDynamicLayerChannelTint's own doc comment for the full contract. */
-inline EVertexMaskForgeDynamicLayerChannelTint ResolveDynamicLayerChannelTint(const bool bAffectRed, const bool bAffectGreen, const bool bAffectBlue)
+inline EVertexMaskForgeDynamicLayerChannelTint ResolveDynamicLayerChannelTint(const bool bAffectRed, const bool bAffectGreen, const bool bAffectBlue, const bool bAffectAlpha)
 {
-	const int32 ActiveChannelCount = (bAffectRed ? 1 : 0) + (bAffectGreen ? 1 : 0) + (bAffectBlue ? 1 : 0);
+	const int32 ActiveChannelCount = (bAffectRed ? 1 : 0) + (bAffectGreen ? 1 : 0) + (bAffectBlue ? 1 : 0) + (bAffectAlpha ? 1 : 0);
 	if (ActiveChannelCount != 1)
 	{
 		return EVertexMaskForgeDynamicLayerChannelTint::Default;
@@ -200,16 +210,25 @@ inline EVertexMaskForgeDynamicLayerChannelTint ResolveDynamicLayerChannelTint(co
 	{
 		return EVertexMaskForgeDynamicLayerChannelTint::Red;
 	}
+	if (bAffectAlpha)
+	{
+		return EVertexMaskForgeDynamicLayerChannelTint::White;
+	}
 	if (bAffectGreen)
 	{
 		return EVertexMaskForgeDynamicLayerChannelTint::Green;
 	}
-	// ActiveChannelCount == 1 and both bAffectRed/bAffectGreen are false -- bAffectBlue must be the one.
-	return EVertexMaskForgeDynamicLayerChannelTint::Blue;
+	if (bAffectBlue)
+	{
+		return EVertexMaskForgeDynamicLayerChannelTint::Blue;
+	}
+	// ActiveChannelCount == 1 and bAffectRed/bAffectGreen/bAffectBlue/bAffectAlpha are all accounted for
+	// above -- this line is unreachable, kept only as a defensive, never-taken fallback.
+	return EVertexMaskForgeDynamicLayerChannelTint::Default;
 }
 
 /**
- * M16-K.4B: pure, Slate-free literal color for the three EXCLUSIVE-channel tint kinds only (FLinearColor
+ * M16-K.4B: pure, Slate-free literal color for the four EXCLUSIVE-channel tint kinds only (FLinearColor
  * is a Core, not Slate, type -- no widget/style dependency here). Deliberately does NOT handle
  * EVertexMaskForgeDynamicLayerChannelTint::Default -- the correct default/neutral presentation color is
  * FStyleColors::Panel (a real Slate style color, requiring SlateCore), chosen specifically to reproduce
@@ -219,6 +238,9 @@ inline EVertexMaskForgeDynamicLayerChannelTint ResolveDynamicLayerChannelTint(co
  * happens at the one real call site, not here, so this Slate-free header is never given a reason to
  * depend on SlateCore/Styling. Calling this with Default is a caller error; it returns transparent black
  * defensively rather than crashing, but no real call site should ever do so.
+ *
+ * M19-B: White (Alpha-only) uses the EXACT SAME TintAlpha parameter as Red/Green/Blue -- there is no
+ * separate Alpha tint opacity constant anywhere in this function or its caller.
  */
 inline FLinearColor GetDynamicLayerChannelTintColor(const EVertexMaskForgeDynamicLayerChannelTint Tint, const float TintAlpha)
 {
@@ -230,56 +252,72 @@ inline FLinearColor GetDynamicLayerChannelTintColor(const EVertexMaskForgeDynami
 		return FLinearColor(0.0f, 1.0f, 0.0f, TintAlpha);
 	case EVertexMaskForgeDynamicLayerChannelTint::Blue:
 		return FLinearColor(0.0f, 0.0f, 1.0f, TintAlpha);
+	case EVertexMaskForgeDynamicLayerChannelTint::White:
+		return FLinearColor(1.0f, 1.0f, 1.0f, TintAlpha);
 	case EVertexMaskForgeDynamicLayerChannelTint::Default:
 	default:
 		return FLinearColor(0.0f, 0.0f, 0.0f, 0.0f);
 	}
 }
 
-/** M16-K.4C: identifies which of a Dynamic Layer's three RGB Channel Filter checkboxes was clicked --
- *  used only to parameterize ResolveDynamicLayerChannelToggle below, never stored, never a substitute for
- *  LayerId/FGuid identity. */
+/** M16-K.4C: identifies which of a Dynamic Layer's four Channel Filter checkboxes was clicked -- used
+ *  only to parameterize ResolveDynamicLayerChannelToggle below, never stored, never a substitute for
+ *  LayerId/FGuid identity. M19-A: extended with Alpha; the toggle-helper contract below is symmetric
+ *  across all four channels. The artist-facing Alpha checkbox itself remains deferred to M19-B -- adding
+ *  this enumerator only makes the pure decision helper Alpha-capable ahead of that widget existing. */
 enum class EVertexMaskForgeDynamicLayerChannel : uint8
 {
 	Red,
 	Green,
 	Blue,
+	Alpha,
 };
 
-/** Pure output of ResolveDynamicLayerChannelToggle -- the final RGB Channel Filter state to apply via
- *  FVertexMaskForgeDynamicLayerStack::SetLayerChannelFilter (a single, already-atomic call.) */
+/** Pure output of ResolveDynamicLayerChannelToggle -- the final Channel Filter state to apply via
+ *  FVertexMaskForgeDynamicLayerStack::SetLayerChannelFilter (a single, already-atomic call.) M19-A:
+ *  bAffectAlpha defaults to false here, matching FVertexMaskForgeLayer::bAffectAlpha's own default --
+ *  never true, since this result type only ever mirrors an existing layer's current state or a computed
+ *  toggle outcome, never an independent "fresh" default. */
 struct FVertexMaskForgeDynamicLayerChannelToggleResult
 {
 	bool bAffectRed = true;
 	bool bAffectGreen = true;
 	bool bAffectBlue = true;
+	bool bAffectAlpha = false;
 };
 
 /**
  * M16-K.4C: pure, Slate-free Channel Solo decision -- Substance-Painter-style Alt-click behavior for a
- * Dynamic Layer's R/G/B Channel Filter checkboxes. Deliberately separate from both Slate (no widget/
+ * Dynamic Layer's R/G/B/A Channel Filter checkboxes. Deliberately separate from both Slate (no widget/
  * modifier-key type appears here -- bAltDown is a plain bool the caller already resolved) and from
  * FVertexMaskForgeDynamicLayerStack (this function never touches a layer or a stack; it only computes
  * what SHOULD be applied, via the existing SetLayerChannelFilter call, at the one real call site in
  * SVertexMaskForgePanel::BuildDynamicLayerRow).
  *
+ * M19-A: extended from three channels (R/G/B) to four (R/G/B/A), symmetrically -- Alpha participates in
+ * exactly the same normal-toggle and Alt-isolate rules as R/G/B below. This function owns ONLY channel
+ * ownership state; it has no knowledge of, and must never gain knowledge of, Preview Mode, mesh display
+ * colors, viewport presentation, or the layer-row tint (EVertexMaskForgeDynamicLayerChannelTint) -- the
+ * row-tint derivation and the future Alpha checkbox widget are both deferred to M19-B.
+ *
  * Contract:
  *   - bAltDown == false (normal click): ClickedChannel is set to bRequestedChecked (the checkbox's own
- *     new state); the other two channels are returned UNCHANGED from bCurrentRed/Green/Blue. Identical
- *     to the pre-M16-K.4C behavior -- multiple channels, or zero channels, remain fully reachable.
- *   - bAltDown == true (Alt-click, "solo"): ClickedChannel is forced to true; the other two are forced to
- *     false -- REGARDLESS of bRequestedChecked. This is the specific rule that makes Alt-clicking an
+ *     new state); the other three channels are returned UNCHANGED from bCurrentRed/Green/Blue/Alpha.
+ *     Identical to the pre-M16-K.4C behavior -- multiple channels, or zero channels, remain fully
+ *     reachable.
+ *   - bAltDown == true (Alt-click, "solo"): ClickedChannel is forced to true; the other three are forced
+ *     to false -- REGARDLESS of bRequestedChecked. This is the specific rule that makes Alt-clicking an
  *     already-solo channel a no-op rather than a toggle-off: since SCheckBox always requests the OPPOSITE
  *     of its current checked state on click, Alt-clicking a channel that is already the sole active one
  *     would otherwise request bRequestedChecked=false for it -- this function ignores that request
  *     entirely under Alt and forces ClickedChannel to true unconditionally, so the row can never end up
  *     with zero active channels from an Alt-click.
- * Always returns exactly one of the three following shapes: normal-click's "one channel changed, two
- * preserved", or Alt-click's "exactly the clicked channel true, the other two false" -- never a partial
+ * Always returns exactly one of the two following shapes: normal-click's "one channel changed, three
+ * preserved", or Alt-click's "exactly the clicked channel true, the other three false" -- never a partial
  * or ambiguous state.
  */
 inline FVertexMaskForgeDynamicLayerChannelToggleResult ResolveDynamicLayerChannelToggle(
-	const bool bCurrentRed, const bool bCurrentGreen, const bool bCurrentBlue,
+	const bool bCurrentRed, const bool bCurrentGreen, const bool bCurrentBlue, const bool bCurrentAlpha,
 	const EVertexMaskForgeDynamicLayerChannel ClickedChannel,
 	const bool bRequestedChecked,
 	const bool bAltDown)
@@ -291,12 +329,14 @@ inline FVertexMaskForgeDynamicLayerChannelToggleResult ResolveDynamicLayerChanne
 		Result.bAffectRed = (ClickedChannel == EVertexMaskForgeDynamicLayerChannel::Red);
 		Result.bAffectGreen = (ClickedChannel == EVertexMaskForgeDynamicLayerChannel::Green);
 		Result.bAffectBlue = (ClickedChannel == EVertexMaskForgeDynamicLayerChannel::Blue);
+		Result.bAffectAlpha = (ClickedChannel == EVertexMaskForgeDynamicLayerChannel::Alpha);
 		return Result;
 	}
 
 	Result.bAffectRed = bCurrentRed;
 	Result.bAffectGreen = bCurrentGreen;
 	Result.bAffectBlue = bCurrentBlue;
+	Result.bAffectAlpha = bCurrentAlpha;
 	switch (ClickedChannel)
 	{
 	case EVertexMaskForgeDynamicLayerChannel::Red:
@@ -307,6 +347,9 @@ inline FVertexMaskForgeDynamicLayerChannelToggleResult ResolveDynamicLayerChanne
 		break;
 	case EVertexMaskForgeDynamicLayerChannel::Blue:
 		Result.bAffectBlue = bRequestedChecked;
+		break;
+	case EVertexMaskForgeDynamicLayerChannel::Alpha:
+		Result.bAffectAlpha = bRequestedChecked;
 		break;
 	}
 	return Result;
