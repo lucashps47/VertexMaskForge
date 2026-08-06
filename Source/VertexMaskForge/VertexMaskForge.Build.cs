@@ -41,6 +41,19 @@ public class VertexMaskForge : ModuleRules
 				// uses for its Accept/Complete buttons (audited in ModelingToolsEditorModeToolkit.cpp).
 				// Editor-only and already Slate/Editor-Mode-independent, safe for a standalone panel.
 				"ToolWidgets",
+				// M20-E: restored for VertexMaskForgeComponentOverrideBridge's "Send to Mesh Paint
+				// Texture" bridge -- UMeshPaintModeSubsystem::ImportMeshPaintTextureFromVertexColors
+				// (Engine/Plugins/MeshPainting/Source/MeshPaintEditorMode/Public/MeshPaintModeHelpers.h)
+				// is the native "From Vertex" import seam this bridge invokes.
+				"MeshPaintEditorMode",
+				// MeshPaintEditorMode's own module depends on MeshPaintingToolset; required transitively
+				// for the same reason it was required by the original M20-C implementation.
+				"MeshPaintingToolset",
+				// UMeshPaintModeSubsystem : public UEditorSubsystem -- GEditor->GetEditorSubsystem<>()
+				// needs this module's own generated class construction (Z_Construct_UClass_UEditorSubsystem)
+				// at link time, or LNK2019 results. Confirmed against the installed UE 5.8 engine source
+				// exactly as the original M20-C implementation's own compile-fix history describes.
+				"EditorSubsystem",
 			}
 		);
 	}

@@ -264,6 +264,37 @@ private:
 	bool CanEditVertexMask() const { return !bIsEditingVertexMask && !CandidateMeshes.IsEmpty(); }
 
 	/**
+	 * M20-E.1: independent, session-agnostic candidate list for "Send to Mesh Paint Texture" only --
+	 * kept current from the CURRENT scene selection via the exact same CollectViewportSelection/
+	 * UpdateMeshDiagnostics pair CandidateMeshes itself uses, but -- unlike CandidateMeshes -- refreshed
+	 * on EVERY OnEditorSelectionChanged() call, unconditionally, regardless of bIsEditingVertexMask. This
+	 * is the fix for the M20-E defect where the transfer button only became enabled after entering Edit
+	 * Vertex Mask: CandidateMeshes is deliberately NOT maintained during an active session (see its own
+	 * doc comment), but the transfer button has no real dependency on session state at all -- it only
+	 * needs to know a currently-selected component exists, since the color authority it actually reads
+	 * (VertexMaskForgeComponentOverrideBridge::BuildTransferTargets, at click time) is the accepted Static
+	 * Mesh asset's own ColorVertexBuffer, never anything session-owned (WorkingColors, CommittedColors,
+	 * SelectedMeshes). Never mutated by Accept, Cancel, RefreshSelection, or SyncSelectionIfChangedDuring
+	 * Operation -- entirely orthogonal to the Edit Vertex Mask session lifecycle. Used only as a cheap
+	 * IsEnabled gate (CanSendToMeshPaintTexture()); OnSendToMeshPaintTextureClicked() re-derives this same
+	 * list fresh at click time (via RefreshMeshPaintTransferCandidates()) rather than trusting a possibly
+	 * one-frame-stale cached copy, and VertexMaskForgeComponentOverrideBridge::BuildTransferTargets
+	 * performs its own full, independent prerequisite validation regardless of what this list contains.
+	 */
+	TArray<TSharedPtr<FVertexMaskForgeSelectedMesh>> MeshPaintTransferCandidateMeshes;
+
+	/**
+	 * M20-E.1: re-derives MeshPaintTransferCandidateMeshes from the CURRENT scene selection -- same
+	 * CollectViewportSelection/UpdateMeshDiagnostics pair RefreshCandidateSelection() uses, same
+	 * eligibility filtering, but writes to MeshPaintTransferCandidateMeshes instead of CandidateMeshes and
+	 * is called unconditionally (never gated on bIsEditingVertexMask). Never touches CandidateMeshes,
+	 * SelectedMeshes, WorkingMeshes, PreviewComponents' preview/hide state, or any generator/session
+	 * data -- pure, side-effect-free (beyond populating this one member) re-derivation, safe to call any
+	 * number of times, including mid-session.
+	 */
+	void RefreshMeshPaintTransferCandidates();
+
+	/**
 	 * "Edit Vertex Mask" button handler -- the sole entry point into an editing session. Re-validates
 	 * the selection is still eligible, then reuses RefreshSelection() UNCHANGED (it already re-queries
 	 * the CURRENT scene selection and runs the existing WorkingMeshes/preview/baseline lifecycle) to
@@ -1616,9 +1647,36 @@ private:
 	 * Validates every eligible entry, confirms the destination with the user, and -- only if both
 	 * succeed -- writes permanently to the Static Mesh asset(s) inside one FScopedTransaction. See
 	 * the .cpp for the full validate-then-write contract (VertexMaskForgePanel::BuildAcceptTargets /
-	 * WriteAcceptTargets). Returns true only on a fully successful Accept.
+	 * WriteAcceptTargets). Returns true only on a fully successful Accept. This is the plugin's ONLY
+	 * Accept route -- M20-E removed the M20-D "Instance Override" checkbox/persistent-override route
+	 * entirely; there is no longer a second destination or a routing decision to make here.
 	 */
 	bool AcceptPendingChanges();
+
+	/**
+	 * M20-E: restores the interim "Send to Mesh Paint Texture" bridge (originally M20-C, deleted
+	 * uncommitted by M20-D, reconstructed here from behavioral evidence only -- see
+	 * VertexMaskForgeComponentOverrideBridge.h's own module comment and the M20-E final report's
+	 * "M20-C Recovery" section). Narrower than Accept: it transfers vertex colors that have ALREADY
+	 * been consolidated into the Static Mesh asset by a prior Accept, through Unreal's native "From
+	 * Vertex" Mesh Paint Texture import, then restores every touched component's exact prior override
+	 * state. Never itself writes to the Static Mesh asset, never leaves a persistent Forge-owned
+	 * override behind.
+	 *
+	 * M20-E.1: CanSendToMeshPaintTexture() no longer reads SelectedMeshes (the Edit Vertex Mask
+	 * session's own targets, empty until a session starts and cleared the instant Accept/Cancel ends
+	 * one) -- it reads MeshPaintTransferCandidateMeshes instead, a session-independent list kept current
+	 * from the live scene selection (see that member's own doc comment for why this is correct: the
+	 * bridge's real color authority is the accepted asset, never anything session-owned).
+	 * OnSendToMeshPaintTextureClicked() additionally re-resolves that same list fresh at the moment of
+	 * the click (RefreshMeshPaintTransferCandidates()), so a stale one-frame-old IsEnabled snapshot can
+	 * never cause the wrong (or a since-deselected) component to be targeted -- Accept/Cancel's own
+	 * SelectedMeshes/bIsEditingVertexMask lifecycle is completely unmodified by this change.
+	 */
+	bool CanSendToMeshPaintTexture() const;
+	FReply OnSendToMeshPaintTextureClicked();
+	FText GetSendToMeshPaintTextureStatusText() const;
+	FText LastMeshPaintTextureTransferStatusText;
 
 	/** Records the reason the last Accept (or auto-update regeneration) was blocked/failed, shown in
 	 *  GetOperationStatusText(). Cleared explicitly at the START of each fresh attempt -- never by

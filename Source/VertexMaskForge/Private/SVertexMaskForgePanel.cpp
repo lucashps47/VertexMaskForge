@@ -39,6 +39,7 @@
 #include "VertexMaskForgeAmbientOcclusionGenerator.h"
 #include "VertexMaskForgeBoundingBoxGenerator.h"
 #include "VertexMaskForgeColorConversion.h"
+#include "VertexMaskForgeComponentOverrideBridge.h"
 #include "VertexMaskForgeCurvatureGenerator.h"
 #include "VertexMaskForgeDirectionalNormalGenerator.h"
 #include "VertexMaskForgeDynamicAcceptTargetBuilder.h"
@@ -7250,13 +7251,42 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 							.IsEnabled(this, &SVertexMaskForgePanel::CanAcceptChanges)
 						]
 
+						// M20-E.1: Accept/Cancel are the paired session-finalization controls and are now
+						// adjacent; "Send to Mesh Paint Texture" (below) moved to the position Cancel
+						// previously occupied, visually separated as the post-Accept transfer action. Pure
+						// layout reorder -- OnCancelChangesClicked/CanCancelChanges are byte-for-byte
+						// unchanged.
 						+ SHorizontalBox::Slot()
 						.AutoWidth()
+						.Padding(FMargin(0.f, 0.f, 8.f, 0.f))
 						[
 							SNew(SButton)
 							.Text(LOCTEXT("CancelChanges", "Cancel"))
 							.OnClicked(this, &SVertexMaskForgePanel::OnCancelChangesClicked)
 							.IsEnabled(this, &SVertexMaskForgePanel::CanCancelChanges)
+						]
+
+						// M20-E: restores the interim "Send to Mesh Paint Texture" bridge (M20-C, deleted
+						// uncommitted by M20-D, reconstructed from behavioral evidence -- see
+						// VertexMaskForgeComponentOverrideBridge.h's own module comment). Honest tooltip:
+						// this transfers already-ACCEPTED colors, never the current unaccepted preview.
+						// M20-E.1: moved to the position Cancel previously occupied (see the Accept/Cancel
+						// slot comment above) -- OnSendToMeshPaintTextureClicked/CanSendToMeshPaintTexture
+						// behavior is otherwise unchanged by this reorder itself (see their own doc
+						// comments for the actual M20-E.1 lifecycle/enablement fix).
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						[
+							SNew(SButton)
+							.Text(LOCTEXT("SendToMeshPaintTexture", "Send to Mesh Paint Texture"))
+							.ToolTipText(LOCTEXT("SendToMeshPaintTextureTooltip",
+								"Sends the CURRENTLY ACCEPTED vertex colors (from the last Accept) through Unreal's native "
+								"Mesh Paint \"From Vertex\" import, producing/replacing each selected component's Mesh "
+								"Paint Texture. Does NOT transfer the current unaccepted Forge preview -- click Accept "
+								"first if you want this button to use your latest result. Each component's own prior "
+								"vertex color override state is restored afterward; no persistent Forge override is left behind."))
+							.OnClicked(this, &SVertexMaskForgePanel::OnSendToMeshPaintTextureClicked)
+							.IsEnabled(this, &SVertexMaskForgePanel::CanSendToMeshPaintTexture)
 						]
 					]
 
@@ -7280,6 +7310,18 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 						.ColorAndOpacity(FSlateColor::UseSubduedForeground())
 						.AutoWrapText(true)
 					]
+
+					// M20-E: separate status line for the restored Send to Mesh Paint Texture bridge --
+					// deliberately independent of GetOperationStatusText (Accept's own status), since the
+					// two operations are independent and can each report their own last result.
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					[
+						SNew(STextBlock)
+						.Text(this, &SVertexMaskForgePanel::GetSendToMeshPaintTextureStatusText)
+						.ColorAndOpacity(FSlateColor::UseSubduedForeground())
+						.AutoWrapText(true)
+					]
 				]
 			]
 			] // closes SScrollBox::Slot content
@@ -7299,6 +7341,12 @@ void SVertexMaskForgePanel::Construct(const FArguments& InArgs)
 	// only populates the Idle-state candidate list so "Edit Vertex Mask" is correctly enabled/disabled
 	// from the very first paint.
 	RefreshCandidateSelection();
+
+	// M20-E.1: populates the session-independent "Send to Mesh Paint Texture" candidate list from
+	// whatever is already selected in the Editor at the moment the panel is opened -- so the button is
+	// correctly enabled from the very first paint even if the artist never touches the selection again
+	// (Scenario A of the M20-E.1 manual checklist).
+	RefreshMeshPaintTransferCandidates();
 }
 
 SVertexMaskForgePanel::~SVertexMaskForgePanel()
@@ -7360,6 +7408,14 @@ void SVertexMaskForgePanel::OnEditorSelectionChanged(UObject* NewSelection)
 	// its own doc comment), consumes this flag and calls RefreshCandidateSelection() once the session
 	// has fully concluded -- never RefreshSelection(), so concluding a session never auto-starts
 	// another one (requirement #6).
+	//
+	// M20-E.1: MeshPaintTransferCandidateMeshes is refreshed UNCONDITIONALLY, before the
+	// bIsEditingVertexMask early-return below -- unlike CandidateMeshes/SelectedMeshes, it has no
+	// dependency on the Edit Vertex Mask session at all (see its own doc comment), so a selection
+	// change while a session IS active must still update the "Send to Mesh Paint Texture" button's
+	// eligibility immediately, exactly like it does while Idle.
+	RefreshMeshPaintTransferCandidates();
+
 	if (bIsEditingVertexMask)
 	{
 		bSceneSelectionChangedDuringActiveOperation = true;
@@ -7460,6 +7516,21 @@ void SVertexMaskForgePanel::RefreshCandidateSelection()
 	TMap<FString, int32> PathToIndex;
 	CollectViewportSelection(CandidateMeshes, PathToIndex);
 	UpdateMeshDiagnostics(CandidateMeshes);
+}
+
+void SVertexMaskForgePanel::RefreshMeshPaintTransferCandidates()
+{
+	// M20-E.1: the session-independent counterpart to RefreshCandidateSelection() -- same
+	// CollectViewportSelection/UpdateMeshDiagnostics pair, same eligibility filtering, but writes to
+	// MeshPaintTransferCandidateMeshes and is called UNCONDITIONALLY (see call sites: Construct()'s
+	// tail and every OnEditorSelectionChanged() firing, regardless of bIsEditingVertexMask). Never
+	// touches CandidateMeshes, SelectedMeshes, WorkingMeshes, or any preview/hide/generator state --
+	// see MeshPaintTransferCandidateMeshes' own doc comment for why the transfer button's eligibility
+	// has no real dependency on the Edit Vertex Mask session lifecycle at all.
+	MeshPaintTransferCandidateMeshes.Empty();
+	TMap<FString, int32> PathToIndex;
+	CollectViewportSelection(MeshPaintTransferCandidateMeshes, PathToIndex);
+	UpdateMeshDiagnostics(MeshPaintTransferCandidateMeshes);
 }
 
 void SVertexMaskForgePanel::RefreshSelection()
@@ -8661,6 +8732,107 @@ bool SVertexMaskForgePanel::AcceptPendingChanges()
 	UE_LOG(LogVertexMaskForge, Log, TEXT("Vertex Mask Forge: Accept lifecycle finished (pending state cleared, OperationState=Idle)."));
 
 	return true;
+}
+
+// M20-E: restored "Send to Mesh Paint Texture" bridge handlers. Deliberately independent of Accept's
+// own OperationState/LastOperationErrorText -- this is a separate operation with its own status line
+// (LastMeshPaintTextureTransferStatusText), never gated behind CanAcceptChanges(). Available whenever a
+// selection exists; it operates on whatever accepted colors already live on the Static Mesh asset(s),
+// which may be from an Accept earlier in this same session or from any prior source.
+//
+// M20-E.1: CanSendToMeshPaintTexture() reads MeshPaintTransferCandidateMeshes (session-independent,
+// live-selection-derived -- see its own doc comment), NEVER SelectedMeshes (the Edit Vertex Mask
+// session's own targets, empty until a session starts and cleared the instant Accept/Cancel ends one).
+// This is the actual fix for the M20-E defect where the button only became enabled after entering Edit
+// Vertex Mask: the bridge's real color authority is the accepted Static Mesh asset's own
+// ColorVertexBuffer (read fresh in BuildTransferTargets below), which has no dependency whatsoever on
+// whether a Forge editing session happens to be active.
+bool SVertexMaskForgePanel::CanSendToMeshPaintTexture() const
+{
+	return !MeshPaintTransferCandidateMeshes.IsEmpty();
+}
+
+FReply SVertexMaskForgePanel::OnSendToMeshPaintTextureClicked()
+{
+	LastMeshPaintTextureTransferStatusText = FText::GetEmpty();
+
+	// AUDITED (Phase 5, honest "Accept first" signal): reuses the panel's OWN EXISTING pending-changes
+	// authority (EVertexMaskForgeOperationState::PendingChanges, the same flag CanAcceptChanges() reads)
+	// rather than inventing a new comparison -- if the current preview has unaccepted changes, the
+	// button still proceeds (per the documented interim contract: it always transfers whatever is
+	// currently accepted on the asset), but the status line makes the distinction explicit rather than
+	// letting the artist assume the just-edited preview was what got transferred.
+	const bool bHadUnacceptedChanges = (OperationState == EVertexMaskForgeOperationState::PendingChanges);
+
+	// M20-E.1: re-resolves the CURRENT Editor selection fresh, right here, rather than trusting
+	// whatever MeshPaintTransferCandidateMeshes happened to hold when this button's IsEnabled last
+	// repainted (which could be a stale frame old, or -- more importantly -- could still be pointing at
+	// components from a session that has since been retargeted). This also means the handler stays
+	// correct even if it were ever invoked through some other path where IsEnabled was never consulted
+	// at all.
+	RefreshMeshPaintTransferCandidates();
+
+	TArray<VertexMaskForgeComponentOverrideBridge::FTransferTarget> Targets;
+	TArray<FText> IneligibleReasons;
+	FText ErrorText;
+	if (!VertexMaskForgeComponentOverrideBridge::BuildTransferTargets(MeshPaintTransferCandidateMeshes, Targets, IneligibleReasons, ErrorText))
+	{
+		LastMeshPaintTextureTransferStatusText = ErrorText;
+		UE_LOG(LogVertexMaskForge, Warning, TEXT("Vertex Mask Forge: Send to Mesh Paint Texture blocked: %s"), *ErrorText.ToString());
+		return FReply::Handled();
+	}
+
+	if (Targets.IsEmpty())
+	{
+		LastMeshPaintTextureTransferStatusText = IneligibleReasons.IsEmpty()
+			? LOCTEXT("SendToMeshPaintTextureNothingEligible", "No eligible component has accepted vertex colors to send yet. Click Accept first.")
+			: FText::Join(FText::FromString(TEXT(" ")), IneligibleReasons);
+		UE_LOG(LogVertexMaskForge, Warning, TEXT("Vertex Mask Forge: Send to Mesh Paint Texture blocked: %s"), *LastMeshPaintTextureTransferStatusText.ToString());
+		return FReply::Handled();
+	}
+
+	UE_LOG(LogVertexMaskForge, Log, TEXT("Vertex Mask Forge: Send to Mesh Paint Texture preflight succeeded -- %d component target(s)."), Targets.Num());
+
+	TArray<UStaticMeshComponent*> SucceededComponents;
+	{
+		// AUDITED (transient-only, M20-E Phase 4/6): unlike Accept, this transaction wraps a
+		// SYNCHRONOUS install-bake-restore sequence whose net effect on each component's own persistent
+		// state is a no-op (restored exactly) -- the transaction exists so the native import's own real,
+		// persistent side effect (the component's Mesh Paint Texture assignment) is Undo/Redo-capable,
+		// matching how Accept and the former Instance Override route both wrap their own real mutations.
+		FScopedTransaction Transaction(LOCTEXT("SendToMeshPaintTextureTransaction", "Send to Mesh Paint Texture"));
+		VertexMaskForgeComponentOverrideBridge::TransferToMeshPaintTexture(Targets, SucceededComponents, ErrorText);
+	}
+
+	if (SucceededComponents.IsEmpty())
+	{
+		LastMeshPaintTextureTransferStatusText = ErrorText.IsEmpty()
+			? LOCTEXT("SendToMeshPaintTextureFailedUnknown", "Send to Mesh Paint Texture failed for every target.")
+			: ErrorText;
+		UE_LOG(LogVertexMaskForge, Error, TEXT("Vertex Mask Forge: Send to Mesh Paint Texture failed: %s"), *LastMeshPaintTextureTransferStatusText.ToString());
+		return FReply::Handled();
+	}
+
+	UE_LOG(LogVertexMaskForge, Log, TEXT("Vertex Mask Forge: Send to Mesh Paint Texture succeeded for %d component(s)."), SucceededComponents.Num());
+
+	FText SuccessText = FText::Format(
+		LOCTEXT("SendToMeshPaintTextureSuccessFormat", "Sent accepted vertex colors to the Mesh Paint Texture for {0} component(s)."),
+		FText::AsNumber(SucceededComponents.Num()));
+	if (bHadUnacceptedChanges)
+	{
+		SuccessText = FText::Format(
+			LOCTEXT("SendToMeshPaintTextureSuccessWithPendingFormat",
+				"{0} Note: the current preview has unaccepted changes -- this transfer used the LAST ACCEPTED result, not the current preview. Click Accept first if you want the current result instead."),
+			SuccessText);
+	}
+	LastMeshPaintTextureTransferStatusText = SuccessText;
+
+	return FReply::Handled();
+}
+
+FText SVertexMaskForgePanel::GetSendToMeshPaintTextureStatusText() const
+{
+	return LastMeshPaintTextureTransferStatusText;
 }
 
 bool SVertexMaskForgePanel::HasNaniteMeshInSelection() const
