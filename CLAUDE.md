@@ -2,173 +2,166 @@
 
 ## Project
 
-Plugin nativo Editor-only para Unreal Engine 5.8, para gerar e editar Vertex
-Colors em Static Meshes.
+Native Editor-only plugin for Unreal Engine 5.8, for generating and editing
+Vertex Colors on Static Meshes.
 
-- **Nome técnico / repositório:** VertexMaskForge
-- **Nome visual (UI):** Vertex Mask Forge
+- **Technical name / repository:** VertexMaskForge
+- **Visual name (UI):** Vertex Mask Forge
 - **Engine:** Unreal Engine 5.8
-- **Projeto de teste:** `G:\UnrealProjects\MyProject`
-- **Conexão com o projeto:** junction em
-  `G:\UnrealProjects\MyProject\Plugins\VertexMaskForge` apontando para este
-  repositório.
+- **Test project:** `G:\UnrealProjects\MyProject`
+- **Connection to the project:** junction at
+  `G:\UnrealProjects\MyProject\Plugins\VertexMaskForge` pointing to this
+  repository.
 
-## Regras fundamentais
+## Fundamental rules
 
-- Editor-only. Não deve compilar/carregar em builds de jogo (Runtime).
-- Código 100% C++. Nenhum Blueprint.
-- Interface 100% Slate. Nenhum Editor Utility Widget.
-- Nenhuma dependência de Houdini ou Houdini Engine.
-- Entrada de menu: `Tools → Custom Tools → Vertex Mask Forge`.
-- Processamento de Vertex Color implementado nativamente em C++, usando as
-  APIs de Dynamic Mesh e Geometry Script da UE 5.8 quando apropriado.
+- Editor-only. Must not compile/load in game (Runtime) builds.
+- 100% C++ code. No Blueprint.
+- 100% Slate interface. No Editor Utility Widget.
+- No dependency on Houdini or Houdini Engine.
+- Menu entry: `Tools → Custom Tools → Vertex Mask Forge`.
+- Vertex Color processing implemented natively in C++, using UE 5.8's
+  Dynamic Mesh and Geometry Script APIs when appropriate.
 
-## Metodologia de desenvolvimento
+## Development methodology
 
-- Desenvolvimento incremental, em checkpoints pequenos.
-- Cada checkpoint deve compilar sem erros antes de seguir para o próximo.
-- Nunca continuar implementando depois de um erro de build sem resolvê-lo
-  primeiro.
-- Antes de presumir a assinatura de uma API (Dynamic Mesh, Geometry Script,
-  Slate, etc.), inspecionar o código-fonte real instalado da UE 5.8 em
-  `G:\UE_5.8\Engine`. Não presumir com base em versões anteriores da engine.
+- Incremental development, in small checkpoints.
+- Each checkpoint must compile without errors before moving on to the next.
+- Never keep implementing after a build error without resolving it first.
+- Before assuming the signature of an API (Dynamic Mesh, Geometry Script,
+  Slate, etc.), inspect the actual installed UE 5.8 source code at
+  `G:\UE_5.8\Engine`. Do not assume based on previous engine versions.
 
 ## Architectural Documentation Protocol
 
-Vertex Mask Forge possui documentação arquitetural viva e versionada junto do
-plugin:
+Vertex Mask Forge has living, versioned architectural documentation
+alongside the plugin:
 
 - [Docs/VertexMaskForgeArchitecture.md](Docs/VertexMaskForgeArchitecture.md)
-  — descreve o estado arquitetural vigente (ownership, domínios, ciclo de
-  vida de cores, composição, geradores, integração, limitações).
+  — describes the current architectural state (ownership, domains, color
+  lifecycle, composition, generators, integration, limitations).
 - [Docs/VertexMaskForgeDecisionLog.md](Docs/VertexMaskForgeDecisionLog.md)
-  — registra as decisões arquiteturais aceitas, seus motivos, e as questões
-  ainda em aberto.
+  — records the accepted architectural decisions, their reasons, and the
+  questions still open.
 
-### Início de todo checkpoint
+### Start of every checkpoint
 
-Antes de auditar, planejar, implementar ou modificar qualquer parte do
+Before auditing, planning, implementing, or modifying any part of
 Vertex Mask Forge:
 
-1. Ler integralmente os dois documentos acima.
-2. Usar `VertexMaskForgeArchitecture.md` como descrição do estado
-   arquitetural vigente.
-3. Usar `VertexMaskForgeDecisionLog.md` para entender decisões já aceitas,
-   seus motivos, e o que ainda está em aberto (nunca tratar um item em
-   aberto como decidido).
-4. Depois da leitura, auditar no código e nos testes somente os arquivos,
-   símbolos e fronteiras (boundaries) realmente afetados pelo checkpoint —
-   não redescobrir a arquitetura inteira a cada vez.
-5. Código e testes validados continuam sendo a autoridade factual: não
-   confiar cegamente na documentação se ela divergir do que o código/teste
-   realmente prova.
-6. Se houver divergência entre documentação e código/testes, não seguir
-   silenciosamente uma das duas versões: identificar a inconsistência,
-   determinar o contrato realmente comprovado, corrigir a documentação
-   dentro do escopo do checkpoint quando apropriado, e reportar a
-   reconciliação.
+1. Read both of the documents above in full.
+2. Use `VertexMaskForgeArchitecture.md` as the description of the current
+   architectural state.
+3. Use `VertexMaskForgeDecisionLog.md` to understand decisions already
+   accepted, their reasons, and what is still open (never treat an open
+   item as decided).
+4. After reading, audit in the code and tests only the files, symbols, and
+   boundaries actually affected by the checkpoint — do not rediscover the
+   entire architecture every time.
+5. Validated code and tests remain the factual authority: do not blindly
+   trust the documentation if it diverges from what the code/tests actually
+   prove.
+6. If there is a divergence between documentation and code/tests, do not
+   silently follow either version: identify the inconsistency, determine
+   the contract actually proven, correct the documentation within the
+   checkpoint's scope when appropriate, and report the reconciliation.
 
-### Durante o checkpoint
+### During the checkpoint
 
-- Manter `Current Contract`, `Compatibility Boundary`, `Known Limitation` e
-  `Planned` sempre claramente separados, como já definido nos dois
-  documentos.
-- Nunca apresentar comportamento `Planned` como se já estivesse
-  implementado.
-- Nunca tratar uma decisão ainda em aberto como `Accepted`.
-- Tratar qualquer mudança de ownership, domínio, identidade, cardinalidade,
-  composição, persistência ou integração como uma possível mudança
-  arquitetural, mesmo que pequena.
-- Relacionar novos testes ao boundary que eles congelam sempre que isso
-  afetar a documentação.
-- Manter a auditoria limitada à fronteira realmente afetada, depois da
-  leitura inicial dos dois documentos.
+- Keep `Current Contract`, `Compatibility Boundary`, `Known Limitation`, and
+  `Planned` always clearly separated, as already defined in both documents.
+- Never present `Planned` behavior as if it were already implemented.
+- Never treat a decision still open as `Accepted`.
+- Treat any change of ownership, domain, identity, cardinality,
+  composition, persistence, or integration as a possible architectural
+  change, even if small.
+- Relate new tests to the boundary they freeze whenever this affects the
+  documentation.
+- Keep the audit limited to the boundary actually affected, after the
+  initial reading of both documents.
 
-### Revisão de impacto documental
+### Documentation impact review
 
-Depois de implementar e validar, e antes de qualquer staging/commit, avaliar
-explicitamente se o checkpoint mudou:
+After implementing and validating, and before any staging/commit,
+explicitly evaluate whether the checkpoint changed:
 
-- o estado arquitetural vigente;
+- the current architectural state;
 - ownership;
-- o domínio render-vertex/source-topology;
-- o comportamento de identidade (`MaskInstanceId`/`LayerId`);
-- a composição ou a semântica de canais;
-- o comportamento de geração/result-store;
-- o contrato de cache/invalidação;
-- o comportamento de preview, Accept, Cancel ou persistência;
-- alguma compatibility boundary;
-- o integration status;
-- alguma limitação (introduzida, alterada ou resolvida);
-- os testes representativos que protegem alguma fronteira;
-- alguma decisão arquitetural (introduzida, revisada, superseded ou
-  rejeitada);
-- se, à luz do que foi avaliado acima, alguma atualização documental é
-  necessária.
+- the render-vertex/source-topology domain;
+- identity behavior (`MaskInstanceId`/`LayerId`);
+- composition or channel semantics;
+- generation/result-store behavior;
+- the cache/invalidation contract;
+- preview, Accept, Cancel, or persistence behavior;
+- any compatibility boundary;
+- integration status;
+- any limitation (introduced, changed, or resolved);
+- the representative tests that protect any boundary;
+- any architectural decision (introduced, revised, superseded, or
+  rejected);
+- whether, in light of what was evaluated above, any documentation update
+  is necessary.
 
-A revisão deve terminar em uma de duas saídas, nunca ambígua: atualizar
-`VertexMaskForgeArchitecture.md` e/ou `VertexMaskForgeDecisionLog.md`
-conforme os critérios da próxima seção, ou aplicar o protocolo de
-"Checkpoints sem impacto documental".
+The review must end in one of two outcomes, never ambiguous: update
+`VertexMaskForgeArchitecture.md` and/or `VertexMaskForgeDecisionLog.md`
+per the criteria in the next section, or apply the "Checkpoints with no
+documentation impact" protocol.
 
-### Quando atualizar cada documento
+### When to update each document
 
-Atualizar `VertexMaskForgeArchitecture.md` quando: o estado arquitetural
-vigente mudar; ownership, domain, identity, lifecycle ou data flow mudar; um
-Current Contract ou Compatibility Boundary mudar; o integration status
-mudar; uma limitação surgir, mudar ou for resolvida; os testes
-representativos que protegem uma fronteira arquitetural mudarem; ou os
-símbolos centrais/responsabilidades documentadas mudarem.
+Update `VertexMaskForgeArchitecture.md` when: the current architectural
+state changes; ownership, domain, identity, lifecycle, or data flow
+changes; a Current Contract or Compatibility Boundary changes; the
+integration status changes; a limitation arises, changes, or is resolved;
+the representative tests protecting an architectural boundary change; or
+the documented core symbols/responsibilities change.
 
-Atualizar `VertexMaskForgeDecisionLog.md` quando: uma decisão arquitetural
-for introduzida; uma decisão `Accepted` for materialmente revisada; uma
-decisão for superseded; uma decisão anterior deixar de representar o
-projeto; ou uma questão listada em Future Decision Candidates se tornar uma
-decisão comprovada.
+Update `VertexMaskForgeDecisionLog.md` when: an architectural decision is
+introduced; an `Accepted` decision is materially revised; a decision is
+superseded; a previous decision no longer represents the project; or a
+question listed in Future Decision Candidates becomes a proven decision.
 
-Não criar um novo ADR para mudanças locais sem relevância arquitetural.
+Do not create a new ADR for local changes with no architectural relevance.
 
-### Mesmo commit
+### Same commit
 
-Quando uma mudança de código ou teste alterar um contrato ou decisão
-documentada:
+When a code or test change alters a documented contract or decision:
 
-- atualizar a documentação correspondente como parte do mesmo checkpoint;
-- incluir código, testes e documentação no mesmo commit;
-- nunca deixar a atualização documental para um checkpoint futuro;
-- validar novamente a consistência entre implementação, testes, Architecture
-  e Decision Log antes do commit.
+- update the corresponding documentation as part of the same checkpoint;
+- include code, tests, and documentation in the same commit;
+- never leave the documentation update for a future checkpoint;
+- re-validate consistency between implementation, tests, Architecture, and
+  Decision Log before the commit.
 
-Para metadata de baseline, seguir exatamente o protocolo definido em
-`VertexMaskForgeArchitecture.md`, seção "Architectural Maintenance
-Protocol". Nunca inventar ou antecipar o hash de um commit futuro.
+For baseline metadata, follow exactly the protocol defined in
+`VertexMaskForgeArchitecture.md`, section "Architectural Maintenance
+Protocol". Never invent or anticipate the hash of a future commit.
 
-### Checkpoints sem impacto documental
+### Checkpoints with no documentation impact
 
-Quando a revisão de impacto documental concluir que nenhuma alteração é
-necessária:
+When the documentation impact review concludes that no change is
+necessary:
 
-- não editar os documentos mecanicamente;
-- declarar explicitamente no relatório final do checkpoint que os dois
-  documentos foram lidos, que a revisão de impacto documental foi
-  executada, que nenhuma mudança documental foi necessária, e apresentar
-  uma justificativa curta baseada na fronteira (boundary) afetada pelo
-  checkpoint.
+- do not edit the documents mechanically;
+- explicitly state in the checkpoint's final report that both documents
+  were read, that the documentation impact review was performed, that no
+  documentation change was necessary, and present a short justification
+  based on the boundary affected by the checkpoint.
 
-Um checkpoint não deve ser considerado concluído sem essa declaração
-explícita ou sem as atualizações documentais exigidas.
+A checkpoint must not be considered complete without this explicit
+statement or without the required documentation updates.
 
-## Restrições
+## Restrictions
 
-- Nunca editar arquivos da Engine (`G:\UE_5.8\Engine\...`).
-- Nunca sobrescrever alterações preexistentes no projeto de teste ou no
-  repositório sem inspecionar antes.
-- Não adicionar assets binários ao repositório sem necessidade real.
-- Nunca fazer commit sem autorização explícita do usuário.
+- Never edit Engine files (`G:\UE_5.8\Engine\...`).
+- Never overwrite preexisting changes in the test project or in the
+  repository without inspecting them first.
+- Do not add binary assets to the repository without real need.
+- Never commit without explicit authorization from the user.
 
-## Ambiente
+## Environment
 
-- Engine instalada em: `G:\UE_5.8`
-- Projeto de teste: `G:\UnrealProjects\MyProject` (`EngineAssociation: 5.8`)
-- O projeto de teste tem seu próprio repositório Git, independente deste.
-  Não inicializar nem alterar Git dentro de `G:\UnrealProjects\MyProject`.
+- Engine installed at: `G:\UE_5.8`
+- Test project: `G:\UnrealProjects\MyProject` (`EngineAssociation: 5.8`)
+- The test project has its own Git repository, independent of this one.
+  Do not initialize or alter Git inside `G:\UnrealProjects\MyProject`.
